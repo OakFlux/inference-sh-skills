@@ -1,0 +1,121 @@
+name: Temporary Konruns revised report Windows
+
+on:
+  push:
+    branches:
+      - tmp-konruns-revised-windows-20260826
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-revised:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+      - name: Fetch revised report
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > fetch_revised.py <<'PY'
+          import html
+          import re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from pypdf import PdfReader
+
+          code = "603590"
+          org_id = "9900034526"
+          api = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+          referer = f"https://www.cninfo.com.cn/new/disclosure/stock?stockCode={code}&orgId={org_id}"
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Referer": referer,
+              "Origin": "https://www.cninfo.com.cn",
+              "X-Requested-With": "XMLHttpRequest",
+              "Accept": "application/json, text/javascript, */*; q=0.01",
+          })
+
+          rows = []
+          for searchkey in ("2023年年度报告", ""):
+              form = {
+                  "stock": f"{code},{org_id}",
+                  "tabName": "fulltext",
+                  "pageSize": "100",
+                  "pageNum": "1",
+                  "column": "sse",
+                  "category": "",
+                  "plate": "sh",
+                  "seDate": "2024-05-01~2024-05-10",
+                  "searchkey": searchkey,
+                  "secid": "",
+                  "sortName": "",
+                  "sortType": "",
+                  "isHLtitle": "true",
+              }
+              response = session.post(api, data=form, timeout=60)
+              response.raise_for_status()
+              batch = response.json().get("announcements") or []
+              print("QUERY", repr(searchkey), "ROWS", len(batch))
+              rows.extend(x for x in batch if isinstance(x, dict))
+
+          def clean(value):
+              text = html.unescape(str(value or ""))
+              text = re.sub(r"<[^>]+>", "", text)
+              return " ".join(text.split())
+
+          candidates = []
+          seen = set()
+          for row in rows:
+              title = clean(row.get("announcementTitle"))
+              adjunct = str(row.get("adjunctUrl") or "")
+              key = adjunct or str(row.get("announcementId") or "")
+              if not key or key in seen:
+                  continue
+              seen.add(key)
+              print("ROW", title, adjunct)
+              compact = re.sub(r"\s+", "", title).replace("（", "(").replace("）", ")")
+              if "2023年年度报告" in compact and "修正版" in compact and "摘要" not in compact and "关于" not in compact:
+                  candidates.append((row, title))
+          if not candidates:
+              raise RuntimeError("Revised 2023 annual report not found")
+
+          row, title = candidates[0]
+          adjunct = str(row.get("adjunctUrl") or "").lstrip("/")
+          output_dir = Path("dist")
+          output_dir.mkdir(parents=True, exist_ok=True)
+          destination = output_dir / "康辰药业_603590_2023年年度报告_修正版.pdf"
+          errors = []
+          for base in ("https://static.cninfo.com.cn/", "https://www.cninfo.com.cn/", "http://static.cninfo.com.cn/"):
+              url = urljoin(base, adjunct)
+              try:
+                  response = session.get(url, headers={"Referer": referer, "Accept": "application/pdf,*/*"}, timeout=240)
+                  response.raise_for_status()
+                  raw = response.content
+                  if len(raw) < 80000 or not raw.startswith(b"%PDF-"):
+                      raise RuntimeError(f"not PDF: {len(raw)} bytes")
+                  destination.write_bytes(raw)
+                  pages = len(PdfReader(str(destination), strict=False).pages)
+                  if pages < 100:
+                      raise RuntimeError(f"unexpected page count: {pages}")
+                  print("SELECTED", title, adjunct)
+                  print("OK", destination, pages, len(raw))
+                  break
+              except Exception as exc:
+                  destination.unlink(missing_ok=True)
+                  errors.append(f"{url}: {exc}")
+          else:
+              raise RuntimeError("; ".join(errors))
+          PY
+          python fetch_revised.py
+      - name: Upload revised PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: konruns-2023-revised-pdf-windows
+          path: dist/康辰药业_603590_2023年年度报告_修正版.pdf
+          retention-days: 1
+          if-no-files-found: error
