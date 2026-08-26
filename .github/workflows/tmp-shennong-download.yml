@@ -11,6 +11,7 @@ permissions:
 jobs:
   download-and-verify:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Install PDF utilities
         run: |
@@ -31,44 +32,31 @@ jobs:
             local expected_regex="$4"
             shift 4
             local tmp="${dest}.part"
-            local url referer pages
+            local url pages
             local ok=0
 
             for url in "$@"; do
+              rm -f "$tmp"
               echo "Trying ${label}: ${url}"
-              for referer in \
-                'https://www.sse.com.cn/' \
-                'https://money.finance.sina.com.cn/' \
-                'https://www.cninfo.com.cn/' \
-                'https://stock.eastmoney.com/' \
-                'https://stock.10jqka.com.cn/'; do
-                rm -f "$tmp"
-                if curl -k -L --fail --retry 5 --retry-delay 3 --retry-all-errors \
-                  --connect-timeout 30 --max-time 1500 --http1.1 \
-                  -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
-                  -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
-                  -e "$referer" "$url" -o "$tmp"; then
-                  if [[ -s "$tmp" ]] && [[ "$(head -c 4 "$tmp")" == '%PDF' ]]; then
-                    pages="$(pdfinfo "$tmp" 2>/dev/null | awk '/^Pages:/ {print $2}')"
-                    if [[ -n "${pages:-}" ]] && (( pages >= min_pages )); then
-                      pdftotext -f 1 -l 18 "$tmp" - 2>/dev/null | tr -d '\000' > /tmp/shennong_text.txt || true
-                      if grep -Eq '神农集团|云南神农农业产业集团股份有限公司' /tmp/shennong_text.txt \
-                        && grep -Eq "$expected_regex" /tmp/shennong_text.txt; then
-                        mv "$tmp" "$dest"
-                        ok=1
-                        echo "Verified ${label}: ${pages} pages"
-                        break 2
-                      else
-                        echo "Rejected ${label}: title/company text validation failed"
-                      fi
-                    else
-                      echo "Rejected ${label}: only ${pages:-unknown} pages"
+              if curl -k -L --fail --retry 3 --retry-delay 2 --retry-all-errors \
+                --connect-timeout 30 --max-time 600 --http1.1 \
+                -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+                -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+                -e 'https://money.finance.sina.com.cn/' "$url" -o "$tmp"; then
+                if [[ -s "$tmp" ]] && [[ "$(head -c 4 "$tmp")" == '%PDF' ]]; then
+                  pages="$(pdfinfo "$tmp" 2>/dev/null | awk '/^Pages:/ {print $2}')"
+                  if [[ -n "${pages:-}" ]] && (( pages >= min_pages )); then
+                    pdftotext -f 1 -l 20 "$tmp" - 2>/dev/null | tr -d '\000' > /tmp/shennong_text.txt || true
+                    if grep -Eq '神农集团|云南神农农业产业集团股份有限公司' /tmp/shennong_text.txt \
+                      && grep -Eq "$expected_regex" /tmp/shennong_text.txt; then
+                      mv "$tmp" "$dest"
+                      ok=1
+                      echo "Verified ${label}: ${pages} pages"
+                      break
                     fi
-                  else
-                    echo "Rejected ${label}: response is not a PDF"
                   fi
                 fi
-              done
+              fi
             done
 
             rm -f "$tmp"
@@ -79,7 +67,6 @@ jobs:
 
             qpdf --check "$dest"
             pages="$(pdfinfo "$dest" | awk '/^Pages:/ {print $2}')"
-            local stem
             stem="$(basename "$dest" .pdf)"
             pdftoppm -f 1 -singlefile -png -r 90 "$dest" "previews/${stem}_first" >/dev/null 2>&1
             pdftoppm -f "$pages" -singlefile -png -r 90 "$dest" "previews/${stem}_last" >/dev/null 2>&1
@@ -89,8 +76,8 @@ jobs:
             'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2021/2021-6/2021-06-22/7331350.PDF'
 
           download_pdf "$package_dir/神农集团_2021年年度报告.pdf" 150 '2021年年度报告' '2021[[:space:]]*年年度报告|2021年年度报告' \
-            'https://pdf.dfcfw.com/pdf/H2_AN202204211560714518_1.pdf' \
-            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2022/2022-4/2022-04-22/8040268.PDF'
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2022/2022-4/2022-04-22/8040268.PDF' \
+            'https://pdf.dfcfw.com/pdf/H2_AN202204211560714518_1.pdf'
 
           download_pdf "$package_dir/神农集团_2022年年度报告_修订版.pdf" 150 '2022年年度报告（修订版）' '2022[[:space:]]*年年度报告|2022年年度报告' \
             'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2023/2023-6/2023-06-09/9279879.PDF'
@@ -99,18 +86,14 @@ jobs:
             'https://static.cninfo.com.cn/finalpage/2024-04-26/1219837411.PDF'
 
           download_pdf "$package_dir/神农集团_2024年年度报告.pdf" 150 '2024年年度报告' '2024[[:space:]]*年年度报告|2024年年度报告' \
-            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2025-04-29/605296_20250429_IH40.pdf' \
-            'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2025-04-29/605296_20250429_IH40.pdf' \
             'https://static.cninfo.com.cn/finalpage/2025-04-29/1223366038.PDF'
 
           download_pdf "$package_dir/神农集团_2025年年度报告.pdf" 150 '2025年年度报告' '2025[[:space:]]*年年度报告|2025年年度报告' \
-            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-25/605296_20260425_MF3A.pdf' \
-            'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-25/605296_20260425_MF3A.pdf' \
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2026/2026-4/2026-04-25/12187689.PDF' \
             'https://pdf.dfcfw.com/pdf/H2_AN202604241821555054_1.pdf'
 
           download_pdf "$package_dir/神农集团_2026年半年度报告.pdf" 50 '2026年半年度报告' '2026[[:space:]]*年半年度报告|2026年半年度报告' \
-            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-08-25/605296_20260825_YJPM.pdf' \
-            'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-08-25/605296_20260825_YJPM.pdf'
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2026/2026-8/2026-08-25/12522715.PDF'
 
           {
             echo '神农集团（605296.SH）报告包，共7份PDF。'
