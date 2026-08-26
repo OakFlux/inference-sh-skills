@@ -1,0 +1,136 @@
+name: Temporary Wantai report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-wantai-reports-20260826
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf zip
+
+      - name: Download, verify and package original reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews
+
+          download_pdf() {
+            local dest="$1"
+            local min_pages="$2"
+            local label="$3"
+            shift 3
+            local tmp="${dest}.part"
+            local url pages text
+            local ok=0
+
+            for url in "$@"; do
+              rm -f "$tmp"
+              echo "Trying ${label}: ${url}"
+              for referer in 'https://www.sse.com.cn/' 'https://money.finance.sina.com.cn/' 'https://stock.10jqka.com.cn/' 'https://www.cninfo.com.cn/'; do
+                rm -f "$tmp"
+                if curl -k -L --fail --retry 4 --retry-delay 2 --retry-all-errors \
+                  --connect-timeout 30 --max-time 1200 --http1.1 \
+                  -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+                  -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+                  -e "$referer" "$url" -o "$tmp"; then
+                  if [[ -s "$tmp" ]] && [[ "$(head -c 4 "$tmp")" == "%PDF" ]]; then
+                    pages="$(pdfinfo "$tmp" 2>/dev/null | awk '/^Pages:/ {print $2}')"
+                    if [[ -n "${pages:-}" ]] && (( pages >= min_pages )); then
+                      pdftotext -f 1 -l 12 "$tmp" - 2>/dev/null | tr -d '\000' > /tmp/wantai_text.txt || true
+                      if grep -Eq '万泰生物|北京万泰生物药业股份有限公司' /tmp/wantai_text.txt; then
+                        mv "$tmp" "$dest"
+                        ok=1
+                        echo "Verified ${label}: ${pages} pages"
+                        break 2
+                      fi
+                    fi
+                  fi
+                fi
+              done
+            done
+
+            rm -f "$tmp"
+            if [[ "$ok" != "1" ]]; then
+              echo "All sources failed validation for ${label}" >&2
+              exit 1
+            fi
+
+            qpdf --check "$dest"
+            pages="$(pdfinfo "$dest" | awk '/^Pages:/ {print $2}')"
+            local stem
+            stem="$(basename "$dest" .pdf)"
+            pdftoppm -f 1 -singlefile -png -r 80 "$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 80 "$dest" "previews/${stem}_last" >/dev/null 2>&1
+          }
+
+          download_pdf 'output/万泰生物_2020年年度报告.pdf' 150 '2020年年度报告' \
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2021/2021-3/2021-03-26/6979737.PDF' \
+            'https://notice.10jqka.com.cn/api/pdf/f4c9f6c3a19e1578.pdf'
+
+          download_pdf 'output/万泰生物_2021年年度报告.pdf' 150 '2021年年度报告' \
+            'https://stockn.xueqiu.com/SH603392/20220317031596.pdf' \
+            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2022-03-18/603392_20220318_2_KCzwSXJq.pdf' \
+            'https://notice.10jqka.com.cn/api/pdf/e1f1473faddcfa88.pdf'
+
+          download_pdf 'output/万泰生物_2022年年度报告.pdf' 150 '2022年年度报告' \
+            'https://www.cnpharm.com/upload/resources/file/2023/03/21/134429.pdf' \
+            'https://notice.10jqka.com.cn/api/pdf/a19dc02e806d88b7.pdf'
+
+          download_pdf 'output/万泰生物_2023年年度报告.pdf' 150 '2023年年度报告' \
+            'https://stockn.xueqiu.com/SH603392/20240328419604.pdf' \
+            'https://notice.10jqka.com.cn/api/pdf/b6a3762b1a5deb59.pdf'
+
+          download_pdf 'output/万泰生物_2024年年度报告.pdf' 150 '2024年年度报告' \
+            'https://static.cninfo.com.cn/finalpage/2025-04-12/1223071956.PDF' \
+            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2025-04-12/603392_20250412_UTP6.pdf' \
+            'https://notice.10jqka.com.cn/api/pdf/65fc70991c65240b.pdf'
+
+          download_pdf 'output/万泰生物_2025年年度报告.pdf' 150 '2025年年度报告' \
+            'https://www.cnpharm.com/upload/resources/file/2026/04/21/187775.pdf' \
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2026/2026-4/2026-04-21/12123220.PDF' \
+            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-21/603392_20260421_19WO.pdf' \
+            'https://notice.10jqka.com.cn/api/pdf/c0c0cfc03be44b6f.pdf'
+
+          download_pdf 'output/万泰生物_2026年第一季度报告.pdf' 5 '2026年第一季度报告' \
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2026/2026-4/2026-04-28/12212443.PDF' \
+            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-28/603392_20260428_PEID.pdf' \
+            'https://notice.10jqka.com.cn/api/pdf/8db5d8be2c1cf609.pdf'
+
+          download_pdf 'output/万泰生物_2026年半年度报告.pdf' 80 '2026年半年度报告' \
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2026/2026-8/2026-08-20/12504675.PDF' \
+            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-08-20/603392_20260820_A9MT.pdf'
+
+          {
+            echo '万泰生物（603392.SH）定期报告，共8份：'
+            echo
+            for f in output/*.pdf; do
+              p="$(pdfinfo "$f" | awk '/^Pages:/ {print $2}')"
+              s="$(stat -c%s "$f")"
+              printf '%s | %s页 | %s字节\n' "$(basename "$f")" "$p" "$s"
+            done
+            echo
+            echo '核验：PDF文件头、公司名称、最小页数、qpdf结构检查，以及首页和末页渲染。'
+          } > output/报告清单与核验说明.txt
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          zip -9 -r '万泰生物_2020-2025年报及最新季报.zip' output >/dev/null
+          unzip -t '万泰生物_2020-2025年报及最新季报.zip'
+          ls -lh output '万泰生物_2020-2025年报及最新季报.zip'
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: wantai-final-package
+          path: 万泰生物_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
