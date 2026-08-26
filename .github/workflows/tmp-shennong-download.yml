@@ -1,0 +1,143 @@
+name: Temporary Shennong report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-shennong-reports-20260826
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf zip
+
+      - name: Download, verify and package original reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir='神农集团_2020-2025年报及最新季报'
+          mkdir -p "$package_dir" previews
+
+          download_pdf() {
+            local dest="$1"
+            local min_pages="$2"
+            local label="$3"
+            local expected_regex="$4"
+            shift 4
+            local tmp="${dest}.part"
+            local url referer pages
+            local ok=0
+
+            for url in "$@"; do
+              echo "Trying ${label}: ${url}"
+              for referer in \
+                'https://www.sse.com.cn/' \
+                'https://money.finance.sina.com.cn/' \
+                'https://www.cninfo.com.cn/' \
+                'https://stock.eastmoney.com/' \
+                'https://stock.10jqka.com.cn/'; do
+                rm -f "$tmp"
+                if curl -k -L --fail --retry 5 --retry-delay 3 --retry-all-errors \
+                  --connect-timeout 30 --max-time 1500 --http1.1 \
+                  -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+                  -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+                  -e "$referer" "$url" -o "$tmp"; then
+                  if [[ -s "$tmp" ]] && [[ "$(head -c 4 "$tmp")" == '%PDF' ]]; then
+                    pages="$(pdfinfo "$tmp" 2>/dev/null | awk '/^Pages:/ {print $2}')"
+                    if [[ -n "${pages:-}" ]] && (( pages >= min_pages )); then
+                      pdftotext -f 1 -l 18 "$tmp" - 2>/dev/null | tr -d '\000' > /tmp/shennong_text.txt || true
+                      if grep -Eq '神农集团|云南神农农业产业集团股份有限公司' /tmp/shennong_text.txt \
+                        && grep -Eq "$expected_regex" /tmp/shennong_text.txt; then
+                        mv "$tmp" "$dest"
+                        ok=1
+                        echo "Verified ${label}: ${pages} pages"
+                        break 2
+                      else
+                        echo "Rejected ${label}: title/company text validation failed"
+                      fi
+                    else
+                      echo "Rejected ${label}: only ${pages:-unknown} pages"
+                    fi
+                  else
+                    echo "Rejected ${label}: response is not a PDF"
+                  fi
+                fi
+              done
+            done
+
+            rm -f "$tmp"
+            if [[ "$ok" != '1' ]]; then
+              echo "All sources failed validation for ${label}" >&2
+              exit 1
+            fi
+
+            qpdf --check "$dest"
+            pages="$(pdfinfo "$dest" | awk '/^Pages:/ {print $2}')"
+            local stem
+            stem="$(basename "$dest" .pdf)"
+            pdftoppm -f 1 -singlefile -png -r 90 "$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 90 "$dest" "previews/${stem}_last" >/dev/null 2>&1
+          }
+
+          download_pdf "$package_dir/神农集团_2020年度股东大会会议资料_含2020年度财务资料.pdf" 20 '2020年度资料' '2020.*年度股东大会|2020.*年度.*财务' \
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2021/2021-6/2021-06-22/7331350.PDF'
+
+          download_pdf "$package_dir/神农集团_2021年年度报告.pdf" 150 '2021年年度报告' '2021[[:space:]]*年年度报告|2021年年度报告' \
+            'https://pdf.dfcfw.com/pdf/H2_AN202204211560714518_1.pdf' \
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2022/2022-4/2022-04-22/8040268.PDF'
+
+          download_pdf "$package_dir/神农集团_2022年年度报告_修订版.pdf" 150 '2022年年度报告（修订版）' '2022[[:space:]]*年年度报告|2022年年度报告' \
+            'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2023/2023-6/2023-06-09/9279879.PDF'
+
+          download_pdf "$package_dir/神农集团_2023年年度报告.pdf" 150 '2023年年度报告' '2023[[:space:]]*年年度报告|2023年年度报告' \
+            'https://static.cninfo.com.cn/finalpage/2024-04-26/1219837411.PDF'
+
+          download_pdf "$package_dir/神农集团_2024年年度报告.pdf" 150 '2024年年度报告' '2024[[:space:]]*年年度报告|2024年年度报告' \
+            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2025-04-29/605296_20250429_IH40.pdf' \
+            'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2025-04-29/605296_20250429_IH40.pdf' \
+            'https://static.cninfo.com.cn/finalpage/2025-04-29/1223366038.PDF'
+
+          download_pdf "$package_dir/神农集团_2025年年度报告.pdf" 150 '2025年年度报告' '2025[[:space:]]*年年度报告|2025年年度报告' \
+            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-25/605296_20260425_MF3A.pdf' \
+            'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-04-25/605296_20260425_MF3A.pdf' \
+            'https://pdf.dfcfw.com/pdf/H2_AN202604241821555054_1.pdf'
+
+          download_pdf "$package_dir/神农集团_2026年半年度报告.pdf" 50 '2026年半年度报告' '2026[[:space:]]*年半年度报告|2026年半年度报告' \
+            'http://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-08-25/605296_20260825_YJPM.pdf' \
+            'https://static.sse.com.cn/disclosure/listedinfo/announcement/c/new/2026-08-25/605296_20260825_YJPM.pdf'
+
+          {
+            echo '神农集团（605296.SH）报告包，共7份PDF。'
+            echo
+            echo '说明：神农集团于2021年5月28日上市，上市公司口径不存在单独披露的《2020年年度报告》。本包以公司《2020年度股东大会会议资料》（含2020年度财务资料）补充2020年度。'
+            echo '2022年度报告采用公司后续披露的修订版。'
+            echo '截至2026年8月26日，最新一期完整定期报告为2026年半年度报告。'
+            echo
+            for f in "$package_dir"/*.pdf; do
+              p="$(pdfinfo "$f" | awk '/^Pages:/ {print $2}')"
+              s="$(stat -c%s "$f")"
+              printf '%s | %s页 | %s字节\n' "$(basename "$f")" "$p" "$s"
+            done
+            echo
+            echo '核验项目：PDF文件头、公司名称、报告年度/类型、最小页数、qpdf结构检查，以及首页和末页渲染。'
+          } > "$package_dir/报告清单与核验说明.txt"
+
+          (cd "$package_dir" && sha256sum ./*.pdf > SHA256SUMS.txt)
+          zip -9 -r '神农集团_2020-2025年报及最新季报.zip' "$package_dir" >/dev/null
+          unzip -t '神农集团_2020-2025年报及最新季报.zip'
+          ls -lh "$package_dir" '神农集团_2020-2025年报及最新季报.zip'
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: shennong-final-package
+          path: 神农集团_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
