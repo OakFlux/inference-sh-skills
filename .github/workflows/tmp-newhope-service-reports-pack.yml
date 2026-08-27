@@ -11,7 +11,7 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - name: Install dependencies
         run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
@@ -27,6 +27,7 @@ jobs:
           import re
           import time
           import zipfile
+          from datetime import date, datetime, timedelta
           from pathlib import Path
           from typing import Any
           from urllib.parse import urljoin
@@ -39,7 +40,6 @@ jobs:
           COMPANY_CN = "新希望服务"
           COMPANY_TRAD = "新希望服務"
           COMPANY_EN = "NEW HOPE SERVICE"
-          TODAY = "20260828"
 
           OUT = Path("dist")
           WORK = Path("work")
@@ -72,17 +72,31 @@ jobs:
                           return [x for x in value if isinstance(x, dict)]
               raise RuntimeError(f"Unexpected HKEX response shape: {type(obj)} {str(obj)[:500]}")
 
-          def hkex_query(*, stock_id: str, start: str, end: str, lang: str = "zh", title: str = "", row_range: int = 2000) -> list[dict[str, Any]]:
+          def field(row: dict[str, Any], *names: str) -> str:
+              for name in names:
+                  if name in row and row[name] is not None:
+                      return str(row[name]).strip()
+                  lower = name.lower()
+                  for key, value in row.items():
+                      if str(key).lower() == lower and value is not None:
+                          return str(value).strip()
+              return ""
+
+          def norm_code(value: Any) -> str:
+              digits = re.sub(r"\D", "", str(value or ""))
+              return digits.zfill(5)[-5:] if digits else ""
+
+          def hkex_query(start: str, end: str, *, lang: str, category: int = 0, row_range: int = 5000) -> list[dict[str, Any]]:
               params = {
                   "sortDir": "0",
                   "sortByOptions": "DateTime",
-                  "category": "0",
+                  "category": str(category),
                   "market": "SEHK",
-                  "stockId": stock_id,
+                  "stockId": "-1",
                   "documentType": "-1",
                   "fromDate": start,
                   "toDate": end,
-                  "title": title,
+                  "title": "",
                   "searchType": "1",
                   "t1code": "40000",
                   "t2Gcode": "-2",
@@ -94,77 +108,56 @@ jobs:
                   SEARCH_API,
                   params=params,
                   headers={"Accept": "application/json", "Referer": SEARCH_PAGE},
-                  timeout=90,
+                  timeout=120,
               )
-              print("HKEX QUERY", response.status_code, len(response.content), response.url)
+              print("QUERY", response.status_code, len(response.content), response.url)
               response.raise_for_status()
               rows = parse_rows(response.json())
-              print("HKEX ROWS", len(rows))
-              return rows
+              matched = [row for row in rows if norm_code(field(row, "STOCK_CODE", "stockCode")) == CODE]
+              print("ROWS", len(rows), "MATCHED", len(matched))
+              return matched
 
-          def norm_code(value: Any) -> str:
-              digits = re.sub(r"\D", "", str(value or ""))
-              return digits.zfill(5)[-5:] if digits else ""
+          def iter_chunks(start: str, end: str, days: int = 10):
+              current = datetime.strptime(start, "%Y%m%d").date()
+              finish = datetime.strptime(end, "%Y%m%d").date()
+              while current <= finish:
+                  chunk_end = min(current + timedelta(days=days - 1), finish)
+                  yield current.strftime("%Y%m%d"), chunk_end.strftime("%Y%m%d")
+                  current = chunk_end + timedelta(days=1)
 
-          def field(row: dict[str, Any], *names: str) -> str:
-              for name in names:
-                  if name in row and row[name] is not None:
-                      return str(row[name]).strip()
-                  lower = name.lower()
-                  for key, value in row.items():
-                      if str(key).lower() == lower and value is not None:
-                          return str(value).strip()
-              return ""
+          records: list[dict[str, Any]] = []
+          seen_links: set[str] = set()
 
-          def discover_stock_id() -> str:
-              attempts = [
-                  ("20260701", "20260710", ""),
-                  ("20260325", "20260410", ""),
-                  ("20260425", "20260505", ""),
-                  ("20250820", "20250910", ""),
-                  ("20260701", "20260710", "證券變動月報表"),
-                  ("20260325", "20260410", "年度業績"),
-              ]
-              for start, end, title in attempts:
-                  for lang in ("zh", "EN"):
-                      try:
-                          rows = hkex_query(stock_id="-1", start=start, end=end, lang=lang, title=title, row_range=5000)
-                      except Exception as exc:
-                          print("DISCOVERY QUERY ERROR", start, end, title, lang, repr(exc))
+          def collect_window(start: str, end: str, *, lang: str, category: int = 0) -> None:
+              for chunk_start, chunk_end in iter_chunks(start, end):
+                  for row in hkex_query(chunk_start, chunk_end, lang=lang, category=category):
+                      title = field(row, "TITLE", "title")
+                      link = field(row, "FILE_LINK", "fileLink", "LINK")
+                      if not title or not link or link in seen_links:
                           continue
-                      for row in rows:
-                          code = norm_code(field(row, "STOCK_CODE", "stockCode", "SECURITY_CODE"))
-                          name = field(row, "STOCK_NAME", "stockName", "SECURITY_NAME")
-                          if code == CODE or COMPANY_TRAD in name or COMPANY_CN in name or COMPANY_EN in name.upper():
-                              stock_id = field(row, "STOCK_ID", "stockId", "SECURITY_ID")
-                              print("DISCOVERED STOCK", code, name, stock_id, row)
-                              if stock_id:
-                                  return stock_id
-              raise RuntimeError("Unable to discover HKEX stockId for 03658")
+                      seen_links.add(link)
+                      copy = dict(row)
+                      copy["_TITLE"] = title
+                      copy["_LINK"] = link
+                      copy["_LANG"] = "中文" if lang == "zh" else "英文"
+                      records.append(copy)
 
-          stock_id = discover_stock_id()
-          print("STOCK_ID", stock_id)
+          # Annual-report filing seasons for fiscal years 2021-2025.
+          annual_windows = [
+              ("20220315", "20220515"),
+              ("20230315", "20230515"),
+              ("20240315", "20240515"),
+              ("20250315", "20250515"),
+              ("20260315", "20260515"),
+          ]
+          for start, end in annual_windows:
+              collect_window(start, end, lang="zh")
 
-          all_records: list[dict[str, Any]] = []
-          seen_records: set[tuple[str, str]] = set()
-          for lang in ("zh", "EN"):
-              rows = hkex_query(stock_id=stock_id, start="20210101", end=TODAY, lang=lang, row_range=3000)
-              for row in rows:
-                  title = field(row, "TITLE", "title")
-                  link = field(row, "FILE_LINK", "fileLink", "LINK")
-                  key = (title, link)
-                  if not title or not link or key in seen_records:
-                      continue
-                  seen_records.add(key)
-                  row = dict(row)
-                  row["_TITLE"] = title
-                  row["_LINK"] = link
-                  row["_LANG"] = "中文" if lang == "zh" else "英文"
-                  all_records.append(row)
-
-          print("TOTAL RECORDS", len(all_records))
-          for row in all_records:
-              print("REC", field(row, "DATE_TIME", "dateTime", "DATE"), row["_LANG"], row["_TITLE"], row["_LINK"])
+          # IPO documents and latest interim periods.
+          collect_window("20210501", "20210620", lang="zh", category=0)
+          collect_window("20210501", "20210620", lang="zh", category=1)
+          collect_window("20250801", "20251015", lang="zh")
+          collect_window("20260801", "20260828", lang="zh")
 
           CN_YEAR_TOKENS = {
               2020: ("二零二零", "二〇二〇"),
@@ -189,97 +182,90 @@ jobs:
                       return year
               return None
 
-          def record_date(row: dict[str, Any]) -> str:
-              return field(row, "DATE_TIME", "dateTime", "DATE", "PUBLISH_DATE")
-
           def file_url(row: dict[str, Any]) -> str:
               link = row["_LINK"]
               if link.startswith("http://") or link.startswith("https://"):
                   return link
               return urljoin("https://www1.hkexnews.hk/", link.lstrip("/"))
 
-          annuals: dict[int, dict[str, Any]] = {}
-          annual_exclusions = ("業績", "业绩", "RESULTS", "摘要", "環境", "环境", "ESG", "可持續", "可持续", "SUSTAINABILITY", "通函", "CIRCULAR")
-          for row in all_records:
-              title = row["_TITLE"]
-              s = compact(title)
-              upper = s.upper()
-              is_annual = ("年報" in s or "年度報告" in s or "ANNUALREPORT" in upper)
-              if not is_annual or any(token in upper if token.isascii() else token in s for token in annual_exclusions):
-                  continue
-              year = detect_year(title)
-              if year not in range(2021, 2026):
-                  continue
-              score = (
-                  1 if row["_LANG"] == "中文" else 0,
-                  1 if file_url(row).lower().endswith(".pdf") else 0,
-                  record_date(row),
-              )
-              current = annuals.get(year)
-              if current is None:
-                  annuals[year] = row
-              else:
-                  current_score = (
-                      1 if current["_LANG"] == "中文" else 0,
-                      1 if file_url(current).lower().endswith(".pdf") else 0,
-                      record_date(current),
-                  )
-                  if score > current_score:
-                      annuals[year] = row
+          def record_date(row: dict[str, Any]) -> str:
+              return field(row, "DATE_TIME", "dateTime", "DATE")
 
-          if not annuals:
-              raise RuntimeError("No annual reports selected")
-          print("ANNUALS SELECTED", {year: row["_TITLE"] for year, row in sorted(annuals.items())})
+          def select_annuals(source: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+              chosen: dict[int, dict[str, Any]] = {}
+              for row in source:
+                  title = row["_TITLE"]
+                  s = compact(title)
+                  upper = s.upper()
+                  if not ("年報" in s or "年度報告" in s or "ANNUALREPORT" in upper):
+                      continue
+                  if any(token in s for token in ("業績", "业绩", "摘要", "環境", "环境", "可持續", "可持续", "通函")):
+                      continue
+                  if any(token in upper for token in ("RESULTS", "ESG", "SUSTAINABILITY", "CIRCULAR")):
+                      continue
+                  year = detect_year(title)
+                  if year not in range(2021, 2026):
+                      continue
+                  score = (1 if row["_LANG"] == "中文" else 0, record_date(row))
+                  current = chosen.get(year)
+                  if current is None or score > (1 if current["_LANG"] == "中文" else 0, record_date(current)):
+                      chosen[year] = row
+              return chosen
 
-          formal_half_candidates: list[dict[str, Any]] = []
-          results_half_candidates: list[dict[str, Any]] = []
-          older_half_candidates: list[dict[str, Any]] = []
-          for row in all_records:
-              title = row["_TITLE"]
-              s = compact(title)
-              upper = s.upper()
-              year = detect_year(title)
-              if any(token in s for token in ("摘要", "英文版")):
-                  continue
-              formal = ("中期報告" in s or "半年度報告" in s or "INTERIMREPORT" in upper)
-              results = (
-                  "中期業績" in s
-                  or "中期业绩" in s
-                  or "INTERIMRESULT" in upper
-                  or ("SIXMONTHSENDED" in upper and "2026" in upper)
-              )
-              if year == 2026 and formal:
-                  formal_half_candidates.append(row)
-              elif year == 2026 and results:
-                  results_half_candidates.append(row)
-              elif formal and year is not None:
-                  older_half_candidates.append(row)
+          annuals = select_annuals(records)
+          missing_years = [year for year in range(2021, 2026) if year not in annuals]
+          if missing_years:
+              print("MISSING CHINESE ANNUALS", missing_years, "-- searching English filings")
+              for start, end in annual_windows:
+                  collect_window(start, end, lang="EN")
+              annuals = select_annuals(records)
+              missing_years = [year for year in range(2021, 2026) if year not in annuals]
+          if missing_years:
+              raise RuntimeError(f"Missing annual reports for years {missing_years}")
+          print("ANNUALS", {year: annuals[year]["_TITLE"] for year in sorted(annuals)})
 
-          def rank_record(row: dict[str, Any]) -> tuple[int, str]:
-              return (1 if row["_LANG"] == "中文" else 0, record_date(row))
+          def choose_half(source: list[dict[str, Any]]) -> tuple[dict[str, Any], str, str, int]:
+              formal_2026: list[dict[str, Any]] = []
+              results_2026: list[dict[str, Any]] = []
+              older_formal: list[dict[str, Any]] = []
+              for row in source:
+                  title = row["_TITLE"]
+                  s = compact(title)
+                  upper = s.upper()
+                  if any(token in s for token in ("摘要", "英文版")):
+                      continue
+                  year = detect_year(title)
+                  formal = "中期報告" in s or "半年度報告" in s or "INTERIMREPORT" in upper
+                  results = "中期業績" in s or "中期业绩" in s or "INTERIMRESULT" in upper or ("SIXMONTHSENDED" in upper and "2026" in upper)
+                  if year == 2026 and formal:
+                      formal_2026.append(row)
+                  elif year == 2026 and results:
+                      results_2026.append(row)
+                  elif formal and year is not None:
+                      older_formal.append(row)
+              rank = lambda row: (1 if row["_LANG"] == "中文" else 0, record_date(row))
+              if formal_2026:
+                  row = sorted(formal_2026, key=rank, reverse=True)[0]
+                  return row, "正式2026年中期报告", "新希望服务_03658_2026年中期报告.pdf", 25
+              if results_2026:
+                  row = sorted(results_2026, key=rank, reverse=True)[0]
+                  return row, "2026年中期业绩公告（含六个月财务报表）", "新希望服务_03658_2026年中期业绩公告_含六个月财务报表.pdf", 8
+              if older_formal:
+                  row = sorted(older_formal, key=lambda r: (detect_year(r["_TITLE"]) or 0, *rank(r)), reverse=True)[0]
+                  year = detect_year(row["_TITLE"]) or 0
+                  return row, f"截至检索日最新正式中期报告（{year}年）", f"新希望服务_03658_{year}年中期报告.pdf", 25
+              raise RuntimeError("No interim report or interim-results filing found")
 
-          if formal_half_candidates:
-              half_row = sorted(formal_half_candidates, key=rank_record, reverse=True)[0]
-              half_kind = "正式2026年中期报告"
-              half_filename = "新希望服务_03658_2026年中期报告.pdf"
-              half_min_pages = 25
-          elif results_half_candidates:
-              half_row = sorted(results_half_candidates, key=rank_record, reverse=True)[0]
-              half_kind = "2026年中期业绩公告（含六个月财务报表）"
-              half_filename = "新希望服务_03658_2026年中期业绩公告_含六个月财务报表.pdf"
-              half_min_pages = 8
-          elif older_half_candidates:
-              half_row = sorted(older_half_candidates, key=lambda r: (detect_year(r["_TITLE"]) or 0, *rank_record(r)), reverse=True)[0]
-              latest_year = detect_year(half_row["_TITLE"]) or 0
-              half_kind = f"截至检索日最新正式中期报告（{latest_year}年）"
-              half_filename = f"新希望服务_03658_{latest_year}年中期报告.pdf"
-              half_min_pages = 25
-          else:
-              raise RuntimeError("No interim report or interim-results document selected")
-          print("HALF SELECTED", half_kind, half_row["_TITLE"], file_url(half_row))
+          try:
+              half_row, half_kind, half_filename, half_min_pages = choose_half(records)
+          except RuntimeError:
+              collect_window("20260801", "20260828", lang="EN")
+              collect_window("20250801", "20251015", lang="EN")
+              half_row, half_kind, half_filename, half_min_pages = choose_half(records)
+          print("HALF", half_kind, half_row["_TITLE"], file_url(half_row))
 
           prospectus_records: list[dict[str, Any]] = []
-          for row in all_records:
+          for row in records:
               title = row["_TITLE"]
               s = compact(title)
               upper = s.upper()
@@ -287,11 +273,21 @@ jobs:
                   continue
               if any(token in s for token in ("全球發售", "全球发售", "招股章程", "招股說明書")) or "GLOBALOFFERING" in upper or "PROSPECTUS" in upper:
                   prospectus_records.append(row)
-
           if not prospectus_records:
-              raise RuntimeError("No prospectus records found")
+              collect_window("20210501", "20210620", lang="EN", category=0)
+              collect_window("20210501", "20210620", lang="EN", category=1)
+              for row in records:
+                  title = row["_TITLE"]
+                  s = compact(title)
+                  upper = s.upper()
+                  if any(token in s for token in ("申請表格", "申请表格")) or "APPLICATIONFORM" in upper:
+                      continue
+                  if any(token in s for token in ("全球發售", "全球发售", "招股章程", "招股說明書")) or "GLOBALOFFERING" in upper or "PROSPECTUS" in upper:
+                      prospectus_records.append(row)
+          if not prospectus_records:
+              raise RuntimeError("No prospectus filing found")
 
-          def download_bytes(url: str, destination: Path, referer: str | None = None) -> str:
+          def download(url: str, path: Path, *, referer: str | None = None) -> str:
               errors: list[str] = []
               for attempt in range(4):
                   try:
@@ -300,13 +296,13 @@ jobs:
                           headers["Referer"] = referer
                       with session.get(url, headers=headers, timeout=300, stream=True, allow_redirects=True) as response:
                           response.raise_for_status()
-                          with destination.open("wb") as output:
+                          with path.open("wb") as output:
                               for chunk in response.iter_content(1024 * 1024):
                                   if chunk:
                                       output.write(chunk)
                           return response.url
                   except Exception as exc:
-                      destination.unlink(missing_ok=True)
+                      path.unlink(missing_ok=True)
                       errors.append(repr(exc))
                       if attempt < 3:
                           time.sleep(2 ** attempt)
@@ -327,80 +323,76 @@ jobs:
               sample = re.sub(r"\s+", " ", " ".join(parts)).strip()
               return pages, sample, hashlib.sha256(raw).hexdigest()
 
-          prospectus_candidates: list[tuple[tuple[int, int, int, int], Path, str, str]] = []
+          prospectus_candidates: list[tuple[tuple[int, int, int, int], Path, str]] = []
           seen_candidate_urls: set[str] = set()
-          candidate_index = 0
-          for record in prospectus_records:
-              entry_url = file_url(record)
-              entry_title = record["_TITLE"]
-              candidate_links: list[tuple[str, str]] = []
+          index = 0
+          for row in prospectus_records:
+              entry_url = file_url(row)
+              links: list[tuple[str, str]] = []
               if entry_url.lower().endswith(".pdf"):
-                  candidate_links.append((entry_title, entry_url))
+                  links.append((row["_TITLE"], entry_url))
               else:
                   try:
                       response = session.get(entry_url, timeout=90)
-                      print("PROSPECTUS PAGE", response.status_code, len(response.content), response.url)
                       response.raise_for_status()
                       soup = BeautifulSoup(response.text, "html.parser")
                       for anchor in soup.find_all("a", href=True):
                           child_title = " ".join(anchor.get_text(" ", strip=True).split())
                           child_url = urljoin(response.url, anchor["href"])
                           if child_url.lower().endswith(".pdf"):
-                              candidate_links.append((child_title, child_url))
+                              links.append((child_title, child_url))
                   except Exception as exc:
                       print("PROSPECTUS PAGE ERROR", entry_url, repr(exc))
-              for child_title, child_url in candidate_links:
+              for child_title, child_url in links:
                   if child_url in seen_candidate_urls:
                       continue
                   seen_candidate_urls.add(child_url)
-                  candidate_index += 1
-                  temp = WORK / f"prospectus_candidate_{candidate_index:03d}.pdf"
+                  index += 1
+                  temp = WORK / f"prospectus_{index:03d}.pdf"
                   try:
-                      final_url = download_bytes(child_url, temp, referer=entry_url)
+                      final_url = download(child_url, temp, referer=entry_url)
                       pages, sample, digest = pdf_info(temp)
                   except Exception as exc:
                       print("PROSPECTUS CANDIDATE ERROR", child_url, repr(exc))
                       continue
-                  text = (child_title + " " + entry_title + " " + sample).lower()
-                  company_score = int(any(name.lower() in text for name in (COMPANY_CN, COMPANY_TRAD, COMPANY_EN, "new hope service")))
-                  prospectus_score = int(any(token.lower() in text for token in ("招股", "prospectus", "global offering", "全球發售", "全球发售")))
-                  language_score = 1 if record["_LANG"] == "中文" else 0
+                  text = (row["_TITLE"] + " " + child_title + " " + sample).lower()
+                  company_score = int(any(token.lower() in text for token in (COMPANY_CN, COMPANY_TRAD, COMPANY_EN, "new hope service")))
+                  prospectus_score = int(any(token.lower() in text for token in ("招股", "prospectus", "global offering", "全球發售")))
+                  language_score = 1 if row["_LANG"] == "中文" else 0
                   score = (company_score, prospectus_score, language_score, pages)
-                  prospectus_candidates.append((score, temp, final_url, digest))
-                  print("PROSPECTUS CANDIDATE", score, child_title, pages, temp.stat().st_size, final_url)
+                  prospectus_candidates.append((score, temp, final_url))
+                  print("PROSPECTUS", score, child_title, pages, temp.stat().st_size, final_url)
 
           if not prospectus_candidates:
-              raise RuntimeError("No downloadable prospectus PDF candidate")
+              raise RuntimeError("No downloadable prospectus candidate")
           prospectus_candidates.sort(key=lambda item: (item[0], item[1].stat().st_size), reverse=True)
-          prospectus_score, prospectus_temp, prospectus_source, prospectus_digest = prospectus_candidates[0]
-          prospectus_pages, prospectus_sample, _ = pdf_info(prospectus_temp)
+          prospectus_score, prospectus_temp, prospectus_source = prospectus_candidates[0]
+          prospectus_pages, prospectus_sample, prospectus_digest = pdf_info(prospectus_temp)
           if prospectus_pages < 150:
-              raise RuntimeError(f"Selected prospectus is unexpectedly short: {prospectus_pages} pages, score={prospectus_score}")
+              raise RuntimeError(f"Selected prospectus too short: {prospectus_pages} pages, score={prospectus_score}")
           prospectus_path = DOCS / "新希望服务_03658_全球发售招股章程_2021.pdf"
           prospectus_path.write_bytes(prospectus_temp.read_bytes())
 
           manifest = [
               "新希望服务控股有限公司（03658.HK）",
               "资料范围：上市后全部完整年度报告、最终全球发售招股章程，以及截至2026-08-28最新半年期财务披露。",
-              f"港交所内部股票ID：{stock_id}",
+              f"年度报告年份：{', '.join(str(y) for y in sorted(annuals))}。",
               f"最新半年期文件口径：{half_kind}。",
               "来源：香港交易所披露易（HKEXnews）官方文件；优先采用中文版本。",
-              "版本规则：排除年报摘要、年度业绩公告、ESG/可持续发展报告和申请表格。",
+              "版本规则：排除年度业绩公告、摘要、ESG/可持续发展报告和申请表格。",
               "",
           ]
 
-          def save_selected(filename: str, row: dict[str, Any], kind: str, minimum_pages: int, expected_year: int | None) -> None:
+          def save_report(filename: str, row: dict[str, Any], kind: str, minimum_pages: int, expected_year: int | None) -> None:
               path = DOCS / filename
-              source = file_url(row)
-              final_url = download_bytes(source, path, referer=SEARCH_PAGE)
+              final_url = download(file_url(row), path, referer=SEARCH_PAGE)
               pages, sample, digest = pdf_info(path)
               if pages < minimum_pages:
                   raise RuntimeError(f"Unexpectedly short {kind}: {filename} has {pages} pages")
-              company_ok = any(name.lower() in sample.lower() for name in (COMPANY_CN, COMPANY_TRAD, COMPANY_EN, "new hope service"))
-              if not company_ok:
-                  print("WARNING company name not extracted from first pages", filename)
+              if not any(token.lower() in sample.lower() for token in (COMPANY_CN, COMPANY_TRAD, COMPANY_EN, "new hope service")):
+                  print("WARNING company name not extracted", filename)
               if expected_year is not None and str(expected_year) not in sample and not any(token in sample for token in CN_YEAR_TOKENS.get(expected_year, ())):
-                  print("WARNING expected year not extracted from first pages", expected_year, filename)
+                  print("WARNING year not extracted", expected_year, filename)
               manifest.extend([
                   filename,
                   f"  港交所标题：{row['_TITLE']}",
@@ -414,16 +406,9 @@ jobs:
               ])
               print("OK", filename, pages, path.stat().st_size, final_url)
 
-          for year in sorted(annuals):
-              save_selected(
-                  f"新希望服务_03658_{year}年年度报告.pdf",
-                  annuals[year],
-                  f"{year}年年度报告",
-                  60,
-                  year,
-              )
-
-          save_selected(half_filename, half_row, half_kind, half_min_pages, detect_year(half_row["_TITLE"]))
+          for year in range(2021, 2026):
+              save_report(f"新希望服务_03658_{year}年年度报告.pdf", annuals[year], f"{year}年年度报告", 60, year)
+          save_report(half_filename, half_row, half_kind, half_min_pages, detect_year(half_row["_TITLE"]))
 
           prospectus_raw = prospectus_path.read_bytes()
           manifest.extend([
@@ -435,27 +420,24 @@ jobs:
               f"  官方来源：{prospectus_source}",
               "",
           ])
-
           (DOCS / "资料清单与港交所官方来源.txt").write_text("\n".join(manifest), encoding="utf-8")
 
-          half_label = "2026年最新半年期报告" if detect_year(half_row["_TITLE"]) == 2026 else "最新半年期报告"
+          half_year = detect_year(half_row["_TITLE"])
+          half_label = f"{half_year}年最新半年期报告" if half_year else "最新半年期报告"
           final_zip = OUT / f"新希望服务_03658_所有年报_招股说明书_{half_label}.zip"
           with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
               for path in sorted(DOCS.iterdir()):
                   archive.write(path, arcname=path.name)
-
           with zipfile.ZipFile(final_zip, "r") as archive:
               bad = archive.testzip()
               if bad:
                   raise RuntimeError(f"ZIP integrity failure: {bad}")
-              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
-              expected_count = len(annuals) + 2
-              if len(pdf_names) != expected_count:
-                  raise RuntimeError(f"Expected {expected_count} PDFs, got {pdf_names}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdfs}")
 
           print(f"FINAL_ZIP={final_zip}")
           print(f"ZIP_SIZE={final_zip.stat().st_size}")
-          print(f"ANNUAL_YEARS={','.join(str(y) for y in sorted(annuals))}")
           print(f"HALF_KIND={half_kind}")
           print("CONTENTS")
           for path in sorted(DOCS.iterdir()):
