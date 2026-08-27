@@ -1,0 +1,48 @@
+name: Temporary Zoom filing diagnostics
+
+on:
+  push:
+    branches:
+      - tmp-zoom-diag-20260827
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect latest Zoom 10-Q links
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          import requests
+          from bs4 import BeautifulSoup
+          from urllib.parse import urljoin
+
+          urls = [
+              'https://investors.zoom.us/sec-filings/sec-filing/10-q/0001585521-26-000121',
+              'https://investors.zoom.us/sec-filings/sec-filing/10-q/0001585521-26-000121/',
+              'https://www.sec.gov/Archives/edgar/data/1585521/000158552126000121/0001585521-26-000121-index.htm',
+              'https://www.sec.gov/Archives/edgar/data/1585521/000158552126000121/zm-20260731.htm',
+          ]
+          s = requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Accept-Language':'en-US,en;q=0.9'})
+          for u in urls:
+              try:
+                  r=s.get(u,timeout=60,allow_redirects=True)
+                  print('\nURL',u,'STATUS',r.status_code,'FINAL',r.url,'TYPE',r.headers.get('content-type'),'LEN',len(r.content))
+                  print('HEAD',repr(r.content[:100]))
+                  text=r.text
+                  print('STATIC MATCHES',sorted(set(re.findall(r'https?://[^\"\'<> ]*(?:static-files|\.pdf)[^\"\'<> ]*',text,re.I)))[:50])
+                  soup=BeautifulSoup(text,'html.parser')
+                  for a in soup.find_all('a',href=True):
+                      t=' '.join(a.get_text(' ',strip=True).split())
+                      href=urljoin(r.url,a['href'])
+                      if 'pdf' in t.lower() or 'static-files' in href or href.lower().endswith('.pdf') or 'download' in t.lower():
+                          print('LINK',repr(t),href)
+              except Exception as e:
+                  print('ERROR',u,repr(e))
+          PY
