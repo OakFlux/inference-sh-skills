@@ -1,0 +1,72 @@
+name: Temporary Reportify company report list
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-reportify-company-list.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch company document pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          for p in 1 2 3 4 5 6 7 8 9 10; do
+            curl -L --compressed --retry 3 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://reportify.cn/' \
+              "https://reportify.cn/companies/HK%3A03658/documents?page=$p" \
+              -o "diagnostic/page_${p}.html" || true
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, json
+          records=[]
+          seen=set()
+          for p in sorted(Path('diagnostic').glob('page_*.html')):
+              t=p.read_text(errors='replace').replace('\\"','"').replace('\\/','/')
+              # report page links with nearby text
+              for m in re.finditer(r'(?:https://reportify\.cn)?/reports/(\d{12,})',t):
+                  rid=m.group(1)
+                  if rid in seen: continue
+                  seen.add(rid)
+                  ctx=t[max(0,m.start()-1500):m.start()+3000]
+                  titles=re.findall(r'"(?:report_title|title)":"([^"]+)"',ctx)
+                  dates=re.findall(r'"(?:publish_at|published_at)":(\d+)',ctx)
+                  insts=re.findall(r'"institution_name":"([^"]+)"',ctx)
+                  totals=re.findall(r'"document_total_page":(\d+)',ctx)
+                  records.append({'report_id':rid,'page_source':p.name,'titles':titles[-3:],'dates':dates[-3:],'institutions':insts[-3:],'pages':totals[-3:],'context':ctx})
+              # direct report_id objects
+              for m in re.finditer(r'"report_id":"(\d{12,})"',t):
+                  rid=m.group(1)
+                  if rid in seen: continue
+                  seen.add(rid)
+                  ctx=t[max(0,m.start()-500):m.start()+2500]
+                  titles=re.findall(r'"(?:report_title|title)":"([^"]+)"',ctx)
+                  dates=re.findall(r'"(?:publish_at|published_at)":(\d+)',ctx)
+                  insts=re.findall(r'"institution_name":"([^"]+)"',ctx)
+                  totals=re.findall(r'"document_total_page":(\d+)',ctx)
+                  records.append({'report_id':rid,'page_source':p.name,'titles':titles[-3:],'dates':dates[-3:],'institutions':insts[-3:],'pages':totals[-3:],'context':ctx})
+          Path('diagnostic/records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/summary.tsv','w',encoding='utf-8') as f:
+              f.write('report_id\tsource\ttitles\tdates\tinstitutions\tpages\n')
+              for r in records:
+                  f.write(f"{r['report_id']}\t{r['page_source']}\t{' | '.join(r['titles'])}\t{' | '.join(r['dates'])}\t{' | '.join(r['institutions'])}\t{' | '.join(r['pages'])}\n")
+          print('records',len(records))
+          print(Path('diagnostic/summary.tsv').read_text(encoding='utf-8'))
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: reportify-newhope-company-list
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
