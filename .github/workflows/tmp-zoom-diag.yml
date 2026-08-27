@@ -11,11 +11,11 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 2
     steps:
       - name: Install dependency
         run: python -m pip install --disable-pip-version-check beautifulsoup4
-      - name: Inspect Zoom investor filing links and annual PDFs
+      - name: Inspect Zoom GCS filing link
         shell: bash
         run: |
           python - <<'PY'
@@ -23,36 +23,19 @@ jobs:
           from bs4 import BeautifulSoup
           from urllib.parse import urljoin
 
-          filing_urls = [
-              'https://investors.zoom.us/sec-filings/sec-filing/10-q/0001585521-26-000121',
-              'https://zoom.gcs-web.com/sec-filings/sec-filing/10-q/0001585521-26-000121',
-          ]
-          annual_urls = [
-              'https://investors.zoom.us/static-files/a6b3b254-94ff-415f-bb3b-8c3146b061d4',
-              'https://investors.zoom.us/static-files/a17fd391-13ae-429b-8cb3-bfd95b61b007',
-              'https://investors.zoom.us/static-files/9a9d91bf-5c62-45fd-9573-fb03159c8a93',
-              'https://investors.zoom.us/static-files/50e0c380-f4bd-4a16-80e3-da56b64017ce',
-              'https://investors.zoom.us/static-files/b0dac8db-4e35-4dd8-a148-c02a0029b1c5',
-              'https://investors.zoom.us/static-files/f5b92b93-5af9-42cb-ab0d-931c309417a9',
-          ]
-          s = requests.Session()
+          u='https://zoom.gcs-web.com/sec-filings/sec-filing/10-q/0001585521-26-000121'
+          s=requests.Session()
           s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Accept-Language':'en-US,en;q=0.9'})
-          for u in filing_urls:
-              try:
-                  r=s.get(u,timeout=20,allow_redirects=True)
-                  print('\nFILING',u,'STATUS',r.status_code,'FINAL',r.url,'TYPE',r.headers.get('content-type'),'LEN',len(r.content))
-                  soup=BeautifulSoup(r.text,'html.parser')
-                  for a in soup.find_all('a',href=True):
-                      t=' '.join(a.get_text(' ',strip=True).split())
-                      href=urljoin(r.url,a['href'])
-                      if 'pdf' in t.lower() or 'static-files' in href or href.lower().endswith('.pdf') or 'download' in t.lower():
-                          print('LINK',repr(t),href)
-              except Exception as e:
-                  print('FILING ERROR',u,repr(e))
-          for u in annual_urls:
-              try:
-                  r=s.get(u,headers={'Range':'bytes=0-255','Accept':'application/pdf,*/*','Referer':'https://investors.zoom.us/financial-information/annual-reports'},timeout=20,allow_redirects=True)
-                  print('ANNUAL',u,'STATUS',r.status_code,'FINAL',r.url,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'HEAD',repr(r.content[:12]))
-              except Exception as e:
-                  print('ANNUAL ERROR',u,repr(e))
+          try:
+              r=s.get(u,timeout=25,allow_redirects=True)
+              print('FILING',u,'STATUS',r.status_code,'FINAL',r.url,'TYPE',r.headers.get('content-type'),'LEN',len(r.content))
+              print('HEAD',repr(r.content[:200]))
+              soup=BeautifulSoup(r.text,'html.parser')
+              for a in soup.find_all('a',href=True):
+                  t=' '.join(a.get_text(' ',strip=True).split())
+                  href=urljoin(r.url,a['href'])
+                  if 'pdf' in t.lower() or 'static-files' in href or href.lower().endswith('.pdf') or 'download' in t.lower():
+                      print('LINK',repr(t),href)
+          except Exception as e:
+              print('FILING ERROR',repr(e))
           PY
