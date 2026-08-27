@@ -1,0 +1,42 @@
+name: Temporary Zoom macOS download test
+
+on:
+  push:
+    branches:
+      - tmp-zoom-macos-20260827
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: Test Zoom and SEC endpoints
+        shell: bash
+        run: |
+          set +e
+          echo '=== ZOOM STATIC ==='
+          curl -L --max-time 45 --connect-timeout 10 -r 0-1023 \
+            -A 'Mozilla/5.0' \
+            -e 'https://zoom.gcs-web.com/financial-information/annual-reports' \
+            -D /tmp/zoom_headers.txt \
+            -o /tmp/zoom_chunk.bin \
+            'https://zoom.gcs-web.com/static-files/a6b3b254-94ff-415f-bb3b-8c3146b061d4'
+          echo CURL_EXIT=$?
+          cat /tmp/zoom_headers.txt || true
+          ls -l /tmp/zoom_chunk.bin || true
+          xxd -l 32 /tmp/zoom_chunk.bin || true
+          echo '=== SEC DATA ==='
+          curl -L --max-time 45 --connect-timeout 10 \
+            -A 'OpenAI Research Assistant research@openai.com' \
+            -H 'Accept-Encoding: gzip, deflate' --compressed \
+            -D /tmp/sec_headers.txt \
+            -o /tmp/sec.html \
+            'https://www.sec.gov/Archives/edgar/data/1585521/000158552126000121/zm-20260731.htm'
+          echo CURL_EXIT=$?
+          cat /tmp/sec_headers.txt || true
+          ls -l /tmp/sec.html || true
+          head -c 100 /tmp/sec.html || true
+          echo
