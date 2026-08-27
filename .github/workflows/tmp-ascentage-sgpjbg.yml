@@ -1,0 +1,59 @@
+name: Temporary Ascentage SGPJBG retrieval
+
+on:
+  push:
+    branches:
+      - 'tmp/ascentage-reports-20260828'
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Fetch topic and report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics reports
+          python - <<'PY'
+          import html, json, re, urllib.parse, urllib.request
+          from pathlib import Path
+          UA={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'}
+          def get(url, timeout=90):
+              req=urllib.request.Request(url,headers=UA)
+              return urllib.request.urlopen(req,timeout=timeout).read()
+          base='https://www.sgpjbg.com/zhuanti/quanqiuyiyaobaogao.html'
+          raw=get(base)
+          Path('diagnostics/topic.html').write_bytes(raw)
+          text=raw.decode('utf-8','ignore')
+          links=[]
+          for href,label in re.findall(r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+              clean=re.sub(r'<[^>]+>',' ',label)
+              clean=html.unescape(re.sub(r'\s+',' ',clean)).strip()
+              href=html.unescape(href)
+              if '亚盛医药' in clean or '亚盛医药' in urllib.parse.unquote(href):
+                  links.append((urllib.parse.urljoin(base,href),clean))
+          Path('diagnostics/ascentage_links.txt').write_text('\n\n'.join(f'{l}\n{u}' for u,l in links),encoding='utf-8')
+          for i,(u,label) in enumerate(links):
+              try:
+                  b=get(u)
+                  Path(f'diagnostics/detail_{i:02d}.html').write_bytes(b)
+              except Exception as e:
+                  with open('diagnostics/errors.txt','a',encoding='utf-8') as f:f.write(f'{u}\t{e}\n')
+          PY
+          grep -RIEo 'https?[^"<> ]+\.pdf([^"<> ]*)?|https?[^"<> ]+(download|down|file|attachment|report)[^"<> ]*|/[A-Za-z0-9_./?=&%-]*(download|down|file|attachment|pdf)[A-Za-z0-9_./?=&%-]*' diagnostics \
+            | sort -u > diagnostics/candidate_urls.txt || true
+          grep -RIE '亚盛医药|250127|细胞凋亡赛道领军者|血液瘤创新药细分龙头|厚积薄发|小荷才露尖尖角|立即下载' diagnostics \
+            > diagnostics/relevant_lines.txt || true
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-sgpjbg-diagnostics
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
