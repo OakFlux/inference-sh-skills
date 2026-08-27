@@ -1,0 +1,63 @@
+name: Temporary New Hope Service 2026 report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-2026-download.yml
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF and image utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils img2pdf file
+
+      - name: Download all rendered report pages and create PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages output /tmp/previews
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          count=0
+          for i in $(seq 1 100); do
+            url="https://public.fxbaogao.com/report-image/2026/06/15/5488726-${i}.png"
+            dest=$(printf 'pages/%03d.png' "$i")
+            code=$(curl -L --compressed --retry 4 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 180 -A "$UA" -e 'https://www.fxbaogao.com/detail/5488726' \
+              -sS -w '%{http_code}' -o "$dest" "$url" || true)
+            if [ "$code" != '200' ] || [ ! -s "$dest" ]; then
+              rm -f "$dest"
+              if [ "$i" -eq 1 ]; then echo "first page failed HTTP $code"; exit 1; fi
+              break
+            fi
+            kind=$(file -b --mime-type "$dest")
+            case "$kind" in image/png|image/jpeg|image/webp) ;; *) echo "unexpected page $i mime $kind"; exit 1;; esac
+            count=$i
+          done
+          echo "downloaded pages=$count"
+          test "$count" -ge 10
+
+          img2pdf pages/*.png -o 'output/01_开源证券_新希望服务_高派息构筑安全垫多元服务筑就民生护城河_20260615.pdf'
+          test "$(head -c 4 'output/01_开源证券_新希望服务_高派息构筑安全垫多元服务筑就民生护城河_20260615.pdf')" = '%PDF'
+          pages_pdf=$(pdfinfo 'output/01_开源证券_新希望服务_高派息构筑安全垫多元服务筑就民生护城河_20260615.pdf' | awk '/^Pages:/ {print $2}')
+          test "$pages_pdf" = "$count"
+          pdftoppm -f 1 -singlefile -png -r 90 'output/01_开源证券_新希望服务_高派息构筑安全垫多元服务筑就民生护城河_20260615.pdf' /tmp/previews/first >/dev/null 2>&1
+          pdftoppm -f "$pages_pdf" -singlefile -png -r 90 'output/01_开源证券_新希望服务_高派息构筑安全垫多元服务筑就民生护城河_20260615.pdf' /tmp/previews/last >/dev/null 2>&1
+          printf '开源证券：港股公司首次覆盖报告《高派息构筑安全垫，多元服务筑就民生护城河》\n日期：2026-06-15\n页数：%s页\n说明：依据公开完整逐页原图合成为PDF，未改动页面内容；已校验全部页面并成功渲染首页与末页。\n' "$pages_pdf" > output/核验说明.txt
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output
+
+      - name: Upload verified report
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-service-2026-deep-report
+          path: output/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
