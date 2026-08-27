@@ -1,0 +1,303 @@
+name: Temporary Zoom SEC reports package
+
+on:
+  push:
+    branches:
+      - tmp-zoom-secpack-20260827
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Download official SEC filings, render PDFs, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_zoom_sec.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CIK_PADDED = "0001585521"
+          CIK_NUMERIC = "1585521"
+          COMPANY = "Zoom Communications, Inc."
+          USER_AGENT = "OpenAI Research Assistant research@openai.com"
+          OUT = Path("dist")
+          WORK = Path("work")
+          DOCS = OUT / "Zoom_Communications_ZM_2020-2025年报_2026年半年报"
+          WORK.mkdir(parents=True, exist_ok=True)
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": USER_AGENT,
+              "Accept-Encoding": "gzip, deflate",
+              "Accept-Language": "en-US,en;q=0.9",
+          })
+
+          def get_bytes(url: str, *, accept: str, attempts: int = 4, timeout: int = 120) -> bytes:
+              errors: list[str] = []
+              for attempt in range(attempts):
+                  try:
+                      response = session.get(url, headers={"Accept": accept}, timeout=timeout, allow_redirects=True)
+                      response.raise_for_status()
+                      if len(response.content) < 1_000:
+                          raise RuntimeError(f"response too short: {len(response.content)} bytes")
+                      return response.content
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      if attempt < attempts - 1:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(f"Failed fetching {url}: {'; '.join(errors)}")
+
+          def records_from_columns(columns: dict[str, Any]) -> list[dict[str, Any]]:
+              keys = [
+                  "accessionNumber", "filingDate", "reportDate", "acceptanceDateTime",
+                  "act", "form", "fileNumber", "filmNumber", "items", "size",
+                  "isXBRL", "isInlineXBRL", "primaryDocument", "primaryDocDescription",
+              ]
+              count = len(columns.get("accessionNumber", []))
+              records: list[dict[str, Any]] = []
+              for index in range(count):
+                  record: dict[str, Any] = {}
+                  for key in keys:
+                      values = columns.get(key, [])
+                      record[key] = values[index] if isinstance(values, list) and index < len(values) else None
+                  records.append(record)
+              return records
+
+          submissions_url = f"https://data.sec.gov/submissions/CIK{CIK_PADDED}.json"
+          submissions = json.loads(get_bytes(submissions_url, accept="application/json").decode("utf-8"))
+          all_records = records_from_columns(submissions["filings"]["recent"])
+          for older_file in submissions.get("filings", {}).get("files", []):
+              name = older_file.get("name")
+              if not name:
+                  continue
+              older_url = f"https://data.sec.gov/submissions/{name}"
+              older_payload = json.loads(get_bytes(older_url, accept="application/json").decode("utf-8"))
+              columns = older_payload.get("filings", {}).get("recent") if isinstance(older_payload, dict) else None
+              if not isinstance(columns, dict):
+                  columns = older_payload
+              if isinstance(columns, dict):
+                  all_records.extend(records_from_columns(columns))
+
+          print(f"TOTAL SEC RECORDS={len(all_records)}")
+
+          target_years = list(range(2020, 2026))
+          annual_records: dict[int, dict[str, Any]] = {}
+          for year in target_years:
+              target_date = f"{year}-01-31"
+              candidates = [
+                  row for row in all_records
+                  if row.get("form") == "10-K" and row.get("reportDate") == target_date
+              ]
+              if not candidates:
+                  candidates = [
+                      row for row in all_records
+                      if row.get("form") == "10-K"
+                      and str(row.get("reportDate") or "").startswith(str(year))
+                  ]
+              if not candidates:
+                  raise RuntimeError(f"No Form 10-K found for annual-report year {year}")
+              candidates.sort(key=lambda row: str(row.get("filingDate") or ""), reverse=True)
+              annual_records[year] = candidates[0]
+              print("SELECT ANNUAL", year, annual_records[year])
+
+          half_candidates = [
+              row for row in all_records
+              if row.get("form") == "10-Q" and row.get("reportDate") == "2026-07-31"
+          ]
+          if not half_candidates:
+              half_candidates = [
+                  row for row in all_records
+                  if row.get("form") == "10-Q" and str(row.get("filingDate") or "") >= "2026-08-01"
+              ]
+          if not half_candidates:
+              raise RuntimeError("No latest Form 10-Q found for period ended 2026-07-31")
+          half_candidates.sort(key=lambda row: str(row.get("filingDate") or ""), reverse=True)
+          half_record = half_candidates[0]
+          print("SELECT HALF", half_record)
+
+          def filing_url(record: dict[str, Any]) -> str:
+              accession = str(record.get("accessionNumber") or "")
+              primary = str(record.get("primaryDocument") or "")
+              if not accession or not primary:
+                  raise RuntimeError(f"Incomplete SEC record: {record}")
+              compact = accession.replace("-", "")
+              return f"https://www.sec.gov/Archives/edgar/data/{CIK_NUMERIC}/{compact}/{primary}"
+
+          chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+          if not chrome:
+              raise RuntimeError("Headless Chrome is unavailable on the runner")
+          print("CHROME", chrome)
+
+          def prepare_html(raw: bytes, source_url: str, destination: Path) -> None:
+              text = raw.decode("utf-8", errors="replace")
+              soup = BeautifulSoup(text, "html.parser")
+              for script in soup.find_all("script"):
+                  script.decompose()
+              if soup.head is None:
+                  head = soup.new_tag("head")
+                  if soup.html is not None:
+                      soup.html.insert(0, head)
+                  else:
+                      wrapper = soup.new_tag("html")
+                      wrapper.append(head)
+                      body = soup.new_tag("body")
+                      for child in list(soup.contents):
+                          body.append(child.extract())
+                      wrapper.append(body)
+                      soup.append(wrapper)
+              base = soup.new_tag("base", href=source_url.rsplit("/", 1)[0] + "/")
+              soup.head.insert(0, base)
+              style = soup.new_tag("style")
+              style.string = """
+                  @page { size: Letter; margin: 0.45in; }
+                  body { background: white !important; }
+                  ix\\:hidden, ix\\:header { display: none !important; }
+                  table { page-break-inside: auto; }
+                  tr { page-break-inside: avoid; page-break-after: auto; }
+              """
+              soup.head.append(style)
+              destination.write_text(str(soup), encoding="utf-8")
+
+          def render_pdf(html_path: Path, pdf_path: Path) -> None:
+              profile = WORK / f"chrome-{html_path.stem}"
+              profile.mkdir(parents=True, exist_ok=True)
+              command = [
+                  chrome,
+                  "--headless=new",
+                  "--no-sandbox",
+                  "--disable-gpu",
+                  "--disable-dev-shm-usage",
+                  "--disable-extensions",
+                  "--disable-sync",
+                  "--no-first-run",
+                  "--allow-file-access-from-files",
+                  "--no-pdf-header-footer",
+                  "--virtual-time-budget=8000",
+                  f"--user-data-dir={profile.resolve()}",
+                  f"--print-to-pdf={pdf_path.resolve()}",
+                  html_path.resolve().as_uri(),
+              ]
+              print("RENDER", pdf_path.name)
+              completed = subprocess.run(command, capture_output=True, text=True, timeout=240)
+              print("CHROME RETURN", completed.returncode)
+              print("CHROME STDERR", completed.stderr[-2500:])
+              if completed.returncode != 0 or not pdf_path.exists():
+                  raise RuntimeError(f"Chrome PDF render failed for {html_path.name}")
+              if pdf_path.stat().st_size < 100_000:
+                  raise RuntimeError(f"Rendered PDF too small: {pdf_path.stat().st_size} bytes")
+
+          def validate_pdf(path: Path, expected_year: int, kind: str) -> tuple[int, int, str, str]:
+              raw = path.read_bytes()
+              if not raw.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF signature for {path.name}")
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              minimum = 30 if kind == "10-K" else 20
+              if pages < minimum:
+                  raise RuntimeError(f"Unexpectedly short {kind}: {pages} pages")
+              text_parts: list[str] = []
+              for page in reader.pages[:8]:
+                  try:
+                      text_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", " ", " ".join(text_parts))
+              if "zoom" not in sample.lower():
+                  raise RuntimeError(f"Zoom name not found in first pages of {path.name}")
+              if str(expected_year) not in sample:
+                  print(f"WARNING expected year {expected_year} not extracted from first pages of {path.name}")
+              return len(raw), pages, hashlib.sha256(raw).hexdigest(), sample[:500]
+
+          selections: list[tuple[str, int, str, dict[str, Any]]] = []
+          for year in target_years:
+              selections.append((f"Zoom_Communications_ZM_{year}年年度报告_Form_10-K.pdf", year, "10-K", annual_records[year]))
+          selections.append(("Zoom_Communications_ZM_2026年半年报_Form_10-Q.pdf", 2026, "10-Q", half_record))
+
+          manifest = [
+              "Zoom Communications, Inc.（NASDAQ: ZM）",
+              "资料范围：2020—2025年度报告（SEC Form 10-K）及截至2026-08-27最新半年期财务报告。",
+              "最新半年期文件：2026-08-26提交的Form 10-Q，报告期截至2026-07-31，包含六个月累计财务报表。",
+              "说明：PDF由SEC官方原始HTML申报文件等比例打印生成，内容来源为SEC EDGAR，未使用新闻稿代替正式定期报告。",
+              "",
+          ]
+
+          for filename, expected_year, kind, record in selections:
+              source_url = filing_url(record)
+              accession = str(record.get("accessionNumber") or "")
+              report_date = str(record.get("reportDate") or "")
+              filing_date = str(record.get("filingDate") or "")
+              html_path = WORK / f"{accession.replace('-', '')}.html"
+              pdf_path = DOCS / filename
+              raw_html = get_bytes(source_url, accept="text/html,application/xhtml+xml", timeout=150)
+              if b"<html" not in raw_html[:10_000].lower() and b"<?xml" not in raw_html[:1_000].lower():
+                  raise RuntimeError(f"Unexpected SEC document content for {source_url}")
+              prepare_html(raw_html, source_url, html_path)
+              render_pdf(html_path, pdf_path)
+              size, pages, digest, _ = validate_pdf(pdf_path, expected_year, kind)
+              manifest.extend([
+                  filename,
+                  f"  表格类型：{kind}",
+                  f"  报告期末：{report_date}",
+                  f"  SEC提交日期：{filing_date}",
+                  f"  Accession Number：{accession}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  SEC官方来源：{source_url}",
+                  "",
+              ])
+              print("OK", filename, pages, size, source_url)
+
+          (DOCS / "资料清单与SEC官方来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / "Zoom_Communications_ZM_2020-2025年报_2026年半年报.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdf_names}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_zoom_sec.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoom-sec-reports-final-zip
+          path: dist/Zoom_Communications_ZM_2020-2025年报_2026年半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
