@@ -1,0 +1,167 @@
+name: Temporary Yuexiu Property reports package
+
+on:
+  push:
+    branches:
+      - tmp-yuexiu-reports-20260827
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Download, validate and package HKEX reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_yuexiu.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path("dist")
+          DOCS = OUT / "越秀地产_00123_2020-2025年报_2025年最新半年报"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          REPORTS = [
+              ("越秀地产_00123_2020年年度报告.pdf", "https://www1.hkexnews.hk/listedco/listconews/sehk/2021/0427/2021042700627.pdf", "2020年年度报告", 100),
+              ("越秀地产_00123_2021年年度报告.pdf", "https://www1.hkexnews.hk/listedco/listconews/sehk/2022/0420/2022042000268.pdf", "2021年年度报告", 100),
+              ("越秀地产_00123_2022年年度报告.pdf", "https://www1.hkexnews.hk/listedco/listconews/sehk/2023/0424/2023042400389.pdf", "2022年年度报告", 100),
+              ("越秀地产_00123_2023年年度报告.pdf", "https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0429/2024042904767.pdf", "2023年年度报告", 100),
+              ("越秀地产_00123_2024年年度报告.pdf", "https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0429/2025042903836.pdf", "2024年年度报告", 100),
+              ("越秀地产_00123_2025年年度报告.pdf", "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0430/2026043002008.pdf", "2025年年度报告", 100),
+              ("越秀地产_00123_2025年中期报告.pdf", "https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0929/2025092900565.pdf", "2025年中期报告", 40),
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
+              "Referer": "https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=201",
+          })
+
+          def language_candidates(english_url: str) -> list[str]:
+              stem, suffix = english_url.rsplit(".", 1)
+              return [f"{stem}_c.{suffix}", english_url]
+
+          def extract_sample(reader: PdfReader, pages_to_read: int = 12) -> str:
+              parts: list[str] = []
+              for page in reader.pages[:pages_to_read]:
+                  try:
+                      parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+          def download_report(english_url: str, destination: Path, minimum_pages: int) -> tuple[str, int, int, str, str]:
+              errors: list[str] = []
+              for url in language_candidates(english_url):
+                  for attempt in range(3):
+                      try:
+                          with session.get(
+                              url,
+                              headers={"Accept": "application/pdf,application/octet-stream,*/*"},
+                              timeout=300,
+                              stream=True,
+                              allow_redirects=True,
+                          ) as response:
+                              response.raise_for_status()
+                              with destination.open("wb") as output:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          output.write(chunk)
+                              final_url = response.url
+                              content_type = response.headers.get("content-type", "")
+
+                          raw = destination.read_bytes()
+                          if len(raw) < 500_000 or not raw.startswith(b"%PDF-"):
+                              raise RuntimeError(f"invalid PDF: {len(raw)} bytes, content-type={content_type}")
+
+                          reader = PdfReader(str(destination), strict=False)
+                          pages = len(reader.pages)
+                          if pages < minimum_pages:
+                              raise RuntimeError(f"unexpected page count: {pages}")
+
+                          sample = extract_sample(reader)
+                          company_ok = "越秀地产" in sample or "Yuexiu Property" in sample or "YUEXIU PROPERTY" in sample
+                          if not company_ok:
+                              print(f"WARNING company name not extracted from first pages: {destination.name}")
+
+                          digest = hashlib.sha256(raw).hexdigest()
+                          language = "中文" if "_c.pdf" in final_url.lower() else "英文"
+                          return final_url, len(raw), pages, digest, language
+                      except Exception as exc:
+                          destination.unlink(missing_ok=True)
+                          errors.append(f"{url} attempt {attempt + 1}: {exc!r}")
+                          if attempt < 2:
+                              time.sleep(2 ** attempt)
+              raise RuntimeError("; ".join(errors))
+
+          manifest = [
+              "越秀地产股份有限公司（00123.HK）",
+              "资料范围：2020—2025年年度报告全文，以及截至2026年8月27日最新正式半年报。",
+              "最新半年报口径：2026年中期业绩尚待2026年8月28日董事会审议，因此本包采用2025年中期报告。",
+              "来源：香港交易所披露易（HKEXnews）官方PDF。优先下载中文版本；如中文版本不存在则自动采用英文版本。",
+              "",
+          ]
+
+          for filename, source_url, title, minimum_pages in REPORTS:
+              destination = DOCS / filename
+              used_url, size, pages, digest, language = download_report(source_url, destination, minimum_pages)
+              manifest.extend([
+                  filename,
+                  f"  文件类型：{title}",
+                  f"  语言版本：{language}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  港交所官方来源：{used_url}",
+                  "",
+              ])
+              print("OK", filename, language, pages, size, used_url)
+
+          (DOCS / "资料清单与港交所官方来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / "越秀地产_00123_2020-2025年报_2025年最新半年报.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdf_names}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_yuexiu.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuexiu-property-reports-final-zip
+          path: dist/越秀地产_00123_2020-2025年报_2025年最新半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
