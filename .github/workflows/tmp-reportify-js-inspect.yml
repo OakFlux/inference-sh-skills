@@ -1,0 +1,89 @@
+name: Temporary Reportify JS inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-reportify-js-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download page scripts and inspect endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/js
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          curl -L --compressed -A "$UA" 'https://reportify.cn/reports/1105126013194604544' -o diagnostic/page.html
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, html, urllib.request, urllib.parse
+          text=Path('diagnostic/page.html').read_text(errors='replace')
+          urls=[]
+          for m in re.finditer(r'<script[^>]+src="([^"]+\.js[^"]*)"',text,re.I):
+              u=html.unescape(m.group(1))
+              if u.startswith('//'): u='https:'+u
+              elif u.startswith('/'): u='https://reportify.cn'+u
+              urls.append(u)
+          Path('diagnostic/script_urls.txt').write_text('\n'.join(urls),encoding='utf-8')
+          print('scripts',len(urls))
+          for i,u in enumerate(urls):
+              try:
+                  req=urllib.request.Request(u,headers={'User-Agent':'Mozilla/5.0','Referer':'https://reportify.cn/'})
+                  data=urllib.request.urlopen(req,timeout=60).read()
+                  Path(f'diagnostic/js/{i:03d}.js').write_bytes(data)
+              except Exception as exc:
+                  Path(f'diagnostic/js/{i:03d}.error.txt').write_text(repr(exc)+'\n'+u,encoding='utf-8')
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, json
+          needles=[
+            'document_id','documentId','render_type','renderType','document_total_page','report/preview',
+            'url_pdf','urlPdf','page_image','pageImage','image_url','imageUrl','content_url','download',
+            '/document','/report','api.reportify','files.reportify','imageMogr','pageNo','pageNum','pageIndex'
+          ]
+          findings=[]
+          strings=[]
+          for p in sorted(Path('diagnostic/js').glob('*.js')):
+              t=p.read_text(errors='replace')
+              low=t.lower()
+              for needle in needles:
+                  start=0
+                  count=0
+                  while True:
+                      pos=low.find(needle.lower(),start)
+                      if pos<0: break
+                      findings.append({'file':p.name,'needle':needle,'pos':pos,'context':t[max(0,pos-600):pos+1200]})
+                      start=pos+len(needle); count+=1
+                      if count>=30: break
+              for m in re.finditer(r'["\']([^"\']{1,500})["\']',t):
+                  s=m.group(1)
+                  if any(x in s.lower() for x in ['api/','/api','report','document','download','pdf','image','jpeg','png','preview']):
+                      strings.append({'file':p.name,'string':s})
+          Path('diagnostic/findings.json').write_text(json.dumps(findings,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/interesting_strings.tsv').write_text('\n'.join(f"{x['file']}\t{x['string']}" for x in strings),encoding='utf-8')
+          print('findings',len(findings),'strings',len(strings))
+          # concise stdout
+          seen=set()
+          for x in findings:
+              key=(x['file'],x['needle'],x['context'][:100])
+              if key in seen: continue
+              seen.add(key)
+              print('\n###',x['file'],x['needle'],x['pos'])
+              print(x['context'][:1600])
+              if len(seen)>=80: break
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: reportify-js-diagnostic
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
