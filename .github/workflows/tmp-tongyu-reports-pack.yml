@@ -1,0 +1,430 @@
+name: Temporary Tongyu New Materials reports package
+
+on:
+  push:
+    branches:
+      - tmp-tongyu-reports-20260827
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Query CNINFO, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_tongyu.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any, Iterable
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "301630"
+          SHORT_NAME = "同宇新材"
+          FULL_NAME = "同宇新材料（广东）股份有限公司"
+          QUERY_API = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+          TOP_SEARCH_API = "https://www.cninfo.com.cn/new/information/topSearch/query"
+          OUT = Path("dist")
+          DOCS = OUT / "同宇新材_301630_所有年报_招股说明书_最新半年报"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
+          })
+
+          def clean(value: Any) -> str:
+              text = html.unescape(str(value or ""))
+              text = re.sub(r"<[^>]+>", "", text)
+              return " ".join(text.replace("\u3000", " ").split())
+
+          def compact(value: Any) -> str:
+              return re.sub(r"\s+", "", clean(value)).replace("（", "(").replace("）", ")")
+
+          def find_dicts(obj: Any) -> Iterable[dict[str, Any]]:
+              if isinstance(obj, dict):
+                  yield obj
+                  for value in obj.values():
+                      yield from find_dicts(value)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      yield from find_dicts(value)
+
+          def discover_org_id() -> str:
+              candidates: list[str] = []
+              urls = [
+                  "https://www.cninfo.com.cn/new/data/szse_stock.json",
+                  "http://www.cninfo.com.cn/new/data/szse_stock.json",
+              ]
+              for url in urls:
+                  try:
+                      response = session.get(url, timeout=60)
+                      print("STOCK LIST", url, response.status_code, len(response.content), response.headers.get("content-type"))
+                      response.raise_for_status()
+                      payload = response.json()
+                      for item in find_dicts(payload):
+                          values = {str(k).lower(): str(v) for k, v in item.items() if v is not None}
+                          code = values.get("code") or values.get("seccode") or values.get("stockcode") or values.get("zwjc")
+                          text = " ".join(values.values())
+                          if code == CODE or CODE in text:
+                              for key in ("orgid", "org_id", "organizationid"):
+                                  if values.get(key):
+                                      candidates.append(values[key])
+                  except Exception as exc:
+                      print("STOCK LIST ERROR", url, repr(exc))
+
+              for method in ("get", "post"):
+                  try:
+                      kwargs = {
+                          "params" if method == "get" else "data": {
+                              "keyWord": CODE,
+                              "maxSecNum": "20",
+                              "maxListNum": "20",
+                          },
+                          "timeout": 60,
+                      }
+                      response = getattr(session, method)(TOP_SEARCH_API, **kwargs)
+                      print("TOP SEARCH", method, response.status_code, len(response.content), response.headers.get("content-type"))
+                      response.raise_for_status()
+                      payload = response.json()
+                      for item in find_dicts(payload):
+                          text = " ".join(str(v) for v in item.values() if v is not None)
+                          if CODE not in text and SHORT_NAME not in text and "同宇新材料" not in text:
+                              continue
+                          for key, value in item.items():
+                              if str(key).lower() in {"orgid", "org_id", "organizationid"} and value:
+                                  candidates.append(str(value))
+                  except Exception as exc:
+                      print("TOP SEARCH ERROR", method, repr(exc))
+
+              unique: list[str] = []
+              for value in candidates:
+                  value = value.strip()
+                  if value and value not in unique:
+                      unique.append(value)
+              print("ORG ID CANDIDATES", unique)
+              return unique[0] if unique else ""
+
+          org_id = discover_org_id()
+          referer = f"https://www.cninfo.com.cn/new/disclosure/stock?stockCode={CODE}"
+          if org_id:
+              referer += f"&orgId={org_id}"
+          session.headers.update({
+              "Referer": referer,
+              "Origin": "https://www.cninfo.com.cn",
+              "X-Requested-With": "XMLHttpRequest",
+              "Accept": "application/json, text/javascript, */*; q=0.01",
+          })
+
+          stock_values: list[str] = []
+          if org_id:
+              stock_values.append(f"{CODE},{org_id}")
+          stock_values.extend([CODE, f"{CODE},"])
+
+          announcements: list[dict[str, Any]] = []
+          seen: set[str] = set()
+
+          def add_rows(rows: Any, source: str) -> None:
+              if not isinstance(rows, list):
+                  return
+              print("ROWS", source, len(rows))
+              for row in rows:
+                  if not isinstance(row, dict):
+                      continue
+                  title = clean(row.get("announcementTitle") or row.get("title"))
+                  sec_code = clean(row.get("secCode") or row.get("stockCode") or row.get("code"))
+                  if sec_code and sec_code != CODE:
+                      continue
+                  if not sec_code and SHORT_NAME not in title and "同宇新材料" not in title:
+                      continue
+                  adjunct = str(row.get("adjunctUrl") or row.get("URL") or "").strip()
+                  identifier = str(row.get("announcementId") or adjunct or title)
+                  if not adjunct or identifier in seen:
+                      continue
+                  seen.add(identifier)
+                  row["_TITLE"] = title
+                  row["_ADJUNCT"] = adjunct
+                  row["_SOURCE_QUERY"] = source
+                  announcements.append(row)
+
+          def query(stock: str, *, category: str = "", searchkey: str = "", se_date: str = "2022-01-01~2026-08-27") -> None:
+              for page in range(1, 11):
+                  data = {
+                      "stock": stock,
+                      "tabName": "fulltext",
+                      "pageSize": "100",
+                      "pageNum": str(page),
+                      "column": "szse",
+                      "category": category,
+                      "plate": "sz",
+                      "seDate": se_date,
+                      "searchkey": searchkey,
+                      "secid": "",
+                      "sortName": "",
+                      "sortType": "",
+                      "isHLtitle": "true",
+                  }
+                  response = session.post(QUERY_API, data=data, timeout=90)
+                  print("QUERY", stock, category, searchkey, page, response.status_code, len(response.content))
+                  response.raise_for_status()
+                  payload = response.json()
+                  rows = payload.get("announcements") or []
+                  add_rows(rows, f"stock={stock}|category={category}|search={searchkey}|page={page}")
+                  if not rows or len(rows) < 100:
+                      break
+                  time.sleep(0.3)
+
+          query_errors: list[str] = []
+          for stock in stock_values:
+              for category, searchkey in [
+                  ("category_ndbg_szsh;category_bndbg_szsh", ""),
+                  ("", "招股说明书"),
+                  ("", ""),
+              ]:
+                  try:
+                      query(stock, category=category, searchkey=searchkey)
+                  except Exception as exc:
+                      query_errors.append(f"{stock}|{category}|{searchkey}: {exc!r}")
+                      print("QUERY ERROR", query_errors[-1])
+
+          if not announcements:
+              for searchkey in (SHORT_NAME, "同宇新材料", "301630"):
+                  try:
+                      query("", category="", searchkey=searchkey, se_date="2023-01-01~2026-08-27")
+                  except Exception as exc:
+                      query_errors.append(f"fallback|{searchkey}: {exc!r}")
+                      print("FALLBACK QUERY ERROR", query_errors[-1])
+
+          print("TOTAL ANNOUNCEMENTS", len(announcements))
+          for row in sorted(announcements, key=lambda x: int(x.get("announcementTime") or 0)):
+              print("ANN", row.get("announcementTime"), row.get("secCode"), row.get("_TITLE"), row.get("_ADJUNCT"))
+
+          if not announcements:
+              raise RuntimeError("No CNINFO announcements found. " + "; ".join(query_errors))
+
+          def filing_time(row: dict[str, Any]) -> int:
+              try:
+                  return int(row.get("announcementTime") or 0)
+              except (TypeError, ValueError):
+                  return 0
+
+          def revised_score(title: str) -> int:
+              return int(any(token in title for token in ("修订", "修正", "更正", "更新")))
+
+          excluded_common = (
+              "摘要", "英文版", "取消", "关于", "董事会", "监事会", "审计报告",
+              "问询", "回复", "审核", "说明会", "提示性公告", "募集说明书",
+          )
+
+          annual_by_year: dict[int, dict[str, Any]] = {}
+          for row in announcements:
+              title = compact(row.get("_TITLE"))
+              match = re.search(r"(20\d{2})年年度报告", title)
+              if not match:
+                  continue
+              if any(token in title for token in excluded_common):
+                  continue
+              year = int(match.group(1))
+              current = annual_by_year.get(year)
+              if current is None or (revised_score(title), filing_time(row)) > (revised_score(compact(current.get("_TITLE"))), filing_time(current)):
+                  annual_by_year[year] = row
+
+          if not annual_by_year:
+              raise RuntimeError("No full annual report found in CNINFO announcements")
+
+          half_candidates: list[tuple[int, dict[str, Any]]] = []
+          for row in announcements:
+              title = compact(row.get("_TITLE"))
+              match = re.search(r"(20\d{2})年半年度报告", title)
+              if not match:
+                  continue
+              if any(token in title for token in excluded_common):
+                  continue
+              half_candidates.append((int(match.group(1)), row))
+          if not half_candidates:
+              raise RuntimeError("No full semiannual report found in CNINFO announcements")
+          half_candidates.sort(key=lambda item: (item[0], revised_score(compact(item[1].get("_TITLE"))), filing_time(item[1])), reverse=True)
+          half_year, half_row = half_candidates[0]
+
+          prospectus_candidates: list[tuple[tuple[int, int, int], dict[str, Any]]] = []
+          for row in announcements:
+              title = compact(row.get("_TITLE"))
+              if "招股说明书" not in title:
+                  continue
+              if any(token in title for token in ("摘要", "提示性公告", "招股意向书", "问询", "回复", "审核", "保荐")):
+                  continue
+              is_final = int(
+                  "首次公开发行股票并在创业板上市招股说明书" in title
+                  and not any(token in title for token in ("注册稿", "申报稿", "上会稿", "预披露"))
+              )
+              is_registration = int("注册稿" in title)
+              prospectus_candidates.append(((is_final, is_registration, filing_time(row)), row))
+          if not prospectus_candidates:
+              raise RuntimeError("No prospectus document found in CNINFO announcements")
+          prospectus_candidates.sort(key=lambda item: item[0], reverse=True)
+          prospectus_row = prospectus_candidates[0][1]
+
+          selections: list[tuple[str, dict[str, Any], str, int, int | None]] = []
+          for year in sorted(annual_by_year):
+              selections.append((f"同宇新材_301630_{year}年年度报告.pdf", annual_by_year[year], "年度报告", 50, year))
+          selections.append(("同宇新材_301630_首次公开发行股票并在创业板上市招股说明书.pdf", prospectus_row, "招股说明书", 150, None))
+          selections.append((f"同宇新材_301630_{half_year}年半年度报告.pdf", half_row, "半年度报告", 20, half_year))
+
+          print("SELECTIONS")
+          for filename, row, kind, _, year in selections:
+              print("SELECT", kind, year, filename, row.get("_TITLE"), row.get("_ADJUNCT"))
+
+          def source_candidates(adjunct: str) -> list[str]:
+              path = adjunct.lstrip("/")
+              return [
+                  urljoin("https://static.cninfo.com.cn/", path),
+                  urljoin("http://static.cninfo.com.cn/", path),
+                  urljoin("https://www.cninfo.com.cn/", path),
+                  urljoin("http://www.cninfo.com.cn/", path),
+              ]
+
+          def disclosure_date(row: dict[str, Any]) -> str:
+              adjunct = str(row.get("_ADJUNCT") or "")
+              match = re.search(r"finalpage/(\d{4}-\d{2}-\d{2})/", adjunct)
+              if match:
+                  return match.group(1)
+              value = filing_time(row)
+              if value:
+                  if value > 10_000_000_000:
+                      value //= 1000
+                  return datetime.fromtimestamp(value, tz=timezone.utc).date().isoformat()
+              return "未知"
+
+          def validate_pdf(path: Path, *, kind: str, minimum_pages: int, expected_year: int | None) -> tuple[int, str]:
+              raw = path.read_bytes()
+              if len(raw) < 100_000 or not raw.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF {path.name}: {len(raw)} bytes, head={raw[:12]!r}")
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(f"Unexpectedly short {kind}: {pages} pages")
+              text_parts: list[str] = []
+              for page in reader.pages[:8]:
+                  try:
+                      text_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", "", "".join(text_parts))
+              if "同宇新材料" not in sample and "同宇新材" not in sample:
+                  raise RuntimeError(f"Company name not found in first pages of {path.name}")
+              if expected_year is not None and str(expected_year) not in sample:
+                  print("WARNING expected year not extracted", expected_year, path.name)
+              if kind == "招股说明书" and "招股说明书" not in sample:
+                  raise RuntimeError("Prospectus title not found in first pages")
+              return pages, sample[:500]
+
+          def download(row: dict[str, Any], destination: Path, *, kind: str, minimum_pages: int, expected_year: int | None) -> tuple[str, int, int, str]:
+              adjunct = str(row.get("_ADJUNCT") or "").strip()
+              errors: list[str] = []
+              for url in source_candidates(adjunct):
+                  for attempt in range(3):
+                      try:
+                          with session.get(
+                              url,
+                              headers={"Referer": referer, "Accept": "application/pdf,application/octet-stream,*/*"},
+                              timeout=240,
+                              stream=True,
+                              allow_redirects=True,
+                          ) as response:
+                              response.raise_for_status()
+                              with destination.open("wb") as output:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          output.write(chunk)
+                              final_url = response.url
+                          pages, _ = validate_pdf(destination, kind=kind, minimum_pages=minimum_pages, expected_year=expected_year)
+                          raw = destination.read_bytes()
+                          return final_url, len(raw), pages, hashlib.sha256(raw).hexdigest()
+                      except Exception as exc:
+                          destination.unlink(missing_ok=True)
+                          errors.append(f"{url} attempt {attempt + 1}: {exc!r}")
+                          if attempt < 2:
+                              time.sleep(2 ** attempt)
+              raise RuntimeError("; ".join(errors))
+
+          manifest = [
+              f"{FULL_NAME}（{CODE}.SZ）",
+              "资料范围：公司在巨潮资讯网披露的全部上市公司年度报告、最终版招股说明书及最新半年度报告。",
+              f"检索截止日期：2026-08-27；检出的年度报告年份：{', '.join(str(y) for y in sorted(annual_by_year))}；最新半年报年份：{half_year}。",
+              "版本规则：排除摘要、英文版及说明性公告；如同一报告存在修订/更正版本，优先采用后续版本。",
+              "",
+          ]
+
+          for filename, row, kind, minimum_pages, expected_year in selections:
+              destination = DOCS / filename
+              used_url, size, pages, digest = download(
+                  row,
+                  destination,
+                  kind=kind,
+                  minimum_pages=minimum_pages,
+                  expected_year=expected_year,
+              )
+              manifest.extend([
+                  filename,
+                  f"  公告标题：{row.get('_TITLE', '')}",
+                  f"  披露日期：{disclosure_date(row)}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  官方来源：{used_url}",
+                  "",
+              ])
+              print("OK", filename, pages, size, used_url)
+
+          (DOCS / "资料清单与官方来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / f"同宇新材_301630_所有年报_招股说明书_{half_year}年半年报.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              expected_count = len(annual_by_year) + 2
+              if len(pdfs) != expected_count:
+                  raise RuntimeError(f"Expected {expected_count} PDFs, got {pdfs}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_tongyu.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: tongyu-reports-final-zip
+          path: dist/同宇新材_301630_所有年报_招股说明书_*年半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
