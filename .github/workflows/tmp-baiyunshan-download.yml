@@ -1,0 +1,147 @@
+name: Temporary Baiyunshan deep report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-baiyunshan-reports-20260828
+    paths:
+      - .github/workflows/tmp-baiyunshan-download.yml
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Query, download and verify reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output /tmp/baiyunshan-previews
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+          from urllib.parse import urlencode
+          from urllib.request import Request, urlopen
+
+          out = Path('output')
+          out.mkdir(exist_ok=True)
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/600332.html',
+              'Accept': 'application/json,text/plain,*/*',
+          }
+          params = {
+              'industryCode': '*', 'pageSize': '100', 'industry': '*',
+              'rating': '*', 'ratingChange': '*', 'beginTime': '2020-01-01',
+              'endTime': '2026-08-28', 'pageNo': '1', 'fields': '',
+              'qType': '0', 'orgCode': '', 'code': '600332', 'rcode': '',
+              'p': '1', 'pageNum': '1', 'pageNumber': '1',
+          }
+          api_url = 'https://reportapi.eastmoney.com/report/list?' + urlencode(params)
+          req = Request(api_url, headers=headers)
+          with urlopen(req, timeout=60) as resp:
+              catalog = json.load(resp)
+          (out / '东方财富研报目录原始数据.json').write_text(
+              json.dumps(catalog, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          targets = [
+              '25Q3报表端已企稳修复',
+              '华南医药消费龙头稳健增长',
+          ]
+          rows = catalog.get('data') or []
+          selected = []
+          for needle in targets:
+              matches = [r for r in rows if needle in (r.get('title') or '')]
+              if not matches:
+                  raise RuntimeError(f'未在东方财富研报目录中找到目标报告：{needle}')
+              matches.sort(key=lambda r: r.get('publishDate') or '', reverse=True)
+              selected.append(matches[0])
+
+          def safe(text: str) -> str:
+              text = re.sub(r'[\\/:*?"<>|\s]+', '_', text.strip())
+              return text.strip('_')[:120]
+
+          manifest = ['白云山（600332.SH / 00874.HK）券商深度报告，共2份', '']
+          checksums = []
+          for idx, item in enumerate(selected, 1):
+              title = item['title']
+              org = item.get('orgSName') or item.get('orgName') or '未知机构'
+              date = (item.get('publishDate') or '')[:10]
+              info_code = item['infoCode']
+              expected_pages = int(item.get('attachPages') or 0)
+              rating = item.get('emRatingName') or item.get('sRatingName') or ''
+              filename = f'{idx:02d}_{safe(org)}_白云山_{safe(title)}_{date.replace("-", "")}_{expected_pages}页.pdf'
+              dest = out / filename
+              pdf_url = f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf'
+              pdf_headers = {
+                  'User-Agent': headers['User-Agent'],
+                  'Referer': 'https://data.eastmoney.com/',
+                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              }
+              pdf_req = Request(pdf_url, headers=pdf_headers)
+              with urlopen(pdf_req, timeout=180) as resp, dest.open('wb') as fh:
+                  while True:
+                      chunk = resp.read(1024 * 1024)
+                      if not chunk:
+                          break
+                      fh.write(chunk)
+              if dest.stat().st_size < 10000 or dest.read_bytes()[:4] != b'%PDF':
+                  raise RuntimeError(f'下载内容不是有效PDF：{pdf_url}')
+              info = subprocess.check_output(['pdfinfo', str(dest)], text=True, errors='replace')
+              actual_pages = None
+              for line in info.splitlines():
+                  if line.startswith('Pages:'):
+                      actual_pages = int(line.split(':', 1)[1].strip())
+                      break
+              if actual_pages is None:
+                  raise RuntimeError(f'无法读取PDF页数：{dest}')
+              if expected_pages and actual_pages != expected_pages:
+                  raise RuntimeError(f'页数不符：{dest}，目录{expected_pages}页，实际{actual_pages}页')
+              stem = safe(dest.stem)
+              subprocess.check_call([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90',
+                  str(dest), f'/tmp/baiyunshan-previews/{stem}_first'
+              ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              subprocess.check_call([
+                  'pdftoppm', '-f', str(actual_pages), '-singlefile', '-png', '-r', '90',
+                  str(dest), f'/tmp/baiyunshan-previews/{stem}_last'
+              ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+              checksums.append(f'{digest}  {filename}')
+              manifest.extend([
+                  f'{idx}. {org}：《{title}》',
+                  f'   日期：{date}；页数：{actual_pages}页；评级：{rating or "未标注"}。',
+                  f'   东方财富研报编号：{info_code}',
+                  f'   原始PDF：{pdf_url}',
+                  '',
+              ])
+
+          manifest.extend([
+              '核验说明：两份文件均检查PDF文件头、实际页数，并成功渲染首页与末页。',
+              '仅供研究资料整理，不构成投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(manifest), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text('\n'.join(checksums) + '\n', encoding='utf-8')
+          print('\n'.join(manifest))
+          for p in sorted(out.iterdir()):
+              print(p.name, p.stat().st_size)
+          PY
+
+      - name: Upload verified original PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: baiyunshan-broker-deep-reports-2
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
