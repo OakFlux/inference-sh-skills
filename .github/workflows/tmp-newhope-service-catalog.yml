@@ -1,0 +1,76 @@
+name: Temporary New Hope Service report catalog
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-service-catalog.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query Eastmoney report catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          import json, urllib.parse, urllib.request, pathlib, re
+
+          base = 'https://reportapi.eastmoney.com/report/list'
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          variants = [
+              {'name':'code_03658','code':'03658','qType':'0'},
+              {'name':'code_3658','code':'3658','qType':'0'},
+              {'name':'code_HK03658','code':'HK03658','qType':'0'},
+              {'name':'name_q0','code':'新希望服务','qType':'0'},
+              {'name':'name_q1','code':'新希望服务','qType':'1'},
+          ]
+          all_items = {}
+          for v in variants:
+              params = {
+                  'industryCode':'*','pageSize':'200','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':'2020-01-01','endTime':'2030-12-31','pageNo':'1','fields':'',
+                  'qType':v['qType'],'orgCode':'','code':v['code'],'rcode':'','p':'1','pageNum':'1','pageNumber':'1'
+              }
+              url = base + '?' + urllib.parse.urlencode(params)
+              req = urllib.request.Request(url, headers={'User-Agent':ua,'Referer':'https://data.eastmoney.com/report/'})
+              try:
+                  raw = urllib.request.urlopen(req, timeout=60).read().decode('utf-8','replace')
+              except Exception as exc:
+                  raw = json.dumps({'error':repr(exc),'url':url}, ensure_ascii=False)
+              pathlib.Path(f'diagnostic/{v["name"]}.txt').write_text(raw, encoding='utf-8')
+              text = raw.strip()
+              if text.startswith('datatable(') and text.endswith(')'):
+                  text = text[len('datatable('):-1]
+              try:
+                  obj = json.loads(text)
+              except Exception:
+                  continue
+              for item in obj.get('data') or []:
+                  key = item.get('infoCode') or json.dumps(item, sort_keys=True, ensure_ascii=False)
+                  all_items[key] = item
+
+          items = list(all_items.values())
+          relevant = [x for x in items if x.get('stockName') == '新希望服务' or x.get('stockCode') in {'03658','3658'} or '新希望服务' in (x.get('title') or '')]
+          relevant.sort(key=lambda x: (x.get('publishDate') or '', x.get('attachPages') or 0), reverse=True)
+          pathlib.Path('diagnostic/relevant.json').write_text(json.dumps(relevant, ensure_ascii=False, indent=2), encoding='utf-8')
+          with open('diagnostic/summary.tsv','w',encoding='utf-8') as f:
+              f.write('publishDate\tstockCode\torgSName\tattachPages\treportType\tinfoCode\ttitle\n')
+              for x in relevant:
+                  f.write('\t'.join(str(x.get(k,'')) for k in ['publishDate','stockCode','orgSName','attachPages','reportType','infoCode','title'])+'\n')
+          print('TOTAL ITEMS', len(items), 'RELEVANT', len(relevant))
+          print(pathlib.Path('diagnostic/summary.tsv').read_text(encoding='utf-8'))
+          PY
+
+      - name: Upload catalog diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-service-report-catalog
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
