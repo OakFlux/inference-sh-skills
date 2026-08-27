@@ -11,21 +11,23 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
-      - name: Inspect Zoom GCS static file delivery
+      - name: Test GCS static and SEC fair-access download
         shell: bash
         run: |
           python - <<'PY'
           import requests
-          urls=[
-            'https://zoom.gcs-web.com/static-files/a6b3b254-94ff-415f-bb3b-8c3146b061d4',
-            'https://zoom.gcs-web.com/static-files/f5b92b93-5af9-42cb-ab0d-931c309417a9',
+
+          tests = [
+            ('GCS2020','https://zoom.gcs-web.com/static-files/a6b3b254-94ff-415f-bb3b-8c3146b061d4', {'User-Agent':'Mozilla/5.0','Accept':'application/pdf,*/*','Range':'bytes=0-1023','Referer':'https://zoom.gcs-web.com/financial-information/annual-reports'}),
+            ('SEC_SUBMISSIONS','https://data.sec.gov/submissions/CIK0001585521.json', {'User-Agent':'OpenAI Research Assistant research@openai.com','Accept-Encoding':'gzip, deflate','Accept':'application/json'}),
+            ('SEC_10Q','https://www.sec.gov/Archives/edgar/data/1585521/000158552126000121/zm-20260731.htm', {'User-Agent':'OpenAI Research Assistant research@openai.com','Accept-Encoding':'gzip, deflate','Accept':'text/html,application/xhtml+xml'}),
           ]
-          for u in urls:
+          for name,u,h in tests:
             try:
-              r=requests.get(u,headers={'User-Agent':'Mozilla/5.0','Accept':'application/pdf,*/*','Range':'bytes=0-1023','Referer':'https://zoom.gcs-web.com/financial-information/annual-reports'},timeout=20,allow_redirects=True)
-              print('URL',u,'STATUS',r.status_code,'FINAL',r.url,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'HEAD',repr(r.content[:20]))
+              r=requests.get(u,headers=h,timeout=30,allow_redirects=True)
+              print(name,'STATUS',r.status_code,'FINAL',r.url,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'HEAD',repr(r.content[:40]))
             except Exception as e:
-              print('ERROR',u,repr(e))
+              print(name,'ERROR',repr(e))
           PY
