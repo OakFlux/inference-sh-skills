@@ -1,0 +1,117 @@
+name: Temporary Ascentage report index download
+
+on:
+  push:
+    branches:
+      - 'tmp/ascentage-reports-20260828'
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils >/dev/null
+          mkdir -p reports diagnostics
+
+      - name: Locate and download Ascentage reports from public index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import html
+          import re
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          base = 'https://aigc.idigital.com.cn/djyanbao/'
+          req = urllib.request.Request(base, headers={'User-Agent':'Mozilla/5.0'})
+          data = urllib.request.urlopen(req, timeout=120).read().decode('utf-8', 'ignore')
+          Path('diagnostics/index.html').write_text(data, encoding='utf-8')
+
+          hrefs = re.findall(r'href=["\']([^"\']+)["\']', data, flags=re.I)
+          matches = []
+          for href in hrefs:
+              decoded = html.unescape(urllib.parse.unquote(href))
+              if '亚盛医药' in decoded and decoded.lower().endswith('.pdf'):
+                  matches.append((href, decoded))
+
+          with open('diagnostics/ascentage_index_matches.txt','w',encoding='utf-8') as f:
+              for href, decoded in matches:
+                  f.write(f'{decoded}\n{urllib.parse.urljoin(base, href)}\n\n')
+
+          preferred = []
+          priorities = [
+              ('细胞凋亡赛道领军者', '01_东吴证券_亚盛医药_细胞凋亡赛道领军者_加速迈向全球化_2025-01-27.pdf'),
+              ('血液瘤创新药细分龙头', '02_国海证券_亚盛医药_血液瘤创新药细分龙头_加速国际化布局_2025-01-14.pdf'),
+              ('国际化进程加速', '03_广发证券_亚盛医药_国际化进程加速_全球临床顺利推进_2024-07-15.pdf'),
+          ]
+          for keyword, outname in priorities:
+              hit = next(((href, decoded) for href, decoded in matches if keyword in decoded), None)
+              if hit:
+                  preferred.append((hit[0], outname, hit[1]))
+
+          if len(preferred) < 2:
+              raise SystemExit(f'Only found {len(preferred)} preferred reports; matches={matches}')
+
+          for href, outname, decoded in preferred:
+              url = urllib.parse.urljoin(base, href)
+              req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0','Referer':base})
+              content = urllib.request.urlopen(req, timeout=180).read()
+              if not content.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Not PDF: {decoded}; first bytes={content[:20]!r}')
+              Path('reports', outname).write_bytes(content)
+              print(outname, len(content), url)
+          PY
+
+      - name: Verify and prepare package
+        shell: bash
+        run: |
+          set -euo pipefail
+          count="$(find reports -maxdepth 1 -type f -name '*.pdf' | wc -l)"
+          test "$count" -ge 2
+          {
+            echo '亚盛医药（06855.HK）券商深度报告校验清单'
+            echo
+            for f in reports/*.pdf; do
+              test "$(head -c 5 "$f")" = '%PDF-'
+              pages="$(pdfinfo "$f" | awk '/^Pages:/ {print $2}')"
+              bytes="$(stat -c '%s' "$f")"
+              title="$(pdfinfo "$f" | sed -n 's/^Title:[[:space:]]*//p' | head -1)"
+              echo "文件：$(basename "$f")"
+              echo "页数：$pages"
+              echo "大小：$bytes 字节"
+              [ -n "$title" ] && echo "PDF标题：$title" || true
+              echo "SHA-256：$(sha256sum "$f" | awk '{print $1}')"
+              echo
+            done
+          } > reports/来源与校验.txt
+          pdftotext -f 1 -l 2 reports/*.pdf diagnostics/first_pages.txt 2>/dev/null || true
+          grep -RIE '亚盛医药|06855' diagnostics/first_pages.txt >/dev/null
+
+      - name: Upload verified PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-broker-deep-reports-original-pdfs
+          path: reports/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Upload index diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-index-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 9
