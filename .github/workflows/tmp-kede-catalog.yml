@@ -1,0 +1,45 @@
+name: Temporary Kede report catalog inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-kede-reports-20260827
+    paths:
+      - .github/workflows/tmp-kede-catalog.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch Eastmoney report catalog variants
+        shell: bash
+        run: |
+          set -u
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          base='https://reportapi.eastmoney.com/report/list'
+          curl -L --compressed -A "$UA" -e 'https://data.eastmoney.com/' \
+            "$base?industryCode=*&pageSize=100&industry=*&rating=*&ratingChange=*&beginTime=2020-01-01&endTime=2030-01-01&pageNo=1&fields=&qType=0&orgCode=&code=688305&rcode=&p=1&pageNum=1&pageNumber=1" \
+            -D diagnostic/headers_variant1.txt -o diagnostic/response_variant1.txt || true
+          curl -L --compressed -A "$UA" -e 'https://data.eastmoney.com/report/' \
+            "$base?cb=datatable&pageSize=100&beginTime=2020-01-01&endTime=2030-01-01&pageNo=1&qType=0&code=688305" \
+            -D diagnostic/headers_variant2.txt -o diagnostic/response_variant2.txt || true
+          python3 - <<'PY'
+          from pathlib import Path
+          for p in Path('diagnostic').glob('*'):
+              print('\n---', p, p.stat().st_size, 'bytes ---')
+              try:
+                  print(p.read_text(errors='replace')[:20000])
+              except Exception as exc:
+                  print(exc)
+          PY
+
+      - name: Upload catalog diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: kede-report-catalog-diagnostic
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
