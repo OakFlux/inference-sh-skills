@@ -1,0 +1,78 @@
+name: Temporary Kede CNC report downloader v2
+
+on:
+  push:
+    branches:
+      - tmp/download-kede-reports-20260827
+    paths:
+      - .github/workflows/tmp-kede-download-v2.yml
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and verify original reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output /tmp/kede-previews
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local expected_pages="$3"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36' \
+              -e 'https://data.eastmoney.com/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "$dest"
+            test -s "$dest"
+            test "$(head -c 4 "$dest")" = "%PDF"
+            local pages
+            pages="$(pdfinfo "$dest" | awk '/^Pages:/ {print $2}')"
+            test "$pages" = "$expected_pages"
+            local stem
+            stem="$(basename "$dest" .pdf)"
+            pdftoppm -f 1 -singlefile -png -r 100 "$dest" "/tmp/kede-previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 100 "$dest" "/tmp/kede-previews/${stem}_last" >/dev/null 2>&1
+          }
+
+          download_pdf 'https://pdf.dfcfw.com/pdf/H3_AP202405191633831318_1.pdf' 'output/01_东海证券_科德数控_高端五轴破壁前行自主技术尽显锋芒_20240518_37页.pdf' '37'
+          download_pdf 'https://pdf.dfcfw.com/pdf/H3_AP202210191579272409_1.pdf' 'output/02_国金证券_科德数控_数控系统功能部件一体化打造五轴机床龙头_20221019_24页.pdf' '24'
+          download_pdf 'https://pdf.dfcfw.com/pdf/H3_AP202208301577819365_1.pdf' 'output/03_山西证券_科德数控_自主可控五轴数控机床国产龙头产能扩张打开成长空间_20220830_29页.pdf' '29'
+
+          cat > output/报告清单与核验说明.txt <<'EOF'
+科德数控（688305.SH）券商深度报告，共3份
+
+1. 东海证券：《公司深度报告：高端五轴破壁前行，自主技术尽显锋芒》
+   日期：2024-05-18；页数：37页；类型：公司深度、首次覆盖；评级：买入。
+
+2. 国金证券：《数控系统功能部件一体化，打造五轴机床龙头》
+   日期：2022-10-19；页数：24页；类型：公司深度、首次覆盖；评级：买入。
+
+3. 山西证券：《自主可控五轴数控机床国产龙头，产能扩张打开成长空间》
+   日期：2022-08-30；页数：29页；类型：公司研究/深度分析、首次覆盖；评级：增持-A。
+
+核验：三份文件均检查PDF文件头、实际页数，并成功渲染首页与末页。
+仅供研究资料整理，不构成投资建议。
+EOF
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output
+
+      - name: Upload verified original PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: kede-cnc-broker-deep-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
