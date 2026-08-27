@@ -1,0 +1,62 @@
+name: Temporary New Hope Service source inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-service-source-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch candidate report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          fetch() {
+            local name="$1"; local url="$2"
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+              -D "diagnostic/${name}.headers" "$url" -o "diagnostic/${name}.html" || true
+          }
+          fetch reportify_2025 'https://reportify.cn/reports/1105126013194604544'
+          fetch fxbaogao_2026 'https://www.fxbaogao.com/detail/5488726'
+          fetch founder_2025 'https://www.foundersc.com/infoResearchMacro/8655160.jhtml'
+          fetch eastmoney_rating 'https://hk.eastmoney.com/rating.html?code=03658'
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, json, html
+          out=[]
+          pats=[
+              r'https?://[^\s"\'<>]+?\.pdf(?:\?[^\s"\'<>]*)?',
+              r'"(?:pdfUrl|pdf_url|downloadUrl|download_url|fileUrl|file_url|sourceUrl|source_url)"\s*:\s*"([^"]+)"',
+              r'href=["\']([^"\']+(?:download|pdf)[^"\']*)["\']',
+          ]
+          for p in sorted(Path('diagnostic').glob('*.html')):
+              text=p.read_text(errors='replace')
+              print('\n===== ',p.name,len(text),' bytes =====')
+              print(text[:2500])
+              for pat in pats:
+                  for m in re.finditer(pat,text,re.I):
+                      u=m.group(1) if m.lastindex else m.group(0)
+                      u=html.unescape(u).replace('\\u002F','/').replace('\\/','/')
+                      out.append((p.name,u))
+          Path('diagnostic/candidate_links.tsv').write_text('\n'.join(f'{a}\t{b}' for a,b in out),encoding='utf-8')
+          print('\nCANDIDATE LINKS')
+          print(Path('diagnostic/candidate_links.tsv').read_text(encoding='utf-8'))
+          PY
+
+      - name: Upload source diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-service-source-diagnostic
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
