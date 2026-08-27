@@ -1,0 +1,247 @@
+name: Temporary fetch InnoCare broker reports
+
+on:
+  push:
+    branches:
+      - tmp/innocare-reports-20260828
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install PDF validator
+        run: python -m pip install --quiet pypdf
+
+      - name: Fetch public broker research PDFs
+        shell: bash
+        run: |
+          cat > /tmp/fetch_reports.py <<'PY'
+          import io
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from datetime import datetime
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = "output"
+          os.makedirs(OUT, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept": "application/json,text/plain,*/*",
+              "Referer": "https://data.eastmoney.com/report/stock.jshtml?encodeUrl=3c349c3a4a81518f",
+          })
+
+          api = "https://reportapi.eastmoney.com/report/list"
+          params = {
+              "cb": "",
+              "pageNo": "1",
+              "pageSize": "200",
+              "code": "688428",
+              "industryCode": "*",
+              "industry": "*",
+              "rating": "*",
+              "ratingChange": "*",
+              "beginTime": "2024-01-01",
+              "endTime": "2026-08-28",
+              "fields": "",
+              "qType": "0",
+              "_": str(int(time.time() * 1000)),
+          }
+
+          r = session.get(api, params=params, timeout=40)
+          r.raise_for_status()
+          text = r.text.strip()
+          if text.startswith(("{", "[")):
+              payload = r.json()
+          else:
+              m = re.search(r"\((\{.*\})\)\s*;?\s*$", text, re.S)
+              if not m:
+                  raise RuntimeError(f"Unexpected API response: {text[:500]}")
+              payload = json.loads(m.group(1))
+
+          rows = payload.get("data") or payload.get("result", {}).get("data") or []
+          if isinstance(rows, dict):
+              rows = rows.get("data") or rows.get("list") or []
+          print(f"Eastmoney rows: {len(rows)}")
+          for row in rows:
+              print(row.get("publishDate"), row.get("orgSName"), row.get("title"), row.get("infoCode"))
+
+          targets = [
+              {
+                  "order": 1,
+                  "org": "华西证券",
+                  "title_key": "血液瘤小龙头",
+                  "date": "2026-07-08",
+                  "fallback_title": "血液瘤小龙头，BTK自免打开第二生长曲线",
+              },
+              {
+                  "order": 2,
+                  "org": "长城证券",
+                  "title_key": "创新基因奠定持续增长潜力",
+                  "date": "2025-03-16",
+                  "fallback_title": "创新基因奠定持续增长潜力，突破自免打开国际化之路",
+              },
+              {
+                  "order": 3,
+                  "org": "国金证券",
+                  "title_key": "奥布替尼放量可期",
+                  "date": "2025-01-26",
+                  "fallback_title": "奥布替尼放量可期，肿瘤自免两翼齐飞",
+              },
+          ]
+
+          def norm(s):
+              return re.sub(r"\s+", "", str(s or "")).replace("-U", "")
+
+          def date8(s):
+              s = str(s or "")[:10]
+              return s.replace("-", "") if re.match(r"\d{4}-\d{2}-\d{2}", s) else ""
+
+          def safe_name(s):
+              return re.sub(r"[\\/:*?\"<>|]+", "_", s).strip(" .")
+
+          selected = []
+          used_codes = set()
+
+          for target in targets:
+              matches = []
+              for row in rows:
+                  title = norm(row.get("title"))
+                  org = norm(row.get("orgSName") or row.get("orgName"))
+                  pub = str(row.get("publishDate") or "")[:10]
+                  score = 0
+                  if norm(target["title_key"]) in title:
+                      score += 100
+                  if norm(target["org"]) in org or org in norm(target["org"]):
+                      score += 20
+                  if pub == target["date"]:
+                      score += 10
+                  if score >= 100:
+                      matches.append((score, row))
+              matches.sort(key=lambda x: (x[0], str(x[1].get("publishDate") or "")), reverse=True)
+              if not matches:
+                  print(f"WARNING: no API metadata match for {target}")
+                  continue
+              row = matches[0][1]
+              code = row.get("infoCode") or row.get("info_code")
+              if not code or code in used_codes:
+                  continue
+              used_codes.add(code)
+              selected.append((target, row, code))
+
+          if len(selected) < 3:
+              # Conservative fallback: only reports whose title explicitly contains 深度/首次覆盖,
+              # with at least one company-specific keyword. No paywalled sources are used.
+              for row in rows:
+                  title = norm(row.get("title"))
+                  code = row.get("infoCode") or row.get("info_code")
+                  if not code or code in used_codes:
+                      continue
+                  if ("深度" in title or "首次覆盖" in title) and ("奥布替尼" in title or "诺诚健华" in title or "自免" in title):
+                      selected.append(({"order": len(selected)+1, "org": row.get("orgSName") or "券商", "fallback_title": row.get("title") or "公司深度报告"}, row, code))
+                      used_codes.add(code)
+                      if len(selected) >= 3:
+                          break
+
+          if not selected:
+              raise RuntimeError("No target research reports found in public report API")
+
+          manifest = []
+          downloaded = 0
+          for target, row, code in selected[:3]:
+              urls = []
+              for key in ("pdfUrl", "attachUrl", "url"):
+                  v = row.get(key)
+                  if isinstance(v, str) and v.lower().startswith("http"):
+                      urls.append(v)
+              urls += [
+                  f"https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{int(time.time()*1000)}.pdf",
+              ]
+
+              content = None
+              source_url = None
+              errors = []
+              for url in dict.fromkeys(urls):
+                  try:
+                      rr = session.get(url, timeout=60, allow_redirects=True)
+                      ctype = rr.headers.get("content-type", "")
+                      if rr.status_code == 200 and rr.content[:5] == b"%PDF-" and len(rr.content) > 50_000:
+                          content = rr.content
+                          source_url = rr.url
+                          break
+                      errors.append(f"{url}: HTTP {rr.status_code}, {ctype}, {len(rr.content)} bytes")
+                  except Exception as exc:
+                      errors.append(f"{url}: {exc}")
+              if content is None:
+                  print("DOWNLOAD FAILED", code, *errors, sep="\n  ")
+                  continue
+
+              try:
+                  reader = PdfReader(io.BytesIO(content), strict=False)
+                  pages = len(reader.pages)
+              except Exception as exc:
+                  print(f"PDF validation failed for {code}: {exc}")
+                  continue
+              if pages < 10:
+                  print(f"Skipping non-deep report ({pages} pages): {row.get('title')}")
+                  continue
+
+              org = row.get("orgSName") or row.get("orgName") or target.get("org") or "券商"
+              title = row.get("title") or target.get("fallback_title") or "诺诚健华公司深度报告"
+              pub = date8(row.get("publishDate")) or target.get("date", "").replace("-", "")
+              filename = safe_name(f"{target.get('order', downloaded+1):02d}_{org}_{title}_{pub}_{pages}页.pdf")
+              path = os.path.join(OUT, filename)
+              with open(path, "wb") as f:
+                  f.write(content)
+              print(f"SAVED {path}: {len(content)} bytes, {pages} pages")
+              manifest.append({
+                  "filename": filename,
+                  "broker": org,
+                  "title": title,
+                  "date": str(row.get("publishDate") or "")[:10],
+                  "pages": pages,
+                  "infoCode": code,
+                  "source": source_url,
+              })
+              downloaded += 1
+
+          if downloaded < 2:
+              raise RuntimeError(f"Only {downloaded} complete deep report(s) downloaded; refusing to package an incomplete set")
+
+          with open(os.path.join(OUT, "报告清单.txt"), "w", encoding="utf-8") as f:
+              f.write("诺诚健华（688428.SH / 09969.HK）券商深度报告\n")
+              f.write("公开来源下载；已验证 PDF 文件头和页数。\n\n")
+              for i, item in enumerate(manifest, 1):
+                  f.write(f"{i}. {item['broker']}：《{item['title']}》\n")
+                  f.write(f"   日期：{item['date']}；页数：{item['pages']}页\n")
+                  f.write(f"   文件：{item['filename']}\n")
+                  f.write(f"   公开PDF：{item['source']}\n\n")
+
+          with open(os.path.join(OUT, "manifest.json"), "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/fetch_reports.py
+          ls -lh output
+
+      - name: Upload verified reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: innocare-broker-deep-reports
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
