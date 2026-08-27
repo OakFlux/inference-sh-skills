@@ -1,0 +1,250 @@
+name: Temporary Zoom reports package
+
+on:
+  push:
+    branches:
+      - tmp-zoom-reports-20260827
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Download, validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_zoom.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import os
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path("dist")
+          DOCS = OUT / "Zoom_Communications_ZM_2020-2025年报_2026年半年报"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          ANNUAL_REPORTS = [
+              (2020, "https://investors.zoom.us/static-files/a6b3b254-94ff-415f-bb3b-8c3146b061d4"),
+              (2021, "https://investors.zoom.us/static-files/a17fd391-13ae-429b-8cb3-bfd95b61b007"),
+              (2022, "https://investors.zoom.us/static-files/9a9d91bf-5c62-45fd-9573-fb03159c8a93"),
+              (2023, "https://investors.zoom.us/static-files/50e0c380-f4bd-4a16-80e3-da56b64017ce"),
+              (2024, "https://investors.zoom.us/static-files/b0dac8db-4e35-4dd8-a148-c02a0029b1c5"),
+              (2025, "https://investors.zoom.us/static-files/f5b92b93-5af9-42cb-ab0d-931c309417a9"),
+          ]
+
+          LATEST_10Q_ACCESSION = "0001585521-26-000121"
+          LATEST_10Q_PAGE = f"https://investors.zoom.us/sec-filings/sec-filing/10-q/{LATEST_10Q_ACCESSION}"
+          SEC_10Q_HTML = "https://www.sec.gov/Archives/edgar/data/1585521/000158552126000121/zm-20260731.htm"
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
+              "Accept-Encoding": "gzip, deflate, br",
+          })
+
+          def read_pdf(path: Path) -> tuple[int, str]:
+              data = path.read_bytes()
+              if len(data) < 100_000 or not data.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF {path.name}: {len(data)} bytes, head={data[:12]!r}")
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < 20:
+                  raise RuntimeError(f"Unexpectedly short report {path.name}: {pages} pages")
+              sample_parts: list[str] = []
+              for page in reader.pages[:5]:
+                  try:
+                      sample_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", " ", " ".join(sample_parts)).strip()
+              return pages, sample
+
+          def download_pdf(url: str, destination: Path, referer: str | None = None) -> tuple[int, int, str, str]:
+              errors: list[str] = []
+              for attempt in range(4):
+                  try:
+                      headers = {
+                          "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                          "Cache-Control": "no-cache",
+                      }
+                      if referer:
+                          headers["Referer"] = referer
+                      with session.get(url, headers=headers, timeout=180, stream=True, allow_redirects=True) as response:
+                          response.raise_for_status()
+                          with destination.open("wb") as output:
+                              for chunk in response.iter_content(1024 * 1024):
+                                  if chunk:
+                                      output.write(chunk)
+                          final_url = response.url
+                          content_type = response.headers.get("content-type", "")
+                      pages, sample = read_pdf(destination)
+                      raw = destination.read_bytes()
+                      if "zoom" not in sample.lower():
+                          raise RuntimeError(f"Zoom name not found in first pages; content-type={content_type}")
+                      return len(raw), pages, hashlib.sha256(raw).hexdigest(), final_url
+                  except Exception as exc:
+                      destination.unlink(missing_ok=True)
+                      errors.append(f"attempt {attempt + 1}: {exc!r}")
+                      if attempt < 3:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(f"Failed to download {url}: {'; '.join(errors)}")
+
+          def find_ir_10q_pdf() -> list[str]:
+              candidates: list[str] = []
+              response = session.get(LATEST_10Q_PAGE, timeout=60, allow_redirects=True)
+              print("IR PAGE", response.status_code, response.url, len(response.content), response.headers.get("content-type"))
+              response.raise_for_status()
+              soup = BeautifulSoup(response.text, "html.parser")
+              for anchor in soup.find_all("a", href=True):
+                  text = " ".join(anchor.get_text(" ", strip=True).split()).lower()
+                  href = urljoin(response.url, anchor["href"])
+                  if "download pdf" in text or href.lower().endswith(".pdf") or "/static-files/" in href:
+                      candidates.append(href)
+              unique: list[str] = []
+              for item in candidates:
+                  if item not in unique:
+                      unique.append(item)
+              print("10-Q PDF CANDIDATES", unique)
+              return unique
+
+          def print_sec_html_to_pdf(destination: Path) -> str:
+              chrome = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+              if not chrome:
+                  raise RuntimeError("No headless Chrome executable found")
+              profile = Path("/tmp/zoom-chrome-profile")
+              profile.mkdir(parents=True, exist_ok=True)
+              command = [
+                  chrome,
+                  "--headless=new",
+                  "--disable-gpu",
+                  "--no-sandbox",
+                  "--disable-dev-shm-usage",
+                  f"--user-data-dir={profile}",
+                  f"--print-to-pdf={destination.resolve()}",
+                  "--print-to-pdf-no-header",
+                  SEC_10Q_HTML,
+              ]
+              print("CHROME COMMAND", command)
+              completed = subprocess.run(command, check=False, text=True, capture_output=True, timeout=300)
+              print("CHROME RETURN", completed.returncode)
+              print("CHROME STDOUT", completed.stdout[-2000:])
+              print("CHROME STDERR", completed.stderr[-4000:])
+              if completed.returncode != 0 or not destination.exists():
+                  raise RuntimeError("Headless Chrome PDF conversion failed")
+              read_pdf(destination)
+              return SEC_10Q_HTML
+
+          manifest: list[str] = [
+              "Zoom Communications, Inc. (NASDAQ: ZM)",
+              "资料范围：公司投资者关系网站列示的2020-2025年度报告，以及截至2026-08-27最新的半年期财务披露。",
+              "口径说明：Zoom财年于每年1月31日结束；最新半年期文件为2026-08-26提交的Form 10-Q，包含截至2026-07-31的三个月及六个月财务报表。",
+              "",
+          ]
+
+          for year, url in ANNUAL_REPORTS:
+              filename = f"Zoom_Communications_ZM_{year}年年度报告.pdf"
+              path = DOCS / filename
+              size, pages, digest, final_url = download_pdf(url, path, referer="https://investors.zoom.us/financial-information/annual-reports")
+              manifest.extend([
+                  filename,
+                  f"  报告年度：{year}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  官方来源：{final_url}",
+                  "",
+              ])
+              print("ANNUAL OK", year, pages, size, final_url)
+
+          half_filename = "Zoom_Communications_ZM_2026年半年度报告_Form_10-Q.pdf"
+          half_path = DOCS / half_filename
+          half_result: tuple[int, int, str, str] | None = None
+          candidate_errors: list[str] = []
+          try:
+              candidates = find_ir_10q_pdf()
+          except Exception as exc:
+              candidates = []
+              candidate_errors.append(f"IR filing page: {exc!r}")
+
+          for candidate in candidates:
+              try:
+                  half_result = download_pdf(candidate, half_path, referer=LATEST_10Q_PAGE)
+                  break
+              except Exception as exc:
+                  candidate_errors.append(f"{candidate}: {exc!r}")
+
+          if half_result is None:
+              print("IR PDF unavailable; using official SEC filing HTML rendered to PDF", candidate_errors)
+              source_url = print_sec_html_to_pdf(half_path)
+              pages, sample = read_pdf(half_path)
+              raw = half_path.read_bytes()
+              if "july 31, 2026" not in sample.lower() and "2026" not in sample:
+                  print("WARNING: date not extracted from first pages of rendered 10-Q")
+              half_result = (len(raw), pages, hashlib.sha256(raw).hexdigest(), source_url)
+
+          size, pages, digest, source_url = half_result
+          manifest.extend([
+              half_filename,
+              "  文件类型：Form 10-Q（季度报告，含六个月累计财务报表）",
+              "  报告期末：2026-07-31",
+              "  SEC提交日期：2026-08-26",
+              f"  SEC登记号：{LATEST_10Q_ACCESSION}",
+              f"  页数：{pages}",
+              f"  文件大小：{size} bytes",
+              f"  SHA-256：{digest}",
+              f"  官方来源：{source_url}",
+              "",
+          ])
+          print("HALF OK", pages, size, source_url)
+
+          manifest_path = DOCS / "资料清单与官方来源.txt"
+          manifest_path.write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / "Zoom_Communications_ZM_2020-2025年报_2026年半年报.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdfs}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_zoom.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zoom-reports-final-zip
+          path: dist/Zoom_Communications_ZM_2020-2025年报_2026年半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
