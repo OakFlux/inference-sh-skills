@@ -11,62 +11,72 @@ permissions:
 jobs:
   discover:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 6
     steps:
-      - name: Install tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq jq poppler-utils unzip >/dev/null
-          mkdir -p diagnostics
-
-      - name: Query Eastmoney report APIs
+      - name: Discover report identifiers and download links
         shell: bash
         run: |
           set -u
+          mkdir -p diagnostics
           UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          fetch() {
+            local url="$1" out="$2"
+            curl -L --fail --show-error --silent --compressed \
+              --connect-timeout 10 --max-time 30 --retry 1 \
+              --user-agent "$UA" "$url" -o "$out" || true
+          }
+
           base='https://reportapi.eastmoney.com/report/list'
           for code in 06855 6855 HK06855 06855.HK 6855.HK; do
             url="$base?cb=callback&industryCode=*&pageSize=100&industry=*&rating=*&ratingChange=*&beginTime=2019-01-01&endTime=2026-08-28&pageNo=1&fields=&qType=0&orgCode=&code=${code}&rcode=&p=1&pageNum=1&pageNumber=1"
-            curl -L --fail --show-error --silent --compressed --user-agent "$UA" --referer 'https://data.eastmoney.com/report/' "$url" -o "diagnostics/eastmoney_${code//[^A-Za-z0-9]/_}.txt" || true
+            fetch "$url" "diagnostics/eastmoney_${code//[^A-Za-z0-9]/_}.txt"
           done
-          curl -L --fail --show-error --silent --compressed --user-agent "$UA" 'https://data.eastmoney.com/report/06855.html' -o diagnostics/eastmoney_stock_page.html || true
-          grep -Eo 'AP[0-9]{12,}|https?[^" ]+\.pdf[^" ]*' diagnostics/eastmoney_* 2>/dev/null | sort -u > diagnostics/eastmoney_hits.txt || true
+          fetch 'https://data.eastmoney.com/report/06855.html' diagnostics/eastmoney_stock_page.html
 
-      - name: Fetch known report pages and search pages
-        shell: bash
-        run: |
-          set -u
-          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
           declare -A pages=(
             [guohai_9fzt]='https://gmg.9fzt.com/report/HKSE/06855/790184497512.html'
             [gf_baogaobox]='https://www.baogaobox.com/reports/240715000023971.html'
+            [related_250629]='https://www.baogaobox.com/reports/250629000065695.html'
+            [related_250205]='https://www.baogaobox.com/reports/250205000047883.html'
+            [related_250114]='https://www.baogaobox.com/reports/250114000046299.html'
+            [related_241129]='https://www.baogaobox.com/reports/241129000040276.html'
+            [related_241121]='https://www.baogaobox.com/reports/241121000039235.html'
+            [related_241011]='https://www.baogaobox.com/reports/241011000034289.html'
             [zhongtai_202509]='https://www.fxbaogao.com/detail/5059921'
             [zhongtai_202604]='https://www.fxbaogao.com/detail/5341558'
             [citic_202603]='https://www.nxny.com/report/view_6246387.html'
             [pharnex]='https://www.pharnexcloud.com/shiyingzheng/xianyangnangxingai'
           )
           for key in "${!pages[@]}"; do
-            curl -L --fail --show-error --silent --compressed --user-agent "$UA" "${pages[$key]}" -o "diagnostics/${key}.html" || true
-            curl -L --fail --show-error --silent --compressed --user-agent "$UA" "https://r.jina.ai/${pages[$key]}" -o "diagnostics/${key}_jina.txt" || true
+            fetch "${pages[$key]}" "diagnostics/${key}.html"
+            fetch "https://r.jina.ai/${pages[$key]}" "diagnostics/${key}_jina.txt"
           done
+
           for q in \
             '亚盛医药 国海证券 血液瘤创新药细分龙头 pdf' \
             '亚盛医药 广发证券 国际化进程加速 全球临床顺利推进 pdf' \
-            '亚盛医药 公司深度报告 pdf 06855' \
-            'Ascentage Pharma research report pdf'; do
+            '亚盛医药 公司深度报告 06855 pdf'; do
             safe="$(printf '%s' "$q" | sha256sum | cut -c1-12)"
-            curl -L --fail --show-error --silent --compressed --user-agent "$UA" --get --data-urlencode "q=$q" 'https://html.duckduckgo.com/html/' -o "diagnostics/ddg_${safe}.html" || true
-            curl -L --fail --show-error --silent --compressed --user-agent "$UA" --get --data-urlencode "q=$q" 'https://www.google.com/search' -o "diagnostics/google_${safe}.html" || true
+            curl -L --fail --show-error --silent --compressed \
+              --connect-timeout 10 --max-time 30 --retry 1 --user-agent "$UA" \
+              --get --data-urlencode "q=$q" 'https://html.duckduckgo.com/html/' \
+              -o "diagnostics/ddg_${safe}.html" || true
           done
-          grep -RIEo 'https?[^"<> ]+\.pdf([^"<> ]*)?|AP[0-9]{12,}|[A-Za-z0-9_-]{20,}\.pdf' diagnostics | sort -u > diagnostics/all_pdf_and_ap_hits.txt || true
-          grep -RIEo 'https?[^"<> ]+' diagnostics | grep -Ei 'pdf|download|report|file|upload|static' | sort -u > diagnostics/all_candidate_urls.txt || true
+
+          grep -RIEo 'AP[0-9]{12,}|https?[^"<> ]+\.pdf([^"<> ]*)?|[A-Za-z0-9_./:-]{12,}\.pdf' diagnostics 2>/dev/null | sort -u > diagnostics/pdf_and_ap_hits.txt || true
+          grep -RIEo 'https?[^"<> ]+' diagnostics 2>/dev/null | grep -Ei 'pdf|download|report|file|upload|static|attachment' | sort -u > diagnostics/candidate_urls.txt || true
+          {
+            echo '=== file sizes ==='
+            find diagnostics -type f -printf '%f %s bytes\n' | sort
+            echo
+            echo '=== AP/PDF hits ==='
+            cat diagnostics/pdf_and_ap_hits.txt 2>/dev/null || true
+          } > diagnostics/summary.txt
 
       - name: Upload discovery diagnostics
         uses: actions/upload-artifact@v4
         with:
-          name: ascentage-report-discovery
+          name: ascentage-report-discovery-fast
           path: diagnostics/
           if-no-files-found: error
           retention-days: 1
