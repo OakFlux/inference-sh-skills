@@ -1,0 +1,74 @@
+name: Temporary Ascentage Pharnex report retrieval
+
+on:
+  push:
+    branches:
+      - 'tmp/ascentage-reports-20260828'
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Fetch report detail pages and inspect download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics reports
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for id in 92505 92962 96774; do
+            curl -L --fail --show-error --silent --compressed \
+              --connect-timeout 15 --max-time 90 --retry 2 \
+              --user-agent "$UA" \
+              "https://consult.pharnexcloud.com/report/detail/${id}.html" \
+              -o "diagnostics/${id}.html"
+            curl -L --fail --show-error --silent --compressed \
+              --connect-timeout 15 --max-time 90 --retry 2 \
+              --user-agent "$UA" \
+              "https://r.jina.ai/https://consult.pharnexcloud.com/report/detail/${id}.html" \
+              -o "diagnostics/${id}_jina.txt" || true
+          done
+
+          grep -RIEo 'https?[^"<> ]+\.pdf([^"<> ]*)?|https?[^"<> ]+(download|file|preview|attachment|report)[^"<> ]*|[A-Za-z0-9_./:-]+\.pdf' diagnostics \
+            | sort -u > diagnostics/candidate_urls.txt || true
+          grep -RIEo '(api|ajax|download|file|pdf|preview|attachment)[A-Za-z0-9_./?=&:%${}+-]*' diagnostics \
+            | sort -u > diagnostics/candidate_tokens.txt || true
+          grep -RIE '92505|92962|96774|血液瘤创新药|厚积薄发|小荷才露尖尖角|57页|37页' diagnostics \
+            > diagnostics/relevant_lines.txt || true
+
+          # Fetch every same-site JS asset referenced by the detail pages for endpoint discovery.
+          python - <<'PY'
+          import html, re, urllib.parse, urllib.request
+          from pathlib import Path
+          ua={'User-Agent':'Mozilla/5.0'}
+          urls=set()
+          for p in Path('diagnostics').glob('*.html'):
+              text=p.read_text(encoding='utf-8',errors='ignore')
+              base=f'https://consult.pharnexcloud.com/report/detail/{p.stem}.html'
+              for src in re.findall(r'<script[^>]+src=["\']([^"\']+)',text,re.I):
+                  u=urllib.parse.urljoin(base,html.unescape(src))
+                  if 'pharnexcloud.com' in u:
+                      urls.add(u)
+          Path('diagnostics/js_urls.txt').write_text('\n'.join(sorted(urls)),encoding='utf-8')
+          for i,u in enumerate(sorted(urls)):
+              try:
+                  req=urllib.request.Request(u,headers=ua)
+                  b=urllib.request.urlopen(req,timeout=45).read()
+                  Path(f'diagnostics/js_{i:03d}.js').write_bytes(b)
+              except Exception as e:
+                  with open('diagnostics/js_errors.txt','a',encoding='utf-8') as f:f.write(f'{u}\t{e}\n')
+          PY
+          grep -RIEo 'https?[^"<> ]+|/[A-Za-z0-9_./-]*(download|pdf|report|file|preview|attachment)[A-Za-z0-9_./?=&:%${}+-]*' diagnostics/js_*.js \
+            | sort -u > diagnostics/js_endpoint_hits.txt || true
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-pharnex-diagnostics
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
