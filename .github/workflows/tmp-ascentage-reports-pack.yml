@@ -1,0 +1,288 @@
+name: Temporary Ascentage Pharma reports package
+
+on:
+  push:
+    branches:
+      - tmp-ascentage-reports-20260828
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Query HKEX, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_ascentage.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK_ID = "1000011006"
+          STOCK_CODE = "06855"
+          COMPANY_CN = "亚盛医药"
+          COMPANY_TRAD = "亞盛醫藥"
+          COMPANY_EN = "Ascentage Pharma"
+          BASE_SEARCH = "https://www1.hkexnews.hk/search/titlesearch.xhtml"
+          OUT = Path("dist")
+          DOCS = OUT / "亚盛医药_06855_2020-2025年报_最新半年期报告"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
+          })
+
+          def search_url(*, lang: str, start: str, end: str, t2code: str | None = None) -> str:
+              params = [
+                  "category=0",
+                  f"from={start}",
+                  f"lang={lang}",
+                  "market=SEHK",
+                  f"stockId={STOCK_ID}",
+                  f"to={end}",
+              ]
+              if t2code:
+                  params.extend(["t1code=40000", "t2Gcode=-1", f"t2code={t2code}"])
+              return BASE_SEARCH + "?" + "&".join(params)
+
+          def fetch_links(url: str) -> list[tuple[str, str]]:
+              response = session.get(url, timeout=90)
+              print("SEARCH", response.status_code, len(response.content), response.url)
+              response.raise_for_status()
+              soup = BeautifulSoup(response.text, "html.parser")
+              links: list[tuple[str, str]] = []
+              for anchor in soup.find_all("a", href=True):
+                  text = " ".join(anchor.get_text(" ", strip=True).split())
+                  href = urljoin(response.url, anchor["href"])
+                  if "/listedco/listconews/" in href and href.lower().endswith(".pdf"):
+                      links.append((text, href))
+              print("LINKS", len(links))
+              for title, href in links:
+                  print("  LINK", title, href)
+              return links
+
+          def year_from_annual_title(title: str) -> int | None:
+              compact = re.sub(r"\s+", "", title)
+              patterns = [
+                  r"年報(20\d{2})",
+                  r"(20\d{2})年報",
+                  r"年度報告(20\d{2})",
+                  r"(20\d{2})年度報告",
+                  r"ANNUALREPORT(20\d{2})",
+                  r"(20\d{2})ANNUALREPORT",
+              ]
+              upper = compact.upper()
+              for pattern in patterns:
+                  match = re.search(pattern, upper if "ANNUAL" in pattern else compact, re.I)
+                  if match:
+                      return int(match.group(1))
+              return None
+
+          annual_links: dict[int, tuple[str, str, str]] = {}
+          for lang in ("ZH", "EN"):
+              url = search_url(lang=lang, start="20210401", end="20260531", t2code="40100")
+              for title, href in fetch_links(url):
+                  year = year_from_annual_title(title)
+                  if year in range(2020, 2026):
+                      current = annual_links.get(year)
+                      language_priority = 1 if lang == "ZH" else 0
+                      current_priority = 1 if current and current[2] == "中文" else 0
+                      if current is None or language_priority > current_priority:
+                          annual_links[year] = (title, href, "中文" if lang == "ZH" else "英文")
+
+          missing = [year for year in range(2020, 2026) if year not in annual_links]
+          if missing:
+              raise RuntimeError(f"Missing annual reports: {missing}; found={annual_links}")
+
+          interim_kind = ""
+          interim_title = ""
+          interim_url = ""
+          interim_language = ""
+
+          # Prefer a formally published 2026 interim report.
+          for lang in ("ZH", "EN"):
+              url = search_url(lang=lang, start="20260801", end="20260828", t2code="40200")
+              for title, href in fetch_links(url):
+                  compact = re.sub(r"\s+", "", title)
+                  upper = compact.upper()
+                  is_2026 = "2026" in compact
+                  is_interim_report = any(token in compact for token in ("中期報告", "半年度報告")) or "INTERIMREPORT" in upper
+                  if is_2026 and is_interim_report:
+                      interim_kind = "正式中期报告"
+                      interim_title = title
+                      interim_url = href
+                      interim_language = "中文" if lang == "ZH" else "英文"
+                      break
+              if interim_url:
+                  break
+
+          # If the formal report has not yet been issued, use the latest official 2026 interim-results announcement,
+          # which contains the six-month financial statements.
+          if not interim_url:
+              for lang in ("ZH", "EN"):
+                  url = search_url(lang=lang, start="20260801", end="20260828")
+                  for title, href in fetch_links(url):
+                      compact = re.sub(r"\s+", "", title)
+                      upper = compact.upper()
+                      is_2026 = "2026" in compact
+                      is_interim_results = (
+                          "中期業績" in compact
+                          or "中期业绩" in compact
+                          or "INTERIMRESULT" in upper
+                          or ("SIXMONTHSENDEDJUNE30,2026" in upper)
+                      )
+                      if is_2026 and is_interim_results:
+                          interim_kind = "中期业绩公告（含六个月财务报表）"
+                          interim_title = title
+                          interim_url = href
+                          interim_language = "中文" if lang == "ZH" else "英文"
+                          break
+                  if interim_url:
+                      break
+
+          if not interim_url:
+              raise RuntimeError("No 2026 interim report or interim-results announcement found on HKEX")
+
+          reports: list[tuple[str, str, str, str, int, int | None]] = []
+          for year in range(2020, 2026):
+              title, href, language = annual_links[year]
+              reports.append((f"亚盛医药_06855_{year}年年度报告.pdf", title, href, language, 80, year))
+
+          interim_filename = (
+              "亚盛医药_06855_2026年中期报告.pdf"
+              if interim_kind == "正式中期报告"
+              else "亚盛医药_06855_2026年中期业绩公告_含六个月财务报表.pdf"
+          )
+          reports.append((interim_filename, interim_title, interim_url, interim_language, 10, 2026))
+
+          def extract_sample(reader: PdfReader, limit: int = 12) -> str:
+              parts: list[str] = []
+              for page in reader.pages[:limit]:
+                  try:
+                      parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              return re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+          def download_pdf(url: str, destination: Path, minimum_pages: int, expected_year: int | None) -> tuple[int, int, str, str]:
+              errors: list[str] = []
+              for attempt in range(4):
+                  try:
+                      with session.get(
+                          url,
+                          headers={
+                              "Accept": "application/pdf,application/octet-stream,*/*",
+                              "Referer": f"https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId={STOCK_ID}",
+                          },
+                          timeout=300,
+                          stream=True,
+                          allow_redirects=True,
+                      ) as response:
+                          response.raise_for_status()
+                          with destination.open("wb") as output:
+                              for chunk in response.iter_content(1024 * 1024):
+                                  if chunk:
+                                      output.write(chunk)
+                          final_url = response.url
+                          content_type = response.headers.get("content-type", "")
+
+                      raw = destination.read_bytes()
+                      if len(raw) < 100_000 or not raw.startswith(b"%PDF-"):
+                          raise RuntimeError(f"invalid PDF: {len(raw)} bytes, content-type={content_type}")
+
+                      reader = PdfReader(str(destination), strict=False)
+                      pages = len(reader.pages)
+                      if pages < minimum_pages:
+                          raise RuntimeError(f"unexpected page count: {pages}")
+
+                      sample = extract_sample(reader)
+                      company_ok = any(name.lower() in sample.lower() for name in (COMPANY_CN, COMPANY_TRAD, COMPANY_EN, "ASCENTAGE"))
+                      if not company_ok:
+                          print("WARNING company name not extracted from first pages", destination.name)
+                      if expected_year is not None and str(expected_year) not in sample:
+                          print("WARNING expected year not extracted", expected_year, destination.name)
+
+                      return len(raw), pages, hashlib.sha256(raw).hexdigest(), final_url
+                  except Exception as exc:
+                      destination.unlink(missing_ok=True)
+                      errors.append(f"attempt {attempt + 1}: {exc!r}")
+                      if attempt < 3:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(f"Failed to download {url}: {'; '.join(errors)}")
+
+          manifest = [
+              "亚盛医药集团（Ascentage Pharma Group International，06855.HK）",
+              "资料范围：2020—2025年年度报告全文及截至2026-08-28最新半年期财务披露。",
+              f"最新半年期文件类型：{interim_kind}。",
+              "来源：香港交易所披露易（HKEXnews）官方PDF；优先采用中文版本。",
+              "版本规则：仅收录完整年度报告，不使用年度业绩公告替代年报。",
+              "",
+          ]
+
+          for filename, title, url, language, minimum_pages, expected_year in reports:
+              destination = DOCS / filename
+              size, pages, digest, final_url = download_pdf(url, destination, minimum_pages, expected_year)
+              manifest.extend([
+                  filename,
+                  f"  港交所公告标题：{title}",
+                  f"  文件类别：{'年度报告' if '年度报告' in filename else interim_kind}",
+                  f"  语言版本：{language}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  港交所官方来源：{final_url}",
+                  "",
+              ])
+              print("OK", filename, language, pages, size, final_url)
+
+          (DOCS / "资料清单与港交所官方来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / "亚盛医药_06855_2020-2025年报_2026年最新半年期报告.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdf_names}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print(f"INTERIM_KIND={interim_kind}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_ascentage.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-reports-final-zip
+          path: dist/亚盛医药_06855_2020-2025年报_2026年最新半年期报告.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
