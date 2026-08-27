@@ -1,0 +1,471 @@
+name: Temporary InnoCare reports package
+
+on:
+  push:
+    branches:
+      - tmp-innocare-reports-20260828
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Query official sources, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_innocare.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import re
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from typing import Any, Iterable
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          HK_STOCK_ID = "1000028052"
+          HK_CODE = "09969"
+          A_CODE = "688428"
+          COMPANY_CN = "诺诚健华"
+          COMPANY_TRAD = "諾誠健華"
+          COMPANY_EN = "InnoCare"
+
+          OUT = Path("dist")
+          DOCS = OUT / "诺诚健华_09969_688428_所有年报_双市场招股说明书_最新半年报"
+          WORK = Path("work")
+          DOCS.mkdir(parents=True, exist_ok=True)
+          WORK.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,zh-HK;q=0.8,en;q=0.7",
+              "Accept-Encoding": "gzip, deflate",
+          })
+
+          def clean(value: Any) -> str:
+              text = html.unescape(str(value or ""))
+              text = re.sub(r"<[^>]+>", "", text)
+              return " ".join(text.replace("\u3000", " ").split())
+
+          def compact(value: Any) -> str:
+              return re.sub(r"\s+", "", clean(value)).replace("（", "(").replace("）", ")")
+
+          def hk_search_url(*, lang: str, start: str, end: str, category: int = 0, t2code: str | None = None) -> str:
+              params = [
+                  f"category={category}",
+                  f"from={start}",
+                  f"lang={lang}",
+                  "market=SEHK",
+                  f"stockId={HK_STOCK_ID}",
+                  f"to={end}",
+              ]
+              if t2code:
+                  params.extend(["t1code=40000", "t2Gcode=-1", f"t2code={t2code}"])
+              return "https://www1.hkexnews.hk/search/titlesearch.xhtml?" + "&".join(params)
+
+          def hk_links(url: str, include_html: bool = False) -> list[tuple[str, str]]:
+              response = session.get(url, timeout=90)
+              print("HK SEARCH", response.status_code, len(response.content), response.url)
+              response.raise_for_status()
+              soup = BeautifulSoup(response.text, "html.parser")
+              out: list[tuple[str, str]] = []
+              for anchor in soup.find_all("a", href=True):
+                  title = clean(anchor.get_text(" ", strip=True))
+                  href = urljoin(response.url, anchor["href"])
+                  low = href.lower()
+                  if "/listedco/listconews/" not in low:
+                      continue
+                  if low.endswith(".pdf") or (include_html and (low.endswith(".htm") or low.endswith(".html"))):
+                      out.append((title, href))
+              for title, href in out:
+                  print(" HK LINK", title, href)
+              return out
+
+          def annual_year(title: str) -> int | None:
+              s = compact(title)
+              for pattern in [r"年報(20\d{2})", r"(20\d{2})年報", r"年度報告(20\d{2})", r"(20\d{2})年度報告", r"ANNUALREPORT(20\d{2})", r"(20\d{2})ANNUALREPORT"]:
+                  match = re.search(pattern, s.upper() if "ANNUAL" in pattern else s, re.I)
+                  if match:
+                      return int(match.group(1))
+              return None
+
+          annuals: dict[int, tuple[str, str, str]] = {}
+          for lang in ("ZH", "EN"):
+              for title, href in hk_links(hk_search_url(lang=lang, start="20210401", end="20260531", t2code="40100")):
+                  year = annual_year(title)
+                  if year not in range(2020, 2026):
+                      continue
+                  language = "中文" if lang == "ZH" else "英文"
+                  current = annuals.get(year)
+                  if current is None or (language == "中文" and current[2] != "中文"):
+                      annuals[year] = (title, href, language)
+
+          missing_annuals = [year for year in range(2020, 2026) if year not in annuals]
+          if missing_annuals:
+              raise RuntimeError(f"Missing HK annual reports: {missing_annuals}; found={annuals}")
+
+          # Find the 2020 Hong Kong global-offering prospectus. The title-search result
+          # may point to a contents HTML page whose child links are sectional PDFs.
+          prospectus_entry_pages: list[tuple[str, str]] = []
+          for category in (0, 1):
+              for lang in ("ZH", "EN"):
+                  for title, href in hk_links(hk_search_url(lang=lang, start="20200301", end="20200415", category=category), include_html=True):
+                      s = compact(title).upper()
+                      if any(token in s for token in ("全球發售", "全球发售", "GLOBALOFFERING", "招股章程", "PROSPECTUS")):
+                          prospectus_entry_pages.append((title, href))
+
+          if not prospectus_entry_pages:
+              raise RuntimeError("No Hong Kong prospectus entry found")
+
+          def pdf_info(path: Path, sample_pages: int = 10) -> tuple[int, str]:
+              raw = path.read_bytes()
+              if len(raw) < 100_000 or not raw.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF {path.name}: {len(raw)} bytes, head={raw[:12]!r}")
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              parts: list[str] = []
+              for page in reader.pages[:sample_pages]:
+                  try:
+                      parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              return pages, re.sub(r"\s+", " ", " ".join(parts)).strip()
+
+          def fetch_pdf(url: str, destination: Path, *, minimum_pages: int = 1) -> tuple[str, int, int, str, str]:
+              errors: list[str] = []
+              for attempt in range(4):
+                  try:
+                      with session.get(
+                          url,
+                          headers={"Accept": "application/pdf,application/octet-stream,*/*"},
+                          timeout=300,
+                          stream=True,
+                          allow_redirects=True,
+                      ) as response:
+                          response.raise_for_status()
+                          with destination.open("wb") as output:
+                              for chunk in response.iter_content(1024 * 1024):
+                                  if chunk:
+                                      output.write(chunk)
+                          final_url = response.url
+                      pages, sample = pdf_info(destination)
+                      if pages < minimum_pages:
+                          raise RuntimeError(f"Unexpectedly short PDF: {pages} pages")
+                      raw = destination.read_bytes()
+                      return final_url, len(raw), pages, hashlib.sha256(raw).hexdigest(), sample
+                  except Exception as exc:
+                      destination.unlink(missing_ok=True)
+                      errors.append(f"attempt {attempt + 1}: {exc!r}")
+                      if attempt < 3:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(f"Failed {url}: {'; '.join(errors)}")
+
+          hk_prospectus_candidates: list[tuple[int, int, str, str, Path]] = []
+          seen_candidate_urls: set[str] = set()
+          for entry_title, entry_url in prospectus_entry_pages:
+              child_urls: list[tuple[str, str]] = []
+              if entry_url.lower().endswith(".pdf"):
+                  child_urls.append((entry_title, entry_url))
+              else:
+                  response = session.get(entry_url, timeout=90)
+                  print("HK PROSPECTUS PAGE", response.status_code, len(response.content), response.url)
+                  response.raise_for_status()
+                  soup = BeautifulSoup(response.text, "html.parser")
+                  for anchor in soup.find_all("a", href=True):
+                      title = clean(anchor.get_text(" ", strip=True))
+                      href = urljoin(response.url, anchor["href"])
+                      if href.lower().endswith(".pdf"):
+                          child_urls.append((title, href))
+              for child_title, child_url in child_urls:
+                  if child_url in seen_candidate_urls:
+                      continue
+                  seen_candidate_urls.add(child_url)
+                  temp_path = WORK / f"hkprospectus_{len(seen_candidate_urls):03d}.pdf"
+                  try:
+                      final_url, size, pages, digest, sample = fetch_pdf(child_url, temp_path, minimum_pages=1)
+                  except Exception as exc:
+                      print("HK PROSPECTUS CANDIDATE ERROR", child_url, repr(exc))
+                      continue
+                  sample_low = sample.lower()
+                  company_score = int(any(token.lower() in sample_low for token in (COMPANY_CN, COMPANY_TRAD, COMPANY_EN, "innocare pharma")))
+                  prospectus_score = int(any(token.lower() in sample_low for token in ("招股", "prospectus", "global offering")))
+                  title_score = int(any(token in compact(child_title).upper() for token in ("整份", "全文", "招股章程", "PROSPECTUS", "GLOBALOFFERING")))
+                  hk_prospectus_candidates.append((company_score * 100000 + prospectus_score * 10000 + title_score * 1000 + pages, size, final_url, digest, temp_path))
+                  print("HK PROSPECTUS CANDIDATE", child_title, pages, size, final_url)
+
+          if not hk_prospectus_candidates:
+              raise RuntimeError("No downloadable Hong Kong prospectus PDF candidates")
+          hk_prospectus_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+          _, _, hk_prospectus_url, hk_prospectus_digest, hk_prospectus_temp = hk_prospectus_candidates[0]
+          hk_prospectus_pages, hk_prospectus_sample = pdf_info(hk_prospectus_temp)
+          if hk_prospectus_pages < 200:
+              raise RuntimeError(f"Selected HK prospectus is too short: {hk_prospectus_pages} pages")
+          hk_prospectus_path = DOCS / "诺诚健华_09969_香港全球发售招股章程_2020.pdf"
+          hk_prospectus_path.write_bytes(hk_prospectus_temp.read_bytes())
+
+          # CNINFO discovery for the A-share prospectus and latest full half-year report.
+          CN_QUERY = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
+          CN_TOP = "https://www.cninfo.com.cn/new/information/topSearch/query"
+
+          def find_dicts(obj: Any) -> Iterable[dict[str, Any]]:
+              if isinstance(obj, dict):
+                  yield obj
+                  for value in obj.values():
+                      yield from find_dicts(value)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      yield from find_dicts(value)
+
+          org_candidates: list[str] = []
+          for method in ("post", "get"):
+              try:
+                  kwargs = {
+                      "data" if method == "post" else "params": {
+                          "keyWord": A_CODE,
+                          "maxSecNum": "20",
+                          "maxListNum": "20",
+                      },
+                      "timeout": 60,
+                  }
+                  response = getattr(session, method)(CN_TOP, **kwargs)
+                  print("CN TOP", method, response.status_code, len(response.content))
+                  response.raise_for_status()
+                  payload = response.json()
+                  for item in find_dicts(payload):
+                      text = " ".join(str(v) for v in item.values() if v is not None)
+                      if A_CODE not in text and COMPANY_CN not in text:
+                          continue
+                      for key, value in item.items():
+                          if str(key).lower() in {"orgid", "org_id", "organizationid"} and value:
+                              org_candidates.append(str(value))
+              except Exception as exc:
+                  print("CN TOP ERROR", method, repr(exc))
+
+          org_id = next((v for v in org_candidates if v), "")
+          print("CN ORG ID", org_id)
+          cn_referer = f"https://www.cninfo.com.cn/new/disclosure/stock?stockCode={A_CODE}"
+          if org_id:
+              cn_referer += f"&orgId={org_id}"
+
+          cn_session = requests.Session()
+          cn_session.headers.update({
+              "User-Agent": session.headers["User-Agent"],
+              "Accept-Language": session.headers["Accept-Language"],
+              "Accept-Encoding": "gzip, deflate",
+              "Referer": cn_referer,
+              "Origin": "https://www.cninfo.com.cn",
+              "X-Requested-With": "XMLHttpRequest",
+              "Accept": "application/json, text/javascript, */*; q=0.01",
+          })
+
+          announcements: list[dict[str, Any]] = []
+          seen: set[str] = set()
+
+          def add_rows(rows: Any) -> None:
+              if not isinstance(rows, list):
+                  return
+              for row in rows:
+                  if not isinstance(row, dict):
+                      continue
+                  title = clean(row.get("announcementTitle") or row.get("title"))
+                  sec_code = clean(row.get("secCode") or row.get("stockCode") or row.get("code"))
+                  if sec_code and sec_code != A_CODE:
+                      continue
+                  if not sec_code and COMPANY_CN not in title:
+                      continue
+                  adjunct = str(row.get("adjunctUrl") or row.get("URL") or "").strip()
+                  ident = str(row.get("announcementId") or adjunct or title)
+                  if not adjunct or ident in seen:
+                      continue
+                  seen.add(ident)
+                  row["_TITLE"] = title
+                  row["_ADJUNCT"] = adjunct
+                  announcements.append(row)
+
+          stock_values = []
+          if org_id:
+              stock_values.append(f"{A_CODE},{org_id}")
+          stock_values.extend([f"{A_CODE},", A_CODE])
+          for stock in stock_values:
+              for category, searchkey in [
+                  ("category_bndbg_szsh", ""),
+                  ("", "2026年半年度报告"),
+                  ("", "招股说明书"),
+                  ("", ""),
+              ]:
+                  try:
+                      data = {
+                          "stock": stock,
+                          "tabName": "fulltext",
+                          "pageSize": "100",
+                          "pageNum": "1",
+                          "column": "sse",
+                          "category": category,
+                          "plate": "sh",
+                          "seDate": "2022-01-01~2026-08-28",
+                          "searchkey": searchkey,
+                          "secid": "",
+                          "sortName": "",
+                          "sortType": "",
+                          "isHLtitle": "true",
+                      }
+                      response = cn_session.post(CN_QUERY, data=data, timeout=90)
+                      print("CN QUERY", stock, category, searchkey, response.status_code, len(response.content))
+                      response.raise_for_status()
+                      add_rows((response.json() or {}).get("announcements") or [])
+                  except Exception as exc:
+                      print("CN QUERY ERROR", stock, category, searchkey, repr(exc))
+
+          print("CN ANNOUNCEMENTS", len(announcements))
+          for row in announcements:
+              print(" CN ANN", row.get("_TITLE"), row.get("_ADJUNCT"))
+
+          def filing_time(row: dict[str, Any]) -> int:
+              try:
+                  return int(row.get("announcementTime") or 0)
+              except Exception:
+                  return 0
+
+          a_prospectus_candidates: list[dict[str, Any]] = []
+          half_candidates: list[dict[str, Any]] = []
+          for row in announcements:
+              title = compact(row.get("_TITLE"))
+              if "招股说明书" in title and not any(token in title for token in ("摘要", "提示性公告", "问询", "回复", "审核")):
+                  a_prospectus_candidates.append(row)
+              if "2026年半年度报告" in title and not any(token in title for token in ("摘要", "英文版", "关于")):
+                  half_candidates.append(row)
+
+          if not a_prospectus_candidates:
+              raise RuntimeError("No A-share prospectus found on CNINFO")
+          a_prospectus_candidates.sort(key=lambda row: (int("首次公开发行股票并在科创板上市招股说明书" in compact(row.get("_TITLE"))), filing_time(row)), reverse=True)
+          a_prospectus_row = a_prospectus_candidates[0]
+
+          def cn_url(row: dict[str, Any]) -> str:
+              return urljoin("https://static.cninfo.com.cn/", str(row.get("_ADJUNCT") or "").lstrip("/"))
+
+          a_prospectus_path = DOCS / "诺诚健华_688428_首次公开发行股票并在科创板上市招股说明书_2022.pdf"
+          a_prospectus_url, a_prospectus_size, a_prospectus_pages, a_prospectus_digest, a_prospectus_sample = fetch_pdf(cn_url(a_prospectus_row), a_prospectus_path, minimum_pages=200)
+
+          latest_half_title = ""
+          latest_half_source = ""
+          latest_half_language = "中文"
+          latest_half_path = DOCS / "诺诚健华_688428_2026年半年度报告.pdf"
+          if half_candidates:
+              half_candidates.sort(key=filing_time, reverse=True)
+              half_row = half_candidates[0]
+              latest_half_title = clean(half_row.get("_TITLE"))
+              latest_half_source = cn_url(half_row)
+              latest_half_source, latest_half_size, latest_half_pages, latest_half_digest, latest_half_sample = fetch_pdf(latest_half_source, latest_half_path, minimum_pages=25)
+          else:
+              # Fallback to the HKEX interim-results announcement released on 24 Aug 2026.
+              hk_interim_candidates: list[tuple[int, str, str, str]] = []
+              for lang in ("ZH", "EN"):
+                  for title, href in hk_links(hk_search_url(lang=lang, start="20260801", end="20260828")):
+                      s = compact(title).upper()
+                      is_half = "2026" in s and any(token in s for token in ("中期業績", "中期业绩", "INTERIMRESULT", "SIXMONTHSENDED30JUNE2026"))
+                      if is_half:
+                          hk_interim_candidates.append((1 if lang == "ZH" else 0, title, href, "中文" if lang == "ZH" else "英文"))
+              if not hk_interim_candidates:
+                  raise RuntimeError("No 2026 half-year report or interim-results announcement found")
+              hk_interim_candidates.sort(reverse=True)
+              _, latest_half_title, latest_half_source, latest_half_language = hk_interim_candidates[0]
+              latest_half_path = DOCS / "诺诚健华_09969_2026年中期业绩公告_含六个月财务报表.pdf"
+              latest_half_source, latest_half_size, latest_half_pages, latest_half_digest, latest_half_sample = fetch_pdf(latest_half_source, latest_half_path, minimum_pages=15)
+
+          manifest = [
+              "诺诚健华医药有限公司（09969.HK / 688428.SH）",
+              "资料范围：2020—2025年完整年度报告、香港全球发售招股章程、科创板首次公开发行招股说明书，以及截至2026-08-28最新半年期报告。",
+              "年度报告采用港交所披露易正式版本，每年度仅保留一份，避免双重上市后的重复报告。",
+              "招股文件同时保留香港上市与科创板上市两个版本。",
+              "",
+          ]
+
+          for year in range(2020, 2026):
+              title, source_url, language = annuals[year]
+              filename = f"诺诚健华_09969_{year}年年度报告.pdf"
+              path = DOCS / filename
+              final_url, size, pages, digest, sample = fetch_pdf(source_url, path, minimum_pages=80)
+              manifest.extend([
+                  filename,
+                  f"  港交所标题：{title}",
+                  f"  语言版本：{language}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  官方来源：{final_url}",
+                  "",
+              ])
+              print("ANNUAL OK", year, pages, size, final_url)
+
+          hk_raw = hk_prospectus_path.read_bytes()
+          manifest.extend([
+              hk_prospectus_path.name,
+              "  文件类型：香港全球发售招股章程",
+              f"  页数：{hk_prospectus_pages}",
+              f"  文件大小：{len(hk_raw)} bytes",
+              f"  SHA-256：{hashlib.sha256(hk_raw).hexdigest()}",
+              f"  官方来源：{hk_prospectus_url}",
+              "",
+              a_prospectus_path.name,
+              f"  巨潮公告标题：{clean(a_prospectus_row.get('_TITLE'))}",
+              f"  页数：{a_prospectus_pages}",
+              f"  文件大小：{a_prospectus_size} bytes",
+              f"  SHA-256：{a_prospectus_digest}",
+              f"  官方来源：{a_prospectus_url}",
+              "",
+              latest_half_path.name,
+              f"  文件标题：{latest_half_title}",
+              f"  语言版本：{latest_half_language}",
+              f"  页数：{latest_half_pages}",
+              f"  文件大小：{latest_half_size} bytes",
+              f"  SHA-256：{latest_half_digest}",
+              f"  官方来源：{latest_half_source}",
+              "",
+          ])
+
+          (DOCS / "资料清单与官方来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / "诺诚健华_09969_688428_所有年报_双市场招股说明书_2026年最新半年报.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 9:
+                  raise RuntimeError(f"Expected 9 PDFs, got {pdfs}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_innocare.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: innocare-reports-final-zip
+          path: dist/诺诚健华_09969_688428_所有年报_双市场招股说明书_2026年最新半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
