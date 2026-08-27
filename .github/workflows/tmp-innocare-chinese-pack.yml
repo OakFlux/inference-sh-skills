@@ -1,0 +1,149 @@
+name: Temporary InnoCare Chinese reports package
+
+on:
+  push:
+    branches:
+      - tmp-innocare-zhpack-20260828
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Download, validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_innocare_zh.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('dist')
+          DOCS = OUT / '诺诚健华_09969_688428_所有年报_双市场招股说明书_2026年最新半年报'
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          REPORTS = [
+              ('诺诚健华_09969_2020年年度报告.pdf', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2021/0420/2021042000342_c.pdf', '2020年年度报告', 100),
+              ('诺诚健华_09969_2021年年度报告.pdf', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2022/0421/2022042101378_c.pdf', '2021年年度报告', 100),
+              ('诺诚健华_09969_2022年年度报告.pdf', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2023/0426/2023042600549_c.pdf', '2022年年度报告', 100),
+              ('诺诚健华_09969_2023年年度报告.pdf', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0426/2024042601495_c.pdf', '2023年年度报告', 100),
+              ('诺诚健华_09969_2024年年度报告.pdf', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0428/2025042800914_c.pdf', '2024年年度报告', 100),
+              ('诺诚健华_09969_2025年年度报告.pdf', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0423/2026042302007_c.pdf', '2025年年度报告', 100),
+              ('诺诚健华_09969_香港全球发售招股章程_2020.pdf', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2020/0311/2020031100036_c.pdf', '香港全球发售招股章程', 400),
+              ('诺诚健华_688428_首次公开发行股票并在科创板上市招股说明书_2022.pdf', 'https://static.cninfo.com.cn/finalpage/2022-09-16/1214602715.PDF', '科创板首次公开发行招股说明书', 300),
+              ('诺诚健华_688428_2026年半年度报告.pdf', 'https://static.cninfo.com.cn/finalpage/2026-08-25/1225497507.PDF', '2026年半年度报告', 50),
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,zh-HK;q=0.8,en;q=0.7',
+              'Accept-Encoding': 'gzip, deflate',
+          })
+
+          def download(url: str, path: Path) -> str:
+              errors = []
+              for attempt in range(4):
+                  try:
+                      headers = {'Accept': 'application/pdf,application/octet-stream,*/*'}
+                      if 'cninfo' in url:
+                          headers['Referer'] = 'https://www.cninfo.com.cn/'
+                      else:
+                          headers['Referer'] = 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=1000028052'
+                      with session.get(url, headers=headers, timeout=300, stream=True, allow_redirects=True) as response:
+                          response.raise_for_status()
+                          with path.open('wb') as output:
+                              for chunk in response.iter_content(1024 * 1024):
+                                  if chunk:
+                                      output.write(chunk)
+                          return response.url
+                  except Exception as exc:
+                      path.unlink(missing_ok=True)
+                      errors.append(repr(exc))
+                      if attempt < 3:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(f'Failed to download {url}: {errors}')
+
+          manifest = [
+              '诺诚健华医药有限公司（09969.HK / 688428.SH）',
+              '资料范围：2020—2025年完整年度报告、香港全球发售招股章程、科创板首次公开发行招股说明书及2026年半年度报告。',
+              '年度报告与香港招股章程采用港交所披露易正式中文版本；科创板文件采用巨潮资讯网官方PDF。',
+              '',
+          ]
+
+          for filename, url, title, min_pages in REPORTS:
+              path = DOCS / filename
+              final_url = download(url, path)
+              raw = path.read_bytes()
+              if len(raw) < 100_000 or not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF {filename}: {len(raw)} bytes')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'Unexpected page count for {filename}: {pages}')
+              parts = []
+              for page in reader.pages[:10]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              sample = re.sub(r'\s+', '', ''.join(parts))
+              if not any(token in sample.lower() for token in ('诺诚健华', '諾誠健華', 'innocare')):
+                  print('WARNING company name not extracted from first pages:', filename)
+              digest = hashlib.sha256(raw).hexdigest()
+              manifest.extend([
+                  filename,
+                  f'  文件类型：{title}',
+                  f'  页数：{pages}',
+                  f'  文件大小：{len(raw)} bytes',
+                  f'  SHA-256：{digest}',
+                  f'  官方来源：{final_url}',
+                  '',
+              ])
+              print('OK', filename, pages, len(raw), final_url)
+
+          (DOCS / '资料清单与官方来源.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = OUT / '诺诚健华_09969_688428_所有年报_双市场招股说明书_2026年最新半年报.zip'
+          with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 9:
+                  raise RuntimeError(f'Expected 9 PDFs, got {pdfs}')
+
+          print(f'FINAL_ZIP={final_zip}')
+          print(f'ZIP_SIZE={final_zip.stat().st_size}')
+          print('CONTENTS')
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_innocare_zh.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: innocare-chinese-reports-final-zip
+          path: dist/诺诚健华_09969_688428_所有年报_双市场招股说明书_2026年最新半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
