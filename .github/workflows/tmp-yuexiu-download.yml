@@ -1,0 +1,73 @@
+name: Temporary Yuexiu Property report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-yuexiu-reports-20260827
+    paths:
+      - .github/workflows/tmp-yuexiu-download.yml
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and verify original reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output /tmp/yuexiu-previews
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local expected_pages="$3"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36' \
+              -e 'https://data.eastmoney.com/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "$dest"
+            test -s "$dest"
+            test "$(head -c 4 "$dest")" = "%PDF"
+            local pages
+            pages="$(pdfinfo "$dest" | awk '/^Pages:/ {print $2}')"
+            test "$pages" = "$expected_pages"
+            local stem
+            stem="$(basename "$dest" .pdf)"
+            pdftoppm -f 1 -singlefile -png -r 90 "$dest" "/tmp/yuexiu-previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 90 "$dest" "/tmp/yuexiu-previews/${stem}_last" >/dev/null 2>&1
+          }
+
+          download_pdf 'https://pdf.dfcfw.com/pdf/H3_AP202305181586740303_1.pdf' 'output/01_民生证券_越秀地产_粤系国企龙头从深耕湾区到全国化发展_20230517_25页.pdf' '25'
+          download_pdf 'https://pdf.dfcfw.com/pdf/H3_AP202302141583152844_1.pdf' 'output/02_国信证券_越秀地产_双国企股东护航大湾区本土优势显著_20230214_23页.pdf' '23'
+
+          {
+            echo '越秀地产（00123.HK）券商深度报告，共2份'
+            echo
+            echo '1. 民生证券：《粤系国企龙头，从深耕湾区到全国化发展》'
+            echo '   日期：2023-05-17；页数：25页；类型：公司深度、首次覆盖；评级：推荐。'
+            echo
+            echo '2. 国信证券：《双国企股东护航，大湾区本土优势显著》'
+            echo '   日期：2023-02-14；页数：23页；类型：海外公司深度、首次覆盖；评级：买入。'
+            echo
+            echo '核验：两份文件均检查PDF文件头、实际页数，并成功渲染首页与末页。'
+          } > output/报告清单与核验说明.txt
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output
+
+      - name: Upload verified original PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: yuexiu-property-broker-reports-2
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
