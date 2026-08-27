@@ -15,40 +15,29 @@ jobs:
     steps:
       - name: Install parser
         run: python -m pip install --disable-pip-version-check requests beautifulsoup4
-      - name: Inspect HKEX title search
+      - name: Inspect filtered HKEX searches
         shell: bash
         run: |
           python - <<'PY'
-          import re
           import requests
           from bs4 import BeautifulSoup
           from urllib.parse import urljoin
 
-          url='https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=201'
           s=requests.Session()
           s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Accept-Language':'en-US,en;q=0.9'})
-          r=s.get(url,timeout=60)
-          print('STATUS',r.status_code,'LEN',len(r.content),'TYPE',r.headers.get('content-type'),'FINAL',r.url)
-          print('HAS ANNUAL 2025', 'Annual Report 2025' in r.text)
-          print('HAS ANNUAL 2024', 'Annual Report 2024' in r.text)
-          soup=BeautifulSoup(r.text,'html.parser')
-          print('FORMS',len(soup.find_all('form')))
-          for i,f in enumerate(soup.find_all('form')):
-              print('FORM',i,'action=',f.get('action'),'method=',f.get('method'),'id=',f.get('id'),'name=',f.get('name'))
-              for inp in f.find_all(['input','select','button']):
-                  print(' FIELD',inp.name,inp.get('name'),inp.get('id'),inp.get('value'),inp.get('type'))
-          print('SCRIPTS')
-          for sc in soup.find_all('script',src=True):
-              print(urljoin(r.url,sc['src']))
-          print('LINKS WITH PAGE/NEXT/ANNUAL/INTERIM')
-          for a in soup.find_all('a',href=True):
+          tests=[
+            ('annual_all','https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&from=20210401&lang=EN&market=SEHK&stockId=201&t1code=40000&t2Gcode=-1&t2code=40100&to=20260531'),
+            ('annual_2021','https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&from=20220401&lang=EN&market=SEHK&stockId=201&t1code=40000&t2Gcode=-1&t2code=40100&to=20220531'),
+            ('interim_2025_guess','https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&from=20250901&lang=EN&market=SEHK&stockId=201&t1code=40000&t2Gcode=-1&t2code=40200&to=20251031'),
+            ('interim_2025_all','https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&from=20250901&lang=EN&market=SEHK&stockId=201&to=20251031'),
+          ]
+          for name,url in tests:
+            r=s.get(url,timeout=60)
+            print('\nTEST',name,'STATUS',r.status_code,'LEN',len(r.content),'FINAL',r.url)
+            soup=BeautifulSoup(r.text,'html.parser')
+            for a in soup.find_all('a',href=True):
               text=' '.join(a.get_text(' ',strip=True).split())
               href=urljoin(r.url,a['href'])
-              if any(k in (text+' '+href).lower() for k in ['annual report','interim report','next','page','titleSearchServlet'.lower()]):
-                  print('LINK',repr(text),href)
-          for pat in ['titleSearchServlet','pageNo','pageNum','nextPage','loadMore','record','fromDate','toDate','sortDir']:
-              print('\nPATTERN',pat)
-              for m in re.finditer(pat,r.text,re.I):
-                  print(r.text[max(0,m.start()-180):m.start()+400].replace('\n',' ')[:600])
-                  break
+              if 'annual report' in text.lower() or 'interim report' in text.lower():
+                print(' REPORT',repr(text),href)
           PY
