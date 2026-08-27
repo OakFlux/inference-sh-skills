@@ -1,0 +1,54 @@
+name: Temporary Ascentage SGPJBG Jina retrieval
+
+on:
+  push:
+    branches:
+      - 'tmp/ascentage-reports-20260828'
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Fetch indexed topic through text proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          curl -L --fail --show-error --silent --compressed \
+            --connect-timeout 15 --max-time 90 --retry 1 --user-agent "$UA" \
+            'https://r.jina.ai/https://www.sgpjbg.com/zhuanti/quanqiuyiyaobaogao.html' \
+            -o diagnostics/topic_jina.txt || true
+          grep -n -C 8 -E '亚盛医药|细胞凋亡赛道领军者|250127' diagnostics/topic_jina.txt \
+            > diagnostics/ascentage_context.txt || true
+          grep -Eo 'https?[^ )]+' diagnostics/ascentage_context.txt | sort -u \
+            > diagnostics/ascentage_urls.txt || true
+          # Fetch any discovered individual report page.
+          i=0
+          while IFS= read -r u; do
+            case "$u" in
+              *sgpjbg.com.cn/baogao/*)
+                curl -L --fail --show-error --silent --compressed \
+                  --connect-timeout 15 --max-time 60 --retry 1 --user-agent "$UA" \
+                  "$u" -o "diagnostics/detail_${i}.html" || true
+                curl -L --fail --show-error --silent --compressed \
+                  --connect-timeout 15 --max-time 60 --retry 1 --user-agent "$UA" \
+                  "https://r.jina.ai/$u" -o "diagnostics/detail_${i}_jina.txt" || true
+                i=$((i+1));;
+            esac
+          done < diagnostics/ascentage_urls.txt
+          grep -RIEo 'https?[^"<> )]+\.pdf([^"<> )]*)?|https?[^"<> )]+(download|down|file|attachment)[^"<> )]*|/[A-Za-z0-9_./?=&%-]*(download|down|file|attachment|pdf)[A-Za-z0-9_./?=&%-]*' diagnostics \
+            | sort -u > diagnostics/candidate_urls.txt || true
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-sgpjbg-jina-diagnostics
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
