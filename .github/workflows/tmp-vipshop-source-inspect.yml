@@ -1,0 +1,99 @@
+name: Temporary Vipshop report source inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-source-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch pages and inspect download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/sdyanbao diagnostic/sgpjbg diagnostic/ashea diagnostic/scripts
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          fetch() {
+            local url="$1" dest="$2"
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -H 'Accept: text/html,application/xhtml+xml,application/json,*/*;q=0.8' "$url" -D "${dest}.headers" -o "$dest" || true
+          }
+          fetch 'https://www.sdyanbao.com/detail/688484' diagnostic/sdyanbao/detail_688484.html
+          fetch 'https://www.sdyanbao.com/search?keyword=%E5%94%AF%E5%93%81%E4%BC%9A' diagnostic/sdyanbao/search_keyword.html
+          fetch 'https://www.sdyanbao.com/search?key=%E5%94%AF%E5%93%81%E4%BC%9A' diagnostic/sdyanbao/search_key.html
+          fetch 'https://www.sdyanbao.com/search?q=%E5%94%AF%E5%93%81%E4%BC%9A' diagnostic/sdyanbao/search_q.html
+          fetch 'https://bg.sgpjbg.com/baogao/150349.html' diagnostic/sgpjbg/150349.html
+          fetch 'https://www.ashea.com.cn/caijing/2021/0421/256837.html' diagnostic/ashea/2021.html
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, urllib.parse, subprocess, os, json
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          all_urls=[]
+          for p in Path('diagnostic').rglob('*.html'):
+              text=p.read_text(errors='replace')
+              base='https://www.sdyanbao.com/' if 'sdyanbao' in str(p) else ('https://bg.sgpjbg.com/' if 'sgpjbg' in str(p) else 'https://www.ashea.com.cn/')
+              urls=[]
+              for pat in [r'(?:src|href)=["\']([^"\']+)', r'https?://[^\s"\'<>]+', r'[^"\']+\.pdf(?:\?[^"\']*)?']:
+                  for m in re.finditer(pat,text,re.I):
+                      u=m.group(1) if m.lastindex else m.group(0)
+                      u=u.replace('&amp;','&').replace('\\/','/')
+                      u=urllib.parse.urljoin(base,u)
+                      if u not in urls: urls.append(u)
+              Path(str(p)+'.urls.txt').write_text('\n'.join(urls),encoding='utf-8')
+              all_urls.extend(urls)
+              print('\n===',p,'===')
+              for line in text.splitlines():
+                  if re.search(r'pdf|download|下载|preview|image|oss|cos|cdn|file|api|report|detail',line,re.I):
+                      print(line[:1000])
+          scripts=[]
+          for u in all_urls:
+              if re.search(r'\.js(?:\?|$)',u,re.I) and u not in scripts: scripts.append(u)
+          for i,u in enumerate(scripts[:80]):
+              out=Path(f'diagnostic/scripts/{i:03d}.js')
+              try:
+                  subprocess.run(['curl','-L','--compressed','--retry','3','--retry-all-errors','--connect-timeout','20','--max-time','120','-A',UA,u,'-o',str(out)],check=False)
+                  Path(str(out)+'.url.txt').write_text(u,encoding='utf-8')
+              except Exception as e: print(e)
+          hits=[]
+          for p in Path('diagnostic/scripts').glob('*.js'):
+              text=p.read_text(errors='replace')
+              for line in text.splitlines():
+                  if re.search(r'download|\.pdf|preview|fileUrl|file_url|oss|cos|reportId|detail|sdyanbao|sgpjbg',line,re.I):
+                      hits.append(f'--- {p} ---\n{line[:3000]}')
+          Path('diagnostic/script_hits.txt').write_text('\n'.join(hits),encoding='utf-8')
+          print('\nSCRIPT HITS',len(hits))
+          print('\n'.join(hits[:200]))
+          PY
+
+          # Probe likely public download endpoints and keep response metadata.
+          endpoints=(
+            'https://www.sdyanbao.com/download/688484'
+            'https://www.sdyanbao.com/api/download/688484'
+            'https://www.sdyanbao.com/api/report/download?id=688484'
+            'https://www.sdyanbao.com/report/download/688484'
+            'https://bg.sgpjbg.com/bgdown/150349.pdf'
+            'https://bg.sgpjbg.com/baogao/150349.pdf'
+            'https://www.sgpjbg.com/bgdown/150349.pdf'
+          )
+          i=0
+          for url in "${endpoints[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 2 --connect-timeout 20 --max-time 90 -A "$UA" -e 'https://www.sdyanbao.com/detail/688484' \
+              -D "diagnostic/probe_${i}.headers" "$url" -o "diagnostic/probe_${i}.bin" || true
+            { echo "$url"; file "diagnostic/probe_${i}.bin"; wc -c "diagnostic/probe_${i}.bin"; head -c 20 "diagnostic/probe_${i}.bin" | xxd; } > "diagnostic/probe_${i}.txt"
+          done
+          cat diagnostic/probe_*.txt || true
+      - name: Upload source diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-source-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
