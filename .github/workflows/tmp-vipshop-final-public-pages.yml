@@ -8,18 +8,18 @@ on:
       - .github/workflows/tmp-vipshop-final-public-pages.yml
 
 jobs:
-  build-and-verify:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Install PDF and image utilities
+      - name: Install utilities
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq poppler-utils python3-pil
           python3 -m pip install --quiet img2pdf pypdf
 
-      - name: Download all publicly rendered pages and assemble PDFs
+      - name: Download and assemble reports
         shell: bash
         run: |
           set -euo pipefail
@@ -27,100 +27,60 @@ jobs:
           UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
 
           build_report() {
-            local base_url="$1"
-            local page_count="$2"
-            local outfile="$3"
-            local stem="$4"
-            local first_text="$5"
-            local last_text="$6"
-            local d="work/$stem"
+            base_url="$1"
+            page_count="$2"
+            outfile="$3"
+            stem="$4"
+            d="work/$stem"
             mkdir -p "$d"
-            for ((i=0; i<page_count; i++)); do
-              url="${base_url}/${i}.png"
+            for i in $(seq 0 $((page_count-1))); do
               dest=$(printf '%s/%03d.png' "$d" "$i")
-              curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
-                --connect-timeout 30 --max-time 300 --compressed \
-                -A "$UA" -e 'https://www.sdyanbao.com/' "$url" -o "$dest"
+              curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors --connect-timeout 30 --max-time 300 --compressed -A "$UA" -e 'https://www.sdyanbao.com/' "${base_url}/${i}.png" -o "$dest"
               test -s "$dest"
-              python3 - "$dest" <<'PY'
-          import sys
-          from PIL import Image
-          p=sys.argv[1]
-          im=Image.open(p)
-          im.verify()
-          if im.width < 700 or im.height < 900:
-              raise SystemExit(f'page image too small: {p} {im.size}')
-          PY
+              python3 -c 'import sys; from PIL import Image; im=Image.open(sys.argv[1]); im.verify(); assert im.width>=700 and im.height>=900, im.size' "$dest"
             done
             test "$(find "$d" -maxdepth 1 -type f -name '*.png' | wc -l)" -eq "$page_count"
-            python3 - "$d" "output/$outfile" <<'PY'
-          import sys, pathlib, img2pdf
-          d=pathlib.Path(sys.argv[1]); out=pathlib.Path(sys.argv[2])
-          imgs=[str(p) for p in sorted(d.glob('*.png'))]
-          out.write_bytes(img2pdf.convert(imgs))
-          PY
-            test "$(head -c 4 "output/$outfile")" = "%PDF"
+            img2pdf "$d"/*.png -o "output/$outfile"
+            test "$(head -c 4 "output/$outfile")" = '%PDF'
             actual=$(pdfinfo "output/$outfile" | awk '/^Pages:/ {print $2}')
-            test "$actual" = "$page_count"
+            test "$actual" -eq "$page_count"
             pdftoppm -f 1 -singlefile -png -r 90 "output/$outfile" "previews/${stem}_first" >/dev/null 2>&1
             pdftoppm -f "$page_count" -singlefile -png -r 90 "output/$outfile" "previews/${stem}_last" >/dev/null 2>&1
             test -s "previews/${stem}_first.png"
             test -s "previews/${stem}_last.png"
-            echo "$first_text" > "previews/${stem}_expected_first.txt"
-            echo "$last_text" > "previews/${stem}_expected_last.txt"
           }
 
-          build_report \
-            'https://oss.sdyanbao.com/page/2023/12/28/910564' 15 \
-            '01_招商证券_唯品会_特卖抗周期看好长期稳固差异化价值_20231227_15页_公开预览页合成版.pdf' \
-            'cms_2023' \
-            '招商证券，唯品会更新报告，2023-12-27，第1页' \
-            '招商证券，唯品会更新报告，末页免责声明'
+          build_report 'https://oss.sdyanbao.com/page/2023/12/28/910564' 15 '01_CMS_Vipshop_Anticyclical_Value_20231227_15p_Public_Pages.pdf' 'cms_2023'
+          build_report 'https://oss.sdyanbao.com/page/2022/10/24/376288' 18 '02_CMS_Vipshop_Initiation_20221023_18p_Public_Pages.pdf' 'cms_2022'
+          build_report 'https://oss.sdyanbao.com/page/2022/9/15/360681' 21 '03_SPDBI_Vipshop_Initiation_20220909_21p_Public_Pages.pdf' 'spdbi_2022'
 
-          build_report \
-            'https://oss.sdyanbao.com/page/2022/10/24/376288' 18 \
-            '02_招商证券_唯品会_特卖电商领军者平台价值长期稳固_20221023_18页_公开预览页合成版.pdf' \
-            'cms_2022' \
-            '招商证券，唯品会首次覆盖，2022-10-23，第1页' \
-            '招商证券，唯品会首次覆盖，末页免责声明'
-
-          build_report \
-            'https://oss.sdyanbao.com/page/2022/9/15/360681' 21 \
-            '03_浦银国际_唯品会_价值股能否重返成长股_20220909_21页_公开预览页合成版.pdf' \
-            'spdbi_2022' \
-            '浦银国际，唯品会首次覆盖，2022-09-09，第1页' \
-            '浦银国际，唯品会首次覆盖，末页免责声明'
-
-          cat > output/报告清单与核验说明.txt <<'EOF'
-唯品会（VIPS.US）券商研究报告，共3份
-
-1. 招商证券：《唯品会更新报告：特卖抗周期，看好唯品会长期稳固差异化价值》
-   日期：2023-12-27；页数：15页；类型：公司深度/更新报告；评级：强烈推荐（维持）。
-
-2. 招商证券：《唯品会：特卖电商领军者，平台价值长期稳固》
-   日期：2022-10-23；页数：18页；类型：公司深度、首次覆盖；评级：增持。
-
-3. 浦银国际：《唯品会：价值股能否重返成长股？》
-   日期：2022-09-09；页数：21页；类型：公司首次覆盖；评级：持有。
-
-文件说明：
-- 三份PDF均由报告平台无需登录即可访问的逐页公开预览图按原页序合成。
-- 它们内容完整、页数与公开元数据一致，但并非券商发布的原始矢量PDF；文本主要以页面图像形式保存。
-- 已逐页验证图像可正常解码，检查PDF文件头和实际页数，并成功渲染首页与末页。
-- 仅供个人研究资料整理，不构成投资建议。
-EOF
+          {
+            echo 'Vipshop (VIPS.US) broker research reports - 3 files'
+            echo
+            echo '1. China Merchants Securities, 2023-12-27, 15 pages'
+            echo '   Vipshop Update: Anticyclical flash-sale model and durable differentiated value.'
+            echo '   Company deep/update; rating: Strong Buy (maintained).'
+            echo
+            echo '2. China Merchants Securities, 2022-10-23, 18 pages'
+            echo '   Vipshop: Leading flash-sale e-commerce platform with durable platform value.'
+            echo '   Company deep initiation; rating: Overweight.'
+            echo
+            echo '3. SPDB International, 2022-09-09, 21 pages'
+            echo '   Vipshop: Can a value stock return to growth?' 
+            echo '   Company initiation; rating: Hold.'
+            echo
+            echo 'File note:'
+            echo '- These PDFs were assembled in original page order from publicly accessible full-page preview images.'
+            echo '- They contain all listed pages, but are rasterized public-preview editions rather than original vector PDFs.'
+            echo '- Every page image was decoded successfully; PDF headers/page counts were checked; first and last pages rendered successfully.'
+            echo '- For personal research use only. Not investment advice.'
+          } > output/README.txt
 
           (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
-          python3 - <<'PY'
-          from pathlib import Path
-          from pypdf import PdfReader
-          for p in Path('output').glob('*.pdf'):
-              r=PdfReader(str(p))
-              print(p.name, len(r.pages), p.stat().st_size)
-          PY
+          python3 -c 'from pathlib import Path; from pypdf import PdfReader; [(print(p.name,len(PdfReader(str(p)).pages),p.stat().st_size)) for p in Path("output").glob("*.pdf")]'
           ls -lh output previews
 
-      - name: Upload verified PDFs and verification previews
+      - name: Upload package
         uses: actions/upload-artifact@v4
         with:
           name: vipshop-broker-reports-3-public-pages
