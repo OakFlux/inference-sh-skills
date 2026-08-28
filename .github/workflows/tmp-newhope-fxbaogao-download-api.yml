@@ -1,0 +1,64 @@
+name: Temporary New Hope Service Fxbaogao download API
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-fxbaogao-download-api.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query detail and download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          api='https://api.fxbaogao.com'
+          get() {
+            local name="$1"; local url="$2"
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/view?id=5488726' -H 'Accept: application/json,application/pdf,*/*' \
+              -D "diagnostic/${name}.headers" "$url" -o "diagnostic/${name}.body" || true
+          }
+          post() {
+            local name="$1"; local url="$2"; local body="$3"
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/view?id=5488726' \
+              -H 'Accept: application/json,*/*' -H 'Content-Type: application/json' \
+              -D "diagnostic/${name}.headers" -X POST "$url" --data "$body" -o "diagnostic/${name}.body" || true
+          }
+          post detail_reportid "$api/mofoun/report/searchReport/detail" '{"reportId":5488726}'
+          post detail_docid "$api/mofoun/report/searchReport/detail" '{"docId":5488726}'
+          post detail_id "$api/mofoun/report/searchReport/detail" '{"id":5488726}'
+          post detail_mixed "$api/mofoun/report/searchReport/detail" '{"reportId":5488726,"docId":5488726,"id":5488726}'
+          get predv2 "$api/mofoun/report/report/report/preDownV2?reportId=5488726"
+          get download "$api/mofoun/report/report/file/downloadReport?reportId=5488726"
+          get bean "$api/mofoun/report/report/downloadReportByBean?reportId=5488726"
+          get catalog "$api/mofoun/report/searchReport/detail/catalog?reportId=5488726"
+          get charts "$api/mofoun/report/searchReport/detail/chartList?page=1&limit=100&reportId=5488726"
+          get xcx "$api/mofoun/report/report/report/getXcxReportInfo?uuid=5488726"
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          for p in sorted(Path('diagnostic').glob('*.body')):
+              raw=p.read_bytes()
+              print('\n=====',p.name,len(raw),'bytes',raw[:4],'=====')
+              print(raw[:100000].decode('utf-8','replace'))
+              try:
+                  obj=json.loads(raw)
+                  Path(str(p)+'.pretty.json').write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding='utf-8')
+              except Exception: pass
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-fxbaogao-download-api
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
