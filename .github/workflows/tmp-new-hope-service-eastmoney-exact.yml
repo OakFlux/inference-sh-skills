@@ -1,0 +1,106 @@
+name: Temporary exact New Hope Service report query
+
+on:
+  push:
+    branches:
+      - tmp/new-hope-service-eastmoney-exact-20260828
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Install PDF validator
+        run: python -m pip install --quiet requests pypdf
+      - name: Query exact report metadata and download PDFs
+        shell: bash
+        run: |
+          cat > /tmp/query.py <<'PY'
+          import hashlib, io, json, re, time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('output'); OUT.mkdir(exist_ok=True)
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/','Accept':'application/json,text/plain,*/*'})
+          API='https://reportapi.eastmoney.com/report/list'
+          windows=[('2026-06-10','2026-06-26'),('2025-03-28','2025-04-10'),('2024-03-20','2024-04-10'),('2023-03-20','2023-04-10'),('2022-03-20','2022-04-10'),('2021-05-01','2021-06-30')]
+          needles=['新希望服务','高派息构筑安全垫','多元服务筑就民生护城河','third party expansion advances','maintain buy','03658']
+          found={}
+          def parse(r):
+            t=r.text.strip()
+            if t.startswith('{'): return r.json()
+            m=re.search(r'\((\{.*\})\)\s*;?\s*$',t,re.S)
+            return json.loads(m.group(1)) if m else {}
+          for begin,end in windows:
+            for qtype in ['0','1','2']:
+              for code in ['','03658','3658']:
+                for page in range(1,20):
+                  p={'cb':'','pageNo':str(page),'pageSize':'100','code':code,'industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':begin,'endTime':end,'fields':'','qType':qtype,'_':str(int(time.time()*1000))}
+                  try:
+                    r=S.get(API,params=p,timeout=20)
+                    if r.status_code!=200: break
+                    d=parse(r); rows=d.get('data') or d.get('result',{}).get('data') or []
+                    if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or []
+                    if not rows: break
+                    for x in rows:
+                      blob=json.dumps(x,ensure_ascii=False).lower()
+                      title=str(x.get('title') or '')
+                      stock=str(x.get('stockName') or x.get('secuName') or x.get('stockCode') or '')
+                      exact=('新希望服务' in blob or '高派息构筑安全垫' in blob or '多元服务筑就民生护城河' in blob or 'third party expansion advances' in blob)
+                      # 03658 alone is accepted only if the row has an exact standalone HK ticker field.
+                      ticker_exact=any(str(x.get(k) or '') in {'03658','3658','HK:03658','03658.HK'} for k in ['stockCode','secuCode','code','ticker','symbol'])
+                      if exact or ticker_exact:
+                        ic=x.get('infoCode') or x.get('info_code')
+                        if ic:
+                          found[ic]=x; print('MATCH',begin,end,qtype,repr(code),page,ic,json.dumps(x,ensure_ascii=False))
+                    if len(rows)<100: break
+                  except Exception as e:
+                    print('ERR',begin,end,qtype,repr(code),page,e); break
+          print('FOUND_COUNT',len(found))
+          candidates=[]
+          for ic,x in found.items():
+            candidates.append((ic,x,f'https://pdf.dfcfw.com/pdf/H3_{ic}_1.pdf'))
+          valid=[]; hashes=set()
+          for ic,x,url in candidates:
+            try:r=S.get(url,timeout=50,allow_redirects=True)
+            except Exception as e:print('PDFERR',ic,e);continue
+            print('PDF',ic,r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+            if r.status_code!=200 or r.content[:5]!=b'%PDF-' or len(r.content)<80000:continue
+            h=hashlib.sha256(r.content).hexdigest()
+            if h in hashes:continue
+            try:
+              pr=PdfReader(io.BytesIO(r.content),strict=False);pages=len(pr.pages);text=''.join((pr.pages[i].extract_text()or'') for i in range(min(6,pages)));c=re.sub(r'\s+','',text).lower()
+              if '新希望服务' not in c and 'newhopeservice' not in c and not re.search(r'(?<!\d)0?3658(?!\d)',c):
+                print('IDENTITY_FAIL',ic,text[:1000]);continue
+              if pages<5:continue
+            except Exception as e:print('PARSEFAIL',ic,e);continue
+            hashes.add(h)
+            valid.append({'infoCode':ic,'row':x,'content':r.content,'pages':pages,'source':r.url,'hash':h})
+          print('VALID_COUNT',len(valid))
+          def safe(s):return re.sub(r'[\\/:*?"<>|]+','_',str(s)).strip(' .')
+          manifest=[]
+          for i,v in enumerate(valid[:3],1):
+            x=v['row'];title=str(x.get('title') or '新希望服务研究报告');broker=str(x.get('orgSName') or x.get('orgName') or '券商');date=str(x.get('publishDate') or '')[:10]
+            fn=safe(f"{i:02d}_{broker}_{title}_{date.replace('-','')or'未知日期'}_{v['pages']}页.pdf")
+            (OUT/fn).write_bytes(v['content'])
+            manifest.append({'filename':fn,'broker':broker,'title':title,'date':date,'pages':v['pages'],'source':v['source'],'infoCode':v['infoCode'],'sha256':v['hash']})
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'查询结果.txt').write_text('FOUND\n'+json.dumps(found,ensure_ascii=False,indent=2)+'\n\nVALID\n'+json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          if not manifest: raise RuntimeError('no exact public PDF found')
+          PY
+          python /tmp/query.py
+          ls -lh output
+      - name: Upload exact reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: new-hope-service-eastmoney-exact
+          path: output/
+          retention-days: 3
+          if-no-files-found: error
+          compression-level: 6
