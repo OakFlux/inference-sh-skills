@@ -1,0 +1,59 @@
+name: Temporary Reportify download probe
+
+on:
+  push:
+    branches:
+      - tmp/reportify-download-probe-20260828
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Probe and fetch exact report
+        shell: bash
+        run: |
+          set -x
+          mkdir -p output
+          ID=1105126013194604544
+          BASE=https://api.reportify.cn
+          curl -4 --http1.1 --connect-timeout 5 --max-time 12 -sS -D output/detail.headers -o output/detail.json "$BASE/reports/$ID" || true
+          curl -4 --http1.1 --connect-timeout 5 --max-time 12 -sS -D output/download.headers -o output/download.json "$BASE/reports/$ID/download" || true
+          echo DETAIL; cat output/detail.headers; head -c 3000 output/detail.json || true; echo
+          echo DOWNLOAD; cat output/download.headers; cat output/download.json || true; echo
+          python - <<'PY'
+          import json,re,requests,sys
+          from pathlib import Path
+          d=Path('output/download.json')
+          if not d.exists():sys.exit(0)
+          try:x=json.loads(d.read_text(errors='ignore'))
+          except Exception as e:print('JSONERR',e);sys.exit(0)
+          urls=[]
+          def w(v):
+            if isinstance(v,str) and v.startswith('http'):urls.append(v)
+            elif isinstance(v,dict):
+              for a in v.values():w(a)
+            elif isinstance(v,list):
+              for a in v:w(a)
+          w(x);print('URLS',urls)
+          for i,u in enumerate(urls):
+            try:
+              r=requests.get(u,timeout=(5,20),headers={'User-Agent':'Mozilla/5.0'},allow_redirects=True)
+              print('FETCH',i,r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+              if r.content[:5]==b'%PDF-':
+                Path('output/report.pdf').write_bytes(r.content);break
+            except Exception as e:print('FETCHERR',i,e)
+          PY
+          ls -la output
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reportify-download-probe
+          path: output/
+          retention-days: 2
+          if-no-files-found: warn
