@@ -1,0 +1,58 @@
+name: Temporary New Hope Service report host probe
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-report-host-probe.yml
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Probe report storage URL variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          i=0
+          probe() {
+            local url="$1"; i=$((i+1))
+            local base="diagnostic/candidate_${i}"
+            printf '%s\n' "$url" > "${base}.url"
+            code=$(curl -L --compressed --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/view?id=5488726' \
+              -H 'Origin: https://www.fxbaogao.com' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              -sS -w '%{http_code}' -D "${base}.headers" -o "${base}.body" "$url" || true)
+            echo "$i HTTP=$code size=$(wc -c < "${base}.body" 2>/dev/null || echo 0) type=$(file -b --mime-type "${base}.body" 2>/dev/null || true) url=$url"
+          }
+          probe 'https://report.fxbaogao.com/report/2026/06/15/5488726.pdf'
+          probe 'https://dr.fxbaogao.com/report/2026/06/15/5488726.pdf'
+          probe 'http://report.fxbaogao.com/report/2026/06/15/5488726.pdf'
+          probe 'https://report.fxbaogao.com//report/2026/06/15/5488726.pdf'
+          probe 'https://report.fxbaogao.com/report/2026/06/15/5488726.pdf?download=1'
+          probe 'https://report.fxbaogao.com/report/2026/06/15/5488726.pdf?response-content-type=application/pdf'
+          probe 'https://report.fxbaogao.com/report-cn/2025/09/02/5037573.pdf'
+          probe 'https://dr.fxbaogao.com/report-cn/2025/09/02/5037573.pdf'
+          probe 'https://report.fxbaogao.com/report-cn/2024/09/05/4489729.pdf'
+          python3 - <<'PY'
+          from pathlib import Path
+          for u in sorted(Path('diagnostic').glob('*.url')):
+              b=Path(str(u)[:-4])
+              print('\n===== ',u.name,u.read_text().strip(),' =====')
+              print((Path(str(b)+'.headers').read_text(errors='replace') if Path(str(b)+'.headers').exists() else '')[:5000])
+              raw=Path(str(b)+'.body').read_bytes() if Path(str(b)+'.body').exists() else b''
+              print('BODY',len(raw),raw[:2000].decode('utf-8','replace'))
+          PY
+      - name: Upload host probes
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-report-host-probes
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
