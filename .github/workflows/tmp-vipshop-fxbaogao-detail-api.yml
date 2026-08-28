@@ -1,0 +1,67 @@
+name: Temporary Vipshop Fxbaogao detail API
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-fxbaogao-detail-api.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query report detail and public previews
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          for data in '{"docId":3376925}' '{"reportId":3376925}' '{"id":3376925}' '{"docId":"3376925"}'; do
+            key=$(echo "$data" | tr -cd '[:alnum:]_' | cut -c1-50)
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/view?id=3376925' \
+              -H 'Content-Type: application/json;charset=UTF-8' -H 'Accept: application/json,*/*' \
+              -X POST 'https://api.fxbaogao.com/mofoun/report/searchReport/detail' --data "$data" \
+              -D "diagnostic/detail_${key}.headers" -o "diagnostic/detail_${key}.json" || true
+          done
+          for url in \
+            'https://api.fxbaogao.com/mofoun/report/report/getReportPreviewImages?reportId=3376925' \
+            'https://api.fxbaogao.com/mofoun/report/searchReport/detail/catalog?reportId=3376925'; do
+            key=$(echo "$url" | sed 's#[^A-Za-z0-9]#_#g' | tail -c 100)
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/view?id=3376925' -H 'Accept: application/json,*/*' \
+              -D "diagnostic/get_${key}.headers" "$url" -o "diagnostic/get_${key}.json" || true
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          pdfpaths=[]
+          for p in Path('diagnostic').glob('*.json'):
+              text=p.read_text(errors='replace')
+              print('\n===',p.name,p.stat().st_size,'===')
+              print(text[:50000])
+              try: obj=json.loads(text)
+              except Exception: continue
+              def walk(v):
+                  if isinstance(v,dict):
+                      for k,val in v.items():
+                          if str(k).lower() in {'pdfpath','pdf_path','fileurl','file_url','path'} and isinstance(val,str):
+                              pdfpaths.append(val)
+                          walk(val)
+                  elif isinstance(v,list):
+                      for vv in v: walk(vv)
+              walk(obj)
+          Path('diagnostic/pdfpaths.txt').write_text('\n'.join(dict.fromkeys(pdfpaths)),encoding='utf-8')
+          print('\nPDFPATHS')
+          print(Path('diagnostic/pdfpaths.txt').read_text(encoding='utf-8'))
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-fxbaogao-detail-api
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
