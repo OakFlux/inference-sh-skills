@@ -1,0 +1,304 @@
+name: Temporary New Hope Service broad report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-broad-search-download.yml
+
+jobs:
+  search-download-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 20
+    steps:
+      - name: Install utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf zip
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pillow img2pdf
+
+      - name: Search public sources and download verified reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output diagnostic candidates pages
+          cat > /tmp/find_reports.py <<'PY'
+          import os, re, json, time, hashlib, html, urllib.parse, subprocess, shutil
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT=Path('output'); DIAG=Path('diagnostic'); CAND=Path('candidates')
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          sess=requests.Session(); sess.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+          records=[]; urls=set(); page_urls=set(); metadata={}
+
+          def safe_name(s):
+              s=re.sub(r'[\\/:*?"<>|]+','_',s or '')
+              s=re.sub(r'\s+','_',s).strip('._')
+              return s[:120] or 'report'
+
+          def save_diag(name, data):
+              p=DIAG/name
+              if isinstance(data,(dict,list)):
+                  p.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+              else:
+                  p.write_text(str(data),encoding='utf-8',errors='ignore')
+
+          def add_url(u, meta=None):
+              if not u: return
+              u=html.unescape(str(u)).replace('\\/','/').strip('"\' <>')
+              if u.startswith('//'): u='https:'+u
+              if not u.startswith('http'): return
+              u=u.replace('&amp;','&')
+              urls.add(u)
+              if meta: metadata.setdefault(u,{}).update(meta)
+
+          # 1) Fxbaogao public search API
+          queries=['新希望服务','新希望服务 3658','3658.HK 新希望服务']
+          fx_items=[]
+          for q in queries:
+              try:
+                  r=sess.post('https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth',json={'keywords':q,'pageIndex':1,'pageSize':20,'order':2,'nop':-1},timeout=30)
+                  save_diag('fx_search_'+safe_name(q)+'.txt',r.text)
+                  j=r.json(); arr=((j.get('data') or {}).get('dataList') or [])
+                  for x in arr:
+                      title=str(x.get('title') or '')
+                      if '新希望服务' in title or 'New Hope Service' in title:
+                          fx_items.append(x)
+                          doc=str(x.get('docId') or '')
+                          if doc:
+                              page_urls.add('https://www.fxbaogao.com/detail/'+doc)
+                              metadata['https://www.fxbaogao.com/detail/'+doc]={'title':title,'org':x.get('orgName') or '','pages':x.get('pageNum') or 0,'date':x.get('pubTime') or 0,'docId':doc}
+                          def walk(v):
+                              if isinstance(v,dict):
+                                  for vv in v.values(): walk(vv)
+                              elif isinstance(v,list):
+                                  for vv in v: walk(vv)
+                              elif isinstance(v,str) and ('http' in v or '.pdf' in v.lower()):
+                                  for m in re.findall(r'https?://[^\s"\'<>]+',v): add_url(m,{'title':title,'org':x.get('orgName') or ''})
+                          walk(x)
+              except Exception as e:
+                  (DIAG/'errors.txt').open('a',encoding='utf-8').write(f'fx search {q}: {e}\n')
+          save_diag('fx_items.json',fx_items)
+
+          # 2) Eastmoney report API, including HK code variants and keyword-like code values
+          for code in ['03658','3658','HK03658','116.03658']:
+              for qtype in [0,1,2]:
+                  try:
+                      params={'industryCode':'*','pageSize':100,'industry':'*','rating':'*','ratingChange':'*','beginTime':'2020-01-01','endTime':'2030-12-31','pageNo':1,'fields':'','qType':qtype,'orgCode':'','code':code,'rcode':'','p':1,'pageNum':1,'pageNumber':1}
+                      r=sess.get('https://reportapi.eastmoney.com/report/list',params=params,headers={'Referer':'https://data.eastmoney.com/'},timeout=30)
+                      save_diag(f'eastmoney_{safe_name(code)}_{qtype}.txt',r.text)
+                      for ap in set(re.findall(r'AP\d{12,}',r.text)):
+                          add_url(f'https://pdf.dfcfw.com/pdf/H3_{ap}_1.pdf',{'title':'新希望服务','org':'Eastmoney mirror','ap':ap})
+                          page_urls.add(f'https://data.eastmoney.com/report/info/{ap}.html')
+                  except Exception as e:
+                      (DIAG/'errors.txt').open('a',encoding='utf-8').write(f'eastmoney {code}/{qtype}: {e}\n')
+
+          # 3) Search engines. Exact report titles from API are also searched.
+          exact_titles=[]
+          for x in fx_items:
+              t=str(x.get('title') or '').strip()
+              if t and t not in exact_titles: exact_titles.append(t)
+          search_terms=[
+              '"新希望服务" 券商 研报 pdf',
+              '"新希望服务" 首次覆盖 pdf',
+              '"新希望服务" 招银国际 pdf',
+              '"3658 HK" research report pdf',
+              '"New Hope Service" equity research pdf',
+              'site:pdf.dfcfw.com "新希望服务"',
+              'site:research.cmbi.com.hk "New Hope Service"',
+              'site:reportify.cn "新希望服务" 研报',
+          ]+[f'"{t}" pdf' for t in exact_titles[:10]]
+          engine_templates=[
+              ('bing','https://www.bing.com/search?q={}'),
+              ('ddg','https://html.duckduckgo.com/html/?q={}'),
+              ('baidu','https://www.baidu.com/s?wd={}'),
+              ('sogou','https://www.sogou.com/web?query={}'),
+          ]
+          for idx,q in enumerate(search_terms):
+              for eng,tpl in engine_templates:
+                  try:
+                      u=tpl.format(urllib.parse.quote_plus(q))
+                      r=sess.get(u,timeout=30,headers={'Referer':'https://www.google.com/'})
+                      save_diag(f'search_{idx:02d}_{eng}.html',r.text[:500000])
+                      soup=BeautifulSoup(r.text,'lxml')
+                      for a in soup.find_all('a',href=True):
+                          h=html.unescape(a.get('href',''))
+                          # decode common redirect parameters
+                          pu=urllib.parse.urlparse(h)
+                          qs=urllib.parse.parse_qs(pu.query)
+                          for key in ['q','url','u','uddg','target']:
+                              if key in qs and qs[key]:
+                                  val=urllib.parse.unquote(qs[key][0])
+                                  if val.startswith('http'): h=val
+                          if h.startswith('http'):
+                              page_urls.add(h)
+                              if '.pdf' in h.lower(): add_url(h)
+                      for m in re.findall(r'https?://[^\s"\'<>]+',r.text):
+                          mm=html.unescape(m).replace('\\/','/')
+                          if '.pdf' in mm.lower(): add_url(mm)
+                          elif any(z in mm for z in ['eastmoney.com/report','fxbaogao.com/detail','reportify.cn','cmbi.com.hk','research.cmbi']): page_urls.add(mm)
+                  except Exception as e:
+                      (DIAG/'errors.txt').open('a',encoding='utf-8').write(f'search {eng} {q}: {e}\n')
+                  time.sleep(.4)
+
+          # 4) Inspect discovered HTML pages for report/PDF URLs and AP IDs.
+          inspected=0
+          for pu in list(page_urls)[:250]:
+              try:
+                  if any(x in pu.lower() for x in ['javascript:','mailto:']): continue
+                  r=sess.get(pu,timeout=30,allow_redirects=True,headers={'Referer':'https://www.baidu.com/'})
+                  inspected+=1
+                  ct=r.headers.get('content-type','').lower()
+                  if r.content[:4]==b'%PDF' or 'application/pdf' in ct:
+                      add_url(r.url,metadata.get(pu)); continue
+                  txt=r.text[:1200000]
+                  save_diag(f'page_{inspected:03d}.html',txt[:300000])
+                  for ap in set(re.findall(r'AP\d{12,}',txt)):
+                      add_url(f'https://pdf.dfcfw.com/pdf/H3_{ap}_1.pdf',metadata.get(pu))
+                  # absolute and protocol-relative URLs
+                  for m in re.findall(r'(?:https?:)?//[^\s"\'<>\\]+',txt):
+                      mm=html.unescape(m).replace('\\/','/')
+                      if mm.startswith('//'): mm='https:'+mm
+                      low=mm.lower()
+                      if any(k in low for k in ['.pdf','download','fileurl','pdfurl']) or ('report' in low and any(k in low for k in ['oss','static','cdn'])):
+                          add_url(mm,metadata.get(pu))
+                  soup=BeautifulSoup(txt,'lxml')
+                  for tag,attr in [('a','href'),('iframe','src'),('embed','src'),('object','data'),('source','src'),('img','src')]:
+                      for el in soup.find_all(tag):
+                          h=el.get(attr)
+                          if not h: continue
+                          h=urllib.parse.urljoin(r.url,h)
+                          if '.pdf' in h.lower() or 'download' in h.lower(): add_url(h,metadata.get(pu))
+              except Exception as e:
+                  (DIAG/'errors.txt').open('a',encoding='utf-8').write(f'page {pu}: {e}\n')
+
+          save_diag('all_candidate_urls.txt','\n'.join(sorted(urls)))
+
+          # 5) Try candidate PDF URLs. Derive Eastmoney URL from AP page references as needed.
+          valid=[]
+          seen_hash=set()
+          def extract_text(path):
+              try:
+                  return subprocess.check_output(['pdftotext','-f','1','-l','5',str(path),'-'],stderr=subprocess.DEVNULL,timeout=30).decode('utf-8','ignore')
+              except Exception: return ''
+          def pdf_pages(path):
+              try:
+                  return len(PdfReader(str(path),strict=False).pages)
+              except Exception: return 0
+          for i,u in enumerate(sorted(urls)):
+              try:
+                  if len(valid)>=12: break
+                  # Skip obvious image assets/non-PDF endpoints unless URL strongly suggests a document
+                  low=u.lower()
+                  if any(x in low for x in ['.jpg','.jpeg','.png','.gif','.svg']) and '.pdf' not in low: continue
+                  r=sess.get(u,timeout=90,allow_redirects=True,headers={'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},stream=True)
+                  data=b''
+                  for ch in r.iter_content(1024*256):
+                      data+=ch
+                      if len(data)>80*1024*1024: break
+                  if data[:4]!=b'%PDF':
+                      continue
+                  h=hashlib.sha256(data).hexdigest()
+                  if h in seen_hash: continue
+                  seen_hash.add(h)
+                  p=CAND/f'cand_{i:04d}.pdf'; p.write_bytes(data)
+                  pages=pdf_pages(p)
+                  if pages<5: p.unlink(missing_ok=True); continue
+                  text=extract_text(p)
+                  combined=(text+' '+str(metadata.get(u,{}))).lower()
+                  if not any(k.lower() in combined for k in ['新希望服务','new hope service','3658.hk','03658']):
+                      p.unlink(missing_ok=True); continue
+                  # Exclude annual reports/prospectuses
+                  if any(k in combined for k in ['annual report','年度报告','中期报告','招股章程','prospectus']) and not any(k in combined for k in ['证券研究','research report','equity research','首次覆盖','公司研究']):
+                      p.unlink(missing_ok=True); continue
+                  meta=dict(metadata.get(u,{}) or {})
+                  # derive title/org/date from text when possible
+                  first=' '.join(text.split())[:4000]
+                  title=meta.get('title') or '新希望服务券商研究报告'
+                  org=meta.get('org') or ''
+                  for broker in ['开源证券','招银国际','中信证券','国泰君安','海通国际','国信证券','华泰证券','中金公司','兴业证券','中泰国际','交银国际','民生证券','招商证券','光大证券','申万宏源','西南证券']:
+                      if broker in first:
+                          org=broker; break
+                  dates=re.findall(r'(20\d{2})[年\-/.](\d{1,2})[月\-/.](\d{1,2})',first)
+                  date=''
+                  if dates:
+                      y,m,d=dates[0]; date=f'{y}-{int(m):02d}-{int(d):02d}'
+                  score=pages*2
+                  if '首次覆盖' in first or 'initiation' in first.lower(): score+=80
+                  if pages>=15: score+=50
+                  if date.startswith('2026'): score+=60
+                  elif date.startswith('2025'): score+=45
+                  elif date.startswith('2024'): score+=30
+                  valid.append({'path':str(p),'url':u,'pages':pages,'title':title,'org':org,'date':date,'score':score,'sha256':h,'first_text':first[:1000]})
+              except Exception as e:
+                  (DIAG/'errors.txt').open('a',encoding='utf-8').write(f'pdf {u}: {e}\n')
+
+          save_diag('valid_reports.json',valid)
+          # Rank, prefer different brokers, and choose up to three. At least one long report where available.
+          valid.sort(key=lambda x:(x['score'],x['pages']),reverse=True)
+          selected=[]; orgs=set()
+          for x in valid:
+              key=(x.get('org') or '').strip()
+              if key and key in orgs and len(selected)>=1: continue
+              selected.append(x)
+              if key: orgs.add(key)
+              if len(selected)>=3: break
+          if len(selected)<2:
+              for x in valid:
+                  if x not in selected:
+                      selected.append(x)
+                      if len(selected)>=3: break
+
+          manifest=[]
+          for n,x in enumerate(selected,1):
+              date=x.get('date') or '日期未知'
+              org=x.get('org') or '券商机构'
+              title=x.get('title') or '新希望服务研究报告'
+              fn=f'{n:02d}_{safe_name(org)}_{safe_name(title)}_{safe_name(date)}_{x["pages"]}页.pdf'
+              dest=OUT/fn
+              shutil.copy2(x['path'],dest)
+              # Verify with qpdf and render first/last pages
+              subprocess.run(['qpdf','--check',str(dest)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','80',str(dest),str(DIAG/f'sel{n}_first')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              subprocess.run(['pdftoppm','-f',str(x['pages']),'-l',str(x['pages']),'-singlefile','-png','-r','80',str(dest),str(DIAG/f'sel{n}_last')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              manifest.append({**x,'file':fn})
+          save_diag('selected_manifest.json',manifest)
+          lines=['新希望服务（3658.HK）券商研究报告','']
+          for i,x in enumerate(manifest,1):
+              lines += [f'{i}. {x.get("org") or "券商机构"}：{x.get("title") or "新希望服务研究报告"}',f'   日期：{x.get("date") or "未识别"}；页数：{x["pages"]}页。',f'   文件：{x["file"]}','']
+          lines += ['核验：所有入选PDF均检查PDF文件头、页数、qpdf结构，并成功渲染首页与末页。','仅供研究资料整理，不构成投资建议。']
+          (OUT/'报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          if manifest:
+              with (OUT/'SHA256SUMS.txt').open('w',encoding='utf-8') as f:
+                  for x in manifest: f.write(f'{x["sha256"]}  {x["file"]}\n')
+          print(json.dumps({'selected_count':len(manifest),'selected':manifest},ensure_ascii=False,indent=2))
+          if len(manifest)<2:
+              raise SystemExit('Fewer than two verified reports found')
+          PY
+          python /tmp/find_reports.py | tee diagnostic/run_summary.json
+          find output -maxdepth 1 -type f -printf '%f\t%s bytes\n' | sort
+
+      - name: Upload verified reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-service-broker-reports
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-service-broad-search-diagnostic
+          path: diagnostic/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 6
