@@ -1,0 +1,82 @@
+name: Temporary Vipshop SGPJBG finder
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-sgpjbg-find.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Locate report detail and inspect public page images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          pages=(
+            'https://www.sgpjbg.com/zhuanti/agubaogao.html'
+            'https://bg.sgpjbg.com/labels/xiaopangu.html'
+            'https://www.sgpjbg.com/search/?q=%E5%94%AF%E5%93%81%E4%BC%9A-%E4%BB%B7%E5%80%BC%E8%82%A1%E8%83%BD%E5%90%A6%E9%87%8D%E8%BF%94%E6%88%90%E9%95%BF%E8%82%A1'
+          )
+          i=0
+          for url in "${pages[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 240 \
+              -A "$UA" -D "diagnostic/list_${i}.headers" "$url" -o "diagnostic/list_${i}.html" || true
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,urllib.parse,json,subprocess
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          candidates=[]
+          for p in Path('diagnostic').glob('list_*.html'):
+              text=p.read_text(errors='replace')
+              print('\n===',p.name,p.stat().st_size,'===')
+              for m in re.finditer(r'(.{0,1000}唯品会.{0,2500})',text,re.S):
+                  print(m.group(1)[:3500])
+              for m in re.finditer(r'href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+                  href=urllib.parse.urljoin('https://www.sgpjbg.com/',m.group(1).replace('&amp;','&'))
+                  label=re.sub('<[^>]+>',' ',m.group(2))
+                  if '唯品会' in label or '价值股能否重返成长股' in label:
+                      candidates.append(href)
+              for m in re.finditer(r'https?://[^\s"\'<>]+',text):
+                  u=m.group(0).replace('&amp;','&')
+                  if any(x in u for x in ['sgpjbg.com/baogao/','sgpjbg.com/bgdown/']) and u not in candidates: candidates.append(u)
+          candidates=list(dict.fromkeys(candidates))
+          Path('diagnostic/candidates.txt').write_text('\n'.join(candidates),encoding='utf-8')
+          print('\nCANDIDATES')
+          print('\n'.join(candidates))
+          for j,u in enumerate(candidates[:50]):
+              out=Path(f'diagnostic/detail_{j:02d}.html')
+              subprocess.run(['curl','-L','--compressed','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',UA,u,'-o',str(out)],check=False)
+              Path(str(out)+'.url.txt').write_text(u,encoding='utf-8')
+          # Extract image and file URLs from likely detail pages.
+          urls=[]
+          for p in Path('diagnostic').glob('detail_*.html'):
+              text=p.read_text(errors='replace')
+              if '唯品会' not in text and '价值股能否重返成长股' not in text: continue
+              print('\n=== MATCH DETAIL',p,'===')
+              print(text[:50000])
+              base=(Path(str(p)+'.url.txt').read_text() if Path(str(p)+'.url.txt').exists() else 'https://www.sgpjbg.com/')
+              for pat in [r'(?:src|href|data-src|data-original)=["\']([^"\']+)',r'https?://[^\s"\'<>]+']:
+                  for m in re.finditer(pat,text,re.I):
+                      u=m.group(1) if m.lastindex else m.group(0)
+                      u=urllib.parse.urljoin(base,u.replace('&amp;','&').replace('\\/','/'))
+                      if u not in urls: urls.append(u)
+          Path('diagnostic/detail_urls.txt').write_text('\n'.join(urls),encoding='utf-8')
+          print('\nDETAIL URLS')
+          print('\n'.join(urls))
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-sgpjbg-finder
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
