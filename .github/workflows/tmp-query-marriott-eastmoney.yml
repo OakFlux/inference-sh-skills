@@ -1,0 +1,44 @@
+name: Temporary query Marriott Eastmoney reports
+
+on:
+  push:
+    branches:
+      - tmp/marriott-eastmoney-20260828
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Query report APIs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re, requests, time
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/'})
+          api='https://reportapi.eastmoney.com/report/list'
+          for qtype in ['1','2','3']:
+            for begin,end in [('2023-11-05','2023-11-08'),('2025-02-17','2025-02-21')]:
+              print('\nWINDOW',qtype,begin,end)
+              for page in range(1,20):
+                p={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':begin,'endTime':end,'pageNo':str(page),'fields':'','qType':qtype,'orgCode':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page),'_':str(int(time.time()*1000))}
+                r=S.get(api,params=p,timeout=40); print('REQ',r.status_code,r.url,'len',len(r.content))
+                if r.status_code!=200: break
+                t=r.text.strip()
+                try:
+                  d=r.json() if t.startswith('{') else json.loads(re.search(r'\((\{.*\})\)',t,re.S).group(1))
+                except Exception as e:
+                  print('PARSEERR',e,t[:500]); break
+                rows=d.get('data') or []
+                if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or []
+                print('ROWS',len(rows),'TOTAL',d.get('TotalPage'),d.get('hits'))
+                for x in rows:
+                  blob=json.dumps(x,ensure_ascii=False)
+                  if any(k.lower() in blob.lower() for k in ['万豪','marriott','并购为王','4q24收入利润','李昊臻']):
+                    print('MATCH',json.dumps(x,ensure_ascii=False))
+                if not rows or len(rows)<100: break
+          PY
