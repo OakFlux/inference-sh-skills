@@ -1,0 +1,64 @@
+name: Temporary Ascentage SPDBI report discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/ascentage-reports-20260828'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch SPDBI research page and JavaScript assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          curl -L --fail --show-error --silent --compressed \
+            --connect-timeout 15 --max-time 90 --retry 2 --user-agent "$UA" \
+            'https://www.spdbi.com/researchReports.html' \
+            -o diagnostics/researchReports.html
+
+          python - <<'PY'
+          import html, re, urllib.parse, urllib.request
+          from pathlib import Path
+          base='https://www.spdbi.com/researchReports.html'
+          text=Path('diagnostics/researchReports.html').read_text(encoding='utf-8',errors='ignore')
+          urls=set()
+          for attr in ('src','href'):
+              for u in re.findall(rf'{attr}=["\']([^"\']+)["\']',text,re.I):
+                  u=html.unescape(u)
+                  full=urllib.parse.urljoin(base,u)
+                  if full.endswith('.js') or '.js?' in full:
+                      urls.add(full)
+          Path('diagnostics/js_urls.txt').write_text('\n'.join(sorted(urls)),encoding='utf-8')
+          headers={'User-Agent':'Mozilla/5.0'}
+          for i,u in enumerate(sorted(urls)):
+              try:
+                  req=urllib.request.Request(u,headers=headers)
+                  b=urllib.request.urlopen(req,timeout=60).read()
+                  Path(f'diagnostics/js_{i:03d}.js').write_bytes(b)
+              except Exception as e:
+                  with open('diagnostics/errors.txt','a',encoding='utf-8') as f:f.write(f'{u}\t{e}\n')
+          PY
+
+          grep -RIEo 'https?[^"<> ]+|/[A-Za-z0-9_./?=&:%${}+-]*(research|report|pdf|download|api|ajax)[A-Za-z0-9_./?=&:%${}+-]*' diagnostics \
+            | sort -u > diagnostics/endpoint_hits.txt || true
+          grep -RInE 'researchReports|reportList|report|pdf|download|ajax|axios|fetch\(|\.post\(|\.get\(' diagnostics/js_*.js \
+            > diagnostics/relevant_js_lines.txt || true
+          grep -RInE '亚盛医药|Ascentage|6855|06855' diagnostics \
+            > diagnostics/ascentage_hits.txt || true
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-spdbi-diagnostics
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
