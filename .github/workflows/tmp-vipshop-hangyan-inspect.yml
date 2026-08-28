@@ -1,0 +1,61 @@
+name: Temporary Vipshop Hangyan source inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-hangyan-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch report page and assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/scripts
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 240 \
+            -A "$UA" -D diagnostic/page.headers 'https://www.hangyan.co/reports/2530133449512060505' -o diagnostic/page.html || true
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,urllib.parse,subprocess,json
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          text=Path('diagnostic/page.html').read_text(errors='replace')
+          print(text[:50000])
+          urls=[]
+          for pat in [r'(?:src|href)=["\']([^"\']+)',r'https?://[^\s"\'<>]+']:
+              for m in re.finditer(pat,text,re.I):
+                  u=m.group(1) if m.lastindex else m.group(0)
+                  u=urllib.parse.urljoin('https://www.hangyan.co/',u.replace('&amp;','&').replace('\\/','/'))
+                  if u not in urls: urls.append(u)
+          Path('diagnostic/urls.txt').write_text('\n'.join(urls),encoding='utf-8')
+          scripts=[u for u in urls if re.search(r'\.js(?:\?|$)',u,re.I)]
+          for i,u in enumerate(scripts[:100]):
+              out=Path(f'diagnostic/scripts/{i:03d}.js')
+              subprocess.run(['curl','-L','--compressed','--retry','3','--retry-all-errors','--connect-timeout','20','--max-time','150','-A',UA,u,'-o',str(out)],check=False)
+              Path(str(out)+'.url.txt').write_text(u,encoding='utf-8')
+          pats=re.compile(r'2530133449512060505|download|\.pdf|fileUrl|file_url|pdfUrl|pdf_url|oss|cos|cdn|preview|reportId|report_id|api/',re.I)
+          hits=[]
+          for p in [Path('diagnostic/page.html'),*Path('diagnostic/scripts').glob('*.js')]:
+              t=p.read_text(errors='replace')
+              for m in pats.finditer(t):
+                  a=max(0,m.start()-1000); b=min(len(t),m.end()+2500)
+                  hits.append(f'--- {p} @{m.start()} ---\n{t[a:b]}')
+          Path('diagnostic/hits.txt').write_text('\n\n'.join(hits[:1500]),encoding='utf-8')
+          print('\nURLS')
+          print('\n'.join(urls))
+          print('\nHITS',len(hits))
+          print('\n\n'.join(hits[:100]))
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-hangyan-source
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
