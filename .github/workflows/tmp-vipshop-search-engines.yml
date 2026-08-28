@@ -1,0 +1,121 @@
+name: Temporary Vipshop public PDF search
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-search-engines.yml
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search multiple public engines and probe candidate files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/pages diagnostic/probes
+          python3 - <<'PY'
+          import urllib.request, urllib.parse, re, html, pathlib, json, time, subprocess, os
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          queries=[
+            '"唯品会(VIPS.US)价值股能否重返成长股" pdf',
+            '"唯品会-价值股能否重返成长股" pdf',
+            '"特卖电商领军者，平台价值长期稳固" pdf',
+            '"唯品会(VIPS.US)特卖电商领军者" pdf',
+            '"特卖抗周期，看好唯品会长期稳固差异化价值" pdf',
+            '"享私域年轻流量红利 全渠道深耕品牌特卖" pdf',
+            '"网络零售特卖龙头的兴、衰、转之路" pdf',
+            '唯品会 VIPS 券商 深度 报告 filetype:pdf',
+            '唯品会 首次覆盖 研报 PDF',
+          ]
+          engines={
+            'bing':'https://www.bing.com/search?'+urllib.parse.urlencode({'q':'{q}','count':'50'}),
+            'baidu':'https://www.baidu.com/s?'+urllib.parse.urlencode({'wd':'{q}','rn':'50'}),
+            'sogou':'https://www.sogou.com/web?'+urllib.parse.urlencode({'query':'{q}','num':'50'}),
+            'so360':'https://www.so.com/s?'+urllib.parse.urlencode({'q':'{q}'}),
+            'duck':'https://html.duckduckgo.com/html/?'+urllib.parse.urlencode({'q':'{q}'}),
+          }
+          urls=[]
+          def add(u,src):
+              u=html.unescape(u).replace('\\/','/')
+              if u.startswith('//'): u='https:'+u
+              if not u.startswith('http'): return
+              # unwrap common redirect params
+              p=urllib.parse.urlparse(u)
+              qs=urllib.parse.parse_qs(p.query)
+              for k in ['url','u','target','rurl','q','uddg']:
+                  if k in qs and qs[k]:
+                      cand=urllib.parse.unquote(qs[k][0])
+                      if cand.startswith('http'): u=cand; break
+              if any(x in u for x in ['bing.com/search','baidu.com/s?','sogou.com/web','so.com/s?','duckduckgo.com/html']): return
+              if u not in [x['url'] for x in urls]: urls.append({'url':u,'source':src})
+          for qi,q in enumerate(queries):
+              for en,tmpl in engines.items():
+                  url=tmpl.replace('%7Bq%7D',urllib.parse.quote_plus(q)).replace('{q}',urllib.parse.quote_plus(q))
+                  req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.5'})
+                  try:
+                      raw=urllib.request.urlopen(req,timeout=45).read()
+                  except Exception as e:
+                      raw=str(e).encode()
+                  p=pathlib.Path(f'diagnostic/pages/{qi:02d}_{en}.html'); p.write_bytes(raw)
+                  text=raw.decode('utf-8','replace')
+                  for pat in [r'href=["\'](https?://[^"\']+)',r'(https?://[^\s"\'<>]+)',r'uddg=([^&"<>]+)',r'nuddg=([^&"<>]+)']:
+                      for m in re.finditer(pat,text,re.I):
+                          val=m.group(1)
+                          if pat.startswith('uddg') or pat.startswith('nuddg'): val=urllib.parse.unquote(val)
+                          add(val,f'{qi}:{en}')
+                  time.sleep(.2)
+          # retain likely report/document links and also all external links for audit
+          pathlib.Path('diagnostic/all_links.json').write_text(json.dumps(urls,ensure_ascii=False,indent=2),encoding='utf-8')
+          likely=[]
+          terms=['pdf','report','yanbao','baogao','research','研报','报告','download','file','attach','document','doc','vips','vipshop','唯品会']
+          for x in urls:
+              lo=x['url'].lower()
+              if any(t.lower() in lo for t in terms): likely.append(x)
+          pathlib.Path('diagnostic/likely_links.tsv').write_text('\n'.join(f"{x['source']}\t{x['url']}" for x in likely),encoding='utf-8')
+          print('ALL',len(urls),'LIKELY',len(likely))
+          print(pathlib.Path('diagnostic/likely_links.tsv').read_text(encoding='utf-8')[:50000])
+          PY
+          # Probe likely URLs; cap to 250 unique entries.
+          python3 - <<'PY'
+          import pathlib,subprocess,json,re,urllib.parse,os
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          rows=[]
+          for line in pathlib.Path('diagnostic/likely_links.tsv').read_text(errors='replace').splitlines():
+              if '\t' not in line: continue
+              src,u=line.split('\t',1)
+              if u in [r['url'] for r in rows]: continue
+              rows.append({'source':src,'url':u})
+              if len(rows)>=250: break
+          summary=[]
+          for i,r in enumerate(rows):
+              out=pathlib.Path(f'diagnostic/probes/{i:03d}.bin')
+              hdr=pathlib.Path(f'diagnostic/probes/{i:03d}.headers')
+              cmd=['curl','-L','--compressed','--retry','2','--retry-all-errors','--connect-timeout','15','--max-time','60','-A',UA,'-D',str(hdr),r['url'],'-o',str(out)]
+              subprocess.run(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              size=out.stat().st_size if out.exists() else 0
+              first=out.read_bytes()[:12] if out.exists() else b''
+              ctype=''
+              if hdr.exists():
+                  for line in hdr.read_text(errors='replace').splitlines():
+                      if line.lower().startswith('content-type:'): ctype=line.split(':',1)[1].strip()
+              kind='PDF' if first.startswith(b'%PDF') else ('ZIP' if first.startswith(b'PK') else ('HTML' if b'<html' in first.lower() or b'<!doct' in first.lower() else 'OTHER'))
+              summary.append({**r,'size':size,'content_type':ctype,'kind':kind,'final_headers':hdr.read_text(errors='replace')[-3000:] if hdr.exists() else ''})
+          pathlib.Path('diagnostic/probe_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/probe_summary.tsv','w',encoding='utf-8') as f:
+              f.write('idx\tkind\tsize\tcontent_type\tsource\turl\n')
+              for i,x in enumerate(summary): f.write('\t'.join(map(str,[i,x['kind'],x['size'],x['content_type'],x['source'],x['url']]))+'\n')
+          print('\nPROBES')
+          print(pathlib.Path('diagnostic/probe_summary.tsv').read_text(encoding='utf-8')[:80000])
+          PY
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-public-pdf-search
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
