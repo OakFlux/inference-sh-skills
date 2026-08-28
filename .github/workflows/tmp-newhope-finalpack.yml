@@ -1,0 +1,317 @@
+name: Temporary New Hope Service final package
+
+on:
+  push:
+    branches:
+      - tmp-newhope-finalpack-20260828
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+      - name: Download, validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_newhope_final.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          CODE = "03658"
+          COMPANY_NAMES = ("新希望服务", "新希望服務", "NEW HOPE SERVICE")
+          SEARCH_API = "https://www1.hkexnews.hk/search/titleSearchServlet.do"
+          SEARCH_PAGE = "https://www1.hkexnews.hk/search/titlesearch.xhtml"
+          PROSPECTUS_URL = "https://ir.newhopeservice.com.cn/media/2xibue0h/20210511061501_89429917_tc.pdf"
+
+          OUT = Path("dist")
+          DOCS = OUT / "新希望服务_03658_所有年报_招股说明书_最新半年期报告"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept-Language": "zh-HK,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
+          })
+
+          def parse_rows(payload: Any) -> list[dict[str, Any]]:
+              obj = payload
+              if isinstance(obj, dict) and isinstance(obj.get("result"), str):
+                  obj = json.loads(obj["result"])
+              elif isinstance(obj, dict) and "result" in obj:
+                  obj = obj["result"]
+              if isinstance(obj, list):
+                  return [x for x in obj if isinstance(x, dict)]
+              if isinstance(obj, dict):
+                  for key in ("data", "records", "items", "result"):
+                      value = obj.get(key)
+                      if isinstance(value, list):
+                          return [x for x in value if isinstance(x, dict)]
+              raise RuntimeError(f"Unexpected HKEX response shape: {type(obj)}")
+
+          def field(row: dict[str, Any], *names: str) -> str:
+              for name in names:
+                  for key, value in row.items():
+                      if str(key).lower() == name.lower() and value is not None:
+                          return str(value).strip()
+              return ""
+
+          def norm_code(value: Any) -> str:
+              digits = re.sub(r"\D", "", str(value or ""))
+              return digits.zfill(5)[-5:] if digits else ""
+
+          def query(start: str, end: str, lang: str = "zh") -> list[dict[str, Any]]:
+              params = {
+                  "sortDir": "0",
+                  "sortByOptions": "DateTime",
+                  "category": "0",
+                  "market": "SEHK",
+                  "stockId": "-1",
+                  "documentType": "-1",
+                  "fromDate": start,
+                  "toDate": end,
+                  "title": "",
+                  "searchType": "1",
+                  "t1code": "40000",
+                  "t2Gcode": "-2",
+                  "t2code": "-1",
+                  "rowRange": "5000",
+                  "lang": lang,
+              }
+              response = session.get(
+                  SEARCH_API,
+                  params=params,
+                  headers={"Accept": "application/json", "Referer": SEARCH_PAGE},
+                  timeout=120,
+              )
+              print("QUERY", start, end, lang, response.status_code, len(response.content))
+              response.raise_for_status()
+              rows = parse_rows(response.json())
+              matched = [row for row in rows if norm_code(field(row, "STOCK_CODE", "stockCode")) == CODE]
+              print("MATCHED", len(matched))
+              for row in matched:
+                  print(" ROW", field(row, "DATE_TIME"), field(row, "TITLE"), field(row, "FILE_LINK"))
+              return matched
+
+          def compact(text: str) -> str:
+              return re.sub(r"\s+", "", text or "")
+
+          def select_annual(year: int, start: str, end: str) -> dict[str, Any]:
+              candidates: list[tuple[int, dict[str, Any]]] = []
+              for lang in ("zh", "EN"):
+                  for row in query(start, end, lang):
+                      title = field(row, "TITLE")
+                      s = compact(title)
+                      upper = s.upper()
+                      if str(year) not in s:
+                          continue
+                      if not ("年報" in s or "年度報告" in s or "ANNUALREPORT" in upper):
+                          continue
+                      if any(token in s for token in ("業績", "业绩", "環境", "环境", "可持續", "可持续", "摘要")):
+                          continue
+                      if any(token in upper for token in ("RESULTS", "ESG", "SUSTAINABILITY")):
+                          continue
+                      candidates.append((1 if lang == "zh" else 0, row))
+                  if candidates and lang == "zh":
+                      break
+              if not candidates:
+                  raise RuntimeError(f"No annual report selected for {year}")
+              candidates.sort(key=lambda item: (item[0], field(item[1], "DATE_TIME")), reverse=True)
+              selected = candidates[0][1]
+              selected["_LANGUAGE"] = "中文" if candidates[0][0] else "英文"
+              return selected
+
+          annual_windows = {
+              2021: ("20220424", "20220503"),
+              2022: ("20230424", "20230503"),
+              2023: ("20240414", "20240423"),
+              2024: ("20250424", "20250503"),
+              2025: ("20260424", "20260503"),
+          }
+          annuals = {year: select_annual(year, *window) for year, window in annual_windows.items()}
+
+          def select_half() -> tuple[dict[str, Any], str, str, int, int]:
+              for lang in ("zh", "EN"):
+                  rows = query("20260801", "20260828", lang)
+                  formal: list[dict[str, Any]] = []
+                  results: list[dict[str, Any]] = []
+                  for row in rows:
+                      title = field(row, "TITLE")
+                      s = compact(title)
+                      upper = s.upper()
+                      if "2026" not in s or any(token in s for token in ("摘要", "英文版")):
+                          continue
+                      if "中期報告" in s or "半年度報告" in s or "INTERIMREPORT" in upper:
+                          formal.append(row)
+                      elif "中期業績" in s or "中期业绩" in s or "INTERIMRESULT" in upper or "SIXMONTHSENDED" in upper:
+                          results.append(row)
+                  if formal:
+                      row = formal[0]
+                      row["_LANGUAGE"] = "中文" if lang == "zh" else "英文"
+                      return row, "正式2026年中期报告", "新希望服务_03658_2026年中期报告.pdf", 25, 2026
+                  if results:
+                      row = results[0]
+                      row["_LANGUAGE"] = "中文" if lang == "zh" else "英文"
+                      return row, "2026年中期业绩公告（含六个月财务报表）", "新希望服务_03658_2026年中期业绩公告_含六个月财务报表.pdf", 8, 2026
+              for lang in ("zh", "EN"):
+                  rows = query("20250920", "20250929", lang)
+                  for row in rows:
+                      title = field(row, "TITLE")
+                      s = compact(title)
+                      upper = s.upper()
+                      if "2025" in s and ("中期報告" in s or "半年度報告" in s or "INTERIMREPORT" in upper):
+                          row["_LANGUAGE"] = "中文" if lang == "zh" else "英文"
+                          return row, "截至2026-08-28最新正式中期报告（2025年中期报告）", "新希望服务_03658_2025年中期报告.pdf", 25, 2025
+              raise RuntimeError("No latest half-year report found")
+
+          half_row, half_kind, half_filename, half_min_pages, half_year = select_half()
+
+          def source_url(row: dict[str, Any]) -> str:
+              link = field(row, "FILE_LINK", "fileLink")
+              return link if link.startswith("http") else urljoin("https://www1.hkexnews.hk/", link.lstrip("/"))
+
+          def download(url: str, path: Path, referer: str) -> str:
+              errors: list[str] = []
+              for attempt in range(4):
+                  try:
+                      with session.get(
+                          url,
+                          headers={"Accept": "application/pdf,application/octet-stream,*/*", "Referer": referer},
+                          timeout=300,
+                          stream=True,
+                          allow_redirects=True,
+                      ) as response:
+                          response.raise_for_status()
+                          with path.open("wb") as output:
+                              for chunk in response.iter_content(1024 * 1024):
+                                  if chunk:
+                                      output.write(chunk)
+                          return response.url
+                  except Exception as exc:
+                      path.unlink(missing_ok=True)
+                      errors.append(repr(exc))
+                      if attempt < 3:
+                          time.sleep(2 ** attempt)
+              raise RuntimeError(f"Failed download {url}: {errors}")
+
+          def validate(path: Path, minimum_pages: int) -> tuple[int, str, str]:
+              raw = path.read_bytes()
+              if len(raw) < 100_000 or not raw.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF {path.name}: {len(raw)} bytes")
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(f"Unexpectedly short PDF {path.name}: {pages} pages")
+              text_parts: list[str] = []
+              for page in reader.pages[:10]:
+                  try:
+                      text_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", " ", " ".join(text_parts)).strip()
+              return pages, hashlib.sha256(raw).hexdigest(), sample
+
+          manifest = [
+              "新希望服务控股有限公司（03658.HK）",
+              "资料范围：上市后全部完整年度报告、最终全球发售招股章程及截至2026-08-28最新半年期报告。",
+              "公司于2021年上市，因此完整上市公司年度报告从2021年度开始。",
+              f"最新半年期文件口径：{half_kind}。",
+              "来源：港交所披露易及新希望服务投资者关系官网的正式PDF。",
+              "",
+          ]
+
+          def add_report(filename: str, url: str, kind: str, minimum_pages: int, language: str, referer: str) -> None:
+              path = DOCS / filename
+              final_url = download(url, path, referer)
+              pages, digest, sample = validate(path, minimum_pages)
+              if not any(name.lower() in sample.lower() for name in COMPANY_NAMES):
+                  print("WARNING company name not extracted", filename)
+              manifest.extend([
+                  filename,
+                  f"  文件类型：{kind}",
+                  f"  语言版本：{language}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{path.stat().st_size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  官方来源：{final_url}",
+                  "",
+              ])
+              print("OK", filename, pages, path.stat().st_size, final_url)
+
+          for year in range(2021, 2026):
+              row = annuals[year]
+              add_report(
+                  f"新希望服务_03658_{year}年年度报告.pdf",
+                  source_url(row),
+                  f"{year}年年度报告",
+                  60,
+                  row["_LANGUAGE"],
+                  SEARCH_PAGE,
+              )
+
+          add_report(
+              half_filename,
+              source_url(half_row),
+              half_kind,
+              half_min_pages,
+              half_row["_LANGUAGE"],
+              SEARCH_PAGE,
+          )
+
+          add_report(
+              "新希望服务_03658_全球发售招股章程_2021.pdf",
+              PROSPECTUS_URL,
+              "最终全球发售招股章程",
+              500,
+              "中文",
+              "https://ir.newhopeservice.com.cn/cn/investor-relations/prospectus/",
+          )
+
+          (DOCS / "资料清单与官方来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / f"新希望服务_03658_所有年报_招股说明书_{half_year}年最新半年期报告.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdfs}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print(f"HALF_KIND={half_kind}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_newhope_final.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-service-final-zip
+          path: dist/新希望服务_03658_所有年报_招股说明书_*.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
