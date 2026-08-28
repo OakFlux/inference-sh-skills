@@ -1,0 +1,54 @@
+name: Temporary New Hope Service Fxbaogao search v2
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-fxbaogao-search-v2.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query regular public search endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          post() {
+            local name="$1"; local url="$2"; local body="$3"
+            printf '%s\n%s\n' "$url" "$body" > "diagnostic/${name}.request.txt"
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/rp' -H 'Content-Type: application/json' -H 'Accept: application/json,*/*' \
+              -D "diagnostic/${name}.headers" -X POST "$url" --data "$body" -o "diagnostic/${name}.body" || true
+          }
+          api='https://api.fxbaogao.com'
+          post regular1 "$api/mofoun/report/searchReport/searchNoAuth" '{"keywords":"新希望服务","pageNum":1,"pageSize":50,"orderBy":"newest"}'
+          post regular2 "$api/mofoun/report/searchReport/searchNoAuth" '{"keywords":"新希望服务","pageNum":1,"pageSize":50,"order":2}'
+          post regular3 "$api/mofoun/report/searchReport/searchNoAuth" '{"keywords":"新希望服务","pageIndex":1,"pageSize":50,"order":2,"pdfPage":"all"}'
+          post regular4 "$api/mofoun/report/searchReport/searchNoAuth" '{"keywords":"新希望服务","pageNum":1,"pageSize":50,"orderBy":"2","filterStocks":[],"filterOrgs":[],"filterIndustries":[],"filterDoctype":[],"filterReportType":[]}'
+          post regular5 "$api/mofoun/report/searchReport/searchNoAuth" '{"keywords":"新希望服务","pageNum":1,"pageSize":50,"orderBy":"date_desc","pdfPage":"all"}'
+          post data_simple "$api/mofoun/report/searchReportData/searchListNoAuth" '{"keywords":"新希望服务","pageNum":1,"pageSize":50,"order":2,"nop":-1}'
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          for p in sorted(Path('diagnostic').glob('*.body')):
+              raw=p.read_bytes()
+              print('\n=====',p.name,len(raw),'bytes =====')
+              print(raw[:200000].decode('utf-8','replace'))
+              try:
+                  obj=json.loads(raw)
+                  Path(str(p)+'.pretty.json').write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding='utf-8')
+              except Exception: pass
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-fxbaogao-search-v2
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
