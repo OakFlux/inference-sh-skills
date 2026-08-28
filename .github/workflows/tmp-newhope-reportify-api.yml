@@ -1,0 +1,75 @@
+name: Temporary New Hope Service Reportify API inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-reportify-api.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query public API endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          api='https://api.reportify.cn'
+          get() {
+            local name="$1"; local url="$2"
+            echo "GET $url" | tee "diagnostic/${name}.request.txt"
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://reportify.cn/' -H 'Accept: application/json,*/*' \
+              -D "diagnostic/${name}.headers" "$url" -o "diagnostic/${name}.body" || true
+          }
+          get company_docs_1 "$api/companies/HK%3A03658/docs?page_num=1&page_size=200"
+          get company_docs_2 "$api/companies/HK:03658/docs?page_num=1&page_size=200"
+          get report_detail_2025 "$api/reports/1105126013194604544?spider=true"
+          get report_download_2025 "$api/reports/1105126013194604544/download"
+          get report_permissions_2025 "$api/reports/1105126013194604544/permissions"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, re
+          for p in sorted(Path('diagnostic').glob('*.body')):
+              print('\n===== ',p.name,p.stat().st_size,'bytes =====')
+              raw=p.read_bytes()
+              print(raw[:20000].decode('utf-8','replace'))
+          # parse every JSON body and extract likely report metadata recursively
+          rows=[]
+          def walk(x):
+              if isinstance(x,dict):
+                  if any(k in x for k in ('report_id','report_title','title')):
+                      title=x.get('report_title') or x.get('title') or ''
+                      company=x.get('company_name') or ''
+                      symbol=x.get('symbol') or ''
+                      if '新希望服务' in str(title)+str(company) or symbol=='HK:03658':
+                          rows.append({k:x.get(k) for k in ['report_id','report_title','title','publish_at','institution_name','author_names','document_id','render_type','url','url_pdf','original_url','preview_image','report_type','symbol','company_name','meta_data']})
+                  for v in x.values(): walk(v)
+              elif isinstance(x,list):
+                  for v in x: walk(v)
+          for p in Path('diagnostic').glob('*.body'):
+              try: walk(json.loads(p.read_text(errors='replace')))
+              except Exception: pass
+          # dedupe
+          out=[]; seen=set()
+          for r in rows:
+              key=(str(r.get('report_id')),str(r.get('title')),str(r.get('publish_at')))
+              if key not in seen: seen.add(key); out.append(r)
+          Path('diagnostic/extracted_reports.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('\nEXTRACTED',len(out))
+          print(Path('diagnostic/extracted_reports.json').read_text(encoding='utf-8'))
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-reportify-api-diagnostic
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
