@@ -1,0 +1,64 @@
+name: Temporary New Hope Service Fxbaogao search pages
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-fxbaogao-search-pages.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search all result pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          for page in 1 2 3 4 5; do
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/rp' -H 'Content-Type: application/json' -H 'Accept: application/json,*/*' \
+              -X POST 'https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth' \
+              --data "{\"keywords\":\"新希望服务\",\"pageNum\":$page,\"pageSize\":50,\"orderBy\":\"newest\"}" \
+              -o "diagnostic/page_${page}.json"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re,datetime
+          rows=[]
+          for p in sorted(Path('diagnostic').glob('page_*.json')):
+              obj=json.loads(p.read_text(errors='replace'))
+              for x in (obj.get('data') or {}).get('dataList') or []:
+                  title=re.sub(r'<[^>]+>','',x.get('title') or '')
+                  stocks=x.get('stocks') or []
+                  stocknames='|'.join(re.sub(r'<[^>]+>','',str(s.get('value',''))) for s in stocks)
+                  exact=('新希望服务' in title or '新希望服务' in stocknames or any(str(s.get('key')) in ('03658','3658') for s in stocks))
+                  if exact:
+                      rows.append({
+                        'docId':x.get('docId'),'date':x.get('pubTimeStr'),'org':x.get('orgName'),'pages':x.get('pageNum'),
+                        'docType':x.get('docType'),'reportType':x.get('reportType'),'isDeep':x.get('isDeep'),
+                        'title':title,'pdfPath':x.get('pdfPath'),'authors':x.get('authors'),'stocks':stocknames,
+                        'language':x.get('language'),'isNotBroker':x.get('isNotBroker')
+                      })
+          # dedupe exact doc ids
+          out=[]; seen=set()
+          for x in rows:
+              if x['docId'] not in seen: seen.add(x['docId']); out.append(x)
+          Path('diagnostic/relevant.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/relevant.tsv','w',encoding='utf-8') as f:
+              f.write('date\tdocId\torg\tpages\tdocType\treportType\tisDeep\tisNotBroker\tpdfPath\ttitle\tauthors\n')
+              for x in out:
+                  f.write('\t'.join(str(x.get(k,'')) for k in ['date','docId','org','pages','docType','reportType','isDeep','isNotBroker','pdfPath','title','authors'])+'\n')
+          print(Path('diagnostic/relevant.tsv').read_text(encoding='utf-8'))
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-fxbaogao-all-search-results
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
