@@ -1,0 +1,63 @@
+name: Temporary older Vipshop report catalog
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-sdyanbao-page2.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query older reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          query() {
+            local data="$1" out="$2"
+            curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.sdyanbao.com/' -H 'Content-Type: application/json' -H 'Accept: application/json' -H 'Device: 1' \
+              -X POST 'https://api.sdyanbao.com/api/file/search' --data "$data" -o "$out"
+          }
+          query '{"keyword":"唯品会","page":2,"pageSize":50}' diagnostic/page2.json
+          query '{"keyword":"唯品会","page":3,"pageSize":50}' diagnostic/page3.json
+          query '{"keyword":"特卖电商领军者 平台价值长期稳固","page":1,"pageSize":50}' diagnostic/exact_2022.json
+          query '{"keyword":"享私域年轻流量红利 全渠道深耕品牌特卖","page":1,"pageSize":50}' diagnostic/exact_2021.json
+          query '{"keyword":"唯品会 首次覆盖","page":1,"pageSize":50}' diagnostic/initial.json
+          query '{"keyword":"唯品会 深度报告","page":1,"pageSize":50}' diagnostic/deep.json
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          rows={}
+          for p in Path('diagnostic').glob('*.json'):
+              obj=json.loads(p.read_text())
+              data=obj.get('data') or {}
+              print('\n===',p.name,'total',data.get('total'),'page',data.get('page'),'size',data.get('pageSize'),'===')
+              for x in data.get('files') or []:
+                  blob=' '.join(str(x.get(k,'')) for k in ['name','content'])
+                  if '唯品会' in blob or 'VIPS' in blob.upper():
+                      rows[str(x.get('id'))]=x
+                      print(x.get('id'),x.get('time_text'),x.get('page_count'),(x.get('organization') or {}).get('name'),x.get('name'))
+          out=list(rows.values())
+          out.sort(key=lambda x:(x.get('page_count') or 0,x.get('time_text') or ''),reverse=True)
+          Path('diagnostic/candidates.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/candidates.tsv','w',encoding='utf-8') as f:
+              f.write('id\tdate\tpages\torg\tpage_url\ttitle\n')
+              for x in out:
+                  f.write('\t'.join(map(str,[x.get('id',''),x.get('time_text',''),x.get('page_count',''),(x.get('organization') or {}).get('name',''),x.get('page_url',''),x.get('name','')]))+'\n')
+          print('\nSORTED CANDIDATES')
+          print(Path('diagnostic/candidates.tsv').read_text(encoding='utf-8'))
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-older-catalog
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
