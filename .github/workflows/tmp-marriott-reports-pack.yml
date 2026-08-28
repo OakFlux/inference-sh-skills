@@ -11,10 +11,10 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     steps:
       - name: Install dependencies
-        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+        run: python -m pip install --disable-pip-version-check requests pypdf
 
       - name: Download, validate and package Marriott reports
         shell: bash
@@ -24,14 +24,11 @@ jobs:
           from __future__ import annotations
 
           import hashlib
-          import re
           import time
           import zipfile
           from pathlib import Path
-          from urllib.parse import urljoin
 
           import requests
-          from bs4 import BeautifulSoup
           from pypdf import PdfReader
 
           ANNUAL_PAGE = "https://marriott.gcs-web.com/annual"
@@ -40,122 +37,86 @@ jobs:
           DOCS = OUT / "Marriott_International_MAR_2020-2025_Annual_Reports_2026_H1"
           DOCS.mkdir(parents=True, exist_ok=True)
 
+          REPORTS = [
+              ("Marriott_International_MAR_2020_Annual_Report.pdf", "https://marriott.gcs-web.com/static-files/c5e1faef-f1e5-40e3-bd70-5efbbb929a7f", "2020 Annual Report", 70, ANNUAL_PAGE),
+              ("Marriott_International_MAR_2021_Annual_Report.pdf", "https://marriott.gcs-web.com/static-files/33ba0a19-8a68-4f3f-9f73-fef2c458c22e", "2021 Annual Report", 70, ANNUAL_PAGE),
+              ("Marriott_International_MAR_2022_Annual_Report.pdf", "https://marriott.gcs-web.com/static-files/c0fb865c-15b1-4166-9846-49b548da1ce4", "2022 Annual Report", 70, ANNUAL_PAGE),
+              ("Marriott_International_MAR_2023_Annual_Report.pdf", "https://marriott.gcs-web.com/static-files/ac930e85-f477-4fa8-b873-bf4d2e09ca33", "2023 Annual Report", 70, ANNUAL_PAGE),
+              ("Marriott_International_MAR_2024_Annual_Report.pdf", "https://marriott.gcs-web.com/static-files/12c6f44d-6f02-4c9d-b781-7dae4c1e4df8", "2024 Annual Report", 70, ANNUAL_PAGE),
+              ("Marriott_International_MAR_2025_Annual_Report.pdf", "https://marriott.gcs-web.com/static-files/90ac617a-ef5f-4438-97ec-2e7cf4f8a41e", "2025 Annual Report", 70, ANNUAL_PAGE),
+              ("Marriott_International_MAR_2026_Q2_Form_10-Q_Six_Months.pdf", "https://marriott.gcs-web.com/static-files/ca3c7132-09d8-4261-bc39-e9b3093b9396", "Q2 2026 Form 10-Q (six months ended June 30, 2026)", 25, QUARTERLY_PAGE),
+          ]
+
           session = requests.Session()
           session.headers.update({
               "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
               "Accept-Language": "en-US,en;q=0.9",
               "Accept-Encoding": "gzip, deflate",
+              "Connection": "keep-alive",
           })
 
-          def normalize(text: str) -> str:
-              return re.sub(r"\s+", " ", text or "").strip().lower()
+          def validate(path: Path, minimum_pages: int) -> tuple[int, int, str]:
+              raw = path.read_bytes()
+              if len(raw) < 100_000 or not raw.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF {path.name}: bytes={len(raw)}, head={raw[:16]!r}")
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(f"Unexpectedly short PDF {path.name}: {pages} pages")
+              return len(raw), pages, hashlib.sha256(raw).hexdigest()
 
-          def collect_links(page_url: str) -> list[tuple[str, str]]:
-              response = session.get(page_url, timeout=90)
-              print("PAGE", response.status_code, len(response.content), response.url)
-              response.raise_for_status()
-              soup = BeautifulSoup(response.text, "html.parser")
-              out: list[tuple[str, str]] = []
-              seen: set[tuple[str, str]] = set()
-              for anchor in soup.find_all("a", href=True):
-                  title = " ".join(anchor.get_text(" ", strip=True).split())
-                  href = urljoin(response.url, anchor["href"])
-                  key = (normalize(title), href)
-                  if title and key not in seen:
-                      seen.add(key)
-                      out.append((title, href))
-              return out
-
-          annual_links = collect_links(ANNUAL_PAGE)
-          quarterly_links = collect_links(QUARTERLY_PAGE)
-
-          def find_exact(links: list[tuple[str, str]], wanted: str) -> str:
-              target = normalize(wanted)
-              candidates = [(title, href) for title, href in links if normalize(title) == target]
-              if not candidates:
-                  raise RuntimeError(f"Could not find exact link {wanted!r}")
-              # Prefer direct static-file/PDF links.
-              candidates.sort(key=lambda item: ("static-files" in item[1], item[1].lower().endswith(".pdf")), reverse=True)
-              print("SELECT LINK", wanted, candidates[0][1])
-              return candidates[0][1]
-
-          reports: list[tuple[str, str, str, int]] = []
-          for year in range(2020, 2026):
-              reports.append((
-                  f"Marriott_International_MAR_{year}_Annual_Report.pdf",
-                  find_exact(annual_links, f"{year} Annual Report"),
-                  f"{year} Annual Report",
-                  60,
-              ))
-
-          reports.append((
-              "Marriott_International_MAR_2026_Q2_Form_10-Q_Six_Months.pdf",
-              find_exact(quarterly_links, "Q2 2026 10-Q"),
-              "Q2 2026 Form 10-Q (includes six months ended June 30, 2026)",
-              25,
-          ))
-
-          def download_pdf(url: str, destination: Path, referer: str, minimum_pages: int) -> tuple[str, int, int, str]:
+          def download(url: str, destination: Path, referer: str, minimum_pages: int) -> tuple[str, int, int, str]:
               errors: list[str] = []
-              variants = [url]
-              if "?" not in url:
-                  variants.extend([url + "?download=1", url + "?inline"])
+              variants = [url, url + "?download=1", url + "?inline=1"]
               for candidate in variants:
-                  for attempt in range(4):
+                  for attempt in range(5):
                       try:
                           headers = {
                               "Accept": "application/pdf,application/octet-stream,*/*",
                               "Referer": referer,
+                              "Origin": "https://marriott.gcs-web.com",
                               "Sec-Fetch-Dest": "document",
                               "Sec-Fetch-Mode": "navigate",
                               "Sec-Fetch-Site": "same-origin",
                           }
-                          with session.get(candidate, headers=headers, timeout=300, stream=True, allow_redirects=True) as response:
-                              print("DOWNLOAD", response.status_code, response.url, response.headers.get("content-type"))
+                          with session.get(candidate, headers=headers, timeout=(30, 600), stream=True, allow_redirects=True) as response:
+                              print("GET", response.status_code, response.url, response.headers.get("content-type"), response.headers.get("content-length"))
                               response.raise_for_status()
                               with destination.open("wb") as output:
                                   for chunk in response.iter_content(1024 * 1024):
                                       if chunk:
                                           output.write(chunk)
                               final_url = response.url
-                          raw = destination.read_bytes()
-                          if len(raw) < 100_000 or not raw.startswith(b"%PDF-"):
-                              raise RuntimeError(f"Invalid PDF bytes={len(raw)} head={raw[:16]!r}")
-                          reader = PdfReader(str(destination), strict=False)
-                          pages = len(reader.pages)
-                          if pages < minimum_pages:
-                              raise RuntimeError(f"Unexpected page count: {pages}")
-                          digest = hashlib.sha256(raw).hexdigest()
-                          return final_url, len(raw), pages, digest
+                          size, pages, digest = validate(destination, minimum_pages)
+                          return final_url, size, pages, digest
                       except Exception as exc:
                           destination.unlink(missing_ok=True)
                           errors.append(f"{candidate} attempt {attempt + 1}: {exc!r}")
-                          if attempt < 3:
-                              time.sleep(2 ** attempt)
+                          if attempt < 4:
+                              time.sleep(min(2 ** attempt, 10))
               raise RuntimeError("; ".join(errors))
 
           manifest = [
               "Marriott International, Inc. (NASDAQ: MAR)",
-              "Scope: 2020-2025 official Annual Reports and the latest half-year filing available as of 2026-08-28.",
-              "Half-year convention: U.S. issuers do not publish a separate A-share-style half-year report; this package uses Marriott's Q2 2026 Form 10-Q, which contains financial statements for the six months ended June 30, 2026.",
-              "Sources: Marriott International Investor Relations official PDF files; the Q2 2026 Form 10-Q is also filed with the U.S. SEC.",
+              "Scope: official 2020-2025 Annual Reports plus the latest half-year filing available as of 2026-08-28.",
+              "U.S. reporting convention: the latest half-year document is Marriott's Q2 2026 Form 10-Q, which includes statements for the six months ended June 30, 2026.",
+              "Sources: Marriott International Investor Relations official PDF files; the Form 10-Q is also filed with the U.S. SEC.",
               "",
           ]
 
-          for filename, url, title, minimum_pages in reports:
+          for filename, url, title, minimum_pages, referer in REPORTS:
               destination = DOCS / filename
-              referer = ANNUAL_PAGE if "Annual_Report" in filename else QUARTERLY_PAGE
-              used_url, size, pages, digest = download_pdf(url, destination, referer, minimum_pages)
+              final_url, size, pages, digest = download(url, destination, referer, minimum_pages)
               manifest.extend([
                   filename,
                   f"  Document: {title}",
                   f"  Pages: {pages}",
                   f"  Size: {size} bytes",
                   f"  SHA-256: {digest}",
-                  f"  Official source: {used_url}",
+                  f"  Official source: {final_url}",
                   "",
               ])
-              print("OK", filename, pages, size, used_url)
+              print("OK", filename, pages, size, final_url)
 
           (DOCS / "File_List_and_Official_Sources.txt").write_text("\n".join(manifest), encoding="utf-8")
 
