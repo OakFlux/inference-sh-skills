@@ -1,0 +1,92 @@
+name: Temporary Ascentage SPDBI fetch
+on:
+  push:
+    branches: ['tmp/ascentage-reports-20260828']
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq jq poppler-utils >/dev/null
+          mkdir -p reports diagnostics
+      - name: Query public research API
+        shell: bash
+        run: |
+          set -euo pipefail
+          api='https://www.spdbi.com/ws/api/researchReport/getResearchReportListByPage'
+          for item in '亚盛医药:0' 'Ascentage:2' '6855:0' 'AAPG:2'; do
+            q="${item%:*}"; t="${item##*:}"
+            safe="$(printf '%s' "$q" | sha256sum | cut -c1-10)"
+            jq -n --arg q "$q" --arg t "$t" '{currentUserId:"",classId:"",startTime:"",endTime:"",title:$q,page:"1",size:"100",type:$t}' > "diagnostics/request_$safe.json"
+            curl -L --fail --show-error --silent --compressed --connect-timeout 15 --max-time 90 --retry 2 \
+              -H 'Content-Type: application/json; charset=UTF-8' -H 'Accept: application/json' \
+              -H 'Origin: https://www.spdbi.com' -H 'Referer: https://www.spdbi.com/researchReports.html' \
+              --data-binary @"diagnostics/request_$safe.json" "$api" -o "diagnostics/response_$safe.json"
+          done
+          jq -s '[.[].data[]?] | unique_by(.id // .researchReportUrl // .researchReportTitle)' diagnostics/response_*.json > diagnostics/all.json
+          jq '[.[] | select(((.researchReportTitle // "") + " " + (.researchReportTitleEn // "")) | test("亚盛医药|Ascentage|6855|06855|AAPG";"i"))]' diagnostics/all.json > diagnostics/matches.json
+          jq -r '.[] | [.researchReportTime,.researchReportTitle,.researchReportTitleEn,.researchReportUrl,.researchReportUrlEn] | @tsv' diagnostics/matches.json > diagnostics/matches.tsv
+      - name: Download matched PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re,urllib.parse,urllib.request
+          from pathlib import Path
+          items=json.loads(Path('diagnostics/matches.json').read_text())
+          n=0
+          for item in sorted(items,key=lambda x:str(x.get('researchReportTime','')),reverse=True):
+              for key in ('researchReportUrl','researchReportUrlEn','researchReportUrlCt'):
+                  url=str(item.get(key) or '').strip()
+                  if not url: continue
+                  url=urllib.parse.urljoin('https://www.spdbi.com/',url)
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.spdbi.com/researchReports.html'})
+                      data=urllib.request.urlopen(req,timeout=180).read()
+                  except Exception: continue
+                  if data.startswith(b'%PDF-') and len(data)>100000:
+                      title=str(item.get('researchReportTitle') or item.get('researchReportTitleEn') or '亚盛医药研究报告')
+                      title=re.sub(r'[\\/:*?"<>|\r\n]+','_',title)[:90]
+                      date=str(item.get('researchReportTime') or '')[:10].replace('/','-')
+                      name=f'{n+1:02d}_{date}_{title}.pdf'
+                      Path('reports',name).write_bytes(data)
+                      with open('diagnostics/downloads.tsv','a',encoding='utf-8') as f:f.write(f'{name}\t{url}\n')
+                      n+=1; break
+              if n>=5: break
+          Path('diagnostics/count.txt').write_text(str(n))
+          PY
+      - name: Verify files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if compgen -G 'reports/*.pdf' >/dev/null; then
+            echo '亚盛医药券商研究报告来源与校验' > reports/来源与校验.txt
+            for f in reports/*.pdf; do
+              test "$(head -c 5 "$f")" = '%PDF-'
+              pages="$(pdfinfo "$f" | awk '/^Pages:/ {print $2}')"
+              pdftotext -f 1 -l 3 "$f" - | grep -Eiq '亚盛医药|Ascentage|06855|6855|AAPG'
+              printf '\n文件：%s\n页数：%s\nSHA-256：%s\n' "$(basename "$f")" "$pages" "$(sha256sum "$f" | awk '{print $1}')" >> reports/来源与校验.txt
+            done
+          fi
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-spdbi-reports
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 0
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascentage-spdbi-fetch-diagnostics
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 1
