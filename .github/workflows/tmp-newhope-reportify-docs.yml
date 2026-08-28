@@ -1,0 +1,73 @@
+name: Temporary New Hope Service Reportify docs list
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-reportify-docs.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query all company documents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          for symbol in 'HK%3A03658' 'HK:03658'; do
+            name=$(echo "$symbol" | tr ':%' '__')
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://reportify.cn/companies/HK%3A03658/documents' -H 'Accept: application/json,*/*' \
+              -D "diagnostic/${name}.headers" \
+              "https://api.reportify.cn/companies/${symbol}/docs?page_num=1&page_size=100" \
+              -o "diagnostic/${name}.json" || true
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,datetime
+          rows=[]
+          for p in Path('diagnostic').glob('*.json'):
+              try: obj=json.loads(p.read_text(errors='replace'))
+              except Exception as exc:
+                  print(p,exc,p.read_text(errors='replace')[:1000]); continue
+              print(p.name,'type',type(obj).__name__,'keys',obj.keys() if isinstance(obj,dict) else '')
+              print(json.dumps(obj,ensure_ascii=False)[:5000])
+              def walk(x):
+                  if isinstance(x,dict):
+                      if x.get('report_id'):
+                          rows.append(x)
+                      for v in x.values(): walk(v)
+                  elif isinstance(x,list):
+                      for v in x: walk(v)
+              walk(obj)
+          out=[]; seen=set()
+          for x in rows:
+              rid=str(x.get('report_id'))
+              if rid in seen: continue
+              seen.add(rid)
+              if x.get('report_type') in (7,8,9,10,11,31) or x.get('institution_name'):
+                  out.append(x)
+          out.sort(key=lambda x:x.get('publish_at') or 0,reverse=True)
+          Path('diagnostic/research_reports.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/research_reports.tsv','w',encoding='utf-8') as f:
+              f.write('date\treport_id\treport_type\tinstitution\tauthors\tpages\tdocument_id\ttitle\n')
+              for x in out:
+                  ts=x.get('publish_at') or 0
+                  date=datetime.datetime.utcfromtimestamp(ts/1000).strftime('%Y-%m-%d') if ts else ''
+                  pages=(x.get('meta_data') or {}).get('document_total_page','') if isinstance(x.get('meta_data'),dict) else ''
+                  f.write('\t'.join(map(str,[date,x.get('report_id',''),x.get('report_type',''),x.get('institution_name',''),x.get('author_names',''),pages,x.get('document_id',''),x.get('report_title') or x.get('title','')]))+'\n')
+          print('\nRESEARCH REPORTS',len(out))
+          print(Path('diagnostic/research_reports.tsv').read_text(encoding='utf-8'))
+          PY
+      - name: Upload docs list
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-reportify-docs-list
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
