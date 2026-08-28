@@ -1,0 +1,78 @@
+name: Temporary Vipshop Waterdrop API inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-sdyanbao-api.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query public APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          post() {
+            local endpoint="$1" data="$2" out="$3"
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.sdyanbao.com/' \
+              -H 'Content-Type: application/json' -H 'Accept: application/json' -H 'Device: 1' -H 'X-Token:' \
+              -D "${out}.headers" -X POST "https://api.sdyanbao.com${endpoint}" --data "$data" -o "$out" || true
+          }
+          post '/api/file/detail' '{"id":688484}' diagnostic/detail_688484.json
+          post '/api/file/download' '{"id":688484}' diagnostic/download_688484.json
+          post '/api/file/similarlist' '{"id":688484,"pageSize":20}' diagnostic/similar_688484.json
+          post '/api/file/sameOrganizationlist' '{"id":688484,"pageSize":50}' diagnostic/sameorg_688484.json
+
+          i=0
+          variants=(
+            '{"keyword":"唯品会","page":1,"pageSize":50}'
+            '{"key":"唯品会","page":1,"pageSize":50}'
+            '{"keywords":"唯品会","page":1,"pageSize":50}'
+            '{"searchKey":"唯品会","page":1,"pageSize":50}'
+            '{"name":"唯品会","page":1,"pageSize":50}'
+            '{"keyword":"VIPS","page":1,"pageSize":50}'
+            '{"key":"VIPS","page":1,"pageSize":50}'
+          )
+          for data in "${variants[@]}"; do
+            i=$((i+1))
+            post '/api/file/search' "$data" "diagnostic/search_${i}.json"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,re
+          rows={}
+          for p in Path('diagnostic').glob('*.json'):
+              text=p.read_text(errors='replace')
+              print('\n===',p.name,p.stat().st_size,'===')
+              print(text[:20000])
+              try: obj=json.loads(text)
+              except Exception: continue
+              def walk(v):
+                  if isinstance(v,dict):
+                      blob=' '.join(str(v.get(k,'')) for k in ['name','title','keyword'])
+                      if ('唯品会' in blob or 'VIPS' in blob.upper()) and (v.get('id') or v.get('file_id')):
+                          rows[str(v.get('id') or v.get('file_id'))]=v
+                      for vv in v.values(): walk(vv)
+                  elif isinstance(v,list):
+                      for vv in v: walk(vv)
+              walk(obj)
+          Path('diagnostic/vipshop_rows.json').write_text(json.dumps(list(rows.values()),ensure_ascii=False,indent=2),encoding='utf-8')
+          print('\nVIPSHOP ROWS',len(rows))
+          print(Path('diagnostic/vipshop_rows.json').read_text(encoding='utf-8'))
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-sdyanbao-api
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
