@@ -1,0 +1,67 @@
+name: Temporary New Hope Service publish verified reports
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-publish-results.yml
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/download-newhope-service-reports-20260828
+          fetch-depth: 0
+
+      - name: Wait for verified-report artifact and download it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCH: tmp/download-newhope-service-reports-20260828
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id=''
+          for i in $(seq 1 60); do
+            run_id="$(gh api "/repos/$REPO/actions/workflows/tmp-newhope-broad-search-download.yml/runs?branch=$BRANCH&status=success&per_page=1" --jq '.workflow_runs[0].id // empty')"
+            if [ -n "$run_id" ]; then break; fi
+            sleep 10
+          done
+          test -n "$run_id"
+          artifact_id="$(gh api "/repos/$REPO/actions/runs/$run_id/artifacts" --jq '.artifacts[] | select(.name=="newhope-service-broker-reports") | .id' | head -n1)"
+          test -n "$artifact_id"
+          rm -rf /tmp/newhope-artifact generated/newhope_service
+          mkdir -p /tmp/newhope-artifact generated/newhope_service/files
+          gh api "/repos/$REPO/actions/artifacts/$artifact_id/zip" > /tmp/newhope-artifact.zip
+          unzip -q /tmp/newhope-artifact.zip -d /tmp/newhope-artifact
+          cp -a /tmp/newhope-artifact/. generated/newhope_service/files/
+          (cd generated/newhope_service/files && zip -q -r ../New_Hope_Service_Broker_Reports.zip .)
+          cp generated/newhope_service/New_Hope_Service_Broker_Reports.zip generated/newhope_service/新希望服务_券商研究报告.zip
+          test -s generated/newhope_service/New_Hope_Service_Broker_Reports.zip
+          unzip -t generated/newhope_service/New_Hope_Service_Broker_Reports.zip >/dev/null
+
+      - name: Commit temporary downloadable files to branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'OakFlux'
+          git config user.email '206205057+OakFlux@users.noreply.github.com'
+          git add -- generated/newhope_service
+          git commit -m 'chore: publish verified New Hope Service report package'
+          git push origin HEAD:tmp/download-newhope-service-reports-20260828
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-service-final-package
+          path: generated/newhope_service/
+          retention-days: 1
+          if-no-files-found: error
+          compression-level: 6
