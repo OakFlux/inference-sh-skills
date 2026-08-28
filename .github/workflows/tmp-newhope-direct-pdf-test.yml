@@ -1,0 +1,42 @@
+name: Temporary New Hope Service direct PDF test
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-direct-pdf-test.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Probe inferred public PDF paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          i=0
+          for url in \
+            'https://public.fxbaogao.com/report/2026/06/15/5488726.pdf' \
+            'https://public.fxbaogao.com/report-cn/2026/06/15/5488726.pdf' \
+            'https://public.fxbaogao.com/report-en/2026/06/15/5488726.pdf' \
+            'https://public.fxbaogao.com/report/2026/06/23/5488726.pdf' \
+            'https://public.fxbaogao.com/report-cn/2026/06/23/5488726.pdf'; do
+            i=$((i+1)); dest="diagnostic/candidate_${i}.bin"
+            printf '%s\n' "$url" > "diagnostic/candidate_${i}.url"
+            code=$(curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 600 \
+              -A "$UA" -e 'https://www.fxbaogao.com/view?id=5488726' -sS -w '%{http_code}' \
+              -D "diagnostic/candidate_${i}.headers" -o "$dest" "$url" || true)
+            echo "$i HTTP=$code size=$(wc -c < "$dest" 2>/dev/null || echo 0) type=$(file -b --mime-type "$dest" 2>/dev/null || true) url=$url"
+          done
+      - name: Upload probes
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-direct-pdf-test
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
