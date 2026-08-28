@@ -1,0 +1,68 @@
+name: Temporary New Hope Service targeted report search
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-targeted-search.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Run targeted public searches
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          python3 - <<'PY'
+          import json,urllib.request,pathlib,re,hashlib
+          url='https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          queries=['新希望服务 首次覆盖','新希望服务 招银国际','New Hope Service','3658.HK','03658 新希望服务','新希望服务 买入','新希望服务 物业']
+          rows=[]
+          for q in queries:
+              for page in range(1,11):
+                  body=json.dumps({'keywords':q,'pageNum':page,'pageSize':50,'orderBy':'newest'},ensure_ascii=False).encode()
+                  req=urllib.request.Request(url,data=body,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.fxbaogao.com/rp','Content-Type':'application/json','Accept':'application/json,*/*'})
+                  try:
+                      raw=urllib.request.urlopen(req,timeout=90).read()
+                  except Exception as exc:
+                      print(q,page,exc); break
+                  name=hashlib.sha256(q.encode()).hexdigest()[:10]
+                  pathlib.Path(f'diagnostic/{name}_{page}.json').write_bytes(raw)
+                  try: obj=json.loads(raw)
+                  except Exception: break
+                  data=obj.get('data') or {}
+                  items=data.get('dataList') or []
+                  if not items: break
+                  for x in items:
+                      title=re.sub(r'<[^>]+>','',x.get('title') or '')
+                      stocks=x.get('stocks') or []
+                      stocknames='|'.join(re.sub(r'<[^>]+>','',str(s.get('value',''))) for s in stocks)
+                      relevant=('新希望服务' in title or '新希望服务' in stocknames or 'New Hope Service' in title or any(str(s.get('key')) in ('03658','3658') for s in stocks))
+                      broker=(x.get('docType') in (0,1) or x.get('reportType') in (11,13)) and x.get('orgName') not in ('财报','港股财报')
+                      if relevant and broker:
+                          rows.append({'query':q,'docId':x.get('docId'),'date':x.get('pubTimeStr'),'org':x.get('orgName'),'pages':x.get('pageNum'),'docType':x.get('docType'),'reportType':x.get('reportType'),'title':title,'pdfPath':x.get('pdfPath'),'authors':x.get('authors'),'stocks':stocknames})
+                  if page >= (data.get('pageCount') or page): break
+          out=[];seen=set()
+          for x in rows:
+              if x['docId'] not in seen: seen.add(x['docId']);out.append(x)
+          out.sort(key=lambda x:x.get('date') or '',reverse=True)
+          pathlib.Path('diagnostic/relevant.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/relevant.tsv','w',encoding='utf-8') as f:
+              f.write('date\tdocId\torg\tpages\tdocType\treportType\tpdfPath\ttitle\tauthors\tquery\n')
+              for x in out:
+                  f.write('\t'.join(str(x.get(k,'')) for k in ['date','docId','org','pages','docType','reportType','pdfPath','title','authors','query'])+'\n')
+          print(pathlib.Path('diagnostic/relevant.tsv').read_text(encoding='utf-8'))
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-targeted-search-results
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
