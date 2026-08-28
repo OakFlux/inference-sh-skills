@@ -1,0 +1,75 @@
+name: Temporary Fxbaogao JS endpoint inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-fxbaogao-js-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download application bundles and inspect endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/js
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          base='https://static.fxbaogao.com/_fxbg/2608241759/js'
+          for f in \
+            runtime.c4a35a52e74016986504.js \
+            antd-table.efc2d913db806c205059.chunk.js \
+            vendors~app-pages-fxbg-main-js.3eae845a5829f4e6f26c.chunk.js \
+            app-pages-fxbg-main-js.bf8665a4a5f068d0e1c6.chunk.js; do
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 600 \
+              -A "$UA" -e 'https://www.fxbaogao.com/view?id=5488726' "$base/$f" -o "diagnostic/js/$f"
+          done
+          curl -L --compressed -A "$UA" 'https://static.fxbaogao.com/pub/js/config/production.js' -o diagnostic/production.js
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json,html
+          needles=['5488726','searchListNoAuth','report-image','download','downLoad','pdfUrl','pdfPath','fileUrl','sourceUrl','viewReport','detailReport','docId','pageNum','pageIndex','reportDetail','original','getReport','mofoun/report','api.fxbaogao']
+          findings=[]; strings=[]
+          for p in list(Path('diagnostic/js').glob('*.js'))+[Path('diagnostic/production.js')]:
+              t=p.read_text(errors='replace')
+              low=t.lower()
+              for needle in needles:
+                  start=0; count=0
+                  while True:
+                      pos=low.find(needle.lower(),start)
+                      if pos<0: break
+                      findings.append({'file':p.name,'needle':needle,'pos':pos,'context':t[max(0,pos-1800):pos+3600]})
+                      start=pos+len(needle); count+=1
+                      if count>=150: break
+              # extract URL/path strings
+              for m in re.finditer(r'["\']([^"\']{1,700})["\']',t):
+                  s=html.unescape(m.group(1))
+                  if any(x in s.lower() for x in ['mofoun/','/report','download','pdf','report-image','docid','pagenum','view?id','detail/']):
+                      strings.append({'file':p.name,'string':s})
+          Path('diagnostic/findings.json').write_text(json.dumps(findings,ensure_ascii=False,indent=2),encoding='utf-8')
+          unique=[]; seen=set()
+          for x in strings:
+              k=(x['file'],x['string'])
+              if k not in seen: seen.add(k); unique.append(x)
+          Path('diagnostic/strings.tsv').write_text('\n'.join(f"{x['file']}\t{x['string']}" for x in unique),encoding='utf-8')
+          print('bundles:',[(p.name,p.stat().st_size) for p in Path('diagnostic/js').glob('*.js')])
+          print('\nPRODUCTION CONFIG\n',Path('diagnostic/production.js').read_text(errors='replace'))
+          print('\nINTERESTING STRINGS')
+          for x in unique[:1000]: print(x['file'],'\t',x['string'])
+          print('\nFINDINGS')
+          for x in findings[:300]:
+              print('\n###',x['file'],x['needle'],x['pos'])
+              print(x['context'][:5000])
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-js-endpoint-diagnostic
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
