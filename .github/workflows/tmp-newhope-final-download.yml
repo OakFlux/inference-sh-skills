@@ -1,0 +1,81 @@
+name: Temporary New Hope Service verified report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-final-download.yml
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Download and verify public report PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output /tmp/newhope-previews
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local expected_pages="$3"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36' \
+              -e 'https://www.fxbaogao.com/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "$dest"
+            test -s "$dest"
+            test "$(head -c 4 "$dest")" = '%PDF'
+            local pages
+            pages="$(pdfinfo "$dest" | awk '/^Pages:/ {print $2}')"
+            test "$pages" = "$expected_pages"
+            local stem
+            stem="$(basename "$dest" .pdf)"
+            pdftoppm -f 1 -singlefile -png -r 90 "$dest" "/tmp/newhope-previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 90 "$dest" "/tmp/newhope-previews/${stem}_last" >/dev/null 2>&1
+          }
+
+          download_pdf 'https://report.fxbaogao.com/report/2026/06/15/5488726.pdf' \
+            'output/01_开源证券_新希望服务_高派息构筑安全垫多元服务筑就民生护城河_20260615_25页.pdf' '25'
+          download_pdf 'https://report.fxbaogao.com/report-cn/2025/09/02/5037573.pdf' \
+            'output/02_招银国际_新希望服务_强劲第三方扩张带来11pct股息率维持买入_20250902_6页.pdf' '6'
+          download_pdf 'https://report.fxbaogao.com/report-cn/2024/09/05/4489729.pdf' \
+            'output/03_招银国际_新希望服务_稳健扩张步伐与反周期VAS维持买入_20240905_7页.pdf' '7'
+
+          cat > output/报告清单与核验说明.txt <<'EOF'
+新希望服务（03658.HK）券商报告，共3份
+
+1. 开源证券：《港股公司首次覆盖报告：高派息构筑安全垫，多元服务筑就民生护城河》
+   日期：2026-06-15；页数：25页；类型：公司首次覆盖深度报告；评级：买入（首次）。
+
+2. 招银国际：《2025年半年报：强劲第三方扩张带来11%股息率，维持买入评级》
+   日期：2025-09-02；页数：6页；类型：公司更新报告；评级：买入。
+
+3. 招银国际：《稳健的扩张步伐 + 反周期VAS；维持买入》
+   日期：2024-09-05；页数：7页；类型：公司更新报告；评级：买入。
+
+说明：目前公开可直接取得的近年完整券商PDF中，2026年开源证券为长篇首次覆盖；另两份为招银国际公司更新，作为补充材料。三份文件均已检查PDF文件头、实际页数，并成功渲染首页与末页。
+仅供研究资料整理，不构成投资建议。
+EOF
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output
+
+      - name: Upload verified reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-hope-service-broker-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
