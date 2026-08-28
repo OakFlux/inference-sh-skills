@@ -1,0 +1,61 @@
+name: Temporary New Hope Service Fxbaogao search
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-fxbaogao-search.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search public report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          for kw in '新希望服务' '03658' '新希望服务控股'; do
+            safe=$(echo "$kw" | sha256sum | cut -c1-12)
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A 'Mozilla/5.0' -H 'Content-Type: application/json' \
+              -X POST 'https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth' \
+              --data "{\"keywords\":\"$kw\",\"pageIndex\":1,\"pageSize\":20,\"order\":2,\"nop\":-1}" \
+              -D "diagnostic/${safe}.headers" -o "diagnostic/${safe}.json"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import json,datetime
+          rows=[]
+          for p in Path('diagnostic').glob('*.json'):
+              obj=json.loads(p.read_text(errors='replace'))
+              print('\n===',p.name,'===')
+              print(json.dumps(obj,ensure_ascii=False,indent=2)[:30000])
+              for x in ((obj.get('data') or {}).get('dataList') or []):
+                  if '新希望服务' in (x.get('title') or '') or str(x.get('docId'))=='5488726':
+                      rows.append(x)
+          out=[]; seen=set()
+          for x in rows:
+              k=x.get('docId')
+              if k not in seen: seen.add(k); out.append(x)
+          out.sort(key=lambda x:x.get('pubTime') or 0,reverse=True)
+          Path('diagnostic/relevant_full.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/summary.tsv','w',encoding='utf-8') as f:
+              if out:
+                  keys=sorted(set().union(*(x.keys() for x in out)))
+                  f.write('\t'.join(keys)+'\n')
+                  for x in out:
+                      f.write('\t'.join(str(x.get(k,'')) for k in keys)+'\n')
+          print('\nRELEVANT',len(out))
+          print(Path('diagnostic/relevant_full.json').read_text(encoding='utf-8'))
+          PY
+      - name: Upload search diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-fxbaogao-search-results
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
