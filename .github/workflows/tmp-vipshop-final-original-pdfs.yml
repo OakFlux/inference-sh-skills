@@ -1,0 +1,82 @@
+name: Temporary verified original Vipshop PDF package
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-final-original-pdfs.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and verify original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          download_pdf() {
+            url="$1"
+            dest="$2"
+            pages="$3"
+            expected="$4"
+            stem="$5"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors --connect-timeout 30 --max-time 600 --compressed -A "$UA" -e 'https://www.baidu.com/' "$url" -o "output/$dest"
+            test -s "output/$dest"
+            test "$(head -c 4 "output/$dest")" = '%PDF'
+            actual=$(pdfinfo "output/$dest" | awk '/^Pages:/ {print $2}')
+            test "$actual" -eq "$pages"
+            pdftotext -f 1 -l 2 "output/$dest" "previews/${stem}_text.txt"
+            grep -q "$expected" "previews/${stem}_text.txt"
+            pdftoppm -f 1 -singlefile -png -r 100 "output/$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 100 "output/$dest" "previews/${stem}_last" >/dev/null 2>&1
+            test -s "previews/${stem}_first.png"
+            test -s "previews/${stem}_last.png"
+          }
+
+          download_pdf 'https://pdf.dfcfw.com/pdf/H3_AP202012301445151330_1.pdf' '01_Orient_Securities_Vipshop_Initiation_20201222_31p.pdf' 31 '垂直聚焦特卖' 'orient_2020'
+          download_pdf 'https://img3.gelonghui.com/pdf/ab211-83cfc13d-2b5d-4f1c-9dc8-5a467d87d76d.pdf' '02_TF_Securities_Vipshop_Deep_Report_20190820_15p.pdf' 15 '复购用户筑围城' 'tf_2019'
+          download_pdf 'https://www.spdbi.com/getfile/index/action/images/name/65e185ecc16ad.pdf' '03_SPDBI_Vipshop_Update_20240229_6p.pdf' 6 '季节性需求推动' 'spdbi_2024'
+
+          {
+            echo 'Vipshop (VIPS.US) broker research reports - 3 original PDFs'
+            echo
+            echo '1. Orient Securities, 2020-12-22, 31 pages'
+            echo '   Vertical Focus on Flash Sales: Riding the Industry Tailwind to Renewed Growth.'
+            echo '   Full initiation/deep report; rating: Buy.'
+            echo
+            echo '2. TF Securities, 2019-08-20, 15 pages'
+            echo '   Repeat Customers Build the Moat; Offline Expansion at the Right Time.'
+            echo '   Overseas-company deep research report.'
+            echo
+            echo '3. SPDB International, 2024-02-29, 6 pages'
+            echo '   Seasonal Demand Drives an Earnings Beat; FY2024 Growth Expected to Be Stable.'
+            echo '   Recent financial-model update; rating: Hold.'
+            echo
+            echo 'The first two are full company-deep/initiation reports; the third is a recent company update.'
+            echo 'All files are original searchable-text PDFs, not renamed webpages or reconstructed preview images.'
+            echo 'PDF headers, page counts, expected first-page text, and first/last-page rendering were verified.'
+            echo 'For research use only. Not investment advice.'
+          } > output/README.txt
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output previews
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-original-broker-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
