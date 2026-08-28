@@ -1,0 +1,249 @@
+name: Temporary fetch Marriott public research reports
+
+on:
+  push:
+    branches:
+      - tmp/marriott-public-reports-20260828
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-and-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install validators
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Fetch public open-access Marriott research PDFs
+        shell: bash
+        run: |
+          cat > /tmp/fetch_marriott.py <<'PY'
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import sys
+          import urllib.parse
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          OUT.mkdir(exist_ok=True)
+
+          S = requests.Session()
+          S.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0 Safari/537.36',
+              'Accept': 'application/json,text/html,application/pdf,*/*',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+          })
+
+          candidates = [
+              {
+                  'uuid': '190821e9-840c-4076-8295-eed3d962a5ab',
+                  'preferred': ['Fall2024_46959_Rodrigo_Adao.pdf'],
+                  'filename': '01_Nova_SBE_Marriott_Equity_Research_A_Home_Run_to_Excellence_2025.pdf',
+                  'label': 'Nova SBE: Marriott International, Inc. - A Home Run to Excellence',
+                  'year': '2025',
+              },
+              {
+                  'uuid': '5ed7aa3a-1fdb-4fba-a0b9-97b25ce2484f',
+                  'preferred': ['2021-22_spring_32347_report.pdf'],
+                  'filename': '02_Nova_SBE_Marriott_Equity_Research_The_Hotel_Giants_Recovery_2022.pdf',
+                  'label': "Nova SBE: Marriott International, Inc. - The Hotel Giant's Recovery",
+                  'year': '2022',
+              },
+              {
+                  'uuid': '45f8ac57-56b8-467b-b3aa-49946044a452',
+                  'preferred': ['2021-22_spring_32347_31883.pdf'],
+                  'filename': '03_Nova_SBE_Marriott_Equity_Research_Leading_Position_Amid_Recovery_2022.pdf',
+                  'label': 'Nova SBE: Marriott International, Inc. - Consolidating a Leading Position Amid Recovery',
+                  'year': '2022',
+              },
+          ]
+
+          def get_json(url):
+              r = S.get(url, timeout=45)
+              print('GET JSON', r.status_code, url, len(r.content))
+              r.raise_for_status()
+              return r.json()
+
+          def embedded_list(data, key):
+              return (data.get('_embedded') or {}).get(key) or []
+
+          def resolve_bitstreams(item_uuid):
+              base = f'https://run.unl.pt/server/api/core/items/{item_uuid}'
+              item = get_json(base)
+              bundles_url = ((item.get('_links') or {}).get('bundles') or {}).get('href') or f'{base}/bundles'
+              bundles_data = get_json(bundles_url)
+              bundles = embedded_list(bundles_data, 'bundles')
+              out = []
+              for bundle in bundles:
+                  name = str(bundle.get('name') or '')
+                  if name and name.upper() not in {'ORIGINAL', 'CONTENT'}:
+                      continue
+                  bitstreams_url = ((bundle.get('_links') or {}).get('bitstreams') or {}).get('href')
+                  if not bitstreams_url:
+                      uuid = bundle.get('uuid')
+                      if uuid:
+                          bitstreams_url = f'https://run.unl.pt/server/api/core/bundles/{uuid}/bitstreams'
+                  if not bitstreams_url:
+                      continue
+                  bits_data = get_json(bitstreams_url)
+                  for bit in embedded_list(bits_data, 'bitstreams'):
+                      bname = str(bit.get('name') or '')
+                      content_url = ((bit.get('_links') or {}).get('content') or {}).get('href')
+                      if not content_url and bit.get('uuid'):
+                          content_url = f"https://run.unl.pt/server/api/core/bitstreams/{bit['uuid']}/content"
+                      if bname.lower().endswith('.pdf') and content_url:
+                          out.append({'name': bname, 'url': content_url, 'size': bit.get('sizeBytes') or 0})
+              return out
+
+          def scrape_bitstreams(item_uuid):
+              urls = [
+                  f'https://run.unl.pt/entities/publication/{item_uuid}',
+                  f'https://run.unl.pt/items/{item_uuid}',
+              ]
+              found = []
+              for url in urls:
+                  try:
+                      r = S.get(url, timeout=45)
+                      print('GET HTML', r.status_code, url, len(r.content))
+                      if r.status_code != 200:
+                          continue
+                      html = r.text
+                      for m in re.findall(r'https?://[^\"\'<> ]+/server/api/core/bitstreams/[0-9a-f-]+/content[^\"\'<> ]*', html, re.I):
+                          found.append({'name': urllib.parse.unquote(m.split('/')[-2]) + '.pdf', 'url': m, 'size': 0})
+                      soup = BeautifulSoup(html, 'html.parser')
+                      for a in soup.find_all('a', href=True):
+                          href = urllib.parse.urljoin(r.url, a['href'])
+                          text = ' '.join(a.get_text(' ', strip=True).split())
+                          if '.pdf' in href.lower() or '.pdf' in text.lower() or '/bitstreams/' in href:
+                              found.append({'name': text or href.rsplit('/', 1)[-1], 'url': href, 'size': 0})
+                  except Exception as exc:
+                      print('scrape error', url, exc)
+              return found
+
+          def download_pdf(url):
+              r = S.get(url, timeout=90, allow_redirects=True)
+              print('DOWNLOAD', r.status_code, r.url, r.headers.get('content-type'), len(r.content))
+              if r.status_code == 200 and r.content[:5] == b'%PDF-' and len(r.content) > 100_000:
+                  return r.content, r.url
+              return None, r.url
+
+          def validate_pdf(content):
+              reader = PdfReader(io.BytesIO(content), strict=False)
+              pages = len(reader.pages)
+              text = ''
+              for i in range(min(5, pages)):
+                  try:
+                      text += '\n' + (reader.pages[i].extract_text() or '')
+                  except Exception:
+                      pass
+              normalized = re.sub(r'\s+', '', text).lower()
+              if 'marriott' not in normalized and '万豪' not in normalized:
+                  raise RuntimeError('PDF identity check failed: Marriott not found in first five pages')
+              if pages < 10:
+                  raise RuntimeError(f'PDF is too short for a deep report: {pages} pages')
+              return pages, text[:2000]
+
+          manifest = []
+          used_hashes = set()
+
+          for spec in candidates:
+              if len(manifest) >= 3:
+                  break
+              try:
+                  bits = resolve_bitstreams(spec['uuid'])
+              except Exception as exc:
+                  print('REST discovery failed', spec['uuid'], exc)
+                  bits = []
+              if not bits:
+                  bits = scrape_bitstreams(spec['uuid'])
+              print('BITSTREAM CANDIDATES', spec['uuid'], json.dumps(bits, ensure_ascii=False, indent=2)[:8000])
+
+              preferred = []
+              for want in spec['preferred']:
+                  preferred.extend([b for b in bits if want.lower() in str(b.get('name', '')).lower() or want.lower() in b.get('url', '').lower()])
+              ordered = preferred + sorted([b for b in bits if b not in preferred], key=lambda x: int(x.get('size') or 0), reverse=True)
+
+              saved = False
+              for bit in ordered:
+                  content, final_url = download_pdf(bit['url'])
+                  if not content:
+                      continue
+                  import hashlib
+                  digest = hashlib.sha256(content).hexdigest()
+                  if digest in used_hashes:
+                      print('SKIP DUPLICATE', bit.get('name'))
+                      continue
+                  try:
+                      pages, preview = validate_pdf(content)
+                  except Exception as exc:
+                      print('VALIDATION FAILED', bit.get('name'), exc)
+                      continue
+                  out_path = OUT / spec['filename']
+                  out_path.write_bytes(content)
+                  used_hashes.add(digest)
+                  manifest.append({
+                      'filename': out_path.name,
+                      'title': spec['label'],
+                      'year': spec['year'],
+                      'pages': pages,
+                      'source': final_url,
+                      'sha256': digest,
+                      'size_bytes': len(content),
+                  })
+                  print('SAVED', out_path, pages, len(content), digest)
+                  saved = True
+                  break
+              if not saved:
+                  print('NO VALID PDF SAVED FOR', spec['uuid'])
+
+          if len(manifest) < 2:
+              raise RuntimeError(f'Only {len(manifest)} valid open-access Marriott research PDFs were obtained')
+
+          with open(OUT / '报告清单与来源说明.txt', 'w', encoding='utf-8') as f:
+              f.write('万豪国际（Marriott International, NASDAQ: MAR）公开深度研究报告\n')
+              f.write('===========================================================\n\n')
+              f.write('本压缩包仅收录可从原发布机构公开研究库合法、无需登录下载的完整PDF。\n')
+              f.write('公开检索到的东北证券2023年57页首次覆盖报告和海通国际2025年12页更新报告，\n')
+              f.write('目前仅在会员下载平台提供，因此未绕过登录或付费限制，也未将其纳入压缩包。\n')
+              f.write('下列文件属于完整英文股权研究报告（Equity Research），发布机构为Nova SBE。\n\n')
+              for idx, item in enumerate(manifest, 1):
+                  f.write(f"{idx}. {item['title']}\n")
+                  f.write(f"   年份：{item['year']}；实际页数：{item['pages']}页；大小：{item['size_bytes']/1024/1024:.2f} MB\n")
+                  f.write(f"   文件：{item['filename']}\n")
+                  f.write(f"   原始公开下载地址：{item['source']}\n")
+                  f.write(f"   SHA-256：{item['sha256']}\n\n")
+
+          with open(OUT / 'manifest.json', 'w', encoding='utf-8') as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+          print('FINAL MANIFEST')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/fetch_marriott.py
+          ls -lh output
+          python - <<'PY'
+          from pathlib import Path
+          from pypdf import PdfReader
+          for p in sorted(Path('output').glob('*.pdf')):
+              r = PdfReader(str(p), strict=False)
+              print(f'VERIFIED {p.name}: {len(r.pages)} pages, {p.stat().st_size} bytes')
+          PY
+
+      - name: Upload verified reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: marriott-public-deep-research
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
