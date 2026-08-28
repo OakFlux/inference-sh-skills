@@ -1,0 +1,67 @@
+name: Temporary fast query New Hope Service reports
+
+on:
+  push:
+    branches:
+      - tmp/new-hope-service-fast-20260828
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query exact public report metadata
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re, requests, time
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/'})
+          api='https://reportapi.eastmoney.com/report/list'
+          windows=[('2026-06-10','2026-06-25'),('2025-03-28','2025-04-08'),('2024-03-20','2024-04-05'),('2023-03-15','2023-04-05'),('2022-03-15','2022-04-05')]
+          kws=['新希望服务','03658','高派息构筑安全垫','third party expansion','higher-end level']
+          found={}
+          for begin,end in windows:
+            for qtype in ['0','1','2']:
+              for code in ['','03658','3658']:
+                for page in range(1,10):
+                  p={'cb':'','pageNo':str(page),'pageSize':'100','code':code,'industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':begin,'endTime':end,'fields':'','qType':qtype,'_':str(int(time.time()*1000))}
+                  try:
+                    r=S.get(api,params=p,timeout=25)
+                    if r.status_code!=200: break
+                    t=r.text.strip(); d=r.json() if t.startswith('{') else json.loads(re.search(r'\((\{.*\})\)',t,re.S).group(1))
+                    rows=d.get('data') or []
+                    if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or []
+                    if not rows: break
+                    for x in rows:
+                      blob=json.dumps(x,ensure_ascii=False).lower()
+                      if any(k.lower() in blob for k in kws):
+                        ic=x.get('infoCode') or x.get('info_code')
+                        if ic: found[ic]=x
+                    if len(rows)<100: break
+                  except Exception as e:
+                    print('ERR',begin,end,qtype,repr(code),page,e); break
+          print('FOUND_COUNT',len(found))
+          for ic,x in found.items():
+            print('FOUND',ic,json.dumps(x,ensure_ascii=False))
+            url=f'https://pdf.dfcfw.com/pdf/H3_{ic}_1.pdf'
+            try:
+              rr=S.get(url,timeout=45)
+              print('PDF',rr.status_code,len(rr.content),rr.headers.get('content-type'),url,rr.content[:5])
+            except Exception as e: print('PDFERR',e)
+
+          for url in ['https://reportify.cn/reports/1105126013194604544','https://www.fxbaogao.com/detail/5488726']:
+            try:
+              r=S.get(url,timeout=30)
+              print('PAGE',url,r.status_code,len(r.content),r.url)
+              html=r.text
+              for ap in sorted(set(re.findall(r'AP\d{15,24}',html))): print('PAGE_AP',url,ap)
+              for pdf in sorted(set(re.findall(r'https?://[^\"\'<> ]+\.pdf(?:\?[^\"\'<> ]*)?',html,re.I))): print('PAGE_PDF',url,pdf[:500])
+              for needle in ['sourceUrl','originalUrl','pdfUrl','downloadUrl','fileUrl','reportUrl','cmbi']:
+                i=html.lower().find(needle.lower())
+                if i>=0: print('CONTEXT',url,needle,html[max(0,i-500):i+1200].replace('\n',' ')[:1700])
+            except Exception as e: print('PAGEERR',url,e)
+          PY
