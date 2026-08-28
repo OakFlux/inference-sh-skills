@@ -1,0 +1,68 @@
+name: Temporary New Hope Service prospectus diagnostics
+
+on:
+  push:
+    branches:
+      - tmp-newhope-prospectus-diag-20260828
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect HKEX IPO filings
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re, requests
+
+          api='https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0','Accept-Language':'zh-HK,zh;q=0.9,en;q=0.8','Referer':'https://www1.hkexnews.hk/search/titlesearch.xhtml'})
+
+          def rows(payload):
+              obj=payload
+              if isinstance(obj,dict) and isinstance(obj.get('result'),str): obj=json.loads(obj['result'])
+              elif isinstance(obj,dict) and 'result' in obj: obj=obj['result']
+              if isinstance(obj,list): return obj
+              if isinstance(obj,dict):
+                  for k in ('data','records','items','result'):
+                      if isinstance(obj.get(k),list): return obj[k]
+              return []
+
+          tests=[]
+          for lang in ('zh','EN'):
+            for category in ('0','1'):
+              for t1 in ('40000','-2',''):
+                for start,end in [('20210508','20210515'),('20210516','20210525'),('20210401','20210531')]:
+                  tests.append((lang,category,t1,start,end))
+          seen=set()
+          for lang,category,t1,start,end in tests:
+              p={'sortDir':'0','sortByOptions':'DateTime','category':category,'market':'SEHK','stockId':'-1','documentType':'-1','fromDate':start,'toDate':end,'title':'','searchType':'1','t1code':t1,'t2Gcode':'-2','t2code':'-1','rowRange':'5000','lang':lang}
+              r=s.get(api,params=p,headers={'Accept':'application/json'},timeout=90)
+              print('QUERY',lang,category,repr(t1),start,end,r.status_code,len(r.content))
+              r.raise_for_status()
+              rr=rows(r.json())
+              print('ROWS',len(rr))
+              for x in rr:
+                  title=str(x.get('TITLE') or x.get('title') or '')
+                  name=str(x.get('STOCK_NAME') or x.get('stockName') or '')
+                  code=str(x.get('STOCK_CODE') or x.get('stockCode') or '')
+                  link=str(x.get('FILE_LINK') or x.get('fileLink') or '')
+                  txt=(title+' '+name).upper().replace(' ','')
+                  good=(
+                      '新希望服務' in title or '新希望服务' in title or
+                      '新希望服務' in name or '新希望服务' in name or
+                      'NEWHOPESERVICE' in txt or
+                      ('全球發售' in title) or ('GLOBALOFFERING' in txt) or ('PROSPECTUS' in txt)
+                  )
+                  if good:
+                      key=(title,name,code,link)
+                      if key in seen: continue
+                      seen.add(key)
+                      print('MATCH',json.dumps(x,ensure_ascii=False))
+          print('TOTAL_MATCHES',len(seen))
+          PY
