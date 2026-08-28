@@ -1,0 +1,45 @@
+name: Temporary Vipshop public report path test
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-public-path-test.yml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Probe public paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          urls=(
+            'https://public.fxbaogao.com/report/2022/09/14/3376925.pdf'
+            'https://public.fxbaogao.com/report-cn/2022/09/14/3376925.pdf'
+            'https://public.fxbaogao.com/report-en/2022/09/14/3376925.pdf'
+            'https://public.fxbaogao.com/report-image/2022/09/14/3376925-1.png'
+            'https://public.fxbaogao.com/report-image/2022/09/14/3376925-2.png'
+            'https://public.fxbaogao.com/report-image/2022/09/14/3376925-3.png'
+            'https://public.fxbaogao.com/report-image/2022/09/14/3376925-21.png'
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 3 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/view?id=3376925' -D "diagnostic/${i}.headers" "$url" -o "diagnostic/${i}.bin" || true
+            { echo "$url"; file "diagnostic/${i}.bin"; wc -c "diagnostic/${i}.bin"; head -c 20 "diagnostic/${i}.bin" | xxd; } > "diagnostic/${i}.txt"
+          done
+          cat diagnostic/*.txt
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-public-path-test
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
