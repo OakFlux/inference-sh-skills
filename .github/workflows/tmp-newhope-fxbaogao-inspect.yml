@@ -1,0 +1,61 @@
+name: Temporary New Hope Service Fxbaogao inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-newhope-service-reports-20260828
+    paths:
+      - .github/workflows/tmp-newhope-fxbaogao-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect view page and rendered images
+        shell: bash
+        run: |
+          set -u
+          mkdir -p diagnostic/pages
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+            -A "$UA" -e 'https://www.fxbaogao.com/detail/5488726' \
+            -D diagnostic/view.headers 'https://www.fxbaogao.com/view?id=5488726' -o diagnostic/view.html || true
+          printf 'page\tplain_status\tplain_size\tplain_type\twebp_status\twebp_size\twebp_type\n' > diagnostic/image_status.tsv
+          for i in $(seq 1 30); do
+            plain="diagnostic/pages/plain_${i}.bin"
+            webp="diagnostic/pages/webp_${i}.bin"
+            s1=$(curl -L --compressed --connect-timeout 20 --max-time 60 -A "$UA" -e 'https://www.fxbaogao.com/view?id=5488726' -sS -w '%{http_code}' -o "$plain" "https://public.fxbaogao.com/report-image/2026/06/15/5488726-${i}.png" || true)
+            s2=$(curl -L --compressed --connect-timeout 20 --max-time 60 -A "$UA" -e 'https://www.fxbaogao.com/view?id=5488726' -sS -w '%{http_code}' -o "$webp" "https://public.fxbaogao.com/report-image/2026/06/15/5488726-${i}.png?x-oss-process=image/format,webp" || true)
+            z1=$(wc -c < "$plain" 2>/dev/null || echo 0); z2=$(wc -c < "$webp" 2>/dev/null || echo 0)
+            t1=$(file -b --mime-type "$plain" 2>/dev/null || true); t2=$(file -b --mime-type "$webp" 2>/dev/null || true)
+            printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$s1" "$z1" "$t1" "$s2" "$z2" "$t2" >> diagnostic/image_status.tsv
+            if [ "$s1" != 200 ]; then rm -f "$plain"; fi
+            if [ "$s2" != 200 ]; then rm -f "$webp"; fi
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,html
+          p=Path('diagnostic/view.html')
+          if p.exists():
+              t=p.read_text(errors='replace')
+              print('VIEW SIZE',len(t))
+              print(t[:10000])
+              links=[]
+              for pat in [r'https?://[^\s"\'<>]+',r'(?:src|href)=["\']?([^"\' >]+)']:
+                  for m in re.finditer(pat,t,re.I):
+                      u=m.group(1) if m.lastindex else m.group(0)
+                      u=html.unescape(u)
+                      if any(x in u.lower() for x in ['5488726','pdf','report-image','download','api']): links.append(u)
+              Path('diagnostic/view_links.txt').write_text('\n'.join(dict.fromkeys(links)),encoding='utf-8')
+          print('\nIMAGE STATUS')
+          print(Path('diagnostic/image_status.tsv').read_text())
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: newhope-fxbaogao-diagnostic
+          path: diagnostic/
+          retention-days: 1
+          if-no-files-found: error
