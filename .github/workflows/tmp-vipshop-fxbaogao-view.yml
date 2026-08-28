@@ -1,0 +1,88 @@
+name: Temporary Vipshop Fxbaogao full-view inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-vipshop-reports-20260828
+    paths:
+      - .github/workflows/tmp-vipshop-fxbaogao-view.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch report detail, view page, and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/scripts
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 -A "$UA" \
+            -e 'https://www.fxbaogao.com/detail/3376925' -D diagnostic/view.headers \
+            'https://www.fxbaogao.com/view?id=3376925' -o diagnostic/view.html || true
+          curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 -A "$UA" \
+            -D diagnostic/detail.headers 'https://www.fxbaogao.com/detail/3376925' -o diagnostic/detail.html || true
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,urllib.parse,subprocess,json
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          all_urls=[]
+          for p in [Path('diagnostic/view.html'),Path('diagnostic/detail.html')]:
+              text=p.read_text(errors='replace')
+              print('\n===',p,p.stat().st_size,'===')
+              print(text[:20000])
+              for pat in [r'(?:src|href)=["\']([^"\']+)',r'https?://[^\s"\'<>]+']:
+                  for m in re.finditer(pat,text,re.I):
+                      u=m.group(1) if m.lastindex else m.group(0)
+                      u=urllib.parse.urljoin('https://www.fxbaogao.com/',u.replace('&amp;','&').replace('\\/','/'))
+                      if u not in all_urls: all_urls.append(u)
+          Path('diagnostic/urls.txt').write_text('\n'.join(all_urls),encoding='utf-8')
+          scripts=[u for u in all_urls if re.search(r'\.js(?:\?|$)',u,re.I)]
+          for i,u in enumerate(scripts[:100]):
+              out=Path(f'diagnostic/scripts/{i:03d}.js')
+              subprocess.run(['curl','-L','--compressed','--retry','3','--retry-all-errors','--connect-timeout','20','--max-time','120','-A',UA,u,'-o',str(out)],check=False)
+              Path(str(out)+'.url.txt').write_text(u,encoding='utf-8')
+          hits=[]
+          pats=re.compile(r'3376925|view\?|preview|download|\.pdf|pdfUrl|fileUrl|file_url|pageUrl|page_url|image|imgUrl|img_url|reportId|docId|searchReportData|mofoun|oss|cos|cdn',re.I)
+          for p in Path('diagnostic/scripts').glob('*.js'):
+              text=p.read_text(errors='replace')
+              # save interesting URL-like strings and nearby snippets
+              for m in pats.finditer(text):
+                  a=max(0,m.start()-700); b=min(len(text),m.end()+1500)
+                  hits.append(f'--- {p} @{m.start()} ---\n{text[a:b]}')
+          Path('diagnostic/script_hits.txt').write_text('\n\n'.join(hits[:1000]),encoding='utf-8')
+          print('\nURLS')
+          print('\n'.join(all_urls))
+          print('\nHITS',len(hits))
+          print('\n\n'.join(hits[:100]))
+          PY
+      - name: Try public page APIs observed on common patterns
+        shell: bash
+        run: |
+          set -u
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          endpoints=(
+            'https://api.fxbaogao.com/mofoun/report/getReportDetailNoAuth?docId=3376925'
+            'https://api.fxbaogao.com/mofoun/report/reportDetailNoAuth?docId=3376925'
+            'https://api.fxbaogao.com/mofoun/report/searchReportData/getDetailNoAuth?docId=3376925'
+            'https://api.fxbaogao.com/mofoun/report/getReportDetail?docId=3376925'
+            'https://api.fxbaogao.com/mofoun/report/getReportPreview?docId=3376925'
+            'https://api.fxbaogao.com/mofoun/report/getReportPageNoAuth?docId=3376925'
+          )
+          i=0
+          for url in "${endpoints[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 3 --retry-all-errors --connect-timeout 20 --max-time 120 -A "$UA" \
+              -e 'https://www.fxbaogao.com/view?id=3376925' -D "diagnostic/api_${i}.headers" "$url" -o "diagnostic/api_${i}.bin" || true
+            { echo "$url"; file "diagnostic/api_${i}.bin"; wc -c "diagnostic/api_${i}.bin"; head -c 1000 "diagnostic/api_${i}.bin"; } > "diagnostic/api_${i}.txt"
+          done
+          cat diagnostic/api_*.txt || true
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: vipshop-fxbaogao-full-view
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
