@@ -1,0 +1,72 @@
+name: Temporary Meikang IIVD internal search
+
+on:
+  push:
+    branches:
+      - 'tmp/meikang-iivd-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Query IIVD internal search and candidate article IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics2
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for q in \
+            '医学实验室的全天候服务商' \
+            '美康生物 医学实验室' \
+            '美康生物 马帅' \
+            '美康生物 深度报告'; do
+            key=$(printf '%s' "$q" | sha256sum | cut -c1-10)
+            curl --http1.1 -L --silent --show-error --retry 3 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+              --data-urlencode "srchtxt=$q" \
+              --data 'searchsubmit=yes' \
+              'https://www.iivd.net/search.php?searchsubmit=yes' \
+              -o "diagnostics2/search_${key}.html" || true
+          done
+          # Crawl likely portal article IDs around the company's IPO period and find exact phrases.
+          seq 4800 5450 | xargs -P 20 -I{} bash -c '
+            curl --http1.1 -L --silent --show-error --connect-timeout 5 --max-time 20 \
+              --user-agent "Mozilla/5.0" --header "Accept-Encoding: identity" \
+              "https://www.iivd.net/article-{}-1.html" -o "diagnostics2/article_{}.html" || true
+          '
+          grep -RIlE '医学实验室的全天候服务商|美康生物（300439.SZ）|美康生物.*全天候|马帅' diagnostics2/article_*.html \
+            > diagnostics2/matching_articles.txt || true
+          python - <<'PY'
+          import html,re,urllib.parse
+          from pathlib import Path
+          rows=[]
+          for p in Path('diagnostics2').glob('*.html'):
+              text=p.read_text(encoding='utf-8',errors='ignore')
+              if not re.search(r'医学实验室的全天候服务商|美康生物|马帅',text,re.I):
+                  if not p.name.startswith('search_'):
+                      p.unlink(missing_ok=True)
+                      continue
+              title=''
+              m=re.search(r'<title>(.*?)</title>',text,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>','',html.unescape(m.group(1))).strip()
+              urls=[]
+              for u in re.findall(r'https?://[^"\'<> ]+',html.unescape(text.replace('\\/','/')),re.I):
+                  u=urllib.parse.unquote(u).rstrip('),;]')
+                  if 'iivd.net/article-' in u or '.pdf' in u.lower() or 'attachment' in u.lower():
+                      urls.append(u)
+              rows.append({'file':p.name,'title':title,'urls':list(dict.fromkeys(urls))[:100]})
+          import json
+          Path('diagnostics2/summary.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: meikang-iivd-internal-search
+          path: diagnostics2/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
