@@ -1,0 +1,87 @@
+name: Temporary Guosheng full-page Xinri scan
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-scan-all-pages-xinri.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Scan official public report pages and fetch matching details
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import json, math, requests, threading, time
+
+          EP='https://research.gszq.com/graphql'
+          HEADERS={
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Origin':'https://research.gszq.com',
+              'Referer':'https://research.gszq.com/research',
+              'Content-Type':'application/json',
+              'Accept':'application/json',
+          }
+          local=threading.local()
+          def sess():
+              if not hasattr(local,'s'):
+                  local.s=requests.Session(); local.s.headers.update(HEADERS)
+              return local.s
+
+          def query_page(page):
+              q=f'''query {{ reports(menu_id: "all", limit: 100, page: {page}) {{ is_end total reports {{ rid type title authors catalog updated_time pic can_view }} }} }}'''
+              last=None
+              for attempt in range(1,6):
+                  try:
+                      r=sess().post(EP,json={'query':q},timeout=60)
+                      if r.status_code==200:
+                          obj=r.json()
+                          data=((obj.get('data') or {}).get('reports') or {})
+                          if isinstance(data.get('reports'),list): return page,data
+                      last=f'HTTP {r.status_code}: {r.text[:500]}'
+                  except Exception as e: last=repr(e)
+                  time.sleep(attempt)
+              raise RuntimeError(f'page {page}: {last}')
+
+          page1,data=query_page(1)
+          total=int(data.get('total') or 0)
+          total_pages=math.ceil(total/100)
+          print('TOTAL',total,'PAGES',total_pages)
+          targets=['新日股份','603787','电动两轮高景气','渠道+产品助力公司加速扩张']
+          hits=[]
+          # Scan all pages concurrently. Official endpoint is public and read-only.
+          with ThreadPoolExecutor(max_workers=16) as ex:
+              fs=[ex.submit(query_page,p) for p in range(1,total_pages+1)]
+              done=0
+              for f in as_completed(fs):
+                  page,d=f.result(); done+=1
+                  reports=d.get('reports') or []
+                  if done%25==0: print('PROGRESS',done,'/',total_pages)
+                  for report in reports:
+                      blob=' '.join(str(report.get(k) or '') for k in ['title','type','catalog','authors'])
+                      if any(t in blob for t in targets):
+                          print('HIT_PAGE',page,json.dumps(report,ensure_ascii=False))
+                          hits.append(report)
+
+          # Fetch full metadata for every hit.
+          for report in hits:
+              rid=str(report.get('rid') or '')
+              if not rid: continue
+              rid_escaped=rid.replace('"','\\"')
+              q=f'''query {{ report(rid: "{rid_escaped}") {{ rid type title brief authors custom catalog updated_time pic report_url can_view can_download menus total_views size author_ids richtext }} }}'''
+              r=requests.post(EP,json={'query':q},headers=HEADERS,timeout=90)
+              print('\nDETAIL_HTTP',rid,r.status_code,len(r.content),r.headers.get('content-type'))
+              print(r.text[:300000])
+          print('HIT_COUNT',len(hits))
+          PY
