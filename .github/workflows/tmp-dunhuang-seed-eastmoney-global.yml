@@ -1,0 +1,120 @@
+name: Temporary Dunhuang Seed Eastmoney global date scan
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-eastmoney-global-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Scan exact publication dates in the global report index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/scan.py <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess, tempfile, urllib.parse
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          API='https://reportapi.eastmoney.com/report/list'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          dates=[
+              '2017-09-25','2017-01-05',
+              '2015-03-20','2014-12-15','2014-08-22','2014-04-22','2014-03-31','2014-03-04',
+              '2013-08-23','2013-04-27','2012-08-31','2012-08-30','2012-07-24','2012-05-03',
+              '2012-03-31','2012-03-30','2012-01-31',
+              '2011-12-23','2011-12-22','2011-11-08','2011-11-07','2011-10-27','2011-09-26',
+              '2011-08-25','2011-08-24','2011-08-23','2011-08-22','2011-08-04','2011-08-03','2011-08-02','2011-08-01',
+              '2011-04-20','2011-04-18','2011-02-17','2011-02-16',
+              '2010-09-03','2010-09-01','2010-08-30','2010-04-27','2010-01-28',
+              '2009-11-02','2009-09-22','2009-08-06','2009-08-04','2009-06-18','2009-05-04','2009-04-29','2009-01-22',
+              '2008-12-22','2008-10-29','2008-08-25'
+          ]
+
+          def get(date: str, page: int) -> dict:
+              params={
+                  'pageNo':str(page),'pageSize':'100','code':'*','industryCode':'*','industry':'*',
+                  'rating':'*','ratingchange':'*','beginTime':date,'endTime':date,
+                  'fields':'','qType':'0'
+              }
+              url=API+'?'+urllib.parse.urlencode(params)
+              fd,name=tempfile.mkstemp(prefix='dh_',suffix='.json'); os.close(fd)
+              path=Path(name)
+              try:
+                  proc=subprocess.run([
+                      'curl','--http1.1','-L','--fail','--silent','--show-error',
+                      '--retry','5','--retry-all-errors','--retry-delay','1',
+                      '--connect-timeout','20','--max-time','120',
+                      '--user-agent',UA,'--referer','https://data.eastmoney.com/report/',
+                      '--header','Accept-Encoding: identity','--output',str(path),url
+                  ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if proc.returncode:
+                      raise RuntimeError(proc.stderr[-1000:])
+                  text=path.read_text(encoding='utf-8',errors='ignore').strip()
+                  if text and text[0] not in '[{' and '(' in text and text.endswith(')'):
+                      text=text[text.find('(')+1:text.rfind(')')]
+                  return json.loads(text)
+              finally:
+                  path.unlink(missing_ok=True)
+
+          objects={}
+          jobs=[]
+          for date in dates:
+              obj=get(date,1); objects[(date,1)]=obj
+              rows=obj.get('data') or obj.get('result',{}).get('data') or []
+              total=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+              print('DATE',date,'HITS',obj.get('hits'),'ROWS',len(rows),'PAGES',total)
+              for p in range(2,total+1): jobs.append((date,p))
+
+          with ThreadPoolExecutor(max_workers=10) as pool:
+              future_map={pool.submit(get,d,p):(d,p) for d,p in jobs}
+              for fut in as_completed(future_map):
+                  d,p=future_map[fut]
+                  try: objects[(d,p)]=fut.result()
+                  except Exception as exc: print('ERROR',d,p,repr(exc))
+
+          matches=[]; seen=set()
+          for (date,page),obj in sorted(objects.items()):
+              rows=obj.get('data') or obj.get('result',{}).get('data') or []
+              for row in rows:
+                  code=str(row.get('stockCode') or row.get('code') or '')
+                  name=str(row.get('stockName') or row.get('securityName') or '')
+                  title=str(row.get('title') or row.get('reportTitle') or '')
+                  if code=='600354' or name=='敦煌种业' or '敦煌种业' in title:
+                      info=str(row.get('infoCode') or row.get('infocode') or '')
+                      key=info or json.dumps(row,ensure_ascii=False,sort_keys=True)
+                      if key in seen: continue
+                      seen.add(key)
+                      rec=dict(row); rec['_scanDate']=date; rec['_scanPage']=page
+                      matches.append(rec)
+
+          matches.sort(key=lambda r:str(r.get('publishDate') or r.get('publishTime') or ''),reverse=True)
+          Path('diagnostics/matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCH_COUNT',len(matches))
+          for row in matches:
+              print(json.dumps({
+                  'date':row.get('publishDate') or row.get('publishTime'),
+                  'broker':row.get('orgSName') or row.get('orgName'),
+                  'title':row.get('title') or row.get('reportTitle'),
+                  'stockName':row.get('stockName'),'stockCode':row.get('stockCode'),
+                  'infoCode':row.get('infoCode') or row.get('infocode')
+              },ensure_ascii=False))
+          PY
+          python /tmp/scan.py
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-eastmoney-global-scan
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
