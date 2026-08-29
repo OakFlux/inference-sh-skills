@@ -1,0 +1,56 @@
+name: Temporary Hualan Vaccine Sina discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-sina-discovery.yml
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect Sina report listings and search results
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import re, urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'})
+          urls=[
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?t1=2&symbol=sz301207',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=sz301207&t1=2',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?t1=5&title=%BB%AA%C0%BC%D2%DF%C3%E7',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?t1=5&title=%BB%AA%C0%BC',
+          ]
+          seen=set()
+          for url in urls:
+            print('\n===',url,'===')
+            r=s.get(url,timeout=90)
+            print('HTTP',r.status_code,'bytes',len(r.content),'type',r.headers.get('content-type'),'final',r.url)
+            r.encoding='gb18030'
+            soup=BeautifulSoup(r.text,'lxml')
+            print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+            for a in soup.find_all('a',href=True):
+              href=urllib.parse.urljoin(r.url,a['href'])
+              label=a.get_text(' ',strip=True)
+              if 'vReport_Show' in href:
+                m=re.search(r'/rptid/(\d+)/',href)
+                key=(m.group(1) if m else href,label)
+                if key in seen: continue
+                seen.add(key)
+                parent=a.parent.get_text(' ',strip=True) if a.parent else ''
+                print('REPORT',m.group(1) if m else '',label,href,'PARENT',parent[:1000])
+            for needle in ['华兰疫苗','301207','rptid']:
+              print('COUNT',needle,r.text.count(needle))
+          PY
