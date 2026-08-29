@@ -1,0 +1,67 @@
+name: Temporary Xinri Sdyanbao report probe
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-sdyanbao-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Search public metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Origin':'https://www.sdyanbao.com',
+              'Referer':'https://www.sdyanbao.com/',
+              'Content-Type':'application/json;charset=UTF-8',
+              'Accept':'application/json,text/plain,*/*',
+          })
+          queries=['新日股份','603787','江苏新日电动车','新日电动车']
+          seen=set()
+          for q in queries:
+              payload={
+                  'device':1,'hideTrader':0,'onlyTitle':0,'order':0,
+                  'page':1,'pageSize':100,'keyword':q,'pageCount':0,
+                  'dateRange':0,'startTime':'','endTime':'','typeIds':[], 'industryIds':[]
+              }
+              r=s.post('https://api.sdyanbao.com/api/file/search',json=payload,timeout=90)
+              print('\nQUERY',q,'HTTP',r.status_code,'LEN',len(r.content))
+              r.raise_for_status()
+              obj=r.json()
+              files=((obj.get('data') or {}).get('files') or [])
+              print('COUNT',len(files),'TOTAL',(obj.get('data') or {}).get('total'))
+              for f in files:
+                  fid=f.get('id')
+                  if fid in seen: continue
+                  seen.add(fid)
+                  name=str(f.get('name') or '')
+                  stock=(f.get('stock') or {})
+                  content=str(f.get('content') or '')[:1000]
+                  blob=' '.join([name,str(stock.get('name') or ''),str(stock.get('code') or ''),content])
+                  if any(k in blob for k in ['新日股份','603787','江苏新日电动车']):
+                      print('MATCH',json.dumps({
+                          'id':fid,'name':name,'date':f.get('time_text'),
+                          'pages':f.get('page_count'),'size':f.get('file_size'),
+                          'type':(f.get('type') or {}).get('name'),
+                          'organization':(f.get('organization') or {}).get('name'),
+                          'stock':stock,'uuid':f.get('data_source_uuid'),
+                          'data_source':f.get('data_source'),'original_id':f.get('original_id'),
+                          'page_url':f.get('page_url'),'share_url':f.get('share_url'),
+                          'summary':f.get('summary'),
+                      },ensure_ascii=False))
+          PY
