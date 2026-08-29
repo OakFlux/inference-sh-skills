@@ -1,0 +1,50 @@
+name: Temporary Xinri Eastmoney title lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-eastmoney-title-lookup.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Search global report catalog by dates and title
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, requests
+          from datetime import date, timedelta
+
+          api='https://reportapi.eastmoney.com/report/list'
+          headers={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/'}
+          days=[(date(2022,10,25)+timedelta(days=i)).isoformat() for i in range(-3,5)]
+          keys=['新日股份','603787','修炼内功','新日正东升','Q3业绩靓丽']
+          for d in days:
+              for q in ('0','1','2'):
+                  first_params={
+                      'pageNo':'1','pageSize':'100','code':'','industryCode':'*','industry':'*',
+                      'rating':'*','ratingChange':'*','beginTime':d,'endTime':d,'fields':'',
+                      'qType':q,'orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'
+                  }
+                  r=requests.get(api,params=first_params,headers=headers,timeout=60)
+                  r.raise_for_status(); obj=r.json(); rows=obj.get('data') or []
+                  pages=max(1,int(obj.get('TotalPage') or math.ceil(int(obj.get('hits') or 0)/100) or 1))
+                  print('DAY',d,'Q',q,'HITS',obj.get('hits'),'PAGES',pages)
+                  for page in range(1,min(pages,10)+1):
+                      if page>1:
+                          p=dict(first_params); p.update({'pageNo':str(page),'p':str(page),'pageNum':str(page),'pageNumber':str(page)})
+                          rr=requests.get(api,params=p,headers=headers,timeout=60); rr.raise_for_status(); rows=rr.json().get('data') or []
+                      for row in rows:
+                          blob=' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode','orgSName','researcher'])
+                          if any(k in blob for k in keys):
+                              print('MATCH',json.dumps(row,ensure_ascii=False))
+          PY
