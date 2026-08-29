@@ -1,0 +1,239 @@
+name: Temporary verified Daan Gene report package
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-auto-package.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout temporary branch
+        uses: actions/checkout@v4
+        with:
+          ref: tmp/download-daan-gene-reports-20260829
+          fetch-depth: 0
+
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Select, download, and verify public broker reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf tmp_artifacts/daan_gene work_daan
+          mkdir -p tmp_artifacts/daan_gene work_daan/downloads work_daan/previews
+
+          python3 - <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import re
+          import subprocess
+          import urllib.parse
+          import urllib.request
+
+          ROOT = pathlib.Path('work_daan')
+          OUT = pathlib.Path('tmp_artifacts/daan_gene')
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          def query_catalog():
+              base = 'https://reportapi.eastmoney.com/report/list'
+              found = {}
+              variants = [('0','002030'), ('0','达安基因'), ('1','达安基因')]
+              for qtype, code in variants:
+                  for page in range(1, 11):
+                      params = {
+                          'industryCode':'*','pageSize':'100','industry':'*','rating':'*',
+                          'ratingChange':'*','beginTime':'2010-01-01','endTime':'2030-12-31',
+                          'pageNo':str(page),'fields':'','qType':qtype,'orgCode':'','code':code,
+                          'rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page),
+                      }
+                      url = base + '?' + urllib.parse.urlencode(params)
+                      req = urllib.request.Request(url, headers={
+                          'User-Agent': UA,
+                          'Referer': 'https://data.eastmoney.com/report/',
+                      })
+                      try:
+                          raw = urllib.request.urlopen(req, timeout=90).read().decode('utf-8','replace')
+                      except Exception:
+                          break
+                      text = raw.strip()
+                      if text.startswith('datatable(') and text.endswith(')'):
+                          text = text[len('datatable('):-1]
+                      try:
+                          obj = json.loads(text)
+                      except Exception:
+                          break
+                      data = obj.get('data') or []
+                      for row in data:
+                          title = row.get('title') or ''
+                          if row.get('stockCode') == '002030' or row.get('stockName') == '达安基因' or '达安基因' in title:
+                              key = row.get('infoCode') or json.dumps(row, sort_keys=True, ensure_ascii=False)
+                              found[key] = row
+                      if len(data) < 100:
+                          break
+              return list(found.values())
+
+          def date_key(row):
+              value = str(row.get('publishDate') or '')[:10]
+              try:
+                  return datetime.datetime.strptime(value, '%Y-%m-%d')
+              except Exception:
+                  return datetime.datetime(1900,1,1)
+
+          def deep_score(row):
+              title = row.get('title') or ''
+              report_type = str(row.get('reportType') or '')
+              pages = int(row.get('attachPages') or 0)
+              score = 0
+              if any(k in title for k in ['深度','首次覆盖','首次评级','公司研究','龙头','价值重估']):
+                  score += 100
+              if any(k in report_type for k in ['深度','首次覆盖','公司研究']):
+                  score += 70
+              score += min(pages, 60)
+              score += max(0, date_key(row).year - 2015) * 2
+              return score
+
+          def safe_name(text):
+              text = re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', str(text)).strip(' ._')
+              return text[:60] or 'report'
+
+          rows = query_catalog()
+          if not rows:
+              raise SystemExit('No Daan Gene reports found')
+
+          # Prefer genuine long-form reports, then broaden only if needed.
+          primary = [r for r in rows if int(r.get('attachPages') or 0) >= 15]
+          secondary = [r for r in rows if 10 <= int(r.get('attachPages') or 0) < 15]
+          primary.sort(key=lambda r: (deep_score(r), date_key(r)), reverse=True)
+          secondary.sort(key=lambda r: (deep_score(r), date_key(r)), reverse=True)
+          candidates = primary + secondary
+
+          selected = []
+          used_orgs = set()
+          attempted = set()
+
+          def try_candidate(row, require_new_org):
+              info = row.get('infoCode') or ''
+              if not info or info in attempted:
+                  return False
+              attempted.add(info)
+              org = row.get('orgSName') or row.get('orgName') or 'Unknown'
+              if require_new_org and org in used_orgs:
+                  return False
+              url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              tmp = ROOT / 'downloads' / f'{info}.pdf'
+              cmd = [
+                  'curl','-L','--fail','--retry','6','--retry-delay','2','--retry-all-errors',
+                  '--connect-timeout','30','--max-time','600','--compressed',
+                  '-A',UA,'-e','https://data.eastmoney.com/report/',
+                  '-H','Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  url,'-o',str(tmp),
+              ]
+              try:
+                  subprocess.run(cmd, check=True)
+              except Exception:
+                  tmp.unlink(missing_ok=True)
+                  return False
+              if not tmp.exists() or tmp.stat().st_size < 20000 or tmp.read_bytes()[:4] != b'%PDF':
+                  tmp.unlink(missing_ok=True)
+                  return False
+              try:
+                  out = subprocess.check_output(['pdfinfo', str(tmp)], text=True, errors='replace')
+                  match = re.search(r'^Pages:\s*(\d+)', out, re.M)
+                  pages = int(match.group(1)) if match else 0
+              except Exception:
+                  tmp.unlink(missing_ok=True)
+                  return False
+              if pages < 10:
+                  tmp.unlink(missing_ok=True)
+                  return False
+              text_path = ROOT / 'previews' / f'{info}.txt'
+              subprocess.run(['pdftotext','-f','1','-l',str(min(4,pages)),str(tmp),str(text_path)], check=False)
+              first_text = text_path.read_text(errors='replace') if text_path.exists() else ''
+              if '达安基因' not in first_text and '002030' not in first_text:
+                  tmp.unlink(missing_ok=True)
+                  return False
+              date = str(row.get('publishDate') or '')[:10].replace('-','') or 'unknown'
+              title = row.get('title') or '公司研究报告'
+              index = len(selected) + 1
+              filename = f'{index:02d}_{safe_name(org)}_达安基因_{safe_name(title)}_{date}_{pages}页.pdf'
+              dest = OUT / filename
+              tmp.replace(dest)
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','100',str(dest),str(ROOT/'previews'/f'{index:02d}_first')], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              subprocess.run(['pdftoppm','-f',str(pages),'-singlefile','-png','-r','100',str(dest),str(ROOT/'previews'/f'{index:02d}_last')], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              selected.append({
+                  'index': index,
+                  'publishDate': str(row.get('publishDate') or '')[:10],
+                  'broker': org,
+                  'pages': pages,
+                  'reportType': row.get('reportType') or '',
+                  'rating': row.get('ratingName') or '',
+                  'infoCode': info,
+                  'title': title,
+                  'pdf_url': url,
+                  'filename': filename,
+                  'size_bytes': dest.stat().st_size,
+              })
+              used_orgs.add(org)
+              return True
+
+          # First pass: distinct brokers.
+          for row in candidates:
+              if len(selected) >= 3:
+                  break
+              try_candidate(row, require_new_org=True)
+          # Second pass: allow the same broker if necessary.
+          if len(selected) < 3:
+              for row in candidates:
+                  if len(selected) >= 3:
+                      break
+                  try_candidate(row, require_new_org=False)
+
+          if len(selected) < 2:
+              raise SystemExit(f'Only {len(selected)} verified reports found')
+
+          manifest = {
+              'company': '达安基因',
+              'stock_code': '002030.SZ',
+              'count': len(selected),
+              'reports': selected,
+              'verification': [
+                  'PDF file signature', 'actual page count', 'company text on first pages',
+                  'first-page rendering', 'last-page rendering', 'ZIP integrity'
+              ],
+          }
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          with open(OUT / '报告清单与核验说明.txt','w',encoding='utf-8') as f:
+              f.write(f'达安基因（002030.SZ）券商研究报告，共{len(selected)}份\n\n')
+              for r in selected:
+                  f.write(f"{r['index']}. {r['broker']}，{r['publishDate']}，{r['pages']}页\n")
+                  f.write(f"   《{r['title']}》\n")
+                  f.write(f"   类型：{r['reportType'] or '公司研究'}；评级：{r['rating'] or '未标注'}。\n\n")
+              f.write('所有文件均为原始、完整、可检索PDF。已检查PDF文件结构、实际页数、公司文字，并完成首页与末页渲染。\n')
+              f.write('仅供研究资料整理，不构成投资建议。\n')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+          (cd tmp_artifacts/daan_gene && sha256sum ./*.pdf > SHA256SUMS.txt)
+          (cd tmp_artifacts/daan_gene && zip -q -9 Daan_Gene_Broker_Deep_Reports_Verified.zip ./*.pdf ./manifest.json ./报告清单与核验说明.txt ./SHA256SUMS.txt)
+          unzip -t tmp_artifacts/daan_gene/Daan_Gene_Broker_Deep_Reports_Verified.zip
+          ls -lh tmp_artifacts/daan_gene
+
+      - name: Commit generated package to temporary branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'OakFlux'
+          git config user.email '206205057+OakFlux@users.noreply.github.com'
+          git add -- tmp_artifacts/daan_gene
+          git commit -m 'chore: publish verified Daan Gene broker reports'
+          git push origin HEAD:tmp/download-daan-gene-reports-20260829
