@@ -1,0 +1,106 @@
+name: Temporary Daan Gene 9F report API discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-9f-api-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Query public report APIs and inspect payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/api9f.py <<'PY'
+          from __future__ import annotations
+          import json, re, subprocess, urllib.parse
+          from pathlib import Path
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          host='https://api-hq.chongnengjihua.com'
+          referer='https://www.9fzt.com/detail/sz_002030_10_508957738559.html'
+          def fetch(url,path,method='GET',data=None,headers=None):
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','5','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','180','--user-agent',UA,'--referer',referer,'--header','Accept-Encoding: identity','--header','Accept: application/json,text/plain,*/*']
+              if headers:
+                  for h in headers: cmd += ['--header',h]
+              if method=='POST':
+                  cmd += ['-X','POST','--header','Content-Type: application/json','--data',json.dumps(data or {},ensure_ascii=False)]
+              cmd += [url,'-o',str(path)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              raw=path.read_bytes() if path.exists() else b''
+              return {'url':url,'method':method,'rc':p.returncode,'size':len(raw),'head':raw[:800].decode('utf-8','ignore'),'error':p.stderr[-800:]}
+          probes=[]
+          list_urls=[]
+          for page in range(0,5):
+              for page_size in (10,100):
+                  list_urls.append(f'{host}/news/api/1/stock/a/report/list?market=sz&symbol=002030&page={page}&pageSize={page_size}')
+                  list_urls.append(f'{host}/news/api/1/stock/a/report/list?market=SZ&symbol=002030&page={page}&pageSize={page_size}')
+          ids={'508957738559'}
+          for i,u in enumerate(list_urls):
+              path=Path(f'diagnostics/list_{i}.json')
+              meta=fetch(u,path);probes.append(meta)
+              try:
+                  obj=json.loads(path.read_text(encoding='utf-8',errors='ignore'))
+              except Exception:
+                  continue
+              def walk(x):
+                  if isinstance(x,dict):
+                      for k,v in x.items():
+                          if k.lower() in {'id','reportid','report_id','news_id','articleid','article_id','contentid','content_id'} and isinstance(v,(str,int)):
+                              ids.add(str(v))
+                          walk(v)
+                  elif isinstance(x,list):
+                      for v in x:walk(v)
+              walk(obj)
+          detail_templates=[
+              '/news/api/1/stock/a/report/detail?id={id}',
+              '/news/api/1/stock/a/report/detail?reportId={id}',
+              '/news/api/1/stock/a/report/info?id={id}',
+              '/news/api/1/stock/a/report/info?reportId={id}',
+              '/news/api/1/stock/a/report/content?id={id}',
+              '/news/api/1/stock/a/report/get?id={id}',
+              '/news/api/1/stock/a/report/{id}',
+              '/news/api/1/report/detail?id={id}',
+              '/news/api/1/report/info?id={id}',
+              '/news/api/1/report/content?id={id}',
+              '/news/api/1/report/{id}',
+          ]
+          for rid in sorted(ids)[:100]:
+              for ti,tpl in enumerate(detail_templates):
+                  u=host+tpl.format(id=urllib.parse.quote(rid))
+                  p=Path(f'diagnostics/detail_{rid}_{ti}.bin')
+                  probes.append(fetch(u,p))
+          # Probe gateway report/news service too.
+          gw='https://gateway.chongnengjihua.com/rjhy-news/api/1'
+          for rid in sorted(ids)[:100]:
+              for ti,tpl in enumerate([
+                  '/stock/a/report/detail?id={id}','/stock/a/report/info?id={id}',
+                  '/stock/a/report/content?id={id}','/report/detail?id={id}',
+                  '/report/info?id={id}','/report/{id}'
+              ]):
+                  u=gw+tpl.format(id=urllib.parse.quote(rid));p=Path(f'diagnostics/gw_{rid}_{ti}.bin')
+                  probes.append(fetch(u,p))
+          Path('diagnostics/probes.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/ids.txt').write_text('\n'.join(sorted(ids)),encoding='utf-8')
+          print('IDS',sorted(ids))
+          for x in probes:
+              h=x['head'].replace('\n',' ')[:500]
+              if x['size'] and ('404' not in h[:100] or x['size']>1000):
+                  print('PROBE',x['rc'],x['size'],x['url'],h)
+          PY
+          python /tmp/api9f.py
+
+      - name: Upload API discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-9f-api-discovery
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
