@@ -1,0 +1,99 @@
+name: Temporary verified Layn Natural Ingredients deep report package
+
+on:
+  push:
+    branches:
+      - tmp/download-layn-reports-20260829
+    paths:
+      - .github/workflows/tmp-layn-download.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and verify original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local pages="$3"
+            local expected="$4"
+            local stem="$5"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A "$UA" -e 'https://data.eastmoney.com/report/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "output/$dest"
+            test -s "output/$dest"
+            test "$(head -c 4 "output/$dest")" = '%PDF'
+            actual=$(pdfinfo "output/$dest" | awk '/^Pages:/ {print $2}')
+            test "$actual" -eq "$pages"
+            pdftotext -f 1 -l 3 "output/$dest" "previews/${stem}_text.txt"
+            grep -q "$expected" "previews/${stem}_text.txt"
+            pdftoppm -f 1 -singlefile -png -r 110 "output/$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 110 "output/$dest" "previews/${stem}_last" >/dev/null 2>&1
+            test -s "previews/${stem}_first.png"
+            test -s "previews/${stem}_last.png"
+          }
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202412131641289648_1.pdf' \
+            '01_Huaxin_Securities_Layn_Natural_Ingredients_Deep_Report_20241213_38p.pdf' \
+            38 '天然甜味剂龙头' 'huaxin_20241213'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202301051581715173_1.pdf' \
+            '02_Soochow_Securities_Layn_Natural_Ingredients_Deep_Report_20230105_28p.pdf' \
+            28 '减糖潮涌顺势起' 'soochow_20230105'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202204291562294157_1.pdf' \
+            '03_Guotaiyuan_Securities_Layn_Natural_Ingredients_Deep_Report_20220429_34p.pdf' \
+            34 '植提龙头势能强劲' 'guoyuan_20220429'
+
+          cat > output/报告清单与核验说明.txt <<'EOF'
+          莱茵生物（002166.SZ）券商深度报告，共3份
+
+          1. 华鑫证券，2024-12-13，38页
+             《公司深度报告：天然甜味剂龙头，合成生物再拓空间》
+             研究员：孙山山、胡博新、张倩。
+             类型：完整公司深度报告；覆盖天然甜味剂、植物提取、合成生物、产能布局及盈利预测。
+
+          2. 东吴证券，2023-01-05，28页
+             《减糖潮涌顺势起，又踏层峰辟新天》
+             研究员：汤军、王颖洁。
+             类型：完整公司深度报告；系统分析减糖趋势、天然甜味剂、工业大麻及长期成长逻辑。
+
+          3. 国元证券，2022-04-29，34页
+             《隐形冠军深度系列六：植提龙头势能强劲，工业大麻蓄势待发》
+             研究员：徐偲、邓晖。
+             类型：隐形冠军系列公司深度；覆盖植物提取行业、罗汉果/甜菊糖、工业大麻与产能扩张。
+
+          三份均为原始、完整、可检索PDF，不是网页正文、摘要或预览页重制文件。
+          已核验PDF文件头、实际页数、首页标题文字，并成功渲染首页与末页。
+          仅供研究资料整理，不构成投资建议。
+          EOF
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output previews
+
+      - name: Upload verified original reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: layn-natural-ingredients-broker-deep-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
