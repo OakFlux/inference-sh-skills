@@ -1,0 +1,85 @@
+name: Temporary Daan Gene NXNY source inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-nxny-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Inspect report page, scripts and download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          urls=(
+            'https://www.nxny.com/report/view_4461177.html'
+            'https://www.nxny.com/report/view_4461177'
+            'https://r.jina.ai/https://www.nxny.com/report/view_4461177.html'
+            'https://www.nxny.com/search?keyword=%E8%BE%BE%E5%AE%89%E5%9F%BA%E5%9B%A0'
+            'https://www.nxny.com/report/search?keyword=%E8%BE%BE%E5%AE%89%E5%9F%BA%E5%9B%A0'
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            curl --http1.1 -L --silent --show-error --retry 5 --retry-all-errors \
+              --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' "$url" -o "diagnostics/page_${i}.html" || true
+            i=$((i+1))
+          done
+          python - <<'PY'
+          import html,json,re,subprocess,urllib.parse
+          from pathlib import Path
+          UA='Mozilla/5.0'
+          rows=[]; scripts=[]; urls=[]
+          for p in Path('diagnostics').glob('page_*.html'):
+              raw=p.read_bytes()
+              texts=[raw.decode(e,'ignore') for e in ('utf-8','gb18030','gbk')]
+              text=max(texts,key=lambda x:x.count('达安基因')+x.count('4461177')+x.lower().count('download'))
+              norm=html.unescape(text.replace('\\/','/'))
+              title=''
+              m=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>','',m.group(1)).strip()
+              for u in re.findall(r'(?:href|src|action)=["\']([^"\']+)',norm,re.I):
+                  u=html.unescape(u)
+                  full=urllib.parse.urljoin('https://www.nxny.com/report/view_4461177.html',u)
+                  if any(k in full.lower() for k in ['download','attach','file','.pdf','report','4461177']): urls.append(full)
+                  if u.lower().endswith('.js') or '.js?' in u.lower(): scripts.append(full)
+              for u in re.findall(r'https?://[^"\'<>\s]+',norm,re.I):
+                  u=urllib.parse.unquote(u).rstrip('),;]')
+                  if any(k in u.lower() for k in ['download','attach','file','.pdf','report','4461177']): urls.append(u)
+              relevant=[]
+              for line in norm.splitlines():
+                  if re.search(r'download|下载|pdf|attach|file|4461177|达安基因|股票研究报告|login',line,re.I): relevant.append(re.sub(r'\s+',' ',line)[:3000])
+              rows.append({'file':p.name,'size':len(raw),'title':title,'relevant':relevant[:500]})
+          scripts=list(dict.fromkeys(scripts)); urls=list(dict.fromkeys(urls))
+          Path('diagnostics/summary.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/url_candidates.txt').write_text('\n'.join(urls),encoding='utf-8')
+          for i,u in enumerate(scripts[:50]):
+              out=Path(f'diagnostics/script_{i}.js')
+              subprocess.run(['curl','--http1.1','-L','--silent','--show-error','--retry','3','--retry-all-errors','--connect-timeout','15','--max-time','120','--user-agent',UA,'--header','Accept-Encoding: identity',u,'-o',str(out)])
+          hits=[]
+          for p in Path('diagnostics').glob('script_*.js'):
+              t=p.read_text(encoding='utf-8',errors='ignore')
+              for line in t.splitlines():
+                  if re.search(r'download|reportId|report_id|attach|fileUrl|pdf|login',line,re.I): hits.append(f'{p.name}\t{line[:3000]}')
+          Path('diagnostics/script_hits.txt').write_text('\n'.join(hits),encoding='utf-8')
+          print('PAGES',[(r['file'],r['size'],r['title']) for r in rows])
+          print('URLS')
+          for u in urls: print(u)
+          PY
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-nxny-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
