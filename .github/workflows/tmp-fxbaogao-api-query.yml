@@ -1,0 +1,95 @@
+name: Temporary Fxbaogao anonymous search API query
+
+on:
+  push:
+    branches:
+      - 'tmp/fxbaogao-api-query-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Probe anonymous search endpoints and payload shapes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          python -m pip install --disable-pip-version-check requests
+          cat > /tmp/query.py <<'PY'
+          import json, urllib.parse
+          from pathlib import Path
+          import requests
+
+          S=requests.Session(); S.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+            'Accept-Language':'zh-CN,zh;q=0.9',
+            'Origin':'https://www.fxbaogao.com',
+            'Referer':'https://www.fxbaogao.com/rp?order=2&nop=-1&keywords=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+          })
+          base='https://api.fxbaogao.com'
+          gets=[
+            '/mofoun/report/searchReport/suggestTyping?word='+urllib.parse.quote('敦煌种业')+'&limit=20',
+            '/mofoun/report/searchReport/suggestExplore?word='+urllib.parse.quote('敦煌种业')+'&limit=20',
+            '/mofoun/report/searchReport/suggestTyping?word=600354&limit=20',
+            '/mofoun/report/searchReport/guess?word='+urllib.parse.quote('敦煌种业'),
+            '/mofoun/report/searchReport/hotTag/list',
+          ]
+          rows=[]
+          for i,path in enumerate(gets):
+            try:
+              r=S.get(base+path,timeout=60); text=r.text
+              Path(f'diagnostics/get_{i}.txt').write_text(text,encoding='utf-8',errors='ignore')
+              rows.append({'method':'GET','url':base+path,'status':r.status_code,'length':len(text),'head':text[:2000]})
+            except Exception as e: rows.append({'method':'GET','url':base+path,'error':repr(e)})
+
+          payloads=[
+            {'keywords':'敦煌种业','pageNum':1,'pageSize':20},
+            {'keyword':'敦煌种业','pageNum':1,'pageSize':20},
+            {'word':'敦煌种业','pageNum':1,'pageSize':20},
+            {'query':'敦煌种业','pageNum':1,'pageSize':20},
+            {'searchKey':'敦煌种业','pageNum':1,'pageSize':20},
+            {'keywords':['敦煌种业'],'pageNum':1,'pageSize':20},
+            {'keywords':'敦煌种业','pageNo':1,'pageSize':20},
+            {'keywords':'敦煌种业','current':1,'size':20},
+            {'keywords':'敦煌种业','page':1,'limit':20},
+            {'keywords':'敦煌种业','pageNum':1,'pageSize':20,'order':2,'rt':13,'nop':-1},
+            {'keywords':'敦煌种业','pageNum':1,'pageSize':20,'orderType':2,'reportType':13},
+            {'keyword':'敦煌种业','pageNum':1,'pageSize':20,'order':2,'rt':13,'nop':-1},
+            {'condition':'敦煌种业','pageNum':1,'pageSize':20},
+            {'searchWord':'敦煌种业','pageNum':1,'pageSize':20},
+            {'title':'敦煌种业','pageNum':1,'pageSize':20},
+            {'keywords':'600354','pageNum':1,'pageSize':20},
+          ]
+          endpoints=[
+            '/mofoun/report/searchReport/searchNoAuth',
+            '/mofoun/report/searchReport/search',
+            '/mofoun/report/searchReportData/searchListNoAuth',
+            '/mofoun/report/searchReportData/searchList',
+          ]
+          for ei,ep in enumerate(endpoints):
+            for pi,payload in enumerate(payloads):
+              try:
+                r=S.post(base+ep,json=payload,timeout=60); text=r.text
+                Path(f'diagnostics/post_{ei}_{pi}.txt').write_text(text,encoding='utf-8',errors='ignore')
+                hit=('敦煌种业' in text or '600354' in text)
+                row={'method':'POST','url':base+ep,'payload':payload,'status':r.status_code,'length':len(text),'hit':hit,'head':text[:5000]}
+                rows.append(row)
+                if hit: print('HIT',json.dumps(row,ensure_ascii=False)[:16000])
+              except Exception as e: rows.append({'method':'POST','url':base+ep,'payload':payload,'error':repr(e)})
+          Path('diagnostics/results.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          for row in rows:
+            print(json.dumps(row,ensure_ascii=False)[:12000])
+          PY
+          python /tmp/query.py
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-api-query-results
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
