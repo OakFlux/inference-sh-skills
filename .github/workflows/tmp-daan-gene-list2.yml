@@ -1,0 +1,103 @@
+name: Temporary Daan Gene list2 metadata lookup
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-list2-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install requests
+        run: python -m pip install --disable-pip-version-check requests
+
+      - name: Query stock-report list2 API and rank reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/list2.py <<'PY'
+          from __future__ import annotations
+          import json,re
+          from pathlib import Path
+          import requests
+
+          URL='https://reportapi.eastmoney.com/report/list2'
+          S=requests.Session()
+          S.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/002030.html',
+              'Content-Type':'application/json',
+              'Accept':'application/json,text/plain,*/*',
+          })
+
+          def fetch(page:int):
+              payload={
+                  'pageSize':100,'pageNo':page,'p':page,'pageNum':page,'pageNumber':page,
+                  'beginTime':'2004-01-01','endTime':'2026-08-29','code':'002030',
+                  'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''
+              }
+              r=S.post(URL,json=payload,timeout=90)
+              print('HTTP',page,r.status_code,len(r.content),r.text[:300].replace('\n',' '))
+              r.raise_for_status()
+              return r.json()
+
+          first=fetch(1)
+          rows=list(first.get('data') or [])
+          hits=int(first.get('hits') or first.get('total') or len(rows))
+          total_pages=int(first.get('TotalPage') or first.get('totalPage') or ((hits+99)//100) or 1)
+          print('FIRST_ROWS',len(rows),'HITS',hits,'TOTAL_PAGES',total_pages)
+          for p in range(2,total_pages+1):
+              obj=fetch(p)
+              rows.extend(obj.get('data') or [])
+
+          seen=set();dedup=[]
+          for x in rows:
+              k=str(x.get('infoCode') or '')
+              if not k or k in seen: continue
+              seen.add(k);dedup.append(x)
+
+          def title(r):return str(r.get('title') or r.get('reportTitle') or '')
+          def date(r):
+              x=str(r.get('publishDate') or r.get('publishTime') or '')
+              m=re.search(r'20\d{2}-\d{2}-\d{2}',x);return m.group(0) if m else x[:10]
+          def broker(r):return str(r.get('orgSName') or r.get('orgName') or '')
+          pos=['深度','首次覆盖','公司深度','分子诊断','核酸检测','体外诊断','IVD','检验龙头','诊断龙头','全产业链','平台型','龙头企业','新冠检测','核酸试剂','医学检验','基因检测','护城河','价值重估','成长空间','国产替代','研发平台','规模效应','拐点','迎里程碑']
+          neg=['一季报点评','中报点评','半年报点评','年报点评','三季报点评','季报点评','业绩点评','事件点评','公告点评','点评报告','业绩快报','公司信息更新','信息更新报告','定期报告点评','跟踪点评','简评']
+          def score(r):
+              t=re.sub(r'\s+','',title(r));v=0
+              if '深度' in t:v+=500
+              if '首次覆盖' in t:v+=450
+              if '公司深度' in t:v+=180
+              v+=sum(65 for k in pos if re.sub(r'\s+','',k) in t)
+              v-=sum(260 for k in neg if re.sub(r'\s+','',k) in t)
+              try:y=int(date(r)[:4])
+              except:y=0
+              v+={2026:90,2025:80,2024:70,2023:60,2022:50,2021:40,2020:35,2019:25,2018:20,2017:15,2016:10}.get(y,0)
+              return v
+
+          ranked=sorted(dedup,key=lambda r:(score(r),date(r)),reverse=True)
+          Path('diagnostics/all_reports.json').write_text(json.dumps(dedup,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/ranked.json').write_text(json.dumps([
+              {'score':score(r),'date':date(r),'broker':broker(r),'title':title(r),'infoCode':r.get('infoCode'),'stockCode':r.get('stockCode'),'stockName':r.get('stockName')}
+              for r in ranked
+          ],ensure_ascii=False,indent=2),encoding='utf-8')
+          print('DEDUP_COUNT',len(dedup))
+          for r in ranked:
+              print('REPORT',json.dumps({'score':score(r),'date':date(r),'broker':broker(r),'title':title(r),'infoCode':r.get('infoCode'),'stockCode':r.get('stockCode'),'stockName':r.get('stockName')},ensure_ascii=False))
+          PY
+          python /tmp/list2.py
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-list2-metadata
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
