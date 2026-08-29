@@ -1,0 +1,73 @@
+name: Diagnose Anxu Biotech report sources
+on:
+  push:
+    branches:
+      - tmp/anxu-biotech-reports-20260829
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect Sina and CFI report sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s = requests.Session()
+          s.headers.update({'User-Agent': ua, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          print('=== SINA REPORT LISTS ===')
+          for ft in ['ndbg', 'ndbgzy', 'zqbg', 'all']:
+              if ft == 'all':
+                  url = 'https://money.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/688075.phtml'
+              else:
+                  url = f'https://money.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/688075.phtml?ftype={ft}'
+              r = s.get(url, timeout=60)
+              r.raise_for_status()
+              r.encoding = r.apparent_encoding or 'gb18030'
+              soup = BeautifulSoup(r.text, 'html.parser')
+              print('LIST', ft, r.status_code, len(r.content), r.url)
+              for a in soup.find_all('a', href=True):
+                  text = ' '.join(a.get_text(' ', strip=True).split())
+                  href = urljoin(r.url, a['href'])
+                  if any(k in text for k in ['年度报告', '半年度报告', '招股说明书']):
+                      print(json.dumps({'text': text, 'href': href}, ensure_ascii=False))
+
+          print('=== SINA PROSPECTUS PAGE ===')
+          url = 'https://money.finance.sina.com.cn/corp/go.php/vISSUE_RaiseExplanation/stockid/688075.phtml'
+          r = s.get(url, timeout=60)
+          r.raise_for_status()
+          r.encoding = r.apparent_encoding or 'gb18030'
+          soup = BeautifulSoup(r.text, 'html.parser')
+          print('PROSPECTUS_PAGE', r.status_code, len(r.content), r.url)
+          for a in soup.find_all('a', href=True):
+              text = ' '.join(a.get_text(' ', strip=True).split())
+              href = urljoin(r.url, a['href'])
+              if '招股' in text or '.pdf' in href.lower() or 'AllBulletinDetail' in href:
+                  print(json.dumps({'text': text, 'href': href}, ensure_ascii=False))
+
+          print('=== CFI ANNOUNCEMENTS ===')
+          for url in [
+              'https://quotewh.cfi.cn/quote.aspx?client=phone&contenttype=cbgg&stockid=135117',
+              'https://quote.cfi.cn/cbgg/135117/688075.html',
+          ]:
+              try:
+                  r = s.get(url, timeout=60)
+                  r.raise_for_status()
+                  r.encoding = r.apparent_encoding or 'utf-8'
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  print('CFI', url, r.status_code, len(r.content))
+                  for a in soup.find_all('a', href=True):
+                      text = ' '.join(a.get_text(' ', strip=True).split())
+                      href = urljoin(r.url, a['href'])
+                      if any(k in text for k in ['年度报告', '半年度报告', '招股说明书']) or 'static.cninfo.com.cn' in href:
+                          print(json.dumps({'text': text, 'href': href}, ensure_ascii=False))
+              except Exception as exc:
+                  print('CFI_ERROR', url, repr(exc))
+          PY
