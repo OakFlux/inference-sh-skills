@@ -1,0 +1,98 @@
+name: Temporary final Dabeinong broker deep report package
+
+on:
+  push:
+    branches:
+      - tmp/download-dabeinong-reports-20260829
+    paths:
+      - .github/workflows/tmp-dabeinong-final-package.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Download and verify selected original reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local pages="$3"
+            local expected="$4"
+            local stem="$5"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A "$UA" -e 'https://data.eastmoney.com/report/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "output/$dest"
+            test -s "output/$dest"
+            test "$(head -c 4 "output/$dest")" = '%PDF'
+            actual=$(pdfinfo "output/$dest" | awk '/^Pages:/ {print $2}')
+            test "$actual" -eq "$pages"
+            pdftotext -f 1 -l 5 "output/$dest" "previews/${stem}.txt"
+            grep -q '大北农' "previews/${stem}.txt"
+            grep -q "$expected" "previews/${stem}.txt"
+            pdftoppm -f 1 -singlefile -png -r 90 "output/$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 90 "output/$dest" "previews/${stem}_last" >/dev/null 2>&1
+            test -s "previews/${stem}_first.png"
+            test -s "previews/${stem}_last.png"
+          }
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202303291584643290_1.pdf' \
+            '01_East_Asia_Qianhai_Securities_Dabeinong_Initiation_20230329_44p.pdf' \
+            44 '多业务条线齐头并进' 'eaqh_2023'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202207281576640459_1.pdf' \
+            '02_Huaan_Securities_Dabeinong_Deep_Report_20220728_30p.pdf' \
+            30 '核心业务持续发力' 'huaan_2022'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202004291378986911_1.pdf' \
+            '03_Kaiyuan_Securities_Dabeinong_Initiation_20200429_12p.pdf' \
+            12 '生猪养殖增厚利润' 'kaiyuan_2020'
+
+          cat > output/报告清单与核验说明.txt <<'EOF'
+          大北农（002385.SZ）券商深度研究报告，共3份
+
+          1. 东亚前海证券，2023-03-29，44页
+             《首次覆盖报告：多业务条线齐头并进，转基因龙头启航在即》
+             类型：首次覆盖、完整公司深度研究。
+
+          2. 华安证券，2022-07-28，30页
+             《核心业务持续发力，多轮驱动助推企业发展》
+             类型：完整公司深度研究。
+
+          3. 开源证券，2020-04-29，12页
+             《公司首次覆盖报告：生猪养殖增厚利润，种子业务静待花开》
+             类型：首次覆盖报告；用于替代年份更早的2018年深度报告。
+
+          三份均为原始、完整、可检索PDF。已检查PDF文件头、实际页数、公司名称、标题关键词，
+          并完成首页和末页渲染。仅供研究资料整理，不构成投资建议。
+          EOF
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          (cd output && zip -q -9 Dabeinong_Broker_Deep_Reports_3_Verified.zip ./*.pdf ./报告清单与核验说明.txt ./SHA256SUMS.txt)
+          unzip -t output/Dabeinong_Broker_Deep_Reports_3_Verified.zip
+          ls -lh output previews
+
+      - name: Upload verified final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dabeinong-broker-deep-reports-final
+          path: output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
