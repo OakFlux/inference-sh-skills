@@ -1,0 +1,159 @@
+name: Temporary Dunhuang Seed Fxbaogao browser search
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-fx-browser-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Selenium
+        run: python -m pip install --disable-pip-version-check selenium
+
+      - name: Drive search UI and capture network bodies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/fx_browser.py <<'PY'
+          from __future__ import annotations
+          import json, re, shutil, time
+          from pathlib import Path
+
+          from selenium import webdriver
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.common.keys import Keys
+          from selenium.webdriver.chrome.options import Options
+
+          OUT=Path('diagnostics')
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          chrome=shutil.which('google-chrome') or shutil.which('chromium') or shutil.which('chromium-browser')
+          opts=Options()
+          if chrome: opts.binary_location=chrome
+          opts.add_argument('--headless=new'); opts.add_argument('--no-sandbox'); opts.add_argument('--disable-dev-shm-usage'); opts.add_argument('--disable-gpu'); opts.add_argument('--window-size=1440,1400'); opts.add_argument(f'--user-agent={UA}')
+          opts.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          driver=webdriver.Chrome(options=opts)
+          driver.execute_cdp_cmd('Network.enable',{})
+          all_stages=[]
+
+          def drain(label):
+            logs=driver.get_log('performance')
+            reqs=[]; resps=[]; bodies=[]
+            for e in logs:
+              try: msg=json.loads(e['message'])['message']
+              except Exception: continue
+              method=msg.get('method'); params=msg.get('params',{})
+              if method=='Network.requestWillBeSent':
+                r=params.get('request',{}); u=r.get('url','')
+                if re.search(r'api\.fxbaogao|/mofoun/|searchReport|reportStock|download|detail',u,re.I):
+                  reqs.append({'requestId':params.get('requestId'),'url':u,'method':r.get('method'),'postData':r.get('postData'),'headers':r.get('headers'),'type':params.get('type')})
+              elif method=='Network.responseReceived':
+                resp=params.get('response',{}); u=resp.get('url','')
+                if re.search(r'api\.fxbaogao|/mofoun/|searchReport|reportStock|download|detail',u,re.I):
+                  rid=params.get('requestId')
+                  item={'requestId':rid,'url':u,'status':resp.get('status'),'mimeType':resp.get('mimeType'),'headers':resp.get('headers')}
+                  resps.append(item)
+                  try:
+                    body=driver.execute_cdp_cmd('Network.getResponseBody',{'requestId':rid})
+                    text=body.get('body','')
+                    bodies.append({'requestId':rid,'url':u,'base64Encoded':body.get('base64Encoded'),'body':text[:500000]})
+                  except Exception as exc:
+                    bodies.append({'requestId':rid,'url':u,'error':repr(exc)})
+            stage={'label':label,'url':driver.current_url,'title':driver.title,'requests':reqs,'responses':resps,'bodies':bodies,'browser':driver.get_log('browser')}
+            all_stages.append(stage)
+            (OUT/f'{label}.html').write_text(driver.page_source,encoding='utf-8')
+            return stage
+
+          try:
+            driver.get('https://www.fxbaogao.com/')
+            time.sleep(6)
+            drain('home')
+            elements=[]
+            for el in driver.find_elements(By.CSS_SELECTOR,'input,textarea,button,a'):
+              try:
+                elements.append({'tag':el.tag_name,'text':el.text,'displayed':el.is_displayed(),'enabled':el.is_enabled(),'outerHTML':driver.execute_script('return arguments[0].outerHTML',el)})
+              except Exception: pass
+            (OUT/'elements.json').write_text(json.dumps(elements,ensure_ascii=False,indent=2),encoding='utf-8')
+
+            inputs=[el for el in driver.find_elements(By.CSS_SELECTOR,'input,textarea') if el.is_displayed()]
+            for i,el in enumerate(inputs):
+              try:
+                driver.execute_script('arguments[0].focus(); arguments[0].value=""; arguments[0].dispatchEvent(new Event("input",{bubbles:true}));',el)
+                el.send_keys('敦煌种业')
+                driver.execute_script('arguments[0].dispatchEvent(new Event("input",{bubbles:true})); arguments[0].dispatchEvent(new Event("change",{bubbles:true}));',el)
+                el.send_keys(Keys.ENTER)
+                time.sleep(5)
+                drain(f'input_{i}_enter')
+                if '敦煌' in driver.page_source or '600354' in driver.page_source: break
+              except Exception: pass
+
+            # Reset home and click likely search controls after populating first visible text field.
+            driver.get('https://www.fxbaogao.com/'); time.sleep(5); drain('home2')
+            vis=[el for el in driver.find_elements(By.CSS_SELECTOR,'input,textarea') if el.is_displayed()]
+            if vis:
+              el=vis[0]
+              try:
+                el.clear(); el.send_keys('敦煌种业')
+                driver.execute_script('arguments[0].dispatchEvent(new Event("input",{bubbles:true})); arguments[0].dispatchEvent(new Event("change",{bubbles:true}));',el)
+              except Exception: pass
+            controls=[]
+            for el in driver.find_elements(By.CSS_SELECTOR,'button,a,[role="button"],div'):
+              try:
+                txt=(el.text or '').strip(); html=driver.execute_script('return arguments[0].outerHTML',el)
+                if el.is_displayed() and re.search(r'搜索|发现好报告|search',txt+' '+html,re.I): controls.append(el)
+              except Exception: pass
+            for i,el in enumerate(controls[:30]):
+              try:
+                driver.execute_script('arguments[0].click();',el); time.sleep(5); drain(f'control_{i}_click')
+                if '敦煌' in driver.page_source or '600354' in driver.page_source: break
+              except Exception: pass
+
+            # Directly load search-like routes found in DOM.
+            paths=[]
+            for a in driver.find_elements(By.CSS_SELECTOR,'a[href]'):
+              try:
+                href=a.get_attribute('href') or ''
+                if re.search(r'search|report',href,re.I): paths.append(href)
+              except Exception: pass
+            paths += [
+              'https://www.fxbaogao.com/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.fxbaogao.com/search?q=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.fxbaogao.com/report?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+            ]
+            seen=set()
+            for i,u in enumerate(paths[:60]):
+              if u in seen: continue
+              seen.add(u)
+              try: driver.get(u); time.sleep(5); drain(f'route_{i}')
+              except Exception: pass
+          finally:
+            driver.quit()
+
+          (OUT/'stages.json').write_text(json.dumps(all_stages,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('STAGES',len(all_stages))
+          for st in all_stages:
+            interesting=[r for r in st['requests'] if r.get('postData') or 'search' in r.get('url','').lower()]
+            if interesting or any('敦煌种业' in b.get('body','') or '600354' in b.get('body','') for b in st['bodies']):
+              print('===',st['label'],st['url'])
+              for r in interesting: print('REQ',json.dumps({k:r.get(k) for k in ('url','method','postData')},ensure_ascii=False))
+              for b in st['bodies']:
+                if '敦煌种业' in b.get('body','') or '600354' in b.get('body','') or 'searchReport' in b.get('url',''):
+                  print('BODY',b.get('url'),b.get('body','')[:10000])
+          PY
+          python /tmp/fx_browser.py
+
+      - name: Upload browser capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-fxbaogao-browser-capture
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
