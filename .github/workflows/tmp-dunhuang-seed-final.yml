@@ -1,0 +1,274 @@
+name: Temporary Dunhuang Seed final broker deep reports package
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-final-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF parser and renderer
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils >/dev/null
+
+      - name: Download, validate, render-check and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics/renders
+          cat > /tmp/dunhuang_final.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          RENDERS = DIAG / 'renders'
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          candidates = [
+              {
+                  'rptid': '365771252125',
+                  'date': '2011-08-04',
+                  'broker': '国泰君安证券',
+                  'title': '深度研究：先玉高增，加工减亏，盈利可期',
+                  'min_pages': 10,
+              },
+              {
+                  'rptid': '365499152875',
+                  'date': '2011-08-01',
+                  'broker': '齐鲁证券（现中泰证券）',
+                  'title': '深度研究：敦煌先锋产销激增，驱动盈利稳定增长',
+                  'min_pages': 10,
+              },
+              {
+                  'rptid': '336478009061',
+                  'date': '2010-08-30',
+                  'broker': '申银万国（现申万宏源）',
+                  'title': '深度报告：业绩快速回升，敦煌先锋持续快速扩张，公司本部业务亏损减少',
+                  'min_pages': 10,
+              },
+              {
+                  'rptid': '616733300399',
+                  'date': '2017-01-05',
+                  'broker': '天风证券',
+                  'title': '聚焦种业发展机遇，并购打开成长空间',
+                  'min_pages': 8,
+              },
+              {
+                  'rptid': '370367252515',
+                  'date': '2011-09-26',
+                  'broker': '华宝证券',
+                  'title': '政策春风，孕育历史之机遇',
+                  'min_pages': 8,
+              },
+              {
+                  'rptid': '374084966547',
+                  'date': '2011-11-08',
+                  'broker': '国泰君安证券',
+                  'title': '调研报告：打消悲观预期，期待改善来临',
+                  'min_pages': 8,
+              },
+              {
+                  'rptid': '365678691233',
+                  'date': '2011-08-03',
+                  'broker': '长江证券',
+                  'title': '调研报告：看好先锋系列继续扩张，期待母公司经营调整',
+                  'min_pages': 8,
+              },
+          ]
+
+          def safe(value: str, limit: int = 86) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', '', value).strip(' ._')
+              return (value or '报告')[:limit]
+
+          def fetch(url: str, destination: Path, referer: str) -> tuple[bool, str, str]:
+              destination.unlink(missing_ok=True)
+              process = subprocess.run([
+                  'curl', '--http1.1', '--location', '--fail', '--silent', '--show-error',
+                  '--retry', '5', '--retry-all-errors', '--retry-delay', '1',
+                  '--connect-timeout', '20', '--max-time', '300',
+                  '--user-agent', UA, '--referer', referer,
+                  '--header', 'Accept-Encoding: identity',
+                  '--header', 'Accept: application/pdf,application/octet-stream,*/*',
+                  '--output', str(destination),
+                  '--write-out', '%{url_effective}',
+                  url,
+              ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return process.returncode == 0, process.stderr[-1800:], process.stdout.strip()
+
+          results = []
+          failures = []
+          digests = set()
+          temp = DIST / '_candidate.pdf'
+
+          for item in candidates:
+              if len(results) >= 3:
+                  break
+              rid = item['rptid']
+              page_url = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml'
+              source_urls = [
+                  f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/url',
+                  f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/company/rptid/{rid}/url',
+              ]
+              accepted = False
+              errors = []
+              for source_url in source_urls:
+                  ok, error, effective_url = fetch(source_url, temp, page_url)
+                  if not ok:
+                      errors.append(f'{source_url}: {error}')
+                      continue
+                  try:
+                      raw = temp.read_bytes()
+                      if len(raw) < 120_000 or not raw.startswith(b'%PDF-'):
+                          raise RuntimeError(
+                              f'not a complete PDF: {len(raw)} bytes; head={raw[:24]!r}; effective={effective_url}'
+                          )
+                      digest = hashlib.sha256(raw).hexdigest()
+                      if digest in digests:
+                          raise RuntimeError('duplicate PDF')
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < item['min_pages']:
+                          raise RuntimeError(f'only {pages} pages')
+                      sample = ''
+                      for page in reader.pages[:min(12, pages)]:
+                          try:
+                              sample += ' ' + (page.extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = re.sub(r'\s+', '', sample)
+                      if '敦煌种业' not in compact and '600354' not in compact:
+                          raise RuntimeError('company identity not found in first twelve pages')
+                      filename = (
+                          f'{item["date"]}_{safe(item["broker"],24)}_'
+                          f'{safe(item["title"])}_{pages}页.pdf'
+                      )
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+
+                      # Render the first and last pages to ensure the PDF is readable.
+                      render_prefix = RENDERS / f'{len(results)+1:02d}'
+                      subprocess.run([
+                          'pdftoppm', '-f', '1', '-l', '1', '-png', '-r', '100',
+                          str(destination), str(render_prefix) + '_first'
+                      ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                      subprocess.run([
+                          'pdftoppm', '-f', str(pages), '-l', str(pages), '-png', '-r', '100',
+                          str(destination), str(render_prefix) + '_last'
+                      ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                      rendered = list(RENDERS.glob(f'{render_prefix.name}_*.png'))
+                      if len(rendered) < 2 or any(p.stat().st_size < 10_000 for p in rendered):
+                          raise RuntimeError('render verification failed')
+
+                      record = {
+                          **item,
+                          'filename': filename,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': digest,
+                          'source_url': source_url,
+                          'effective_url': effective_url,
+                          'sina_record_page': page_url,
+                      }
+                      results.append(record)
+                      digests.add(digest)
+                      print('OK', json.dumps(record, ensure_ascii=False))
+                      accepted = True
+                      break
+                  except Exception as exc:
+                      errors.append(f'{source_url}: {exc!r}')
+                      for p in RENDERS.glob(f'{len(results)+1:02d}_*.png'):
+                          p.unlink(missing_ok=True)
+                  finally:
+                      temp.unlink(missing_ok=True)
+              if not accepted:
+                  failures.append({**item, 'errors': errors})
+
+          DIAG.joinpath('results.json').write_text(
+              json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          DIAG.joinpath('failures.json').write_text(
+              json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          if len(results) < 2:
+              raise RuntimeError(f'Only {len(results)} validated complete reports downloaded')
+
+          manifest = [
+              '敦煌种业（600354）券商研究报告资料包',
+              '筛选规则：优先明确标注深度研究/深度报告的完整公司报告；不足时以长篇调研或首次覆盖补充。',
+              '所有PDF均已核验文件头、实际页数、公司名称，并渲染检查首页和末页。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(results, 1):
+              manifest += [
+                  f'{index}. {item["title"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   日期：{item["date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   新浪研报档案：{item["sina_record_page"]}',
+                  f'   原始文件接口：{item["source_url"]}',
+                  '',
+              ]
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text(
+              '\n'.join(manifest), encoding='utf-8'
+          )
+
+          final_zip = DIST / f'敦煌种业_券商深度报告_{len(results)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(results):
+                  raise RuntimeError(f'PDF count mismatch: {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/dunhuang_final.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-final-original-deep-reports
+          path: dist/敦煌种业_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-final-results
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
