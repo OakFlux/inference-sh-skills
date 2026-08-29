@@ -1,0 +1,62 @@
+name: Temporary Anxu Bio report discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-anxu-bio-reports-20260829
+    paths:
+      - .github/workflows/tmp-anxu-bio-discovery.yml
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query Eastmoney report catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          url='https://reportapi.eastmoney.com/report/list'
+          params={
+            'pageNo':'1','pageSize':'300','code':'688075',
+            'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+            'beginTime':'2010-01-01','endTime':'2030-12-31','fields':'',
+            'qType':'0','orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'
+          }
+          r=requests.get(url,params=params,headers={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+            'Referer':'https://data.eastmoney.com/report/'
+          },timeout=90)
+          print('HTTP',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+          r.raise_for_status()
+          obj=r.json()
+          rows=obj.get('data') or []
+          print('ROWS',len(rows),'HITS',obj.get('hits'),'PAGES',obj.get('TotalPage'))
+          print('\n=== LIKELY DEEP REPORTS ===')
+          for row in rows:
+            title=str(row.get('title') or '')
+            pages=int(row.get('attachPages') or 0)
+            if pages >= 10 or any(k in title for k in ['深度','首次覆盖','首次','覆盖报告','公司覆盖']):
+              print(json.dumps({
+                'date':str(row.get('publishDate') or '')[:10],
+                'broker':row.get('orgSName'),
+                'title':title,
+                'pages':pages,
+                'infoCode':row.get('infoCode'),
+                'column':row.get('column'),
+                'rating':row.get('sRatingName') or row.get('emRatingName'),
+                'researcher':row.get('researcher')
+              },ensure_ascii=False))
+          print('\n=== ALL REPORTS ===')
+          for row in rows:
+            print(json.dumps({
+              'date':str(row.get('publishDate') or '')[:10],
+              'broker':row.get('orgSName'),
+              'title':row.get('title'),
+              'pages':row.get('attachPages'),
+              'infoCode':row.get('infoCode')
+            },ensure_ascii=False))
+          PY
