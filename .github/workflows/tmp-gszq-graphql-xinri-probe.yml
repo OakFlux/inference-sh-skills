@@ -1,0 +1,86 @@
+name: Temporary Guosheng GraphQL Xinri probe
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-graphql-xinri-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Probe official GraphQL endpoints and report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json, requests
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Origin':'https://research.gszq.com',
+              'Referer':'https://research.gszq.com/',
+              'Accept':'application/json,text/plain,*/*',
+              'Content-Type':'application/json',
+          })
+          endpoints=[
+              'https://tyapp.gszq.com/api/v1/graphql',
+              'https://tyapp.gszq.com/api/graphql',
+              'https://tyapp.gszq.com/graphql',
+              'https://research.gszq.com/api/v1/graphql',
+              'https://research.gszq.com/graphql',
+          ]
+          search_query='''
+          query SearchData($reportsPage: Int, $reportsLimit: Int, $analystPage: Int, $analystLimit: Int, $activityPage: Int, $activityLimit: Int, $keywords: String!) {
+            searchData {
+              reports(limit: $reportsLimit, page: $reportsPage, keywords: $keywords) {
+                total
+                reports { rid type title brief authors custom catalog updated_time pic }
+              }
+              activities(limit: $activityLimit, page: $activityPage, keywords: $keywords) { total activities { act_id title } }
+              analysts(limit: $analystLimit, page: $analystPage, keywords: $keywords) { total analysts { aid name } }
+            }
+          }
+          '''
+          variables={'reportsPage':1,'reportsLimit':100,'analystPage':1,'analystLimit':10,'activityPage':1,'activityLimit':10,'keywords':'新日股份'}
+          working=[]
+          for ep in endpoints:
+              for mode in ('json','graphql'):
+                  try:
+                      if mode=='json':
+                          r=s.post(ep,json={'query':search_query,'variables':variables},timeout=90,allow_redirects=False)
+                      else:
+                          r=s.post(ep,data=json.dumps({'query':search_query,'variables':variables},ensure_ascii=False),timeout=90,allow_redirects=False)
+                      print('\nSEARCH',mode,ep,'HTTP',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'LOC',r.headers.get('location'))
+                      print(r.text[:50000])
+                      if r.status_code==200 and 'data' in r.text and ('新日股份' in r.text or 'searchData' in r.text): working.append(ep)
+                  except Exception as e: print('ERR',mode,ep,repr(e))
+
+          working=list(dict.fromkeys(working))
+          print('\nWORKING',working)
+          # Also search by exact title and ticker.
+          for ep in working:
+              for keyword in ['603787','电动两轮高景气','渠道+产品助力公司加速扩张','新日股份']:
+                  vv=dict(variables); vv['keywords']=keyword
+                  r=s.post(ep,json={'query':search_query,'variables':vv},timeout=90)
+                  print('\nKEYWORD',keyword,'EP',ep,'HTTP',r.status_code,'LEN',len(r.content))
+                  print(r.text[:80000])
+                  try:
+                      obj=r.json(); reports=(((obj.get('data') or {}).get('searchData') or {}).get('reports') or {}).get('reports') or []
+                  except Exception: reports=[]
+                  for report in reports:
+                      rid=report.get('rid')
+                      if not rid: continue
+                      detail_query='''query { report(rid: "%s") { rid type title brief authors custom catalog updated_time pic report_url can_view can_download menus total_views size author_ids richtext } }''' % rid
+                      rr=s.post(ep,json={'query':detail_query},timeout=90)
+                      print('\nDETAIL',rid,'HTTP',rr.status_code,'LEN',len(rr.content))
+                      print(rr.text[:120000])
+          PY
