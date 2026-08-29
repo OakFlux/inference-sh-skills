@@ -1,0 +1,145 @@
+name: Temporary Daan Gene Wayback PDF recovery
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-wayback-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Query Wayback CDX and inspect archived NXNY downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics candidates
+          cat > /tmp/wayback_recover.py <<'PY'
+          from __future__ import annotations
+          import hashlib, json, os, re, subprocess, time, urllib.parse
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          from pypdf import PdfReader
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          D=Path('diagnostics'); C=Path('candidates')
+          queries=[
+              ('vip_exact','http://vip.nxny.com/DownLoad/DownLoad.aspx*'),
+              ('vip_https','https://vip.nxny.com/DownLoad/DownLoad.aspx*'),
+              ('vip_prefix','vip.nxny.com/DownLoad/*'),
+              ('www_download','www.nxny.com/DownLoad/*'),
+              ('www_pdf','www.nxny.com/*.pdf'),
+              ('vip_pdf','vip.nxny.com/*.pdf'),
+          ]
+
+          def curl(url:str,path:Path,max_time=240)->tuple[int,str]:
+              path.parent.mkdir(parents=True,exist_ok=True)
+              p=subprocess.run(['curl','--http1.1','-L','--silent','--show-error','--retry','6','--retry-all-errors','--retry-delay','2','--connect-timeout','25','--max-time',str(max_time),'--user-agent',UA,'--header','Accept-Encoding: identity',url,'-o',str(path)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              return p.returncode,p.stderr[-1200:]
+
+          captures=[]
+          for name,target in queries:
+              params={
+                  'url':target,'output':'json','fl':'timestamp,original,mimetype,statuscode,digest,length,filename',
+                  'filter':'statuscode:200','collapse':'digest','limit':'5000','from':'2014','to':'2022'
+              }
+              # requests with repeated filters are more correct, but one status filter is enough; inspect all mimetypes locally.
+              url='https://web.archive.org/cdx/search/cdx?'+urllib.parse.urlencode(params)
+              out=D/f'cdx_{name}.json';rc,err=curl(url,out,300)
+              print('CDX',name,rc,out.stat().st_size if out.exists() else 0,err)
+              if rc or not out.exists(): continue
+              try: arr=json.loads(out.read_text(encoding='utf-8',errors='ignore'))
+              except Exception as exc:
+                  print('BAD_JSON',name,repr(exc),out.read_text(encoding='utf-8',errors='ignore')[:500]);continue
+              if not isinstance(arr,list) or len(arr)<2: continue
+              header=arr[0]
+              for row in arr[1:]:
+                  if not isinstance(row,list): continue
+                  obj=dict(zip(header,row));obj['query']=name
+                  key=(obj.get('timestamp'),obj.get('original'),obj.get('digest'))
+                  if key not in {(x.get('timestamp'),x.get('original'),x.get('digest')) for x in captures}:
+                      captures.append(obj)
+          D.joinpath('captures.json').write_text(json.dumps(captures,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CAPTURE_COUNT',len(captures))
+          for x in captures[:200]: print('CAP',json.dumps(x,ensure_ascii=False))
+
+          def score_capture(x):
+              try:l=int(x.get('length') or 0)
+              except:l=0
+              mt=(x.get('mimetype') or '').lower();orig=(x.get('original') or '').lower()
+              score=0
+              if 'pdf' in mt: score+=100
+              if 1_500_000<=l<=2_300_000: score+=90
+              if 500_000<=l<=900_000: score+=40
+              if 'download.aspx' in orig: score+=50
+              if '.pdf' in orig: score+=50
+              return score
+          ranked=sorted(captures,key=score_capture,reverse=True)
+          # Limit bandwidth but inspect all likely PDF/octet-stream captures and desired-size records.
+          chosen=[]
+          for x in ranked:
+              try:l=int(x.get('length') or 0)
+              except:l=0
+              mt=(x.get('mimetype') or '').lower()
+              if 'pdf' in mt or 300_000<=l<=3_000_000 or 'download.aspx' in (x.get('original') or '').lower():
+                  chosen.append(x)
+              if len(chosen)>=500: break
+          print('CHOSEN',len(chosen))
+
+          def inspect_one(idx_x):
+              idx,x=idx_x
+              ts=x.get('timestamp','');orig=x.get('original','')
+              if not ts or not orig:return {'capture':x,'error':'missing ts/original'}
+              archive=f'https://web.archive.org/web/{ts}id_/{orig}'
+              p=C/f'cand_{idx:04d}.bin';rc,err=curl(archive,p,300)
+              if rc or not p.exists():return {'capture':x,'archive':archive,'error':err or f'curl {rc}'}
+              raw=p.read_bytes();head=raw[:20]
+              rec={'capture':x,'archive':archive,'size':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'head':head.hex()}
+              if not raw.startswith(b'%PDF-'):
+                  rec['error']='not_pdf';rec['prefix']=raw[:300].decode('utf-8','ignore');return rec
+              try:
+                  reader=PdfReader(str(p),strict=False);pages=len(reader.pages);text=''
+                  for pg in reader.pages[:min(8,pages)]:
+                      try:text+=' '+(pg.extract_text() or '')
+                      except:pass
+                  compact=re.sub(r'\s+','',text)
+                  rec.update({'pages':pages,'identity':('达安基因' in compact or '002030' in compact),'text_prefix':compact[:1000]})
+                  if rec['identity']:
+                      final=C/f'MATCH_{idx:04d}_{pages}p.pdf';p.rename(final);rec['path']=str(final)
+                  else:
+                      p.unlink(missing_ok=True)
+              except Exception as exc:
+                  rec['error']=repr(exc);p.unlink(missing_ok=True)
+              return rec
+
+          results=[]
+          with ThreadPoolExecutor(max_workers=6) as ex:
+              futs=[ex.submit(inspect_one,(i,x)) for i,x in enumerate(chosen)]
+              for fut in as_completed(futs):
+                  rec=fut.result();results.append(rec)
+                  if rec.get('identity'): print('MATCH',json.dumps(rec,ensure_ascii=False))
+          D.joinpath('inspection_results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          matches=[r for r in results if r.get('identity')]
+          print('MATCH_COUNT',len(matches))
+          for m in matches: print(json.dumps(m,ensure_ascii=False))
+          PY
+          python /tmp/wayback_recover.py
+
+      - name: Upload recovery results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-wayback-recovery
+          path: |
+            diagnostics/
+            candidates/MATCH_*.pdf
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 0
