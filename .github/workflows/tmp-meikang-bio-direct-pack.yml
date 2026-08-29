@@ -1,0 +1,199 @@
+name: Temporary verified Meikang Bio reports package
+
+on:
+  push:
+    branches:
+      - tmp-meikang-bio-direct-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Download, validate and package verified reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_meikang_direct.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK = "300439"
+          COMPANY = "美康生物"
+          OUT = Path("dist")
+          DOCS = OUT / "美康生物_300439_2020-2025年报_2026年最新半年报"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          # Exact full-report announcement codes resolved from the issuer's disclosure history.
+          ITEMS = [
+              ("美康生物_300439_2020年年度报告.pdf", "AN202104261487993664", "2020年年度报告", "2021-04-27", 100, 2020),
+              ("美康生物_300439_2021年年度报告.pdf", "AN202204221560905314", "2021年年度报告", "2022-04-23", 100, 2021),
+              ("美康生物_300439_2022年年度报告.pdf", "AN202304251585802339", "2022年年度报告", "2023-04-26", 100, 2022),
+              ("美康生物_300439_2023年年度报告.pdf", "AN202404181630525437", "2023年年度报告", "2024-04-19", 100, 2023),
+              ("美康生物_300439_2024年年度报告.pdf", "AN202504181658429777", "2024年年度报告", "2025-04-19", 100, 2024),
+              ("美康生物_300439_2025年年度报告.pdf", "AN202604281821667822", "2025年年度报告", "2026-04-29", 100, 2025),
+              ("美康生物_300439_2026年半年度报告.pdf", "AN202608280006757903", "2026年半年度报告", "2026-08-29", 50, 2026),
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
+          })
+
+          def pdf_urls(art_code: str) -> list[str]:
+              return [
+                  f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.PDF",
+                  f"http://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf",
+              ]
+
+          def sha256_file(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def validate_pdf(path: Path, minimum_pages: int, expected_year: int, expected_kind: str) -> tuple[int, int, str]:
+              size = path.stat().st_size
+              head = path.read_bytes()[:16]
+              if size < 100_000 or not head.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF {path.name}: size={size}, head={head!r}")
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(f"Unexpectedly short PDF {path.name}: {pages} pages")
+
+              parts: list[str] = []
+              for page in reader.pages[:18]:
+                  try:
+                      parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", "", "".join(parts))
+              if COMPANY not in sample and "Medicalsystem" not in sample:
+                  raise RuntimeError(f"Company name not found in sampled pages: {path.name}")
+              if str(expected_year) not in sample:
+                  raise RuntimeError(f"Expected year {expected_year} not found: {path.name}")
+              if expected_kind not in sample:
+                  print("WARNING report type phrase not extracted", expected_kind, path.name)
+
+              return size, pages, sha256_file(path)
+
+          def download_one(filename: str, art_code: str, minimum_pages: int, expected_year: int, expected_kind: str) -> tuple[str, int, int, str]:
+              destination = DOCS / filename
+              errors: list[str] = []
+              referer = f"https://data.eastmoney.com/notices/detail/{STOCK}/{art_code}.html"
+
+              for url in pdf_urls(art_code):
+                  for attempt in range(5):
+                      try:
+                          with session.get(
+                              url,
+                              headers={
+                                  "Referer": referer,
+                                  "Accept": "application/pdf,application/octet-stream,*/*",
+                              },
+                              timeout=(30, 600),
+                              stream=True,
+                              allow_redirects=True,
+                          ) as response:
+                              print("DOWNLOAD", art_code, response.status_code, response.url, response.headers.get("content-type"), response.headers.get("content-length"))
+                              response.raise_for_status()
+                              with destination.open("wb") as output:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          output.write(chunk)
+                              final_url = response.url
+                          size, pages, digest = validate_pdf(destination, minimum_pages, expected_year, expected_kind)
+                          return final_url, size, pages, digest
+                      except Exception as exc:
+                          destination.unlink(missing_ok=True)
+                          errors.append(f"{url} attempt {attempt + 1}: {exc!r}")
+                          if attempt < 4:
+                              time.sleep(min(2 ** attempt, 10))
+
+              raise RuntimeError("; ".join(errors))
+
+          manifest = [
+              "美康生物科技股份有限公司（300439.SZ）",
+              "资料范围：2020—2025年年度报告全文及2026年半年度报告全文。",
+              "筛选规则：使用逐份核对后的完整报告公告代码，排除年度报告摘要、披露提示、书面确认意见及其他短公告。",
+              "文件来源：东方财富上市公司公告PDF镜像，内容为交易所披露文件。",
+              "",
+          ]
+
+          for filename, art_code, title, disclosure_date, minimum_pages, expected_year in ITEMS:
+              kind_phrase = "半年度报告" if "半年度" in title else "年度报告"
+              used_url, size, pages, digest = download_one(
+                  filename,
+                  art_code,
+                  minimum_pages,
+                  expected_year,
+                  kind_phrase,
+              )
+              manifest.extend([
+                  filename,
+                  f"  公告标题：{title}",
+                  f"  披露日期：{disclosure_date}",
+                  f"  东方财富公告代码：{art_code}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  PDF来源：{used_url}",
+                  "",
+              ])
+              print("OK", filename, pages, size, used_url)
+
+          (DOCS / "资料清单与来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / "美康生物_300439_2020-2025年报_2026年最新半年报.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdfs}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              if path.suffix.lower() == ".pdf":
+                  reader = PdfReader(str(path), strict=False)
+                  print(path.name, path.stat().st_size, len(reader.pages))
+              else:
+                  print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_meikang_direct.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: meikang-bio-verified-reports-final-zip
+          path: dist/美康生物_300439_2020-2025年报_2026年最新半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
