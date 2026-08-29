@@ -1,0 +1,86 @@
+name: Temporary Daan Gene deep-report source inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-deep-source-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Fetch public report pages and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          declare -A urls=(
+            [nxny_deep1]='https://www.nxny.com/report/view_3189898.html'
+            [nxny_deep2]='https://www.nxny.com/report/view_3189923.html'
+            [nxny_2020a]='https://www.nxny.com/report/view_4414374.html'
+            [nxny_2020b]='https://www.nxny.com/report/view_4461177.html'
+            [nxny_indexjs]='https://www.nxny.com/js/index.js?v=1.08'
+            [nxny_popupjs]='https://www.nxny.com/js/Popup.js?v=1.01'
+            [ninefzt]='https://www.9fzt.com/detail/sz_002030_10_508957738559.html'
+            [ninefzt_jina]='https://r.jina.ai/https://www.9fzt.com/detail/sz_002030_10_508957738559.html'
+          )
+          for k in "${!urls[@]}"; do
+            curl --http1.1 -L --fail --silent --show-error --retry 6 --retry-all-errors \
+              --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' "${urls[$k]}" -o "diagnostics/${k}.txt" || true
+          done
+          python - <<'PY'
+          from __future__ import annotations
+          import html,json,re,urllib.parse
+          from pathlib import Path
+
+          out=[]
+          for p in sorted(Path('diagnostics').glob('*.txt')):
+              raw=p.read_bytes()
+              text=''
+              for enc in ('utf-8','gb18030'):
+                  try:
+                      text=raw.decode(enc);break
+                  except Exception:
+                      continue
+              if not text:text=raw.decode('utf-8','ignore')
+              normalized=html.unescape(text.replace('\\/','/'))
+              title=''
+              m=re.search(r'<title>(.*?)</title>',normalized,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>','',m.group(1)).strip()
+              links=[]
+              for u in re.findall(r'https?://[^"\'<>\s]+',normalized,re.I):
+                  u=urllib.parse.unquote(u).rstrip('),;]')
+                  if any(k in u.lower() for k in ['pdf','download','down','attach','file','report','view_','docdetail','source']):
+                      links.append(u)
+              for u in re.findall(r'(?:href|src)=["\']([^"\']+)["\']',normalized,re.I):
+                  absu=urllib.parse.urljoin('https://www.nxny.com/report/view_3189898.html',html.unescape(u))
+                  if any(k in absu.lower() for k in ['pdf','download','down','attach','file','report','view_','script','js']):
+                      links.append(absu)
+              strings=[]
+              for pat in [
+                  r'[^\n]{0,500}(?:loginId|vipId|viewLogin|viewVip|download|down|pdf|3189898|3189923|4461177|4414374)[^\n]{0,1200}',
+                  r'[^\n]{0,500}(?:分子诊断行业待爆发|龙头达安笑傲江湖|达安基因)[^\n]{0,1200}',
+              ]:
+                  for x in re.findall(pat,normalized,re.I):
+                      strings.append(re.sub(r'\s+',' ',x)[:2500])
+              out.append({'file':p.name,'size':len(raw),'title':title,'links':list(dict.fromkeys(links))[:1000],'relevant':list(dict.fromkeys(strings))[:1000]})
+          Path('diagnostics/summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          for x in out:
+              print('PAGE',x['file'],'SIZE',x['size'],'TITLE',x['title'])
+              for u in x['links'][:200]:print('LINK',u)
+              for line in x['relevant'][:100]:print('REL',line)
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-deep-source-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
