@@ -1,0 +1,110 @@
+name: Temporary Xinri exact-title platform search
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-title-platform-search.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Query Sdyanbao exact titles and public search pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept':'application/json,text/plain,text/html,application/xhtml+xml,application/pdf,*/*;q=0.8'
+          })
+          titles=[
+              '电动两轮高景气，渠道+产品助力公司加速扩张',
+              '新日股份-首次覆盖报告',
+              '修炼内功，聚焦份额，“新日”正东升',
+              '修炼内功 聚焦份额 新日正东升',
+          ]
+          for q in titles:
+              payload={
+                  'device':1,'hideTrader':0,'onlyTitle':0,'order':0,
+                  'page':1,'pageSize':100,'keyword':q,'pageCount':0,
+                  'dateRange':0,'startTime':'','endTime':'','typeIds':[], 'industryIds':[]
+              }
+              r=s.post('https://api.sdyanbao.com/api/file/search',json=payload,headers={
+                  'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/',
+                  'Content-Type':'application/json;charset=UTF-8'
+              },timeout=90)
+              print('\nSDY_QUERY',q,'HTTP',r.status_code,'LEN',len(r.content))
+              r.raise_for_status(); obj=r.json(); data=obj.get('data') or {}; files=data.get('files') or []
+              print('TOTAL',data.get('total'),'COUNT',len(files))
+              for f in files:
+                  name=str(f.get('name') or '')
+                  content=str(f.get('content') or '')[:1000]
+                  if ('新日股份' in name or '603787' in name or '电动两轮高景气' in name or '修炼内功' in name or
+                      '新日股份' in content or '603787' in content):
+                      print('SDY_MATCH',json.dumps({
+                          'id':f.get('id'),'name':name,'date':f.get('time_text'),'pages':f.get('page_count'),
+                          'size':f.get('file_size'),'type':(f.get('type') or {}).get('name'),
+                          'organization':(f.get('organization') or {}).get('name'),
+                          'uuid':f.get('data_source_uuid'),'data_source':f.get('data_source'),
+                          'original_id':f.get('original_id'),'page_url':f.get('page_url'),
+                          'share_url':f.get('share_url'),'stock':f.get('stock'),
+                      },ensure_ascii=False))
+
+          # Inspect the three known public pages with proper HTML parser installed.
+          urls=[
+              'https://www.vzkoo.com/read/2022102515f1189d784c8c2d45595bc5.html',
+              'https://xdyanbao.com/doc/dezagtl9e3',
+              'https://www.sgpjbg.com/bgdown/19038.html',
+          ]
+          pats=[
+              r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+              r'https?://[^\s"\'<>]+(?:download|file|attachment|oss|cos|cdn)[^\s"\'<>]*',
+              r'[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+          ]
+          for url in urls:
+              print('\nPAGE',url)
+              try:
+                  r=s.get(url,timeout=90,allow_redirects=True,headers={'Referer':urllib.parse.urljoin(url,'/')})
+                  print('HTTP',r.status_code,'LEN',len(r.content),'TYPE',r.headers.get('content-type'),'FINAL',r.url)
+                  text=r.text
+                  print('HEAD',text[:3000].replace('\n',' '))
+                  for pat in pats:
+                      for x in sorted(set(re.findall(pat,text,re.I))): print('MATCH',x[:2000])
+                  soup=BeautifulSoup(text,'html.parser')
+                  for tag in soup.find_all(['a','iframe','embed','object','source','img']):
+                      vals=[]
+                      for attr in ('href','src','data','data-src','data-original'):
+                          if tag.get(attr): vals.append(urllib.parse.urljoin(r.url,tag.get(attr)))
+                      blob=str(tag).lower()
+                      if vals and any(k in blob for k in ['pdf','download','报告','下载','file','preview','page']):
+                          print('TAG',str(tag)[:1500].replace('\n',' '),'URLS',vals)
+                  scripts=[urllib.parse.urljoin(r.url,t['src']) for t in soup.find_all('script',src=True)]
+                  print('SCRIPT_COUNT',len(scripts))
+                  for u in scripts[:60]:
+                      try:
+                          rr=s.get(u,timeout=60)
+                          t=rr.text
+                          if any(k in t.lower() for k in ['pdf','download','attachment','19038','dezagtl9e3','2022102515f1189d784c8c2d45595bc5']):
+                              print('SCRIPT',u,'HTTP',rr.status_code,'LEN',len(rr.content))
+                              for pat in pats:
+                                  for x in sorted(set(re.findall(pat,t,re.I))): print('SCRIPT_MATCH',x[:2000])
+                              for needle in ['19038','dezagtl9e3','2022102515f1189d784c8c2d45595bc5','download','pdf']:
+                                  pos=t.find(needle)
+                                  if pos>=0: print('CTX',needle,t[max(0,pos-700):pos+1800].replace('\n',' ')[:2500])
+                      except Exception as e: print('SCRIPT_ERR',u,repr(e))
+              except Exception as e: print('PAGE_ERR',repr(e))
+          PY
+        env:
+          PYTHONUNBUFFERED: '1'
