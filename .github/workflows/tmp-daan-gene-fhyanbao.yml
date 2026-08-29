@@ -1,0 +1,100 @@
+name: Temporary Daan Gene Fenghuo report inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-fhyanbao.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect Fenghuo report search and download APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/pages diagnostic/assets diagnostic/probes
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          urls=(
+            'https://www.fhyanbao.com/search?keyword=%E8%BE%BE%E5%AE%89%E5%9F%BA%E5%9B%A0'
+            'https://www.fhyanbao.com/search?q=%E8%BE%BE%E5%AE%89%E5%9F%BA%E5%9B%A0'
+            'https://www.fhyanbao.com/rpview/926809'
+            'https://www.fhyanbao.com/rpview/1616152'
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+              -D "diagnostic/pages/${i}.headers" "$url" -o "diagnostic/pages/${i}.html" || true
+            echo "$url" > "diagnostic/pages/${i}.url"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html, json, re, urllib.request
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          assets=[]; summaries=[]; hits=[]; contexts=[]
+          for p in sorted(Path('diagnostic/pages').glob('*.html')):
+              idx=p.stem; base=Path(f'diagnostic/pages/{idx}.url').read_text().strip(); t=p.read_text(errors='replace')
+              m=re.search(r'<title[^>]*>(.*?)</title>',t,re.I|re.S)
+              title=html.unescape(re.sub('<[^>]+>',' ',m.group(1))).strip() if m else ''
+              summaries.append({'file':p.name,'url':base,'size':p.stat().st_size,'title':title})
+              for mm in re.finditer(r'(?:src|href)=["\']([^"\']+)["\']',t,re.I):
+                  u=urljoin(base,html.unescape(mm.group(1)))
+                  if '.js' in u and u.startswith('http'): assets.append(u)
+              for pat in [r'https?://[^"\'<>\s]+',r'/api/[^"\'<>\s]+',r'[^"\'<>\s]*(?:pdf|download|fileUrl|pdfUrl|reportId|rpview|search)[^"\'<>\s]*']:
+                  for mm in re.finditer(pat,t,re.I): hits.append({'file':p.name,'hit':html.unescape(mm.group(0))[:2500]})
+              for needle in ['达安基因','002030','pdfUrl','fileUrl','download','立即下载','reportId','__NEXT_DATA__','nuxt','api']:
+                  start=0
+                  while True:
+                      pos=t.lower().find(needle.lower(),start)
+                      if pos<0: break
+                      contexts.append({'file':p.name,'needle':needle,'context':t[max(0,pos-1800):pos+5500]})
+                      start=pos+len(needle)
+                      if len(contexts)>7000: break
+                  if len(contexts)>7000: break
+          assets=list(dict.fromkeys(assets))[:300]
+          for i,u in enumerate(assets):
+              try:
+                  req=urllib.request.Request(u,headers={'User-Agent':UA,'Referer':'https://www.fhyanbao.com/'})
+                  raw=urllib.request.urlopen(req,timeout=60).read()
+                  if len(raw)>10_000_000: raw=raw[:10_000_000]
+                  Path(f'diagnostic/assets/{i:03d}.txt').write_bytes(raw)
+                  Path(f'diagnostic/assets/{i:03d}.url').write_text(u,encoding='utf-8')
+              except Exception as exc: Path(f'diagnostic/assets/{i:03d}.error').write_text(repr(exc),encoding='utf-8')
+          for p in Path('diagnostic/assets').glob('*.txt'):
+              t=p.read_text(errors='replace')
+              for pat in [r'https?://[^"\'<>\s]+',r'/api/[^"\'<>\s]+',r'[^"\'<>\s]*(?:pdf|download|fileUrl|pdfUrl|reportId|rpview|search)[^"\'<>\s]*']:
+                  for mm in re.finditer(pat,t,re.I):
+                      h=mm.group(0)
+                      if any(k in h.lower() for k in ['pdf','download','fileurl','pdfurl','report','rpview','search','api']): hits.append({'file':p.name,'hit':h[:3000]})
+              for needle in ['926809','1616152','pdfUrl','fileUrl','downloadUrl','reportId','rpview','searchReport','keyword']:
+                  start=0
+                  while True:
+                      pos=t.lower().find(needle.lower(),start)
+                      if pos<0: break
+                      hits.append({'file':p.name,'needle':needle,'context':t[max(0,pos-2200):pos+7000]})
+                      start=pos+len(needle)
+                      if len(hits)>25000: break
+                  if len(hits)>25000: break
+          Path('diagnostic/summaries.json').write_text(json.dumps(summaries,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/assets.json').write_text(json.dumps(assets,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/hits.json').write_text(json.dumps(hits[:25000],ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/contexts.json').write_text(json.dumps(contexts[:7000],ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summaries,ensure_ascii=False,indent=2))
+          print('ASSETS',len(assets),'HITS',len(hits),'CONTEXTS',len(contexts))
+          print(json.dumps(contexts[:100],ensure_ascii=False,indent=2)[:150000])
+          print(json.dumps(hits[:700],ensure_ascii=False,indent=2)[:180000])
+          PY
+      - name: Upload Fenghuo diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-fhyanbao-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
