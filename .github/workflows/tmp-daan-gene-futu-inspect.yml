@@ -1,0 +1,113 @@
+name: Temporary Daan Gene Futu report inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-futu-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch Futu institutional ratings page and inspect data
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/pages diagnostic/assets
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          urls=(
+            'https://www.futunn.com/stock/002030-SZ/institutional-ratings'
+            'https://www.futunn.com/stock/002030-SZ/research'
+            'https://news.futunn.com/stock/002030-SZ/institutional-ratings'
+            'https://news.futunn.com/stock/002030-SZ/research'
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+              -D "diagnostic/pages/page_${i}.headers" "$url" -o "diagnostic/pages/page_${i}.html" || true
+            echo "$url" > "diagnostic/pages/page_${i}.url"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html, json, re, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          summaries=[]; assets=[]; hits=[]; contexts=[]
+          for p in sorted(Path('diagnostic/pages').glob('page_*.html')):
+              idx=p.stem.split('_')[-1]
+              base=Path(f'diagnostic/pages/page_{idx}.url').read_text().strip()
+              text=p.read_text(errors='replace')
+              m=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              title=html.unescape(re.sub('<[^>]+>',' ',m.group(1))).strip() if m else ''
+              summaries.append({'file':p.name,'url':base,'size':p.stat().st_size,'title':title})
+              for mm in re.finditer(r'(?:src|href)=["\']([^"\']+)["\']',text,re.I):
+                  u=html.unescape(mm.group(1))
+                  full=urljoin(base,u)
+                  if '.js' in full and full.startswith('http'): assets.append(full)
+              # Capture inline JSON and report contexts.
+              for needle in ['达安基因','002030','institutional','research','reportId','report_id','rating','国海证券','分子诊断行业待爆发','后疫情时代新冠筛查从严']:
+                  start=0
+                  while True:
+                      pos=text.lower().find(needle.lower(),start)
+                      if pos<0: break
+                      contexts.append({'file':p.name,'needle':needle,'context':text[max(0,pos-1600):pos+5000]})
+                      start=pos+len(needle)
+                      if len(contexts)>5000: break
+                  if len(contexts)>5000: break
+              for pat in [r'https?://[^"\'<>\s]+',r'/api/[^"\'<>\s]+',r'[^"\'<>\s]*(?:reportId|report_id|research|institutional|rating)[^"\'<>\s]*']:
+                  for mm in re.finditer(pat,text,re.I):
+                      h=mm.group(0)
+                      if any(k in h.lower() for k in ['report','research','institutional','rating','api']): hits.append({'file':p.name,'hit':h[:2000]})
+
+          assets=list(dict.fromkeys(assets))[:250]
+          for i,u in enumerate(assets):
+              try:
+                  req=urllib.request.Request(u,headers={'User-Agent':UA,'Referer':'https://www.futunn.com/'})
+                  raw=urllib.request.urlopen(req,timeout=60).read()
+                  if len(raw)>8_000_000: raw=raw[:8_000_000]
+                  Path(f'diagnostic/assets/{i:03d}.txt').write_bytes(raw)
+                  Path(f'diagnostic/assets/{i:03d}.url').write_text(u,encoding='utf-8')
+              except Exception as exc:
+                  Path(f'diagnostic/assets/{i:03d}.error').write_text(repr(exc),encoding='utf-8')
+
+          for p in Path('diagnostic/assets').glob('*.txt'):
+              text=p.read_text(errors='replace')
+              for pat in [r'https?://[^"\'<>\s]+',r'/api/[^"\'<>\s]+',r'[^"\'<>\s]*(?:reportId|report_id|research|institutional|rating|analyst)[^"\'<>\s]*']:
+                  for mm in re.finditer(pat,text,re.I):
+                      h=mm.group(0)
+                      if any(k in h.lower() for k in ['report','research','institutional','rating','analyst','api']): hits.append({'file':p.name,'hit':h[:2500]})
+              for needle in ['reportId','report_id','institutional-ratings','research','analyst_rating','stock/002030','security_id']:
+                  start=0
+                  while True:
+                      pos=text.lower().find(needle.lower(),start)
+                      if pos<0: break
+                      hits.append({'file':p.name,'needle':needle,'context':text[max(0,pos-1800):pos+5500]})
+                      start=pos+len(needle)
+                      if len(hits)>15000: break
+                  if len(hits)>15000: break
+
+          Path('diagnostic/summaries.json').write_text(json.dumps(summaries,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/assets.json').write_text(json.dumps(assets,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/contexts.json').write_text(json.dumps(contexts[:5000],ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/hits.json').write_text(json.dumps(hits[:15000],ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summaries,ensure_ascii=False,indent=2))
+          print('ASSETS',len(assets),'CONTEXTS',len(contexts),'HITS',len(hits))
+          print(json.dumps(contexts[:80],ensure_ascii=False,indent=2)[:120000])
+          print(json.dumps(hits[:500],ensure_ascii=False,indent=2)[:120000])
+          PY
+
+      - name: Upload Futu diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-futu-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
