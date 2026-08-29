@@ -1,0 +1,65 @@
+name: Temporary Dunhuang exact Fxbaogao metadata
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-fx-exact-meta-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Query exact title fragments
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          python -m pip install --disable-pip-version-check requests
+          cat > /tmp/exact.py <<'PY'
+          import json,re,time
+          from pathlib import Path
+          import requests
+          S=requests.Session();S.headers.update({'User-Agent':'Mozilla/5.0','Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/rp','Content-Type':'application/json;charset=UTF-8'})
+          API='https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          queries=[
+            '敦煌种业 先玉高增 加工减亏 盈利可期',
+            '敦煌种业 敦煌先锋产销激增 驱动盈利稳定增长',
+            '敦煌种业 业绩快速回升 敦煌先锋持续快速扩张',
+            '敦煌种业 聚焦种业发展机遇 并购打开成长空间',
+            '敦煌种业 政策春风 孕育历史之机遇',
+            '敦煌种业 打消悲观预期 期待改善来临',
+            '敦煌种业 看好先锋系列继续扩张 期待母公司经营调整',
+            '敦煌种业 借力政策 公司坚定专业化道路',
+            '敦煌种业 进一步聚焦种业 公司业绩有望回升',
+          ]
+          out=[]
+          for i,q in enumerate(queries):
+            for attempt in range(5):
+              r=S.post(API,json={'keywords':q,'pageNum':1,'pageSize':20},timeout=60)
+              try: obj=r.json()
+              except: obj={'raw':r.text[:1000]}
+              if obj.get('code')==1025:
+                time.sleep(8+attempt*3);continue
+              break
+            rows=(obj.get('data') or {}).get('dataList') or []
+            simp=[]
+            for x in rows:
+              title=re.sub('<[^>]+>','',x.get('title') or '')
+              simp.append({k:x.get(k) for k in ('docId','pdfPath','pageNum','orgName','isDeep','isNotBroker','reportType','pubTime') } | {'title':title,'stocks':x.get('stocks')})
+            out.append({'query':q,'code':obj.get('code'),'msg':obj.get('msg'),'count':(obj.get('data') or {}).get('count'),'rows':simp})
+            print('QUERY',q,'CODE',obj.get('code'),'ROWS',len(simp))
+            for x in simp: print(json.dumps(x,ensure_ascii=False))
+            time.sleep(1.5)
+          Path('diagnostics/exact.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/exact.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-fx-exact-meta
+          path: diagnostics/
+          retention-days: 2
+          compression-level: 9
