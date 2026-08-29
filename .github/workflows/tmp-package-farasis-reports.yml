@@ -1,0 +1,505 @@
+name: Package verified Farasis Energy reports
+
+on:
+  push:
+    branches:
+      - tmp/farasis-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+
+      - name: Download, verify, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html as html_lib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import parse_qs, urljoin, urlsplit
+
+          import pymupdf as fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          ROOT = Path.cwd()
+          PACKAGE = ROOT / "farasis_verified_package"
+          ANNUAL_DIR = PACKAGE / "01_年度报告_2020-2025"
+          HALF_DIR = PACKAGE / "02_最新半年度报告"
+          ANNUAL_DIR.mkdir(parents=True, exist_ok=True)
+          HALF_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": (
+                  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36"
+              ),
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def normalize(text: str) -> str:
+              return re.sub(r"\s+", "", text or "").lower()
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for block in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def decode_response(response: requests.Response) -> str:
+              candidates = [response.encoding, response.apparent_encoding, "gb18030", "utf-8"]
+              best = ""
+              best_score = -10**9
+              for encoding in candidates:
+                  if not encoding:
+                      continue
+                  try:
+                      text = response.content.decode(encoding, errors="replace")
+                  except LookupError:
+                      continue
+                  score = sum(text.count(token) * 10 for token in (
+                      "孚能科技", "年度报告", "半年度报告", "下载公告", "公告日期"
+                  )) - text.count("�") * 5
+                  if score > best_score:
+                      best = text
+                      best_score = score
+              return html_lib.unescape(best or response.text).replace("\\/", "/")
+
+          def request_html(url: str) -> tuple[str, str]:
+              response = session.get(url, timeout=(25, 180), allow_redirects=True)
+              response.raise_for_status()
+              return decode_response(response), response.url
+
+          def extract_detail_id(url: str) -> int:
+              values = parse_qs(urlsplit(url).query).get("id") or []
+              if values and values[0].isdigit():
+                  return int(values[0])
+              match = re.search(r"[?&]id=(\d+)", url)
+              return int(match.group(1)) if match else 0
+
+          def listing_urls(report_type: str) -> list[str]:
+              ftype = "ndbg" if report_type == "annual" else "zqbg"
+              page_type = ftype
+              urls: list[str] = []
+              for host in ("money.finance.sina.com.cn", "vip.stock.finance.sina.com.cn"):
+                  urls.extend([
+                      f"https://{host}/corp/go.php/vCB_AllBulletin/stockid/688567.phtml?ftype={ftype}",
+                      f"https://{host}/corp/go.php/vCB_Bulletin/stockid/688567/page_type/{page_type}.phtml",
+                  ])
+                  if report_type == "half":
+                      urls.append(f"https://{host}/corp/go.php/vCB_AllBulletin/stockid/688567.phtml")
+              return list(dict.fromkeys(urls))
+
+          def collect_records(report_type: str) -> list[dict[str, Any]]:
+              records: dict[int, dict[str, Any]] = {}
+              errors: list[str] = []
+              for listing_url in listing_urls(report_type):
+                  try:
+                      raw_html, final_url = request_html(listing_url)
+                      soup = BeautifulSoup(raw_html, "html.parser")
+                      found_here = 0
+                      for anchor in soup.find_all("a", href=True):
+                          title = " ".join(anchor.get_text(" ", strip=True).split())
+                          href = urljoin(final_url, anchor["href"])
+                          if "vCB_AllBulletinDetail.php" not in href:
+                              continue
+                          detail_id = extract_detail_id(href)
+                          if not detail_id or not title:
+                              continue
+                          records[detail_id] = {
+                              "title": title,
+                              "href": href,
+                              "detail_id": detail_id,
+                              "listing_url": final_url,
+                          }
+                          found_here += 1
+                      print(f"Listing {listing_url}: {found_here} detail links")
+                  except Exception as exc:
+                      errors.append(f"{listing_url}: {exc}")
+              if not records:
+                  raise RuntimeError(f"No {report_type} records collected: " + " | ".join(errors))
+              result = sorted(records.values(), key=lambda item: item["detail_id"])
+              print(f"Collected {len(result)} unique {report_type} records")
+              print(json.dumps(result, ensure_ascii=False, indent=2))
+              return result
+
+          annual_records = collect_records("annual")
+          half_records = collect_records("half")
+
+          title_company_markers = (
+              "孚能科技",
+              "孚能科技（赣州）股份有限公司",
+              "孚能科技(赣州)股份有限公司",
+          )
+          pdf_company_markers = (
+              "孚能科技",
+              "孚能科技（赣州）股份有限公司",
+              "孚能科技(赣州)股份有限公司",
+              "688567",
+              "farasis",
+          )
+
+          def record_matches_company(title: str) -> bool:
+              compact = normalize(title)
+              return any(marker in compact for marker in title_company_markers)
+
+          def choose_annual(year: int) -> dict[str, Any]:
+              tokens = (f"{year}年年度报告", f"{year}年度报告")
+              candidates: list[tuple[float, dict[str, Any]]] = []
+              for record in annual_records:
+                  title = normalize(record["title"])
+                  if not record_matches_company(title):
+                      continue
+                  if not any(token in title for token in tokens):
+                      continue
+                  if any(bad in title for bad in (
+                      "摘要", "英文版", "审计报告", "问询", "更正公告", "取消",
+                      "内部控制", "社会责任", "环境社会", "可持续发展", "esg"
+                  )):
+                      continue
+                  score = 100.0
+                  if any(marker in title for marker in (
+                      "修订", "更正后", "更新后", "修订后"
+                  )):
+                      score += 100.0
+                  if "全文" in title:
+                      score += 5.0
+                  score += record["detail_id"] / 100_000_000
+                  candidates.append((score, record))
+              if not candidates:
+                  raise RuntimeError(f"No complete annual report found for {year}")
+              candidates.sort(key=lambda item: item[0], reverse=True)
+              chosen = candidates[0][1]
+              print(f"Chosen annual {year}: {chosen}")
+              return chosen
+
+          def choose_latest_half() -> tuple[int, dict[str, Any]]:
+              candidates: list[tuple[float, int, dict[str, Any]]] = []
+              for record in half_records:
+                  title = normalize(record["title"])
+                  if not record_matches_company(title):
+                      continue
+                  match = re.search(r"(20\d{2})年半年度报告", title)
+                  if not match:
+                      continue
+                  if any(bad in title for bad in (
+                      "摘要", "英文版", "审计报告", "问询", "更正公告", "取消",
+                      "募集资金", "专项报告", "内部控制", "经营情况"
+                  )):
+                      continue
+                  year = int(match.group(1))
+                  score = year * 1000.0
+                  if any(marker in title for marker in (
+                      "修订", "更正后", "更新后", "修订后"
+                  )):
+                      score += 100.0
+                  score += record["detail_id"] / 100_000_000
+                  candidates.append((score, year, record))
+              if not candidates:
+                  raise RuntimeError("No complete half-year report found")
+              candidates.sort(key=lambda item: item[0], reverse=True)
+              _, year, chosen = candidates[0]
+              if year < 2025:
+                  raise RuntimeError(f"Latest half-year report is unexpectedly old: {chosen}")
+              print(f"Chosen latest half-year report ({year}): {chosen}")
+              return year, chosen
+
+          def detail_variants(record: dict[str, Any]) -> list[str]:
+              detail_id = record["detail_id"]
+              variants = [record["href"]]
+              for host in ("money.finance.sina.com.cn", "vip.stock.finance.sina.com.cn"):
+                  variants.extend([
+                      f"https://{host}/corp/view/vCB_AllBulletinDetail.php?id={detail_id}&stockid=688567",
+                      f"https://{host}/corp/view/vCB_AllBulletinDetail.php?stockid=688567&id={detail_id}",
+                  ])
+              return list(dict.fromkeys(variants))
+
+          def extract_pdf_from_detail(record: dict[str, Any]) -> tuple[str, str, str]:
+              errors: list[str] = []
+              pattern = re.compile(
+                  r"https?://(?:file\.finance\.sina\.com\.cn|static\.cninfo\.com\.cn|static\.sse\.com\.cn)/[^\"'<>\s]+?\.PDF",
+                  flags=re.I,
+              )
+              for detail_url in detail_variants(record):
+                  try:
+                      raw_html, final_url = request_html(detail_url)
+                      soup = BeautifulSoup(raw_html, "html.parser")
+                      links: list[str] = []
+                      for anchor in soup.find_all("a", href=True):
+                          href = urljoin(final_url, anchor["href"])
+                          lower = href.lower()
+                          if ".pdf" in lower and any(domain in lower for domain in (
+                              "file.finance.sina.com.cn",
+                              "static.cninfo.com.cn",
+                              "static.sse.com.cn",
+                          )):
+                              links.append(href)
+                      links.extend(pattern.findall(raw_html))
+                      links = list(dict.fromkeys(links))
+                      if links:
+                          context = " ".join(soup.get_text(" ", strip=True).split())[:1800]
+                          print(f"Detail {record['detail_id']}: {links[0]}")
+                          return links[0], final_url, context
+                      errors.append(f"{detail_url}: no PDF link")
+                  except Exception as exc:
+                      errors.append(f"{detail_url}: {exc}")
+              raise RuntimeError(
+                  f"No PDF link found for detail {record['detail_id']}: " + " | ".join(errors)
+              )
+
+          def download_candidates(url: str) -> list[str]:
+              url = html_lib.unescape(url).replace("\\/", "/")
+              candidates = [url]
+              parsed = urlsplit(url)
+              if parsed.hostname == "file.finance.sina.com.cn":
+                  path = parsed.path
+                  marker = "/211.154.219.97:9494/"
+                  if path.startswith(marker):
+                      encoded = "/211.154.219.97%3A9494/" + path[len(marker):]
+                      candidates.insert(0, "https://file.finance.sina.com.cn" + encoded)
+                  elif "/211.154.219.97%3A9494/" in path:
+                      candidates.insert(0, "https://file.finance.sina.com.cn" + path)
+              if url.startswith("http://"):
+                  candidates.insert(0, "https://" + url[len("http://"):])
+              return list(dict.fromkeys(candidates))
+
+          def download_pdf(urls: list[str], target: Path, referer: str) -> str:
+              errors: list[str] = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      part = target.with_suffix(target.suffix + ".part")
+                      part.unlink(missing_ok=True)
+                      try:
+                          with session.get(
+                              url,
+                              headers={"Referer": referer, "Accept": "application/pdf,*/*;q=0.8"},
+                              stream=True,
+                              timeout=(30, 360),
+                              allow_redirects=True,
+                          ) as response:
+                              response.raise_for_status()
+                              with part.open("wb") as handle:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          handle.write(chunk)
+                          if part.stat().st_size < 250_000:
+                              raise RuntimeError(f"file too small: {part.stat().st_size}")
+                          with part.open("rb") as handle:
+                              if handle.read(5) != b"%PDF-":
+                                  raise RuntimeError("response is not a PDF")
+                          part.replace(target)
+                          print(f"Downloaded {url} -> {target} ({target.stat().st_size} bytes)")
+                          return url
+                      except Exception as exc:
+                          part.unlink(missing_ok=True)
+                          errors.append(f"{url} attempt {attempt}: {exc}")
+                          time.sleep(attempt * 2)
+              raise RuntimeError("Unable to download PDF: " + " | ".join(errors))
+
+          def inspect_pdf(path: Path, *, expected_year: int, kind: str) -> dict[str, Any]:
+              reader = PdfReader(str(path))
+              encrypted = reader.is_encrypted
+              if encrypted and reader.decrypt("") == 0:
+                  raise RuntimeError(f"Cannot decrypt PDF: {path}")
+              pages = len(reader.pages)
+              minimum_pages = {"annual": 100, "half": 60}[kind]
+              if pages < minimum_pages:
+                  raise RuntimeError(f"Unexpectedly short {kind} PDF {path}: {pages} pages")
+
+              document = fitz.open(path)
+              if document.page_count != pages:
+                  raise RuntimeError(f"Page-count mismatch: {path}")
+
+              front_text = "\n".join(
+                  document.load_page(index).get_text("text")
+                  for index in range(min(120, pages))
+              )
+              front_compact = normalize(front_text)
+              if not any(marker in front_compact for marker in pdf_company_markers):
+                  raise RuntimeError(f"Company marker missing from front section: {path}")
+              if str(expected_year) not in front_compact:
+                  raise RuntimeError(f"Year marker {expected_year} missing: {path}")
+              if kind == "annual" and "年度报告" not in front_compact:
+                  raise RuntimeError(f"Annual-report marker missing: {path}")
+              if kind == "half" and "半年度报告" not in front_compact:
+                  raise RuntimeError(f"Half-year marker missing: {path}")
+
+              for index in sorted(set([0, min(1, pages - 1), pages // 3, pages // 2, (pages * 2) // 3, pages - 1])):
+                  pixmap = document.load_page(index).get_pixmap(
+                      matrix=fitz.Matrix(0.55, 0.55), alpha=False
+                  )
+                  if pixmap.width < 150 or pixmap.height < 150:
+                      raise RuntimeError(f"Render check failed: {path}, page {index + 1}")
+              document.close()
+              return {
+                  "pages": pages,
+                  "bytes": path.stat().st_size,
+                  "sha256": sha256(path),
+                  "encrypted": encrypted,
+              }
+
+          documents: list[dict[str, Any]] = []
+
+          for year in range(2020, 2026):
+              record = choose_annual(year)
+              raw_url, detail_url, context = extract_pdf_from_detail(record)
+              normalized_title = normalize(record["title"])
+              suffix = ""
+              if any(marker in normalized_title for marker in (
+                  "修订", "更正后", "更新后", "修订后"
+              )):
+                  suffix = "_修订版"
+              target = ANNUAL_DIR / f"孚能科技_{year}年年度报告{suffix}.pdf"
+              used_url = download_pdf(download_candidates(raw_url), target, detail_url)
+              metadata = inspect_pdf(target, expected_year=year, kind="annual")
+              note = "完整年度报告，不含摘要。"
+              if suffix:
+                  note += "采用后续披露的修订或更新版本。"
+              documents.append({
+                  "category": "Annual Report",
+                  "year": year,
+                  "label": record["title"],
+                  "period": f"截至{year}年12月31日止年度",
+                  "file": str(target.relative_to(PACKAGE)),
+                  "source": used_url,
+                  "source_detail": detail_url,
+                  "source_context": context,
+                  "note": note,
+                  **metadata,
+              })
+
+          half_year, half_record = choose_latest_half()
+          half_raw_url, half_detail_url, half_context = extract_pdf_from_detail(half_record)
+          half_target = HALF_DIR / f"孚能科技_{half_year}年半年度报告.pdf"
+          half_used_url = download_pdf(
+              download_candidates(half_raw_url), half_target, half_detail_url
+          )
+          half_metadata = inspect_pdf(half_target, expected_year=half_year, kind="half")
+          date_match = re.search(r"/(20\d{2})-(\d{2})-(\d{2})/", half_used_url)
+          published_date = "-".join(date_match.groups()) if date_match else None
+          half_item: dict[str, Any] = {
+              "category": "Latest Half-Year Report",
+              "year": half_year,
+              "label": half_record["title"],
+              "period": f"截至{half_year}年6月30日止六个月",
+              "file": str(half_target.relative_to(PACKAGE)),
+              "source": half_used_url,
+              "source_detail": half_detail_url,
+              "source_context": half_context,
+              "note": "截至整理日实际最新的完整半年度报告，不含摘要。",
+              **half_metadata,
+          }
+          if published_date:
+              half_item["published_date"] = published_date
+          documents.append(half_item)
+
+          if len(documents) != 7:
+              raise RuntimeError(f"Expected 7 documents, found {len(documents)}")
+          annual_years = sorted(
+              item["year"] for item in documents if item["category"] == "Annual Report"
+          )
+          if annual_years != list(range(2020, 2026)):
+              raise RuntimeError(f"Annual-year coverage mismatch: {annual_years}")
+
+          total_pages = sum(int(item["pages"]) for item in documents)
+          total_bytes = sum(int(item["bytes"]) for item in documents)
+          half_date_text = half_item.get("published_date", "未能从文件地址解析披露日期")
+          readme = [
+              "孚能科技（赣州）股份有限公司（688567.SH）",
+              "2020—2025年年度报告及最新半年度报告",
+              "整理日期：2026-08-29",
+              "",
+              "文件口径",
+              "1. 收录2020—2025年共6份完整年度报告，排除年度报告摘要。",
+              "2. 同一年度如存在修订、更正后或更新后版本，优先采用后续版本。",
+              f"3. 截至2026年8月29日，实时公告列表中的最新完整半年报为{half_year}年半年度报告。",
+              f"4. 最新半年报披露日期：{half_date_text}；报告覆盖截至{half_year}年6月30日止六个月。",
+              "",
+              "文件清单",
+          ]
+          checksum_lines: list[str] = []
+          for index, item in enumerate(documents, 1):
+              readme.extend([
+                  f"{index}. {item['label']}",
+                  f"   报告期：{item['period']}",
+                  f"   文件：{item['file']}",
+                  f"   页数：{item['pages']}",
+                  f"   大小：{item['bytes']} bytes",
+                  f"   SHA-256：{item['sha256']}",
+                  f"   来源：{item['source']}",
+                  f"   说明：{item['note']}",
+                  "",
+              ])
+              checksum_lines.append(f"{item['sha256']}  {item['file']}")
+
+          readme.extend([
+              "完整性检查",
+              f"- 共{len(documents)}份PDF，合计{total_pages}页，未压缩总大小{total_bytes / 1024 / 1024:.2f} MiB。",
+              "- 每份PDF均检查文件头、结构可解析性、公司名称、报告年度/期间及文档类型。",
+              "- 已抽查每份PDF的首页、中间页和末页渲染结果。",
+              "- ZIP已通过CRC完整性测试；逐文件SHA-256见SHA256SUMS.txt。",
+          ])
+
+          (PACKAGE / "README_来源与校验.txt").write_text("\n".join(readme), encoding="utf-8")
+          (PACKAGE / "SHA256SUMS.txt").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
+          (PACKAGE / "manifest.json").write_text(
+              json.dumps({
+                  "company": "孚能科技（赣州）股份有限公司",
+                  "ticker": "688567.SH",
+                  "prepared_date": "2026-08-29",
+                  "latest_half_year": half_year,
+                  "documents": documents,
+                  "total_pages": total_pages,
+                  "total_bytes": total_bytes,
+              }, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          output = ROOT / "孚能科技_2020-2025年报_最新半年报_完整PDF.zip"
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in sorted(PACKAGE.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(path.relative_to(PACKAGE)))
+
+          with zipfile.ZipFile(output, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP CRC failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, found {len(pdfs)}: {pdfs}")
+
+          print("\n".join(readme))
+          print(f"LATEST_HALF_YEAR={half_year}")
+          print(f"LATEST_HALF_DATE={half_date_text}")
+          print(f"ZIP_FILE={output}")
+          print(f"ZIP_BYTES={output.stat().st_size}")
+          print(f"ZIP_SHA256={sha256(output)}")
+          PY
+
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: farasis-reports-final
+          path: 孚能科技_2020-2025年报_最新半年报_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
