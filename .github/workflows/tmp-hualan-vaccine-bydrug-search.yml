@@ -1,0 +1,124 @@
+name: Temporary Hualan Vaccine ByDrug search
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-bydrug-search.yml
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect ByDrug report listing, scripts and public APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import json, re, urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+            'Accept':'text/html,application/json,text/plain,*/*;q=0.8',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.6',
+            'Referer':'https://bydrug.pharmcube.com/'
+          })
+          seed='https://bydrug.pharmcube.com/report/detail/f464547e60c64c37b44e9d99835c332e'
+          pages=[
+            seed,
+            'https://bydrug.pharmcube.com/report',
+            'https://bydrug.pharmcube.com/report/list',
+            'https://bydrug.pharmcube.com/report?keyword='+urllib.parse.quote('华兰疫苗'),
+            'https://bydrug.pharmcube.com/report/list?keyword='+urllib.parse.quote('华兰疫苗'),
+            'https://bydrug.pharmcube.com/search?keyword='+urllib.parse.quote('华兰疫苗'),
+          ]
+          script_urls=[]
+          for url in pages:
+            print('\n===== PAGE',url,'=====')
+            try:
+              r=s.get(url,timeout=90,allow_redirects=True)
+              print('HTTP',r.status_code,'BYTES',len(r.content),'TYPE',r.headers.get('content-type'),'FINAL',r.url)
+              r.encoding=r.apparent_encoding or r.encoding or 'utf-8'
+              text=r.text
+              print('HEAD',text[:1000])
+              soup=BeautifulSoup(text,'lxml')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+              visible=' '.join(soup.get_text(' ',strip=True).split())
+              print('VISIBLE',visible[:16000])
+              for pat in [
+                r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+                r'https?://[^\s"\'<>]+(?:api|report|download|file|pdf)[^\s"\'<>]*',
+                r'H3_AP\d{18}_1(?:\.pdf|imgss\d+\.jpg)?',
+                r'AP\d{18}',
+              ]:
+                for hit in list(dict.fromkeys(re.findall(pat,text,re.I)))[:500]: print('MATCH',hit)
+              for form in soup.find_all('form'):
+                print('FORM',form.get('method'),urllib.parse.urljoin(r.url,form.get('action') or ''),str(form)[:6000].replace('\n',' '))
+              for tag in soup.find_all(['a','button','iframe','embed','object','source','script']):
+                for attr in ('href','src','data','data-url','data-id','onclick'):
+                  val=tag.get(attr)
+                  if not val: continue
+                  full=urllib.parse.urljoin(r.url,val) if attr not in ('onclick','data-id') else val
+                  blob=(str(tag)+' '+str(full)).lower()
+                  if any(k in blob for k in ['report','search','download','pdf','api','华兰疫苗','301207']):
+                    print('TAG',attr,str(full)[:3500],str(tag)[:3500].replace('\n',' '))
+              for sc in soup.find_all('script',src=True):
+                u=urllib.parse.urljoin(r.url,sc['src'])
+                if u not in script_urls: script_urls.append(u)
+            except Exception as e: print('PAGE_ERROR',repr(e))
+
+          print('\n===== SCRIPTS',len(script_urls),'=====')
+          for u in script_urls:
+            try:
+              r=s.get(u,timeout=60)
+              text=r.text
+              if any(k in text.lower() for k in ['report','search','download','pdf','/api/']):
+                print('\nSCRIPT',u,'HTTP',r.status_code,'BYTES',len(r.content))
+                for pat in [
+                  r'https?://[^\s"\'<>]+(?:api|report|download|file|pdf)[^\s"\'<>]*',
+                  r'["\']([^"\']*(?:/api/|report/list|report/search|report/detail|download)[^"\']*)["\']',
+                  r'H3_AP\d{18}_1(?:\.pdf|imgss\d+\.jpg)?',
+                  r'AP\d{18}',
+                ]:
+                  for hit in list(dict.fromkeys(re.findall(pat,text,re.I)))[:800]: print('SCRIPT_MATCH',hit)
+                for needle in ['report/list','report/search','/api/','keyword','download','pdf','report/detail']:
+                  for m in list(re.finditer(needle,text,re.I))[:30]:
+                    print('SCRIPT_CTX',needle,text[max(0,m.start()-1800):m.start()+5200].replace('\n',' ')[:7000])
+            except Exception as e: print('SCRIPT_ERROR',u,repr(e))
+
+          # Try ordinary public endpoints inferred from typical frontend conventions; no credentials.
+          qs=['华兰疫苗','天高任鸟飞，海阔凭鱼跃','疫苗行业龙头，业绩有望强势复苏','国内领先流感疫苗制造商，四价流感疫苗打造华兰力量','拨云见日，流感疫苗行业龙头蓄势待发','流感疫苗龙头，业绩有望重回正增长','疫苗龙头，迎风起舞','深耕流感疫苗市场，看好长期发展空间']
+          endpoint_templates=[
+            ('GET','https://bydrug.pharmcube.com/api/report/list',None),
+            ('GET','https://bydrug.pharmcube.com/api/report/search',None),
+            ('GET','https://bydrug.pharmcube.com/api/search/report',None),
+            ('GET','https://bydrug.pharmcube.com/report/api/list',None),
+            ('GET','https://bydrug.pharmcube.com/report/api/search',None),
+            ('GET','https://bydrug.pharmcube.com/api/v1/report/list',None),
+            ('GET','https://bydrug.pharmcube.com/api/v1/report/search',None),
+          ]
+          for q in qs:
+            print('\n######## QUERY',q)
+            for method,u,_ in endpoint_templates:
+              for params in [
+                {'keyword':q,'page':1,'pageSize':100},
+                {'q':q,'page':1,'size':100},
+                {'search':q,'pageNo':1,'pageSize':100},
+              ]:
+                try:
+                  r=s.get(u,params=params,timeout=45,allow_redirects=False)
+                  ctype=str(r.headers.get('content-type') or '')
+                  if r.status_code not in (404,) or len(r.content)>1000:
+                    print('ENDPOINT',u,params,'HTTP',r.status_code,'TYPE',ctype,'LEN',len(r.content),'LOC',r.headers.get('location'))
+                    print(r.text[:30000] if ('json' in ctype.lower() or 'text' in ctype.lower()) else '')
+                except Exception as e: print('ENDPOINT_ERROR',u,repr(e))
+          PY
