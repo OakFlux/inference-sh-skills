@@ -1,0 +1,64 @@
+name: Temporary Guosheng reports query probe
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-reports-query-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Extract reports GraphQL query and test date/keyword listing
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, urllib.parse, requests
+          from bs4 import BeautifulSoup
+
+          root='https://research.gszq.com/'
+          s=requests.Session(); s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Origin':'https://research.gszq.com','Referer':root,
+              'Accept':'application/json,text/plain,*/*','Content-Type':'application/json'
+          })
+          r=s.get(root,timeout=90); r.raise_for_status(); soup=BeautifulSoup(r.text,'html.parser')
+          scripts=[urllib.parse.urljoin(r.url,t['src']) for t in soup.find_all('script',src=True)]
+          small=[]
+          for u in scripts:
+              rr=s.get(u,timeout=120); rr.raise_for_status()
+              if len(rr.content)<200000: small.append((u,rr.text))
+          for u,text in small:
+              print('\nFILE',u,'LEN',len(text))
+              for needle in ['reports(','reports (','start_time','next_batch','is_end','reportCatalogs','reportMenus','query Reports']:
+                  starts=[m.start() for m in re.finditer(re.escape(needle),text,re.I)]
+                  if starts:
+                      print('NEEDLE',needle,'COUNT',len(starts))
+                      for p in starts[:50]: print('CTX',text[max(0,p-2500):p+6000].replace('\n',' ')[:8500])
+
+          endpoint=root+'graphql'
+          queries=[]
+          # Likely resolver shape from the frontend bundle.
+          for field in ['reports','reportList','researchReports']:
+              queries.append((field,f'''query {{ {field}(catalog: "", limit: 100, page: 1, start_time: 1598918400, end_time: 1601510400, keywords: "新日股份") {{ next_batch is_end total reports {{ rid type title brief authors custom catalog updated_time pic can_view }} }} }}'''))
+              queries.append((field+'-datestr',f'''query {{ {field}(catalog: "", limit: 100, page: 1, start_time: "2020-09-01", end_time: "2020-10-01", keywords: "新日股份") {{ next_batch is_end total reports {{ rid type title brief authors custom catalog updated_time pic can_view }} }} }}'''))
+          # Schema/type probes useful even when full introspection is disabled.
+          queries += [
+              ('schema','query { __schema { queryType { name } } }'),
+              ('queryfields','query { __type(name:"Query") { fields { name args { name type { kind name ofType { kind name } } } } } }'),
+          ]
+          for name,q in queries:
+              try:
+                  rr=s.post(endpoint,json={'query':q},timeout=90)
+                  print('\nQUERY',name,'HTTP',rr.status_code,'LEN',len(rr.content),'TYPE',rr.headers.get('content-type'))
+                  print(rr.text[:120000])
+              except Exception as e: print('QUERY_ERR',name,repr(e))
+          PY
