@@ -1,0 +1,51 @@
+name: Package verified Aima Technology reports v3
+
+on:
+  push:
+    branches:
+      - tmp/aima-tech-reports-v3-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+
+      - name: Run corrected verified packaging script
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import requests
+          import textwrap
+
+          source_url = "https://raw.githubusercontent.com/OakFlux/inference-sh-skills/aa368fbe5c2bd3367fee37d2bb8c856b997a114b/.github/workflows/tmp-package-aima-tech-reports-v2.yml"
+          response = requests.get(source_url, timeout=120)
+          response.raise_for_status()
+          workflow = response.text
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n"
+          if start_marker not in workflow or end_marker not in workflow:
+              raise RuntimeError("Unable to extract embedded Python packaging script")
+          block = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
+          code = textwrap.dedent(block)
+          code = code.replace('"kind": "annual", "year": 2021, "detail_id": 8286798,', '"kind": "annual", "year": 2021, "detail_id": 7997200,')
+          code = code.replace('"label": "爱玛科技2021年度报告（后续披露版本）",', '"label": "爱玛科技集团股份有限公司2021年年度报告",')
+          code = code.replace('"target": ANNUAL_DIR / "爱玛科技_2021年年度报告_后续披露版.pdf",', '"target": ANNUAL_DIR / "爱玛科技_2021年年度报告.pdf",')
+          code = code.replace('"note": "完整年度报告，不含摘要；采用后续披露版本。",', '"note": "完整年度报告，不含摘要；采用2022年4月16日首次正式披露版本。",')
+          exec(compile(code, "aima_packaging_v3.py", "exec"), {"__name__": "__main__"})
+          PY
+
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: aima-tech-reports-final-v3
+          path: 爱玛科技_2020年度审计资料_2021-2025年报_2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
