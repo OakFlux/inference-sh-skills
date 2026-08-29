@@ -1,0 +1,138 @@
+name: Temporary Dunhuang Seed Sina report discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-sina-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Fetch Sina company-report listings and metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/lists diagnostics/reports
+          cat > /tmp/dunhuang_sina.py <<'PY'
+          from __future__ import annotations
+          import html, json, re, subprocess, urllib.parse
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          OUT=Path('diagnostics')
+          bases=[
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=sh600354&t1=all',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/company/index.phtml?symbol=sh600354&t1=all',
+            'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=sh600354&t1=all',
+            'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/company/index.phtml?symbol=sh600354&t1=all',
+          ]
+
+          def curl(url: str, path: Path) -> bool:
+              path.parent.mkdir(parents=True,exist_ok=True)
+              p=subprocess.run([
+                  'curl','--http1.1','-L','--fail','--silent','--show-error',
+                  '--retry','3','--retry-all-errors','--retry-delay','1',
+                  '--connect-timeout','15','--max-time','90',
+                  '--user-agent',UA,'--header','Accept-Encoding: identity',
+                  url,'-o',str(path)
+              ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              return p.returncode==0 and path.exists() and path.stat().st_size>0
+
+          jobs=[]
+          for bi,base in enumerate(bases):
+              for page in range(1,31):
+                  jobs.append((bi,page,base+('&' if '?' in base else '?')+f'p={page}'))
+
+          results=[]
+          with ThreadPoolExecutor(max_workers=10) as pool:
+              futs={pool.submit(curl,url,OUT/'lists'/f'base{bi}_p{page}.html'):(bi,page,url) for bi,page,url in jobs}
+              for fut in as_completed(futs):
+                  bi,page,url=futs[fut]
+                  try: ok=fut.result()
+                  except Exception: ok=False
+                  results.append((bi,page,url,ok))
+
+          links={}
+          for bi,page,url,ok in sorted(results):
+              p=OUT/'lists'/f'base{bi}_p{page}.html'
+              if not ok or not p.exists():
+                  continue
+              raw=p.read_bytes()
+              texts=[raw.decode(enc,'ignore') for enc in ('utf-8','gb18030','gbk')]
+              text=max(texts,key=lambda x:x.count('敦煌种业')+x.count('rptid'))
+              for m in re.finditer(r'href=["\']([^"\']*vReport_Show[^"\']*rptid/(\d+)[^"\']*)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+                  href=html.unescape(m.group(1)); rid=m.group(2)
+                  title=re.sub(r'<[^>]+>','',html.unescape(m.group(3)))
+                  title=re.sub(r'\s+',' ',title).strip()
+                  if href.startswith('//'): href='https:'+href
+                  elif href.startswith('/'): href='https://stock.finance.sina.com.cn'+href
+                  elif not href.startswith('http'): href=urllib.parse.urljoin(url,href)
+                  links[rid]={'rptid':rid,'title_from_list':title,'url':href,'list_source':url}
+              for href,rid in re.findall(r'["\']([^"\']*vReport_Show[^"\']*rptid/(\d+)[^"\']*)["\']',text,re.I):
+                  href=html.unescape(href)
+                  if href.startswith('//'): href='https:'+href
+                  elif href.startswith('/'): href='https://stock.finance.sina.com.cn'+href
+                  elif not href.startswith('http'): href=urllib.parse.urljoin(url,href)
+                  links.setdefault(rid,{'rptid':rid,'title_from_list':'','url':href,'list_source':url})
+
+          # Ensure web-indexed report pages are included.
+          known={
+            '325677500781':'敦煌种业一季报点评：敦煌先锋主导公司业绩',
+            '356606809312':'敦煌种业年报点评：先锋良种提升公司盈利',
+          }
+          for rid,title in known.items():
+              links.setdefault(rid,{
+                  'rptid':rid,'title_from_list':title,
+                  'url':f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml',
+                  'list_source':'web-index'
+              })
+
+          def fetch_report(item):
+              rid=item['rptid']; url=item['url']; p=OUT/'reports'/f'{rid}.html'
+              if not curl(url,p): return None
+              raw=p.read_bytes(); candidates=[raw.decode(enc,'ignore') for enc in ('utf-8','gb18030','gbk')]
+              text=max(candidates,key=lambda x:x.count('敦煌种业')+x.count('类别：')+x.count('机构：'))
+              norm=html.unescape(text.replace('\\/','/'))
+              visible=re.sub(r'<script.*?</script>|<style.*?</style>',' ',norm,flags=re.I|re.S)
+              visible=re.sub(r'<[^>]+>',' ',visible); visible=re.sub(r'\s+',' ',visible)
+              if '敦煌种业' not in visible and '600354' not in visible: return None
+              tm=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+              page_title=re.sub(r'<[^>]+>','',tm.group(1)).strip() if tm else ''
+              bm=re.search(r'机构[：:]\s*(.*?)(?:\s+研究员[：:]|\s+日期[：:])',visible)
+              broker=bm.group(1).strip() if bm else ''
+              am=re.search(r'研究员[：:]\s*(.*?)(?:\s+日期[：:]|\s{2,})',visible)
+              analyst=am.group(1).strip() if am else ''
+              dm=re.search(r'日期[：:]\s*(20\d{2}-\d{2}-\d{2})',visible)
+              date=dm.group(1) if dm else ''
+              return {**item,'page_title':page_title,'broker':broker,'analyst':analyst,'date':date,'text_prefix':visible[:2000]}
+
+          rows=[]
+          with ThreadPoolExecutor(max_workers=8) as pool:
+              futs={pool.submit(fetch_report,item):item['rptid'] for item in links.values()}
+              for fut in as_completed(futs):
+                  try: row=fut.result()
+                  except Exception: row=None
+                  if row: rows.append(row)
+
+          rows.sort(key=lambda r:(r.get('date') or '', int(r.get('rptid') or 0)),reverse=True)
+          OUT.joinpath('sina_reports.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('sina_links.json').write_text(json.dumps(list(links.values()),ensure_ascii=False,indent=2),encoding='utf-8')
+          print('LINK_COUNT',len(links),'REPORT_COUNT',len(rows))
+          for r in rows:
+              print(json.dumps({k:r.get(k) for k in ('rptid','date','broker','page_title','title_from_list','url')},ensure_ascii=False))
+          PY
+          python /tmp/dunhuang_sina.py
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-sina-reports
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
