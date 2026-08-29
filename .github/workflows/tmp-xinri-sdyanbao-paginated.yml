@@ -1,0 +1,62 @@
+name: Temporary Xinri paginated Sdyanbao lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-sdyanbao-paginated.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Paginate exact ticker results
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/',
+              'Content-Type':'application/json;charset=UTF-8','Accept':'application/json,text/plain,*/*'
+          })
+          seen=set()
+          for page in range(1,8):
+              payload={
+                  'device':1,'hideTrader':0,'onlyTitle':0,'order':0,
+                  'page':page,'pageSize':100,'keyword':'603787','pageCount':0,
+                  'dateRange':0,'startTime':'','endTime':'','typeIds':[], 'industryIds':[]
+              }
+              r=s.post('https://api.sdyanbao.com/api/file/search',json=payload,timeout=90)
+              print('\nPAGE',page,'HTTP',r.status_code,'LEN',len(r.content))
+              r.raise_for_status()
+              obj=r.json(); data=obj.get('data') or {}; files=data.get('files') or []
+              print('COUNT',len(files),'TOTAL',data.get('total'))
+              if not files: break
+              for f in files:
+                  fid=f.get('id')
+                  if fid in seen: continue
+                  seen.add(fid)
+                  stock=f.get('stock') or {}
+                  name=str(f.get('name') or '')
+                  content=str(f.get('content') or '')[:2000]
+                  is_company=(f.get('type') or {}).get('name')=='公司研究'
+                  exact=('603787' in name or stock.get('code')=='603787' or '新日股份' in name or '新日股份' in content)
+                  if is_company and exact:
+                      print('COMPANY_REPORT',json.dumps({
+                          'id':fid,'name':name,'date':f.get('time_text'),'pages':f.get('page_count'),
+                          'size':f.get('file_size'),'organization':(f.get('organization') or {}).get('name'),
+                          'uuid':f.get('data_source_uuid'),'data_source':f.get('data_source'),
+                          'original_id':f.get('original_id'),'page_url':f.get('page_url'),
+                          'share_url':f.get('share_url'),'stock':stock,
+                      },ensure_ascii=False))
+              if page*100 >= int(data.get('total') or 0): break
+          PY
