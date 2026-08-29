@@ -1,0 +1,79 @@
+name: Temporary Hualan Vaccine Hibor search
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-hibor-search.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect search forms and query candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import re, urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'})
+          seeds=[
+            'https://www.hibor.com.cn/',
+            'https://www.hibor.com.cn/repinfodetail_4765323.html',
+            'https://wap.hibor.com.cn/repinfodetail_4765323.html',
+          ]
+          for url in seeds:
+            print('\n=== SEED',url,'===')
+            r=s.get(url,timeout=60)
+            print(r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+            r.encoding=r.apparent_encoding or 'utf-8'
+            soup=BeautifulSoup(r.text,'lxml')
+            for f in soup.find_all('form'):
+              print('FORM',f.get('method'),urllib.parse.urljoin(r.url,f.get('action') or ''),str(f)[:5000].replace('\n',' '))
+            for sc in soup.find_all('script',src=True):
+              u=urllib.parse.urljoin(r.url,sc['src'])
+              if any(x in u.lower() for x in ['search','common','main','index']):
+                try:
+                  rr=s.get(u,timeout=45)
+                  print('SCRIPT',u,rr.status_code,len(rr.content))
+                  for needle in ['search','keyword','keyWord','txtSearch','SearchKey']:
+                    for m in list(re.finditer(needle,rr.text,re.I))[:6]:
+                      print('SCRIPT_CTX',needle,rr.text[max(0,m.start()-1000):m.start()+2500].replace('\n',' ')[:3500])
+                except Exception as e: print('SCRIPT_ERROR',u,repr(e))
+
+          candidates=[
+            ('GET','https://www.hibor.com.cn/search.aspx',{'key':'华兰疫苗'}),
+            ('GET','https://www.hibor.com.cn/search.aspx',{'keyword':'华兰疫苗'}),
+            ('GET','https://www.hibor.com.cn/newsearch.aspx',{'key':'华兰疫苗'}),
+            ('GET','https://www.hibor.com.cn/newsearch.aspx',{'keyword':'华兰疫苗'}),
+            ('GET','https://www.hibor.com.cn/repsearch.aspx',{'key':'华兰疫苗'}),
+            ('GET','https://www.hibor.com.cn/search',{'key':'华兰疫苗'}),
+            ('GET','https://wap.hibor.com.cn/search.aspx',{'key':'华兰疫苗'}),
+          ]
+          for method,url,params in candidates:
+            print('\n=== TRY',method,url,params,'===')
+            try:
+              r=s.get(url,params=params,timeout=60,allow_redirects=True)
+              print(r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+              r.encoding=r.apparent_encoding or 'utf-8'
+              soup=BeautifulSoup(r.text,'lxml')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+              visible=' '.join(soup.get_text(' ',strip=True).split())
+              print('VISIBLE',visible[:8000])
+              for a in soup.find_all('a',href=True):
+                label=' '.join(a.get_text(' ',strip=True).split())
+                href=urllib.parse.urljoin(r.url,a['href'])
+                if 'repinfo' in href.lower() or 'docdetail' in href.lower() or '华兰疫苗' in label:
+                  print('LINK',label[:800],href)
+            except Exception as e: print('TRY_ERROR',repr(e))
+          PY
