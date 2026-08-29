@@ -1,0 +1,122 @@
+name: Temporary Jiuqi public original brokerage PDF package
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-public-originals-package.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download, validate and package public original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          mkdir -p output
+          python - <<'PY'
+          import hashlib, io, json, re, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          OUT=Path('output'); OUT.mkdir(exist_ok=True)
+          reports=[
+            {
+              'date':'2017-05-19','broker':'民生证券',
+              'title':'调研报告：精耕细作终成细分龙头，关注“久其+”生态',
+              'info':'AP201705190591854735',
+              'filename':'01_民生证券_精耕细作终成细分龙头_关注久其生态_20170519_5页.pdf',
+              'type':'公司调研报告',
+            },
+            {
+              'date':'2017-04-07','broker':'太平洋证券',
+              'title':'四大业务协同驱动，资源整合战略领先',
+              'info':'AP201704070483410298',
+              'filename':'02_太平洋证券_四大业务协同驱动_资源整合战略领先_20170407_5页.pdf',
+              'type':'公司研究报告',
+            },
+            {
+              'date':'2017-11-27','broker':'民生证券',
+              'title':'拟配股收购上海移通，数字传播整合进程提速',
+              'info':'AP201711271058435367',
+              'filename':'03_民生证券_拟配股收购上海移通_数字传播整合进程提速_20171127_5页.pdf',
+              'type':'公司跟踪报告',
+            },
+          ]
+          s=requests.Session(); s.headers.update({
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+            'Referer':'https://data.eastmoney.com/report/002279.html',
+            'Accept':'application/pdf,*/*',
+          })
+          manifest=[]
+          for item in reports:
+            url=f"https://pdf.dfcfw.com/pdf/H3_{item['info']}_1.pdf"
+            r=s.get(url,timeout=120,allow_redirects=True)
+            if r.status_code!=200 or not r.content.startswith(b'%PDF-') or len(r.content)<80000:
+              raise RuntimeError(f"下载失败 {item['info']}: HTTP={r.status_code}, bytes={len(r.content)}, head={r.content[:16]!r}")
+            reader=PdfReader(io.BytesIO(r.content),strict=False)
+            pages=len(reader.pages)
+            if pages!=5:
+              raise RuntimeError(f"页数不符 {item['info']}: {pages}")
+            text=''
+            for p in reader.pages[:3]:
+              try: text += '\n' + (p.extract_text() or '')
+              except Exception: pass
+            compact=re.sub(r'\s+','',text)
+            if '久其软件' not in compact and '002279' not in compact:
+              raise RuntimeError(f"身份核验失败 {item['info']}")
+            path=OUT/item['filename']; path.write_bytes(r.content)
+            sha=hashlib.sha256(r.content).hexdigest()
+            manifest.append({**item,'pages':pages,'bytes':len(r.content),'pdf_url':r.url,'sha256':sha})
+            print('PDF_OK',item['filename'],pages,len(r.content),sha,r.url)
+
+          lines=[
+            '久其软件（002279.SZ）券商研究报告公开原始PDF清单','',
+            '本压缩包收录3份无需登录即可公开取得的券商PDF原文件。',
+            '重要说明：这3份均为5页公司调研、公司研究或公司跟踪材料，不是15页以上的标准长篇深度报告。','',
+          ]
+          for i,x in enumerate(manifest,1):
+            lines += [
+              f"{i}. {x['broker']}：《{x['title']}》",
+              f"   日期：{x['date']}；类型：{x['type']}；页数：{x['pages']}页",
+              f"   文件：{x['filename']}",
+              f"   公开原始PDF：{x['pdf_url']}",
+              f"   SHA-256：{x['sha256']}",'',
+            ]
+          lines += [
+            '已确认存在、但完整PDF需要登录或数据库授权的长篇深度报告：',
+            '1. 爱建证券，2016-02-18，《内生外延，把握行业发展大方向》，20页，首次推荐。',
+            '2. 华泰联合，2011-08-23，《产品客户与独特的商业模式，助推新一轮发展》，19页，首次增持。',
+            '3. 申银万国，2013-10-13，《产品化和定制并举》，18页，增持。',
+            '上述长篇报告没有绕过登录或付费限制，因此未以摘要网页、预览图或伪PDF替代。','',
+            '资料仅供研究参考，不构成投资建议。',
+          ]
+          (OUT/'报告清单与重要说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          final=Path('jiuqi_software_broker_reports_3_public_originals.zip')
+          with zipfile.ZipFile(final,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(OUT.iterdir()): z.write(p,arcname=p.name)
+          with zipfile.ZipFile(final) as z:
+            bad=z.testzip()
+            if bad: raise RuntimeError(f'ZIP完整性失败: {bad}')
+            pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if len(pdfs)!=3: raise RuntimeError(f'PDF数量错误: {len(pdfs)}')
+            print('ZIP_OK',final.stat().st_size,z.namelist())
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiuqi-software-public-originals
+          path: jiuqi_software_broker_reports_3_public_originals.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
