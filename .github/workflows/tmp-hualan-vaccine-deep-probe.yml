@@ -1,0 +1,116 @@
+name: Temporary Hualan Vaccine deep report probe
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-deep-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect report pages and search public PDF sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import html, json, re, urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.6'
+          })
+
+          reports=[
+            ('2023-10-17','拨云见日 流感疫苗行业龙头蓄势待发','750866287806'),
+            ('2023-10-13','国内领先流感疫苗制造商 四价流感疫苗打造华兰力量','750526011202'),
+            ('2023-10-25','流感疫苗龙头 业绩有望重回正增长','751528845702'),
+            ('2023-08-15','深耕流感疫苗市场 看好长期发展空间','745435926166'),
+            ('2023-07-18','疫苗行业龙头 业绩有望强势复苏','743015707602'),
+            ('2022-07-08','天高任鸟飞 海阔凭鱼跃','710584749392'),
+          ]
+          urls=[]
+          for date,title,rptid in reports:
+            urls += [
+              (f'9f_{rptid}',f'https://www.9fzt.com/detail/sz_301207_10_{rptid}.html'),
+              (f'sina_{rptid}',f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rptid}/index.phtml'),
+            ]
+
+          pats=[
+            r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+            r'https?://[^\s"\'<>]+(?:download|file|attach|report|pdf)[^\s"\'<>]*',
+            r'AP\d{18}',
+          ]
+
+          for name,url in urls:
+            print('\n===== PAGE',name,url,'=====')
+            try:
+              r=s.get(url,timeout=90,allow_redirects=True)
+              print('HTTP',r.status_code,'BYTES',len(r.content),'TYPE',r.headers.get('content-type'),'FINAL',r.url)
+              enc=r.apparent_encoding or r.encoding or 'utf-8'
+              r.encoding=enc
+              text=r.text
+              soup=BeautifulSoup(text,'lxml')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+              # normalized visible text gives broker/analyst/date in many pages
+              visible=' '.join(soup.get_text(' ',strip=True).split())
+              print('VISIBLE',visible[:12000])
+              for pat in pats:
+                for hit in list(dict.fromkeys(re.findall(pat,text,re.I)))[:200]:
+                  print('MATCH',hit[:1600])
+              for tag in soup.find_all(['a','iframe','embed','object','source','script']):
+                for attr in ('href','src','data'):
+                  val=tag.get(attr)
+                  if not val: continue
+                  full=urllib.parse.urljoin(r.url,val)
+                  blob=(str(tag)+' '+full).lower()
+                  if any(k in blob for k in ['pdf','download','report','研报','报告','301207']):
+                    print('TAG',attr,full,str(tag)[:1400].replace('\n',' '))
+            except Exception as e:
+              print('ERROR',repr(e))
+
+          queries=[]
+          for date,title,rptid in reports:
+            queries += [
+              f'"华兰疫苗" "{title}" PDF',
+              f'"301207" "{title}"',
+            ]
+
+          for q in queries:
+            print('\n===== QUERY',q,'=====')
+            for engine,url in [
+              ('bing','https://www.bing.com/search?q='+urllib.parse.quote(q)+'&count=50'),
+              ('baidu','https://www.baidu.com/s?wd='+urllib.parse.quote(q)),
+              ('duck','https://html.duckduckgo.com/html/?q='+urllib.parse.quote(q)),
+            ]:
+              try:
+                r=s.get(url,timeout=90,allow_redirects=True)
+                print('ENGINE',engine,'HTTP',r.status_code,'BYTES',len(r.content),'FINAL',r.url)
+                text=html.unescape(r.text)
+                soup=BeautifulSoup(text,'lxml')
+                seen=[]
+                for a in soup.find_all('a',href=True):
+                  label=' '.join(a.get_text(' ',strip=True).split())
+                  full=urllib.parse.urljoin(r.url,a['href'])
+                  blob=(label+' '+full).lower()
+                  if any(k in blob for k in ['华兰疫苗','301207','pdf','研报','报告','dfcfw','sdyanbao','fxbaogao','hangyan','pharnex','baogaobox']):
+                    item=(label,full)
+                    if item not in seen:
+                      seen.append(item)
+                      print('RESULT',label[:600],full[:1800])
+                for pat in pats:
+                  for hit in list(dict.fromkeys(re.findall(pat,text,re.I)))[:100]:
+                    print('RAW_MATCH',hit[:1600])
+              except Exception as e:
+                print('SEARCH_ERROR',engine,repr(e))
+          PY
