@@ -1,0 +1,151 @@
+name: Temporary Daan Gene exact archive recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-archive-exact.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Recover exact report pages and archived PDF payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/html output/pdf output/meta
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import gzip, json, re, urllib.request, zlib, hashlib
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          target_ids=['3189898','3189923','3423061','4461177','4507887','4414374']
+          info=json.loads(urllib.request.urlopen(urllib.request.Request('https://index.commoncrawl.org/collinfo.json',headers={'User-Agent':UA}),timeout=90).read())
+          indexes=[]
+          for year in [2015,2016,2017,2019,2020,2021,2022,2023,2024,2025,2026]:
+              arr=sorted([x for x in info if f'CC-MAIN-{year}-' in x.get('id','')],key=lambda x:x['id'])
+              if arr:
+                  for x in [arr[0],arr[len(arr)//2],arr[-1]]:
+                      if x not in indexes:indexes.append(x)
+          if info and info[0] not in indexes:indexes.append(info[0])
+
+          def query(idx,url,match='exact',filters=(),limit=5000):
+              params=[('url',url),('output','json'),('matchType',match),('collapse','digest'),('pageSize',str(limit))]
+              for f in filters:params.append(('filter',f))
+              q=idx['cdx-api']+'?'+urlencode(params)
+              try:
+                  raw=urllib.request.urlopen(urllib.request.Request(q,headers={'User-Agent':UA}),timeout=120).read().decode('utf-8','replace')
+              except Exception:return []
+              out=[]
+              for line in raw.splitlines():
+                  try:r=json.loads(line)
+                  except Exception:continue
+                  r['_index']=idx['id'];out.append(r)
+              return out
+
+          def extract(block):
+              try:data=gzip.decompress(block)
+              except Exception:
+                  try:data=zlib.decompress(block,16+zlib.MAX_WBITS)
+                  except Exception:return b''
+              # split WARC then HTTP headers
+              p=data.find(b'\r\n\r\n'); sep=4
+              if p<0:p=data.find(b'\n\n');sep=2
+              if p<0:return data
+              rest=data[p+sep:]
+              q=rest.find(b'\r\n\r\n'); sep2=4
+              if q<0:q=rest.find(b'\n\n');sep2=2
+              if q<0:return rest
+              head=rest[:q].decode('latin1','replace').lower();body=rest[q+sep2:]
+              if 'content-encoding: gzip' in head:
+                  try:body=gzip.decompress(body)
+                  except Exception:pass
+              elif 'content-encoding: deflate' in head:
+                  try:body=zlib.decompress(body)
+                  except Exception:pass
+              return body
+
+          def fetch_record(r):
+              off=int(r['offset']);length=int(r['length']);fn=r['filename']
+              req=urllib.request.Request('https://data.commoncrawl.org/'+fn,headers={'User-Agent':UA,'Range':f'bytes={off}-{off+length-1}'})
+              return extract(urllib.request.urlopen(req,timeout=180).read())
+
+          rows=[]
+          for idx in indexes:
+              for rid in target_ids:
+                  for host in ['www.nxny.com','nxny.com']:
+                      rows += query(idx,f'{host}/report/view_{rid}.html','exact',['status:200'])
+                      rows += query(idx,f'{host}/Report/View_{rid}.html','exact',['status:200'])
+              # Download endpoint prefix, restrict likely file payloads by detected MIME.
+              for host in ['vip.nxny.com','www.nxny.com']:
+                  rows += query(idx,f'{host}/DownLoad/DownLoad.aspx','prefix',['status:200'],10000)
+          uniq=[];seen=set()
+          for r in rows:
+              k=(r.get('digest'),r.get('url'),r.get('timestamp'))
+              if k in seen:continue
+              seen.add(k);uniq.append(r)
+          Path('output/meta/index_rows.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('INDEX ROWS',len(uniq))
+
+          tokens=[]; pdf_records=[]
+          for i,r in enumerate(uniq):
+              u=(r.get('url') or '')
+              m=(r.get('mime') or '').lower(); md=(r.get('mime-detected') or '').lower()
+              is_report=any(rid in u for rid in target_ids)
+              is_download='download.aspx' in u.lower()
+              if not (is_report or is_download):continue
+              # Download all exact report HTMLs; download endpoint records only when file-like or plausible size.
+              n=int(r.get('length') or 0)
+              if is_download and not (m=='application/pdf' or md=='application/pdf' or 100000 <= n <= 5000000):
+                  continue
+              try:body=fetch_record(r)
+              except Exception as exc:continue
+              if body.startswith(b'%PDF'):
+                  p=Path(f'output/pdf/archive_{len(pdf_records)+1:04d}.pdf');p.write_bytes(body)
+                  pdf_records.append({'file':str(p),'source':r,'size':len(body),'sha256':hashlib.sha256(body).hexdigest()})
+              elif is_report:
+                  p=Path(f'output/html/report_{i:04d}.html');p.write_bytes(body)
+                  txt=body.decode('utf-8','replace')
+                  if '�' in txt:
+                      try:txt=body.decode('gb18030','replace')
+                      except Exception:pass
+                  for pat in [r'downfile\s*\((.*?)\)',r'DownLoad\.aspx\?rnd=([^"\'<>\s&]+)',r'rnd\s*[:=]\s*["\']([^"\']+)',r'https?://[^"\'<>\s]+']:
+                      for mt in re.finditer(pat,txt,re.I|re.S):
+                          tokens.append({'source':r.get('url'),'timestamp':r.get('timestamp'),'match':mt.group(0)[:1000]})
+          Path('output/meta/tokens.json').write_text(json.dumps(tokens,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('output/meta/pdf_records.json').write_text(json.dumps(pdf_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOKENS',len(tokens),'PDF RECORDS',len(pdf_records))
+          PY
+
+          shopt -s nullglob
+          n=0
+          for pdf in output/pdf/*.pdf; do
+            pages=$(pdfinfo "$pdf" 2>/dev/null | awk '/^Pages:/ {print $2}' || true)
+            pdftotext -f 1 -l 8 "$pdf" "${pdf%.pdf}.txt" 2>/dev/null || true
+            if grep -Eqi '达安基因|002030|分子诊断行业待爆发|独立实验室新业态崛起|新冠筛查从严|三季度业绩超预期|上半年业绩超预期' "${pdf%.pdf}.txt"; then
+              n=$((n+1))
+              cp "$pdf" "output/DAAN_TARGET_${n}_${pages}p.pdf"
+              cp "${pdf%.pdf}.txt" "output/DAAN_TARGET_${n}_${pages}p.txt"
+            fi
+          done
+          echo "$n" > output/target_count.txt
+          find output -maxdepth 2 -type f -printf '%p\t%s bytes\n' | sort
+
+      - name: Upload recovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-exact-archive-recovery
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
