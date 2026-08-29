@@ -1,0 +1,155 @@
+name: Temporary Daan Gene global Eastmoney report scan
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-global-scan-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Scan global company-report index by year
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/scan_daan.py <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import subprocess
+          import tempfile
+          import time
+          import urllib.parse
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          API = 'https://reportapi.eastmoney.com/report/list'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          OUT = Path('diagnostics')
+          PAGE_SIZE = 1000
+
+          def fetch(year: int, page: int) -> dict:
+              params = {
+                  'pageNo': str(page),
+                  'pageSize': str(PAGE_SIZE),
+                  'code': '*',
+                  'industryCode': '*',
+                  'industry': '*',
+                  'rating': '*',
+                  'ratingchange': '*',
+                  'beginTime': f'{year}-01-01',
+                  'endTime': f'{year}-12-31',
+                  'fields': '',
+                  'qType': '0',
+              }
+              url = API + '?' + urllib.parse.urlencode(params)
+              fd, name = tempfile.mkstemp(prefix=f'daan_{year}_{page}_', suffix='.json')
+              os.close(fd)
+              path = Path(name)
+              try:
+                  cmd = [
+                      'curl', '--http1.1', '--location', '--fail', '--silent', '--show-error',
+                      '--retry', '7', '--retry-all-errors', '--retry-delay', '1',
+                      '--connect-timeout', '20', '--max-time', '180',
+                      '--user-agent', UA,
+                      '--referer', 'https://data.eastmoney.com/report/',
+                      '--header', 'Accept-Encoding: identity',
+                      '--output', str(path), url,
+                  ]
+                  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  if proc.returncode:
+                      raise RuntimeError(proc.stderr[-1200:])
+                  text = path.read_text(encoding='utf-8', errors='ignore').strip()
+                  if text and text[0] not in '[{' and '(' in text and text.endswith(')'):
+                      text = text[text.find('(')+1:text.rfind(')')]
+                  return json.loads(text)
+              finally:
+                  path.unlink(missing_ok=True)
+
+          first_pages: dict[int, dict] = {}
+          for year in range(2010, 2027):
+              obj = fetch(year, 1)
+              first_pages[year] = obj
+              rows = obj.get('data') or obj.get('result', {}).get('data') or []
+              hits = int(obj.get('hits') or obj.get('total') or len(rows))
+              total_pages = int(obj.get('TotalPage') or obj.get('totalPage') or ((hits + PAGE_SIZE - 1)//PAGE_SIZE) or 1)
+              print('YEAR', year, 'HITS', hits, 'ROWS', len(rows), 'TOTAL_PAGES', total_pages)
+
+          jobs = []
+          for year, obj in first_pages.items():
+              rows = obj.get('data') or obj.get('result', {}).get('data') or []
+              hits = int(obj.get('hits') or obj.get('total') or len(rows))
+              total_pages = int(obj.get('TotalPage') or obj.get('totalPage') or ((hits + PAGE_SIZE - 1)//PAGE_SIZE) or 1)
+              # Some API versions cap pageSize silently. Trust TotalPage when supplied.
+              for page in range(2, max(1, total_pages) + 1):
+                  jobs.append((year, page))
+
+          all_objects: dict[tuple[int,int], dict] = {(year,1): obj for year,obj in first_pages.items()}
+          print('ADDITIONAL_PAGES', len(jobs))
+          with ThreadPoolExecutor(max_workers=10) as pool:
+              future_map = {pool.submit(fetch, year, page): (year, page) for year, page in jobs}
+              for future in as_completed(future_map):
+                  year, page = future_map[future]
+                  try:
+                      all_objects[(year,page)] = future.result()
+                  except Exception as exc:
+                      print('PAGE_ERROR', year, page, repr(exc))
+                      # retry once synchronously
+                      time.sleep(1)
+                      all_objects[(year,page)] = fetch(year, page)
+
+          matches = []
+          seen = set()
+          for (year,page), obj in sorted(all_objects.items()):
+              rows = obj.get('data') or obj.get('result', {}).get('data') or []
+              for row in rows:
+                  stock_code = str(row.get('stockCode') or row.get('code') or '')
+                  stock_name = str(row.get('stockName') or row.get('securityName') or '')
+                  title = str(row.get('title') or row.get('reportTitle') or '')
+                  if stock_code == '002030' or stock_name == '达安基因' or ('达安基因' in title):
+                      info = str(row.get('infoCode') or row.get('infocode') or row.get('info_code') or '')
+                      key = info or json.dumps(row, sort_keys=True, ensure_ascii=False)
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      row2 = dict(row)
+                      row2['_scanYear'] = year
+                      row2['_scanPage'] = page
+                      matches.append(row2)
+
+          matches.sort(key=lambda r: str(r.get('publishDate') or r.get('publishTime') or ''), reverse=True)
+          OUT.joinpath('daan_matches.json').write_text(json.dumps(matches, ensure_ascii=False, indent=2), encoding='utf-8')
+          OUT.joinpath('scan_summary.json').write_text(json.dumps({
+              'page_size_requested': PAGE_SIZE,
+              'years': list(range(2010,2027)),
+              'pages_fetched': len(all_objects),
+              'matches': len(matches),
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('MATCH_COUNT', len(matches))
+          for row in matches:
+              print(json.dumps({
+                  'date': row.get('publishDate') or row.get('publishTime'),
+                  'broker': row.get('orgSName') or row.get('orgName'),
+                  'title': row.get('title') or row.get('reportTitle'),
+                  'stockName': row.get('stockName'),
+                  'stockCode': row.get('stockCode'),
+                  'infoCode': row.get('infoCode') or row.get('infocode'),
+              }, ensure_ascii=False))
+          PY
+          python /tmp/scan_daan.py
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-global-scan
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
