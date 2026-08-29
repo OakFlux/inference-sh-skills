@@ -1,0 +1,84 @@
+name: Temporary Fxbaogao API inspection v2
+
+on:
+  push:
+    branches:
+      - 'tmp/fxbaogao-inspect-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect pages, scripts and API patterns
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics_v2/scripts diagnostics_v2/pages
+          python -m pip install --disable-pip-version-check requests
+          cat > /tmp/fxscan.py <<'PY'
+          import html,json,re,urllib.parse
+          from pathlib import Path
+          import requests
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'})
+          urls=[
+            'https://www.fxbaogao.com/detail/4810625',
+            'https://www.fxbaogao.com/view?id=4810625',
+            'https://www.fxbaogao.com/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+            'https://www.fxbaogao.com/search?keyword=600354',
+            'https://www.fxbaogao.com/',
+          ]
+          scripts=[]; pages=[]
+          for i,u in enumerate(urls):
+            try:
+              r=S.get(u,timeout=60,allow_redirects=True); raw=r.content
+              Path(f'diagnostics_v2/pages/page_{i}.html').write_bytes(raw)
+              text=raw.decode(r.encoding or 'utf-8','ignore'); norm=html.unescape(text.replace('\\/','/'))
+              title=''; m=re.search(r'<title[^>]*>(.*?)</title>',norm,re.I|re.S)
+              if m: title=re.sub(r'<[^>]+>',' ',m.group(1)).strip()
+              local_scripts=[]
+              for src in re.findall(r'<script[^>]+src=["\']([^"\']+)',norm,re.I):
+                full=urllib.parse.urljoin(r.url,html.unescape(src)); local_scripts.append(full); scripts.append(full)
+              links=[]
+              for val in re.findall(r'(?:href|src|content|data-url|data-src)=["\']([^"\']+)',norm,re.I):
+                full=urllib.parse.urljoin(r.url,html.unescape(val))
+                if any(k in full.lower() for k in ['pdf','report-image','download','api','file','view','detail']): links.append(full)
+              for val in re.findall(r'https?://[^"\'<>\s]+',norm,re.I):
+                val=urllib.parse.unquote(val).rstrip('),;]')
+                if any(k in val.lower() for k in ['pdf','report-image','download','api','file','view','detail']): links.append(val)
+              relevant=[]
+              for m in re.finditer(r'(?:report-image|pdf|download|fileUrl|pdfUrl|originUrl|sourceUrl|/api/|4810625)',norm,re.I):
+                a=max(0,m.start()-700); b=min(len(norm),m.end()+1800); relevant.append(norm[a:b])
+                if len(relevant)>=100: break
+              pages.append({'url':u,'effective':r.url,'status':r.status_code,'size':len(raw),'title':title,'scripts':local_scripts,'links':list(dict.fromkeys(links)),'relevant':relevant})
+            except Exception as e: pages.append({'url':u,'error':repr(e)})
+          scripts=list(dict.fromkeys(scripts)); script_rows=[]
+          for i,u in enumerate(scripts[:100]):
+            try:
+              r=S.get(u,timeout=60); raw=r.content; Path(f'diagnostics_v2/scripts/{i:03d}.js').write_bytes(raw)
+              text=raw.decode(r.encoding or 'utf-8','ignore'); hits=[]
+              for m in re.finditer(r'(?:report-image|pdf|download|fileUrl|pdfUrl|originUrl|sourceUrl|/api/|search|detail|view\?id)',text,re.I):
+                a=max(0,m.start()-900); b=min(len(text),m.end()+2200); hits.append(text[a:b])
+                if len(hits)>=100: break
+              script_rows.append({'url':u,'status':r.status_code,'size':len(raw),'hits':hits})
+            except Exception as e: script_rows.append({'url':u,'error':repr(e)})
+          Path('diagnostics_v2/pages.json').write_text(json.dumps(pages,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics_v2/scripts.json').write_text(json.dumps(script_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PAGES')
+          for row in pages: print(json.dumps(row,ensure_ascii=False)[:18000])
+          print('SCRIPTS',len(script_rows))
+          for row in script_rows:
+            if row.get('hits'): print(json.dumps({'url':row['url'],'hits':row['hits'][:12]},ensure_ascii=False)[:24000])
+          PY
+          python /tmp/fxscan.py
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-inspection-v2
+          path: diagnostics_v2/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
