@@ -1,0 +1,60 @@
+name: Temporary Hualan Vaccine Sdyanbao API lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-sdyanbao-api.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Query public detail, search and unauthenticated download APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+
+          base='https://api.sdyanbao.com'
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+            'Origin':'https://www.sdyanbao.com',
+            'Referer':'https://www.sdyanbao.com/detail/255826',
+            'Content-Type':'application/json;charset=UTF-8',
+            'Accept':'application/json,text/plain,*/*'
+          })
+
+          def post(path,data):
+            r=s.post(base+path,json=data,timeout=90,allow_redirects=False)
+            print('\nPOST',path,json.dumps(data,ensure_ascii=False),'HTTP',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'LOC',r.headers.get('location'))
+            print(r.text[:50000])
+            return r
+
+          post('/api/file/detail',{'id':255826})
+          post('/api/file/download',{'id':255826})
+
+          queries=[
+            '华兰疫苗',
+            '天高任鸟飞，海阔凭鱼跃',
+            '疫苗行业龙头，业绩有望强势复苏',
+            '国内领先流感疫苗制造商，四价流感疫苗打造华兰力量',
+            '流感疫苗龙头，业绩有望重回正增长',
+            '深耕流感疫苗市场，看好长期发展空间',
+            '拨云见日，流感疫苗行业龙头蓄势待发',
+          ]
+          for q in queries:
+            data={
+              'device':1,'hideTrader':0,'onlyTitle':0,'order':0,
+              'page':1,'pageSize':100,'keyword':q,'pageCount':0,
+              'dateRange':0,'startTime':'','endTime':'','typeIds':[], 'industryIds':[]
+            }
+            post('/api/file/search',data)
+          PY
