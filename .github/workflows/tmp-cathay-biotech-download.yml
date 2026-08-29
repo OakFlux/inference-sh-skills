@@ -1,0 +1,98 @@
+name: Temporary verified Cathay Biotech deep report package
+
+on:
+  push:
+    branches:
+      - tmp/download-cathay-biotech-reports-20260829
+    paths:
+      - .github/workflows/tmp-cathay-biotech-download.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and verify original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local pages="$3"
+            local expected="$4"
+            local stem="$5"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A "$UA" -e 'https://data.eastmoney.com/report/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "output/$dest"
+            test -s "output/$dest"
+            test "$(head -c 4 "output/$dest")" = '%PDF'
+            actual=$(pdfinfo "output/$dest" | awk '/^Pages:/ {print $2}')
+            test "$actual" -eq "$pages"
+            pdftotext -f 1 -l 3 -layout "output/$dest" "previews/${stem}_text.txt"
+            grep -q "$expected" "previews/${stem}_text.txt"
+            pdftoppm -f 1 -singlefile -png -r 110 "output/$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 110 "output/$dest" "previews/${stem}_last" >/dev/null 2>&1
+            test -s "previews/${stem}_first.png"
+            test -s "previews/${stem}_last.png"
+          }
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202308151594742765_1.pdf' \
+            '01_Shanxi_Securities_Cathay_Biotech_Deep_Report_20230815_41p.pdf' \
+            41 '全球长链二元酸龙头' 'shanxi_20230815'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202304291586134617_1.pdf' \
+            '02_Huaan_Securities_Cathay_Biotech_Deep_Report_20230429_22p.pdf' \
+            22 '长链二元酸产能持续扩张' 'huaan_20230429'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202206301575660367_1.pdf' \
+            '03_Shanghai_Securities_Cathay_Biotech_Deep_Report_20220630_25p.pdf' \
+            25 '中国合成生物学领导者' 'shanghai_20220630'
+
+          cat > output/报告清单与核验说明.txt <<'EOF'
+          凯赛生物（688065.SH）券商深度研究报告，共3份
+
+          1. 山西证券，2023-08-15，41页
+             《全球长链二元酸龙头，招商局入股共拓生物基尼龙新市场》
+             类型：公司深度研究；系统梳理长链二元酸、生物基聚酰胺、招商局合作、产能与估值。
+
+          2. 华安证券，2023-04-29，22页
+             《长链二元酸产能持续扩张，生物基聚酰胺放量在即》
+             类型：公司深度研究；覆盖二元酸护城河、聚酰胺产业化、项目建设和盈利预测。
+
+          3. 上海证券，2022-06-30，25页
+             《凯赛生物深度报告：中国合成生物学领导者，开启生物尼龙新时代》
+             类型：公司深度研究；分析合成生物平台、尼龙产业链、应用空间及长期成长逻辑。
+
+          三份均为原始、完整、可检索PDF，不是网页正文、摘要或预览页重制文件。
+          已核验PDF文件头、实际页数、首页标题文字，并成功渲染首页与末页。
+          仅供研究资料整理，不构成投资建议。
+          EOF
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output previews
+          echo '--- FIRST PAGE TEXTS ---'
+          for f in previews/*_text.txt; do echo "### $f"; sed -n '1,80p' "$f"; done
+
+      - name: Upload verified original reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: cathay-biotech-broker-deep-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
