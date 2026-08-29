@@ -1,0 +1,449 @@
+name: Temporary Blackstone reports package
+
+on:
+  push:
+    branches:
+      - tmp-blackstone-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies and locate Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+          CHROME="$(command -v google-chrome || command -v google-chrome-stable || command -v chromium || command -v chromium-browser || true)"
+          if [ -z "$CHROME" ]; then
+            sudo apt-get update
+            sudo apt-get install -y chromium-browser
+            CHROME="$(command -v chromium-browser || command -v chromium)"
+          fi
+          echo "CHROME_BIN=$CHROME" >> "$GITHUB_ENV"
+          "$CHROME" --version
+
+      - name: Download, render, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_blackstone.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          CIK = "0001393818"
+          CIK_NUMERIC = "1393818"
+          COMPANY = "Blackstone Inc."
+          TICKER = "BX"
+          OUT = Path("dist")
+          WORK = Path("work")
+          DOCS = OUT / "Blackstone_BX_2020-2025_Annual_Reports_2026_H1"
+          OUT.mkdir(parents=True, exist_ok=True)
+          WORK.mkdir(parents=True, exist_ok=True)
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          USER_AGENT = "OpenAI ChatGPT financial document packaging support@openai.com"
+          SEC_HEADERS = {
+              "User-Agent": USER_AGENT,
+              "Accept-Encoding": "gzip, deflate",
+              "Host": "data.sec.gov",
+          }
+          ARCHIVE_HEADERS = {
+              "User-Agent": USER_AGENT,
+              "Accept-Encoding": "gzip, deflate",
+          }
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9",
+              "Accept-Encoding": "gzip, deflate",
+          })
+
+          DIRECT_PDFS = {
+              2022: "https://d18rn0p25nwr6d.cloudfront.net/CIK-0001393818/1e768a89-f5d2-48da-a19c-42dc63b45cbb.pdf",
+              2023: "https://d18rn0p25nwr6d.cloudfront.net/CIK-0001393818/72d3d21b-427a-457c-adc5-559e452d2fbe.pdf",
+              2024: "https://d18rn0p25nwr6d.cloudfront.net/CIK-0001393818/aa051b10-91fc-40c4-91b8-f8f7278c9a97.pdf",
+              2025: "https://d18rn0p25nwr6d.cloudfront.net/CIK-0001393818/14a5f107-578c-4fb5-ada2-c228344f7ef6.pdf",
+          }
+
+          def get_json(url: str, headers: dict[str, str], attempts: int = 5) -> dict:
+              errors: list[str] = []
+              for attempt in range(attempts):
+                  try:
+                      response = requests.get(url, headers=headers, timeout=(30, 180))
+                      print("JSON", response.status_code, len(response.content), response.url)
+                      response.raise_for_status()
+                      return response.json()
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      if attempt < attempts - 1:
+                          time.sleep(min(2 ** attempt, 12))
+              raise RuntimeError(f"Unable to fetch JSON {url}: {errors}")
+
+          submissions = get_json(
+              f"https://data.sec.gov/submissions/CIK{CIK}.json",
+              SEC_HEADERS,
+          )
+          recent = submissions["filings"]["recent"]
+          columns = {
+              key: recent[key]
+              for key in (
+                  "accessionNumber",
+                  "filingDate",
+                  "reportDate",
+                  "form",
+                  "primaryDocument",
+                  "primaryDocDescription",
+              )
+          }
+          count = len(columns["accessionNumber"])
+          filings: list[dict[str, str]] = []
+          for index in range(count):
+              filings.append({key: str(value[index]) for key, value in columns.items()})
+
+          def select_filing(form: str, report_date: str) -> dict[str, str]:
+              matches = [
+                  filing for filing in filings
+                  if filing["form"] == form and filing["reportDate"] == report_date
+              ]
+              if not matches:
+                  raise RuntimeError(f"No {form} filing found for report date {report_date}")
+              matches.sort(key=lambda item: (item["filingDate"], item["accessionNumber"]), reverse=True)
+              selected = matches[0]
+              print("SELECT", form, report_date, selected)
+              return selected
+
+          annual_filings = {
+              year: select_filing("10-K", f"{year}-12-31")
+              for year in range(2020, 2026)
+          }
+          half_filing = select_filing("10-Q", "2026-06-30")
+
+          def archive_url(filing: dict[str, str]) -> str:
+              accession_no_dashes = filing["accessionNumber"].replace("-", "")
+              return (
+                  f"https://www.sec.gov/Archives/edgar/data/{CIK_NUMERIC}/"
+                  f"{accession_no_dashes}/{filing['primaryDocument']}"
+              )
+
+          def sha256_file(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def validate_pdf(
+              path: Path,
+              *,
+              expected_year: int,
+              minimum_pages: int,
+              expected_phrase: str,
+          ) -> tuple[int, int, str]:
+              raw_head = path.read_bytes()[:16]
+              size = path.stat().st_size
+              if size < 150_000 or not raw_head.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF {path.name}: size={size}, head={raw_head!r}")
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(
+                      f"Unexpectedly short PDF {path.name}: {pages} pages, minimum={minimum_pages}"
+                  )
+
+              text_parts: list[str] = []
+              for page in reader.pages[:16]:
+                  try:
+                      text_parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", " ", " ".join(text_parts)).lower()
+              if "blackstone" not in sample:
+                  raise RuntimeError(f"Blackstone name not found in sampled pages: {path.name}")
+              if str(expected_year) not in sample:
+                  print("WARNING expected year not found in sampled pages", expected_year, path.name)
+              if expected_phrase.lower() not in sample:
+                  print("WARNING expected phrase not found in sampled pages", expected_phrase, path.name)
+
+              return size, pages, sha256_file(path)
+
+          def download_pdf(url: str, destination: Path, referer: str) -> str:
+              errors: list[str] = []
+              variants = [url]
+              if "?" not in url:
+                  variants.extend([url + "?download=1", url + "?inline=1"])
+              for candidate in variants:
+                  for attempt in range(5):
+                      try:
+                          with session.get(
+                              candidate,
+                              headers={
+                                  "Accept": "application/pdf,application/octet-stream,*/*",
+                                  "Referer": referer,
+                              },
+                              timeout=(30, 600),
+                              stream=True,
+                              allow_redirects=True,
+                          ) as response:
+                              print(
+                                  "PDF",
+                                  response.status_code,
+                                  response.url,
+                                  response.headers.get("content-type"),
+                                  response.headers.get("content-length"),
+                              )
+                              response.raise_for_status()
+                              with destination.open("wb") as output:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          output.write(chunk)
+                              return response.url
+                      except Exception as exc:
+                          destination.unlink(missing_ok=True)
+                          errors.append(f"{candidate} attempt {attempt + 1}: {exc!r}")
+                          if attempt < 4:
+                              time.sleep(min(2 ** attempt, 12))
+              raise RuntimeError("; ".join(errors))
+
+          def fetch_filing_html(filing: dict[str, str], destination: Path) -> str:
+              url = archive_url(filing)
+              errors: list[str] = []
+              for attempt in range(5):
+                  try:
+                      response = requests.get(url, headers=ARCHIVE_HEADERS, timeout=(30, 300))
+                      print("HTML", response.status_code, len(response.content), response.url)
+                      response.raise_for_status()
+                      raw = response.content
+                      for encoding in (response.encoding, "utf-8", "windows-1252", "latin-1"):
+                          if not encoding:
+                              continue
+                          try:
+                              text = raw.decode(encoding)
+                              break
+                          except UnicodeDecodeError:
+                              continue
+                      else:
+                          text = raw.decode("utf-8", errors="replace")
+
+                      soup = BeautifulSoup(text, "html.parser")
+                      if soup.head is None:
+                          head = soup.new_tag("head")
+                          if soup.html is None:
+                              html_tag = soup.new_tag("html")
+                              html_tag.append(head)
+                              body = soup.new_tag("body")
+                              for child in list(soup.contents):
+                                  body.append(child.extract())
+                              html_tag.append(body)
+                              soup.append(html_tag)
+                          else:
+                              soup.html.insert(0, head)
+
+                      accession_no_dashes = filing["accessionNumber"].replace("-", "")
+                      base_url = (
+                          f"https://www.sec.gov/Archives/edgar/data/{CIK_NUMERIC}/"
+                          f"{accession_no_dashes}/"
+                      )
+                      base_tag = soup.new_tag("base", href=base_url)
+                      soup.head.insert(0, base_tag)
+                      style = soup.new_tag("style")
+                      style.string = (
+                          "@page { size: Letter; margin: 0.35in; } "
+                          "html, body { -webkit-print-color-adjust: exact !important; "
+                          "print-color-adjust: exact !important; }"
+                      )
+                      soup.head.append(style)
+                      destination.write_text(str(soup), encoding="utf-8")
+                      return url
+                  except Exception as exc:
+                      destination.unlink(missing_ok=True)
+                      errors.append(repr(exc))
+                      if attempt < 4:
+                          time.sleep(min(2 ** attempt, 12))
+              raise RuntimeError(f"Unable to fetch SEC filing HTML {url}: {errors}")
+
+          def render_html_to_pdf(html_path: Path, pdf_path: Path) -> None:
+              chrome = os.environ.get("CHROME_BIN")
+              if not chrome:
+                  raise RuntimeError("CHROME_BIN is not set")
+              command = [
+                  chrome,
+                  "--headless=new",
+                  "--no-sandbox",
+                  "--disable-gpu",
+                  "--disable-dev-shm-usage",
+                  "--allow-file-access-from-files",
+                  "--run-all-compositor-stages-before-draw",
+                  "--virtual-time-budget=30000",
+                  "--no-pdf-header-footer",
+                  f"--print-to-pdf={pdf_path.resolve()}",
+                  html_path.resolve().as_uri(),
+              ]
+              print("CHROME", " ".join(command))
+              result = subprocess.run(
+                  command,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+                  timeout=600,
+                  check=False,
+              )
+              print(result.stdout[-8000:])
+              if result.returncode != 0 or not pdf_path.exists():
+                  raise RuntimeError(
+                      f"Chrome PDF render failed for {html_path.name}: rc={result.returncode}"
+                  )
+
+          manifest = [
+              "Blackstone Inc. (NYSE: BX)",
+              "Scope: official fiscal-year 2020-2025 Form 10-K annual reports and the latest half-year filing available as of 2026-08-29.",
+              "U.S. reporting convention: the half-year document is the Q2 2026 Form 10-Q, which contains financial statements for the six months ended June 30, 2026.",
+              "Sources: Blackstone Investor Relations filing PDFs and the U.S. SEC EDGAR archive.",
+              "The FY2020, FY2021 and Q2 2026 SEC HTML filings were rendered to PDF without altering filing content.",
+              "",
+          ]
+
+          # Use Blackstone Investor Relations' official generated PDFs for FY2022-FY2025.
+          for year in range(2022, 2026):
+              filename = f"Blackstone_BX_{year}_Annual_Report_Form_10-K.pdf"
+              path = DOCS / filename
+              used_url = download_pdf(
+                  DIRECT_PDFS[year],
+                  path,
+                  "https://ir.blackstone.com/sec-filings/",
+              )
+              size, pages, digest = validate_pdf(
+                  path,
+                  expected_year=year,
+                  minimum_pages=250,
+                  expected_phrase="FORM 10-K",
+              )
+              filing = annual_filings[year]
+              manifest.extend([
+                  filename,
+                  f"  Document: Fiscal year {year} Form 10-K annual report",
+                  f"  Filing date: {filing['filingDate']}",
+                  f"  Report date: {filing['reportDate']}",
+                  f"  SEC accession: {filing['accessionNumber']}",
+                  f"  Pages: {pages}",
+                  f"  Size: {size} bytes",
+                  f"  SHA-256: {digest}",
+                  f"  Official PDF source: {used_url}",
+                  f"  SEC filing source: {archive_url(filing)}",
+                  "",
+              ])
+              print("OK", filename, pages, size, used_url)
+
+          # Render FY2020 and FY2021 official SEC filings to PDF.
+          for year in (2020, 2021):
+              filing = annual_filings[year]
+              html_path = WORK / f"blackstone_{year}_10k.html"
+              pdf_path = DOCS / f"Blackstone_BX_{year}_Annual_Report_Form_10-K.pdf"
+              source = fetch_filing_html(filing, html_path)
+              render_html_to_pdf(html_path, pdf_path)
+              size, pages, digest = validate_pdf(
+                  pdf_path,
+                  expected_year=year,
+                  minimum_pages=200,
+                  expected_phrase="FORM 10-K",
+              )
+              manifest.extend([
+                  pdf_path.name,
+                  f"  Document: Fiscal year {year} Form 10-K annual report",
+                  f"  Filing date: {filing['filingDate']}",
+                  f"  Report date: {filing['reportDate']}",
+                  f"  SEC accession: {filing['accessionNumber']}",
+                  f"  Pages: {pages}",
+                  f"  Size: {size} bytes",
+                  f"  SHA-256: {digest}",
+                  f"  Official SEC source: {source}",
+                  "",
+              ])
+              print("OK", pdf_path.name, pages, size, source)
+
+          # Render the latest half-year filing (Q2 2026 Form 10-Q).
+          half_html = WORK / "blackstone_2026_q2_10q.html"
+          half_pdf = DOCS / "Blackstone_BX_2026_Q2_Form_10-Q_Six_Months.pdf"
+          half_source = fetch_filing_html(half_filing, half_html)
+          render_html_to_pdf(half_html, half_pdf)
+          half_size, half_pages, half_digest = validate_pdf(
+              half_pdf,
+              expected_year=2026,
+              minimum_pages=70,
+              expected_phrase="FORM 10-Q",
+          )
+          manifest.extend([
+              half_pdf.name,
+              "  Document: Q2 2026 Form 10-Q, including the six months ended June 30, 2026",
+              f"  Filing date: {half_filing['filingDate']}",
+              f"  Report date: {half_filing['reportDate']}",
+              f"  SEC accession: {half_filing['accessionNumber']}",
+              f"  Pages: {half_pages}",
+              f"  Size: {half_size} bytes",
+              f"  SHA-256: {half_digest}",
+              f"  Official SEC source: {half_source}",
+              "",
+          ])
+          print("OK", half_pdf.name, half_pages, half_size, half_source)
+
+          (DOCS / "File_List_and_Official_Sources.txt").write_text(
+              "\n".join(manifest),
+              encoding="utf-8",
+          )
+
+          final_zip = OUT / "Blackstone_BX_2020-2025_Annual_Reports_2026_Latest_Half-Year.zip"
+          with zipfile.ZipFile(
+              final_zip,
+              "w",
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=6,
+          ) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdfs}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              if path.suffix.lower() == ".pdf":
+                  reader = PdfReader(str(path), strict=False)
+                  print(path.name, path.stat().st_size, len(reader.pages))
+              else:
+                  print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_blackstone.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackstone-reports-final-zip
+          path: dist/Blackstone_BX_2020-2025_Annual_Reports_2026_Latest_Half-Year.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
