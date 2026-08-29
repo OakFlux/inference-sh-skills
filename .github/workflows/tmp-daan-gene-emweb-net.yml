@@ -1,0 +1,77 @@
+name: Temporary Daan Gene Eastmoney HSF10 network capture
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-emweb-net-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install Playwright
+        run: python -m pip install --disable-pip-version-check playwright
+
+      - name: Capture HSF10 research-report data requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/capture_emweb.py <<'PY'
+          from __future__ import annotations
+          import asyncio,json,shutil
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          URL='https://emweb.eastmoney.com/PC_HSF10/ResearchReport/Index?code=SZ002030&type=soft'
+          OUT=Path('diagnostics')
+          async def main():
+              exe=shutil.which('google-chrome') or shutil.which('chromium') or shutil.which('chromium-browser')
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True,executable_path=exe,args=['--no-sandbox','--disable-dev-shm-usage'])
+                  ctx=await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36')
+                  page=await ctx.new_page();rows=[]
+                  async def on_request(req):
+                      u=req.url
+                      if any(k in u.lower() for k in ['api','research','report','datacenter','emweb']):
+                          rows.append({'kind':'request','url':u,'method':req.method,'headers':await req.all_headers(),'post_data':req.post_data})
+                  async def on_response(resp):
+                      u=resp.url
+                      if any(k in u.lower() for k in ['api','research','report','datacenter','emweb']):
+                          row={'kind':'response','url':u,'status':resp.status,'headers':await resp.all_headers()}
+                          try:
+                              body=await resp.body();row['body_size']=len(body)
+                              if len(body)<=5_000_000:row['body']=body.decode('utf-8','ignore')
+                          except Exception as exc:row['body_error']=repr(exc)
+                          rows.append(row)
+                  page.on('request',on_request);page.on('response',on_response)
+                  try:await page.goto(URL,wait_until='networkidle',timeout=120000)
+                  except Exception as exc:rows.append({'navigation_error':repr(exc)})
+                  await page.wait_for_timeout(10000)
+                  OUT.joinpath('page.html').write_text(await page.content(),encoding='utf-8')
+                  await page.screenshot(path=str(OUT/'page.png'),full_page=True)
+                  rows.append({'title':await page.title(),'final_url':page.url})
+                  OUT.joinpath('network.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+                  print('TITLE',await page.title(),'ROWS',len(rows))
+                  for r in rows:
+                      if r.get('kind')=='response':
+                          b=(r.get('body') or '')[:1500].replace('\n',' ')
+                          print('RESP',r.get('status'),r.get('body_size'),r['url'],b)
+                  await browser.close()
+          asyncio.run(main())
+          PY
+          python /tmp/capture_emweb.py
+
+      - name: Upload capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-emweb-network-capture
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
