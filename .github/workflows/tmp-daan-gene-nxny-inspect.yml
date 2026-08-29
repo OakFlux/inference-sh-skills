@@ -1,0 +1,80 @@
+name: Temporary Daan Gene Nxny public-page inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-nxny-inspect-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect public report page and related links
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          urls=(
+            'https://www.nxny.com/report/view_4461177.html'
+            'https://www.nxny.com/report/search.html?key=%E8%BE%BE%E5%AE%89%E5%9F%BA%E5%9B%A0'
+            'https://www.nxny.com/report/list.html?key=%E8%BE%BE%E5%AE%89%E5%9F%BA%E5%9B%A0'
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            curl --http1.1 -L --fail --silent --show-error --retry 5 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' "$url" -o "diagnostics/page_${i}.html" || true
+            i=$((i+1))
+          done
+          python - <<'PY'
+          import html,json,re,urllib.parse
+          from pathlib import Path
+          out=[]
+          for p in sorted(Path('diagnostics').glob('page_*.html')):
+              raw=p.read_bytes()
+              text=''
+              for enc in ('utf-8','gb18030'):
+                  try:
+                      text=raw.decode(enc);break
+                  except Exception:
+                      pass
+              if not text:text=raw.decode('utf-8','ignore')
+              text=html.unescape(text.replace('\\/','/'))
+              title=''
+              m=re.search(r'<title>(.*?)</title>',text,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>','',m.group(1)).strip()
+              links=[]
+              for m in re.finditer(r'(?:href|src)=["\']([^"\']+)["\']',text,re.I):
+                  u=html.unescape(m.group(1))
+                  absu=urllib.parse.urljoin('https://www.nxny.com/report/view_4461177.html',u)
+                  label=''
+                  if any(k in absu.lower() for k in ['pdf','download','down','attach','file','report','view_']):
+                      links.append(absu)
+              rawurls=[]
+              for u in re.findall(r'https?://[^"\'<>\s]+',text,re.I):
+                  u=urllib.parse.unquote(u).rstrip('),;]')
+                  if any(k in u.lower() for k in ['pdf','download','down','attach','file','report','view_']):rawurls.append(u)
+              relevant=[]
+              for line in text.splitlines():
+                  if re.search(r'pdf|下载|login|登录|attach|download|down|file|达安基因|上半年业绩超预期|后疫情时代|三季度业绩超预期|4461177',line,re.I):
+                      relevant.append(re.sub(r'\s+',' ',line)[:3000])
+              out.append({'file':p.name,'title':title,'size':len(raw),'links':list(dict.fromkeys(links+rawurls))[:1000],'relevant':relevant[:1000]})
+          Path('diagnostics/summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          for x in out:
+              print('PAGE',x['file'],'TITLE',x['title'],'SIZE',x['size'])
+              for u in x['links'][:200]:print('LINK',u)
+              for line in x['relevant'][:100]:print('REL',line)
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-nxny-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
