@@ -1,0 +1,193 @@
+name: Temporary Dunhuang Seed public PDF mirror discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-search-engines-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Search public indexes and inspect candidate pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/search diagnostics/pages
+          cat > /tmp/discover.py <<'PY'
+          from __future__ import annotations
+          import html, json, os, re, subprocess, tempfile, urllib.parse, xml.etree.ElementTree as ET
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          OUT=Path('diagnostics')
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          queries=[
+            '"先玉高增 加工减亏 盈利可期"',
+            '"敦煌先锋产销激增 驱动盈利稳定增长"',
+            '"业绩快速回升 敦煌先锋持续快速扩张 公司本部业务亏损减少"',
+            '"聚焦种业发展机遇 并购打开成长空间"',
+            '"敦煌种业" "深度研究" PDF',
+            '"敦煌种业" "深度报告" PDF',
+            '敦煌种业 600354 券商 研报 PDF',
+            '敦煌种业 先玉335 研报 下载',
+          ]
+
+          def curl(url: str, path: Path, max_time: int=60) -> tuple[bool,str]:
+            path.parent.mkdir(parents=True,exist_ok=True)
+            p=subprocess.run([
+              'curl','--http1.1','-L','--fail','--silent','--show-error',
+              '--retry','3','--retry-all-errors','--retry-delay','1',
+              '--connect-timeout','15','--max-time',str(max_time),
+              '--user-agent',UA,'--header','Accept-Encoding: identity',
+              url,'-o',str(path)
+            ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            return p.returncode==0 and path.exists() and path.stat().st_size>0,p.stderr[-800:]
+
+          engines=[]
+          for qi,q in enumerate(queries):
+            e=urllib.parse.quote(q)
+            engines += [
+              (qi,'bing_rss',f'https://www.bing.com/search?format=rss&count=50&q={e}'),
+              (qi,'bing_html',f'https://www.bing.com/search?count=50&q={e}'),
+              (qi,'baidu',f'https://www.baidu.com/s?rn=50&wd={e}'),
+              (qi,'sogou',f'https://www.sogou.com/web?num=50&query={e}'),
+              (qi,'so360',f'https://www.so.com/s?q={e}'),
+            ]
+
+          def fetch_engine(item):
+            qi,name,url=item
+            path=OUT/'search'/f'{qi:02d}_{name}.html'
+            ok,err=curl(url,path,70)
+            return item,path,ok,err
+
+          fetched=[]
+          with ThreadPoolExecutor(max_workers=10) as pool:
+            futs=[pool.submit(fetch_engine,x) for x in engines]
+            for fut in as_completed(futs):
+              fetched.append(fut.result())
+
+          urls=[]
+          search_summary=[]
+          for (qi,name,source_url),path,ok,err in fetched:
+            if not ok:
+              search_summary.append({'query':queries[qi],'engine':name,'ok':False,'error':err})
+              continue
+            raw=path.read_bytes()
+            texts=[raw.decode(enc,'ignore') for enc in ('utf-8','gb18030','gbk')]
+            text=max(texts,key=lambda x:x.count('敦煌种业')+x.lower().count('pdf'))
+            found=[]
+            if name=='bing_rss':
+              try:
+                root=ET.fromstring(text)
+                for item in root.findall('.//item'):
+                  link=item.findtext('link') or ''
+                  title=item.findtext('title') or ''
+                  if link: found.append((link,title))
+              except Exception:
+                pass
+            # all hrefs and absolute URLs
+            norm=html.unescape(text.replace('\\/','/'))
+            for href in re.findall(r'(?:href|data-href|url)=["\']([^"\']+)["\']',norm,re.I):
+              href=html.unescape(href)
+              full=urllib.parse.urljoin(source_url,href)
+              found.append((full,''))
+            for u in re.findall(r'https?://[^"\'<>\s]+',norm,re.I):
+              found.append((urllib.parse.unquote(u).rstrip('),;]'),''))
+            # unwrap common redirect parameters
+            expanded=[]
+            for u,title in found:
+              expanded.append((u,title))
+              try:
+                qs=urllib.parse.parse_qs(urllib.parse.urlsplit(u).query)
+                for key in ('url','u','target','r','q'):
+                  for v in qs.get(key,[]):
+                    if v.startswith('http'): expanded.append((urllib.parse.unquote(v),title))
+              except Exception:
+                pass
+            count=0
+            for u,title in expanded:
+              if not u.startswith('http'): continue
+              host=urllib.parse.urlsplit(u).netloc.lower()
+              if any(x in host for x in ['bing.com','baidu.com','sogou.com','so.com','microsoft.com','sinaimg.cn']):
+                continue
+              if u not in [x['url'] for x in urls]:
+                urls.append({'url':u,'title':title,'query':queries[qi],'engine':name})
+                count+=1
+            search_summary.append({'query':queries[qi],'engine':name,'ok':True,'bytes':len(raw),'new_urls':count})
+
+          # prioritize likely report/PDF domains and title-bearing URLs
+          def priority(x):
+            u=x['url'].lower(); t=(x.get('title') or '')
+            score=0
+            if '.pdf' in u: score+=1000
+            if any(k in u for k in ['report','yanbao','baogao','pdf','research','doc','download']): score+=200
+            if any(k in u for k in ['nxny','fxbaogao','sdyanbao','iyanbao','dfcfw','mbalib','docin','doc88','book118','hibor','stockstar','hexun','sina']): score+=150
+            if '敦煌种业' in t: score+=100
+            return score
+          urls.sort(key=priority,reverse=True)
+          Path(OUT/'search_summary.json').write_text(json.dumps(search_summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path(OUT/'search_urls.json').write_text(json.dumps(urls,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # inspect up to 180 unique candidate pages/files
+          targets=urls[:180]
+          def inspect(i,x):
+            u=x['url']
+            path=OUT/'pages'/f'{i:03d}.bin'
+            ok,err=curl(u,path,55)
+            rec={**x,'ok':ok,'error':err}
+            if not ok: return rec
+            raw=path.read_bytes()
+            rec['bytes']=len(raw); rec['head']=raw[:20].hex()
+            if raw.startswith(b'%PDF-'):
+              rec['is_pdf']=True; return rec
+            rec['is_pdf']=False
+            texts=[raw.decode(enc,'ignore') for enc in ('utf-8','gb18030','gbk')]
+            text=max(texts,key=lambda z:z.count('敦煌种业')+z.lower().count('.pdf')+z.lower().count('download'))
+            norm=html.unescape(text.replace('\\/','/'))
+            rec['contains_company']='敦煌种业' in norm or '600354' in norm
+            rec['page_title']=''
+            m=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+            if m: rec['page_title']=re.sub(r'<[^>]+>','',m.group(1)).strip()
+            pdfs=[]
+            for v in re.findall(r'https?://[^"\'<>\s]+',norm,re.I):
+              v=urllib.parse.unquote(v).rstrip('),;]')
+              if '.pdf' in v.lower(): pdfs.append(v)
+            for v in re.findall(r'(?:href|src|data-url|fileurl|downloadurl)=["\']([^"\']+)["\']',norm,re.I):
+              full=urllib.parse.urljoin(u,html.unescape(v))
+              if '.pdf' in full.lower() or any(k in full.lower() for k in ['download','attach','file']): pdfs.append(full)
+            rec['pdf_candidates']=list(dict.fromkeys(pdfs))[:100]
+            relevant=[]
+            for line in norm.splitlines():
+              if re.search(r'敦煌种业|600354|先玉高增|敦煌先锋产销激增|聚焦种业发展机遇|\.pdf|download|下载',line,re.I):
+                relevant.append(re.sub(r'\s+',' ',line).strip()[:3000])
+            rec['relevant']=relevant[:50]
+            return rec
+
+          inspected=[]
+          with ThreadPoolExecutor(max_workers=12) as pool:
+            futs={pool.submit(inspect,i,x):i for i,x in enumerate(targets)}
+            for fut in as_completed(futs):
+              try: inspected.append(fut.result())
+              except Exception as exc: inspected.append({'index':futs[fut],'exception':repr(exc)})
+          inspected.sort(key=lambda r:(not r.get('is_pdf',False),not r.get('contains_company',False),-len(r.get('pdf_candidates',[]))))
+          Path(OUT/'inspected.json').write_text(json.dumps(inspected,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SEARCH_URLS',len(urls),'INSPECTED',len(inspected))
+          for r in inspected:
+            if r.get('is_pdf') or r.get('contains_company') or r.get('pdf_candidates'):
+              print(json.dumps({k:r.get(k) for k in ('url','title','engine','is_pdf','bytes','contains_company','page_title','pdf_candidates')},ensure_ascii=False))
+          PY
+          python /tmp/discover.py
+
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-public-mirror-discovery
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
