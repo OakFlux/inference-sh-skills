@@ -1,0 +1,73 @@
+name: Dunhuang Hibor dynamic content inspection
+on:
+  push:
+    branches: ['tmp/dunhuang-hibor-content-20260829']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Test dynamic content endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          PAGE='https://www.hibor.com.cn/docdetail_548523.html'
+          curl --http1.1 -L --fail --silent --show-error --retry 5 --retry-all-errors \
+            --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+            --header 'Accept-Encoding: identity' --cookie-jar out/cookies.txt \
+            --dump-header out/page.headers "$PAGE" -o out/page.html
+          NCID=$(python - <<'PY'
+          import re
+          t=open('out/page.html',encoding='utf-8',errors='ignore').read()
+          print(re.search(r"var ncid = '([^']+)'",t).group(1))
+          PY
+          )
+          BUNDLE=$(python - <<'PY'
+          import re,urllib.parse
+          t=open('out/page.html',encoding='utf-8',errors='ignore').read()
+          m=re.search(r'<script src="([^"]*DocDetailNew/js[^"]*)"',t,re.I)
+          print(urllib.parse.urljoin('https://www.hibor.com.cn/docdetail_548523.html',m.group(1)))
+          PY
+          )
+          echo "NCID=$NCID"
+          echo "BUNDLE=$BUNDLE"
+          curl --http1.1 -L --silent --show-error --retry 5 --retry-all-errors \
+            --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+            --referer "$PAGE" --cookie out/cookies.txt --header 'Accept-Encoding: identity' \
+            --dump-header out/bundle.headers "$BUNDLE" -o out/bundle.js || true
+          END='https://www.hibor.com.cn/hiborweb/DocDetail/NewContent'
+          curl --http1.1 -L --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+            --referer "$PAGE" --cookie out/cookies.txt --header 'Accept-Encoding: identity' \
+            --header 'X-Requested-With: XMLHttpRequest' \
+            --get --data-urlencode "ncid=$NCID" --dump-header out/get.headers "$END" -o out/get.body || true
+          curl --http1.1 -L --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+            --referer "$PAGE" --cookie out/cookies.txt --header 'Accept-Encoding: identity' \
+            --header 'X-Requested-With: XMLHttpRequest' \
+            --data-urlencode "ncid=$NCID" --dump-header out/post_form.headers "$END" -o out/post_form.body || true
+          curl --http1.1 -L --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+            --referer "$PAGE" --cookie out/cookies.txt --header 'Accept-Encoding: identity' \
+            --header 'X-Requested-With: XMLHttpRequest' --header 'Content-Type: application/json' \
+            --data "{\"ncid\":\"$NCID\"}" --dump-header out/post_json.headers "$END" -o out/post_json.body || true
+          python - <<'PY'
+          from pathlib import Path
+          for p in sorted(Path('out').iterdir()):
+              if p.is_file():
+                  raw=p.read_bytes()
+                  print('FILE',p.name,'SIZE',len(raw))
+                  if p.suffix in ('.body','.js','.html') or p.name.endswith('.body'):
+                      print(raw[:3000].decode('utf-8','ignore').replace('\n',' ')[:3000])
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-hibor-dynamic-content
+          path: out/
+          retention-days: 2
+          compression-level: 9
