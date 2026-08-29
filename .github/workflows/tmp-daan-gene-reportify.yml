@@ -1,0 +1,144 @@
+name: Temporary Daan Gene Reportify inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-reportify.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query Reportify company documents and inspect document APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/docs diagnostic/pages diagnostic/assets diagnostic/probes
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          symbols=('SZ%3A002030' 'SZ:002030' 'CN%3A002030' 'CN:002030' 'SZ002030' '002030')
+          i=0
+          for symbol in "${symbols[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://reportify.cn/' -H 'Accept: application/json,*/*' \
+              -D "diagnostic/docs/${i}.headers" \
+              "https://api.reportify.cn/companies/${symbol}/docs?page_num=1&page_size=200" \
+              -o "diagnostic/docs/${i}.json" || true
+            echo "$symbol" > "diagnostic/docs/${i}.symbol"
+          done
+
+          curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+            -A "$UA" -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+            'https://reportify.cn/companies/SZ%3A002030/documents' \
+            -o diagnostic/pages/company.html || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html, json, re, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          rows=[]
+          for p in sorted(Path('diagnostic/docs').glob('*.json')):
+              try: obj=json.loads(p.read_text(errors='replace'))
+              except Exception as exc:
+                  print(p.name,'PARSE ERROR',exc,p.read_text(errors='replace')[:1000]); continue
+              print('\n===',p.name,'===')
+              print(json.dumps(obj,ensure_ascii=False)[:5000])
+              def walk(v):
+                  if isinstance(v,dict):
+                      blob=' '.join(str(v.get(k,'')) for k in ['report_title','title','institution_name','author_names'])
+                      if v.get('report_id') or v.get('document_id'):
+                          vv=dict(v); vv['_source']=p.name
+                          if '达安基因' in blob or '002030' in blob or v.get('institution_name'):
+                              rows.append(vv)
+                      for x in v.values(): walk(x)
+                  elif isinstance(v,list):
+                      for x in v: walk(x)
+              walk(obj)
+          uniq=[];seen=set()
+          for r in rows:
+              key=str(r.get('report_id') or '')+'|'+str(r.get('document_id') or '')+'|'+str(r.get('report_title') or r.get('title') or '')
+              if key not in seen: seen.add(key);uniq.append(r)
+          Path('diagnostic/rows.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('\nROWS',len(uniq))
+          for r in uniq:
+              print(json.dumps(r,ensure_ascii=False)[:4000])
+
+          page=Path('diagnostic/pages/company.html')
+          assets=[]
+          if page.exists():
+              text=page.read_text(errors='replace')
+              for m in re.finditer(r'(?:src|href)=["\']([^"\']+)["\']',text,re.I):
+                  u=urljoin('https://reportify.cn/companies/SZ%3A002030/documents',html.unescape(m.group(1)))
+                  if '.js' in u and u.startswith('http'): assets.append(u)
+          assets=list(dict.fromkeys(assets))[:300]
+          for i,u in enumerate(assets):
+              try:
+                  req=urllib.request.Request(u,headers={'User-Agent':UA,'Referer':'https://reportify.cn/'})
+                  raw=urllib.request.urlopen(req,timeout=60).read()
+                  if len(raw)>10_000_000: raw=raw[:10_000_000]
+                  Path(f'diagnostic/assets/{i:03d}.txt').write_bytes(raw)
+                  Path(f'diagnostic/assets/{i:03d}.url').write_text(u,encoding='utf-8')
+              except Exception as exc:
+                  Path(f'diagnostic/assets/{i:03d}.error').write_text(repr(exc),encoding='utf-8')
+          Path('diagnostic/assets.json').write_text(json.dumps(assets,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          hits=[]
+          for p in Path('diagnostic/assets').glob('*.txt'):
+              text=p.read_text(errors='replace')
+              for pat in [r'https?://api\.reportify\.cn[^"\'<>\s]+',r'/[^"\'<>\s]*(?:reports|documents|docs|pages|images|pdf)[^"\'<>\s]*']:
+                  for m in re.finditer(pat,text,re.I):
+                      h=m.group(0)
+                      if any(k in h.lower() for k in ['report','document','docs','page','image','pdf']): hits.append({'file':p.name,'hit':h[:2500]})
+              for needle in ['document_id','report_id','document_total_page','page_num','page_image','pdf_url','download_url','reportify.cn/reports','/documents/']:
+                  start=0
+                  while True:
+                      pos=text.find(needle,start)
+                      if pos<0: break
+                      hits.append({'file':p.name,'needle':needle,'context':text[max(0,pos-1800):pos+5000]})
+                      start=pos+len(needle)
+                      if len(hits)>20000: break
+                  if len(hits)>20000: break
+          Path('diagnostic/hits.json').write_text(json.dumps(hits[:20000],ensure_ascii=False,indent=2),encoding='utf-8')
+          print('ASSETS',len(assets),'HITS',len(hits))
+          print(json.dumps(hits[:500],ensure_ascii=False,indent=2)[:150000])
+
+          # Probe common report/document routes for discovered IDs.
+          ids=[]
+          for r in uniq:
+              for k in ['report_id','document_id']:
+                  v=r.get(k)
+                  if v not in (None,'') and str(v) not in ids: ids.append(str(v))
+          routes=[
+              'https://api.reportify.cn/reports/{id}',
+              'https://api.reportify.cn/reports/{id}/detail',
+              'https://api.reportify.cn/documents/{id}',
+              'https://api.reportify.cn/documents/{id}/pages',
+              'https://api.reportify.cn/docs/{id}',
+              'https://api.reportify.cn/docs/{id}/pages',
+          ]
+          for ii,idv in enumerate(ids[:100]):
+              for jj,tpl in enumerate(routes):
+                  u=tpl.format(id=idv)
+                  try:
+                      req=urllib.request.Request(u,headers={'User-Agent':UA,'Referer':'https://reportify.cn/','Accept':'application/json,*/*'})
+                      resp=urllib.request.urlopen(req,timeout=60); raw=resp.read()
+                      Path(f'diagnostic/probes/{ii:03d}_{jj}.body').write_bytes(raw)
+                      Path(f'diagnostic/probes/{ii:03d}_{jj}.meta.json').write_text(json.dumps({'id':idv,'url':u,'status':resp.status,'headers':dict(resp.headers.items()),'size':len(raw)},ensure_ascii=False,indent=2),encoding='utf-8')
+                  except Exception as exc:
+                      Path(f'diagnostic/probes/{ii:03d}_{jj}.error').write_text(repr(exc)+'\n'+u,encoding='utf-8')
+          Path('diagnostic/ids.json').write_text(json.dumps(ids,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload Reportify diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-reportify-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
