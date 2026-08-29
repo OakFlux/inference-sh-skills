@@ -1,0 +1,98 @@
+name: Temporary Daan Gene archived NXNY page inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-wayback-pages-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Inspect archived report pages for download tokens
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/pages diagnostics/downloads
+          cat > /tmp/archived_pages.py <<'PY'
+          from __future__ import annotations
+          import html,json,re,subprocess,urllib.parse
+          from pathlib import Path
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          ids=['3189898','3189923','4461177','4414374','3491455','3423061','3344271','3237309','3227011','3140491','3132516']
+          D=Path('diagnostics')
+          def curl(url,path,max_time=240):
+              p=subprocess.run(['curl','--http1.1','-L','--silent','--show-error','--retry','6','--retry-all-errors','--retry-delay','2','--connect-timeout','25','--max-time',str(max_time),'--user-agent',UA,'--header','Accept-Encoding: identity',url,'-o',str(path)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              return p.returncode,p.stderr[-1000:]
+          rows=[]; tokens=[]
+          for rid in ids:
+              targets=[f'www.nxny.com/report/view_{rid}.html',f'nxny.com/report/view_{rid}.html',f'http://www.nxny.com/report/view_{rid}.html',f'https://www.nxny.com/report/view_{rid}.html']
+              captures=[]
+              for ti,target in enumerate(targets):
+                  params={'url':target,'output':'json','fl':'timestamp,original,mimetype,statuscode,digest,length','filter':'statuscode:200','collapse':'digest','limit':'1000','from':'2012','to':'2022'}
+                  u='https://web.archive.org/cdx/search/cdx?'+urllib.parse.urlencode(params)
+                  p=D/f'cdx_{rid}_{ti}.json';rc,err=curl(u,p,300)
+                  if rc or not p.exists():continue
+                  try:a=json.loads(p.read_text(encoding='utf-8',errors='ignore'))
+                  except:continue
+                  if isinstance(a,list) and len(a)>1:
+                      h=a[0]
+                      for x in a[1:]:
+                          if isinstance(x,list):captures.append(dict(zip(h,x)))
+              seen=set()
+              for ci,c in enumerate(captures):
+                  key=(c.get('timestamp'),c.get('original'),c.get('digest'))
+                  if key in seen:continue
+                  seen.add(key)
+                  ts=c.get('timestamp','');orig=c.get('original','')
+                  if not ts or not orig:continue
+                  archive=f'https://web.archive.org/web/{ts}id_/{orig}'
+                  p=D/'pages'/f'{rid}_{ci}.html';rc,err=curl(archive,p,300)
+                  raw=p.read_bytes() if p.exists() else b''
+                  texts=[raw.decode(e,'ignore') for e in ('utf-8','gb18030','gbk')]
+                  text=max(texts,key=lambda x:x.count('downfile')+x.count('DownLoad.aspx')+x.count('达安基因')) if texts else ''
+                  norm=html.unescape(text.replace('\\/','/'))
+                  hits=[]
+                  for line in norm.splitlines():
+                      if re.search(r'downfile|DownLoad\.aspx|rnd\s*=|下载|3189898|3189923|4461177|4414374',line,re.I):
+                          hits.append(re.sub(r'\s+',' ',line)[:5000])
+                  for m in re.finditer(r'downfile\s*\(\s*["\']([^"\']+)["\']\s*,\s*["\']([^"\']*)["\']',norm,re.I):
+                      tokens.append({'report_id':rid,'timestamp':ts,'page_archive':archive,'rnd':m.group(1),'filename':m.group(2)})
+                  for m in re.finditer(r'(?:https?://vip\.nxny\.com)?/DownLoad/DownLoad\.aspx\?rnd=([^"\'&<>\s]+)',norm,re.I):
+                      tokens.append({'report_id':rid,'timestamp':ts,'page_archive':archive,'rnd':m.group(1),'filename':''})
+                  rows.append({'report_id':rid,'capture':c,'archive':archive,'rc':rc,'size':len(raw),'error':err,'hits':hits})
+          D.joinpath('page_inspection.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          # dedup tokens
+          uniq=[];seen=set()
+          for t in tokens:
+              k=(t['report_id'],t['rnd'])
+              if k not in seen:seen.add(k);uniq.append(t)
+          D.joinpath('tokens.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PAGE_ROWS',len(rows),'TOKENS',len(uniq))
+          for t in uniq:print('TOKEN',json.dumps(t,ensure_ascii=False))
+          # Try live and archived download URLs for any recovered token.
+          results=[]
+          for i,t in enumerate(uniq):
+              live=f'http://vip.nxny.com/DownLoad/DownLoad.aspx?rnd={urllib.parse.quote(t["rnd"])}'
+              for mode,u in [('live',live),('archive',f'https://web.archive.org/web/{t["timestamp"]}id_/{live}')]:
+                  p=D/'downloads'/f'{i}_{mode}.bin';rc,err=curl(u,p,300);raw=p.read_bytes() if p.exists() else b''
+                  results.append({**t,'mode':mode,'url':u,'rc':rc,'size':len(raw),'head':raw[:40].hex(),'error':err})
+                  if raw.startswith(b'%PDF-'):
+                      p.rename(D/'downloads'/f'MATCH_{t["report_id"]}_{i}_{mode}.pdf')
+          D.joinpath('download_results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/archived_pages.py
+
+      - name: Upload inspection results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-archived-page-inspection
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 0
