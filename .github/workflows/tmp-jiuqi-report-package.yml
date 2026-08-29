@@ -1,0 +1,261 @@
+name: Temporary Jiuqi Software brokerage report package
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-report-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/download-jiuqi-reports-20260829
+          fetch-depth: 0
+
+      - name: Discover, download, validate and package PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pypdf requests
+          mkdir -p jiuqi-output tmp-artifacts
+          cat > /tmp/build_jiuqi.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import math
+          import re
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          API='https://reportapi.eastmoney.com/report/list'
+          CODE='002279'
+          NAME='久其软件'
+          OUT=Path('jiuqi-output')
+          ART=Path('tmp-artifacts')
+          OUT.mkdir(exist_ok=True)
+          ART.mkdir(exist_ok=True)
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/report/{CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+          })
+
+          rows=[]
+          for qtype in ('0','1','2'):
+              for page in range(1,11):
+                  p={
+                      'pageNo':str(page),'pageSize':'100','code':CODE,
+                      'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':'2008-01-01','endTime':'2026-08-29','fields':'',
+                      'qType':qtype,'orgCode':'','rcode':'','p':str(page),
+                      'pageNum':str(page),'pageNumber':str(page),
+                  }
+                  r=s.get(API,params=p,timeout=90)
+                  r.raise_for_status(); obj=r.json(); data=obj.get('data') or []
+                  rows.extend(data)
+                  total=int(obj.get('TotalPage') or math.ceil(int(obj.get('hits') or 0)/100) or 1)
+                  if page>=total: break
+
+          dedup={}
+          for row in rows:
+              info=str(row.get('infoCode') or '')
+              if info and int(row.get('reportType') or 0)==2:
+                  dedup[info]=row
+          rows=list(dedup.values())
+
+          def date_of(row):
+              text=str(row.get('publishDate') or '')[:10]
+              try: return datetime.strptime(text,'%Y-%m-%d').date()
+              except Exception: return datetime(1900,1,1).date()
+
+          def safe(text):
+              text=re.sub(r'[\\/:*?"<>|]+','_',str(text))
+              text=re.sub(r'\s+','',text)
+              return text.strip('._')[:115]
+
+          def prelim_score(row):
+              title=str(row.get('title') or '')
+              pages=int(row.get('attachPages') or 0)
+              year=date_of(row).year
+              score=pages*15 + max(0,year-2008)*3
+              if '深度' in title: score+=650
+              if '首次覆盖' in title: score+=620
+              elif '首次' in title: score+=420
+              if any(k in title for k in ['价值分析','专题','覆盖报告','数字化','大数据','云服务','政府','政企']): score+=80
+              if any(k in title for k in ['点评','季报','年报','快报','跟踪']): score-=180
+              if any(k in title for k in ['新股','询价','申购']): score-=900
+              return score
+
+          rows.sort(key=lambda r:(prelim_score(r),date_of(r),int(r.get('attachPages') or 0)),reverse=True)
+          print('REPORT_ROWS',len(rows))
+          for row in rows:
+              print('META',json.dumps({
+                  'date':str(row.get('publishDate') or '')[:10],
+                  'broker':row.get('orgSName') or row.get('orgName'),
+                  'title':row.get('title'),'pages':row.get('attachPages'),
+                  'infoCode':row.get('infoCode'),'score':prelim_score(row)
+              },ensure_ascii=False))
+
+          valid=[]
+          for row in rows:
+              meta_pages=int(row.get('attachPages') or 0)
+              if meta_pages < 3: continue
+              info=str(row.get('infoCode') or '')
+              url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              data=None; last=''
+              for attempt in range(1,5):
+                  try:
+                      rr=s.get(url,headers={'Accept':'application/pdf,*/*'},timeout=(30,180),allow_redirects=True)
+                      last=f'HTTP {rr.status_code}, {rr.headers.get("content-type")}, {len(rr.content)} bytes'
+                      if rr.status_code==200 and rr.content[:5]==b'%PDF-' and len(rr.content)>50000:
+                          data=rr.content; url=rr.url; break
+                  except Exception as exc:
+                      last=repr(exc)
+                  time.sleep(attempt)
+              if data is None:
+                  print('DOWNLOAD_SKIP',info,last); continue
+              try:
+                  reader=PdfReader(io.BytesIO(data),strict=False)
+                  pages=len(reader.pages)
+              except Exception as exc:
+                  print('PDF_SKIP',info,repr(exc)); continue
+              if pages<3: continue
+              if meta_pages and abs(pages-meta_pages)>1:
+                  print('PAGE_MISMATCH_SKIP',info,pages,meta_pages); continue
+
+              text=''
+              for idx in range(min(5,pages)):
+                  try: text+='\n'+(reader.pages[idx].extract_text() or '')
+                  except Exception: pass
+              compact=re.sub(r'\s+','',text)
+              identity_ok=(NAME in compact or CODE in compact)
+              if compact and not identity_ok:
+                  print('IDENTITY_SKIP',info,compact[:500]); continue
+
+              title=str(row.get('title') or '公司研究报告')
+              broker=str(row.get('orgSName') or row.get('orgName') or '券商')
+              date=str(row.get('publishDate') or '')[:10]
+              if pages>=15:
+                  category='长篇公司研究'
+              elif pages>=10 and ('深度' in title or '首次' in title or '覆盖' in title):
+                  category='公司深度/首次覆盖'
+              elif pages>=8:
+                  category='中篇公司研究'
+              else:
+                  category='公司跟踪/点评'
+              score=prelim_score(row)
+              if pages>=15: score+=500
+              elif pages>=10: score+=260
+              elif pages<6: score-=260
+              if category in ('长篇公司研究','公司深度/首次覆盖'): score+=250
+
+              filename=f"{date}_{safe(broker)}_{safe(title)}_{pages}页.pdf"
+              path=OUT/filename
+              path.write_bytes(data)
+              valid.append({
+                  'filename':filename,'path':str(path),'broker':broker,'date':date,
+                  'title':title,'pages':pages,'category':category,'score':score,
+                  'infoCode':info,'pdf_url':url,
+                  'info_url':f'https://data.eastmoney.com/report/info/{info}.html',
+                  'rating':row.get('emRatingName') or row.get('sRatingName') or '',
+                  'researcher':row.get('researcher') or '',
+                  'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),
+                  'identity_check':'通过（PDF前5页可解析公司名/代码）' if identity_ok else '通过（公开目录公司代码匹配；PDF为扫描型文本）',
+              })
+              print('VALID',json.dumps(valid[-1],ensure_ascii=False))
+
+          if len(valid)<2:
+              raise RuntimeError(f'Only {len(valid)} valid company report PDF(s) found')
+
+          valid.sort(key=lambda x:(x['score'],x['date'],x['pages']),reverse=True)
+          selected=[]; used_brokers=set()
+          # Prefer genuine long/deep reports and broker diversity.
+          for category_set in [
+              {'长篇公司研究','公司深度/首次覆盖'},
+              {'长篇公司研究','公司深度/首次覆盖','中篇公司研究'},
+              {'长篇公司研究','公司深度/首次覆盖','中篇公司研究','公司跟踪/点评'},
+          ]:
+              for item in valid:
+                  if len(selected)>=3: break
+                  if item in selected or item['category'] not in category_set: continue
+                  if item['broker'] in used_brokers and len(valid)>len(selected)+1: continue
+                  selected.append(item); used_brokers.add(item['broker'])
+              if len(selected)>=2: break
+          for item in valid:
+              if len(selected)>=3: break
+              if item not in selected:
+                  selected.append(item)
+
+          selected=selected[:3]
+          selected_names={x['filename'] for x in selected}
+          for p in OUT.glob('*.pdf'):
+              if p.name not in selected_names: p.unlink()
+
+          lines=[
+              f'{NAME}（{CODE}.SZ）券商研究报告清单与核验信息','',
+              f'共收录 {len(selected)} 份实际PDF原文件。选择顺序：长篇公司研究/首次覆盖优先，其次为中篇公司研究；仅在不足时使用短篇公司跟踪。',''
+          ]
+          for i,item in enumerate(selected,1):
+              lines += [
+                  f"{i}. {item['broker']}：《{item['title']}》",
+                  f"   日期：{item['date']}；页数：{item['pages']}页；类型：{item['category']}；评级：{item['rating'] or '未标注'}",
+                  f"   分析师：{item['researcher'] or '未标注'}",
+                  f"   文件：{item['filename']}",
+                  f"   原始PDF：{item['pdf_url']}",
+                  f"   信息页：{item['info_url']}",
+                  f"   身份核验：{item['identity_check']}",
+                  f"   SHA-256：{item['sha256']}",'',
+              ]
+          (OUT/'报告清单与核验信息.txt').write_text('\n'.join(lines),encoding='utf-8')
+          manifest={
+              'company':NAME,'stock_code':f'{CODE}.SZ','selected_reports':selected,
+              'all_valid_reports_count':len(valid),
+          }
+          (ART/'jiuqi_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          zip_path=ART/'jiuqi_software_broker_reports.zip'
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for item in selected:
+                  z.write(OUT/item['filename'],arcname=item['filename'])
+              z.write(OUT/'报告清单与核验信息.txt',arcname='报告清单与核验信息.txt')
+          with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError(f'ZIP integrity error: {bad}')
+              print('FINAL_ZIP',zip_path.stat().st_size,z.namelist())
+          PY
+          python /tmp/build_jiuqi.py
+
+      - name: Commit package and manifest to temporary branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- tmp-artifacts/jiuqi_software_broker_reports.zip tmp-artifacts/jiuqi_manifest.json
+          git commit -m 'chore: add temporary Jiuqi Software report package'
+          git push origin HEAD:tmp/download-jiuqi-reports-20260829
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiuqi-software-broker-reports
+          path: tmp-artifacts/jiuqi_software_broker_reports.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
