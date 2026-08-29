@@ -1,0 +1,47 @@
+name: Temporary Guosheng current bundle probe
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-current-bundle-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Discover current JS bundle and endpoint contexts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import re, urllib.parse, requests
+          from bs4 import BeautifulSoup
+          root='https://research.gszq.com/'
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':root,'Accept':'text/html,application/javascript,*/*'})
+          r=s.get(root,timeout=90); print('INDEX',r.status_code,len(r.content),r.url); r.raise_for_status()
+          print(r.text[:3000])
+          soup=BeautifulSoup(r.text,'html.parser')
+          scripts=[urllib.parse.urljoin(r.url,t['src']) for t in soup.find_all('script',src=True)]
+          print('SCRIPTS',scripts)
+          for u in scripts:
+              rr=s.get(u,timeout=120); print('\nJS',u,rr.status_code,len(rr.content)); rr.raise_for_status(); text=rr.text
+              for needle in ['researchReport','getRecommendReports','baseURL','axios.create','report?rid','download','reportDetail','searchReport','getReportList','getReportDetail']:
+                  starts=[m.start() for m in re.finditer(re.escape(needle),text,re.I)]
+                  if starts:
+                      print('NEEDLE',needle,'COUNT',len(starts))
+                      for p in starts[:20]: print('CTX',text[max(0,p-1800):p+5000].replace('\n',' ')[:6800])
+              quoted=re.findall(r'["\']([^"\']+)["\']',text)
+              for x in sorted(set(quoted)):
+                  if len(x)<500 and any(k in x.lower() for k in ['researchreport','report/','report?','download','attachment','pdf','baseurl']):
+                      print('EP',x)
+              for x in sorted(set(quoted)):
+                  if x.startswith(('http://','https://','//')) and len(x)<500:
+                      print('HOST',x)
+          PY
