@@ -1,0 +1,82 @@
+name: Dunhuang Hibor detail inspection
+on:
+  push:
+    branches: ['tmp/dunhuang-hibor-detail-20260829']
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect report detail pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/scripts
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for id in 548523 373598 1993998 547732 575520; do
+            curl --http1.1 -L --fail --silent --show-error --retry 5 --retry-all-errors \
+              --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' \
+              "https://www.hibor.com.cn/docdetail_${id}.html" -o "out/${id}.html"
+          done
+          python - <<'PY'
+          import html,json,re,subprocess,urllib.parse
+          from pathlib import Path
+          ua='Mozilla/5.0'
+          rows=[]; scripts=[]
+          for p in sorted(Path('out').glob('*.html')):
+              raw=p.read_bytes()
+              texts=[raw.decode(e,'ignore') for e in ('utf-8','gb18030','gbk')]
+              text=max(texts,key=lambda s:s.count('敦煌种业')+s.count('报告原文')+s.lower().count('download'))
+              norm=html.unescape(text.replace('\\/','/'))
+              title=''
+              m=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>',' ',m.group(1)).strip()
+              candidates=[]
+              for u in re.findall(r'(?:href|src|action)=["\']([^"\']+)["\']',norm,re.I):
+                  full=urllib.parse.urljoin(f'https://www.hibor.com.cn/docdetail_{p.stem}.html',html.unescape(u))
+                  if re.search(r'\.js(?:\?|$)',full,re.I): scripts.append(full)
+                  if re.search(r'\.pdf|\.rar|download|down|attach|file|original|source|browse|view|docid|reportid',full,re.I): candidates.append(full)
+              for pat in [
+                  r'(?:file|pdf|download|down|url|source)(?:Url|URL|Path|path|Link|link)?\s*[:=]\s*["\']([^"\']+)',
+                  r'(?:window\.)?open\s*\(\s*["\']([^"\']+)',
+                  r'(?:window\.)?location(?:\.href)?\s*=\s*["\']([^"\']+)',
+                  r'https?://[^"\'<>\s]+',
+              ]:
+                  for u in re.findall(pat,norm,re.I):
+                      full=urllib.parse.urljoin(f'https://www.hibor.com.cn/docdetail_{p.stem}.html',urllib.parse.unquote(html.unescape(u)).rstrip('),;]'))
+                      if re.search(r'\.pdf|\.rar|download|down|attach|file|original|source|docdetail|docid|reportid',full,re.I): candidates.append(full)
+              relevant=[]
+              for line in norm.splitlines():
+                  if re.search(r'报告原文|浏览原文|PDF|RAR|下载|download|attach|file|会员|登录|docid|reportid|onclick',line,re.I):
+                      relevant.append(re.sub(r'\s+',' ',line).strip()[:6000])
+              row={'id':p.stem,'size':len(raw),'title':title,'candidates':list(dict.fromkeys(candidates)),'relevant':relevant[:300]}
+              rows.append(row)
+          scripts=list(dict.fromkeys(scripts))
+          for i,u in enumerate(scripts[:80]):
+              out=Path(f'out/scripts/{i:03d}.js')
+              subprocess.run(['curl','--http1.1','-L','--silent','--show-error','--retry','3','--retry-all-errors','--connect-timeout','15','--max-time','120','--user-agent',ua,'--header','Accept-Encoding: identity',u,'-o',str(out)])
+          hits=[]
+          for p in Path('out/scripts').glob('*.js'):
+              t=p.read_text(encoding='utf-8',errors='ignore')
+              for m in re.finditer(r'pdf|download|attach|file|docid|reportid|原文|浏览',t,re.I):
+                  a=max(0,m.start()-600);b=min(len(t),m.end()+1600)
+                  hits.append(f'===== {p.name} =====\n{t[a:b]}')
+                  if len(hits)>300:break
+          Path('out/details.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('out/script_hits.txt').write_text('\n\n'.join(hits),encoding='utf-8')
+          for row in rows:
+              print('===',row['id'],row['size'],row['title'])
+              for c in row['candidates'][:60]:print('CANDIDATE',c)
+              for line in row['relevant'][:40]:print('LINE',line[:2500])
+          print('SCRIPTS',len(scripts),'HITS',len(hits))
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-hibor-detail-inspection
+          path: out/
+          retention-days: 2
+          compression-level: 9
