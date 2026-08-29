@@ -1,0 +1,89 @@
+name: Temporary Daan Gene Eastmoney inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-inspect-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect report page and API variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          curl --http1.1 -L --fail --silent --show-error --retry 5 --retry-all-errors \
+            --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+            --header 'Accept-Encoding: identity' \
+            'https://data.eastmoney.com/report/002030.html' -o diagnostics/page.html
+          python - <<'PY'
+          import re,html,subprocess,urllib.parse,json
+          from pathlib import Path
+          text=Path('diagnostics/page.html').read_text(encoding='utf-8',errors='ignore')
+          srcs=[]
+          for s in re.findall(r'<script[^>]+src=["\']([^"\']+)',text,re.I):
+              s=html.unescape(s)
+              if s.startswith('//'):s='https:'+s
+              elif s.startswith('/'):
+                  s='https://data.eastmoney.com'+s
+              elif not s.startswith('http'):
+                  s=urllib.parse.urljoin('https://data.eastmoney.com/report/002030.html',s)
+              srcs.append(s)
+          Path('diagnostics/scripts.json').write_text(json.dumps(srcs,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SCRIPTS',len(srcs))
+          for i,u in enumerate(srcs):
+              out=Path(f'diagnostics/script_{i}.js')
+              p=subprocess.run(['curl','--http1.1','-L','--silent','--show-error','--retry','3','--retry-all-errors','--connect-timeout','15','--max-time','120','--user-agent','Mozilla/5.0','--header','Accept-Encoding: identity',u,'-o',str(out)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print(i,p.returncode,u,len(out.read_bytes()) if out.exists() else 0)
+          patterns=re.compile(r'reportapi|report/list|pageNo|pageNumber|stockCode|stockcode|qType|beginTime|infoCode|report\.list|api\.eastmoney',re.I)
+          hits=[]
+          for p in Path('diagnostics').glob('script_*.js'):
+              t=p.read_text(encoding='utf-8',errors='ignore')
+              if patterns.search(t):
+                  for m in patterns.finditer(t):
+                      a=max(0,m.start()-700);b=min(len(t),m.end()+1200)
+                      hits.append(f'===== {p.name} =====\n'+t[a:b])
+                      if len(hits)>100:break
+          Path('diagnostics/script_hits.txt').write_text('\n\n'.join(hits),encoding='utf-8')
+          print('HITS',len(hits))
+          PY
+          # Query common API variants and print response prefixes.
+          python - <<'PY'
+          import subprocess,urllib.parse,json
+          from pathlib import Path
+          variants=[
+            {'code':'002030'},
+            {'code':'SZ002030'},
+            {'code':'002030.SZ'},
+            {'code':'SZ.002030'},
+            {'stockCode':'002030'},
+            {'stockcode':'002030'},
+            {'securityCode':'002030'},
+            {'code':'002030','qType':'0'},
+            {'code':'002030','qType':'1'},
+            {'code':'002030','qType':'2'},
+          ]
+          base={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':'2010-01-01','endTime':'2026-08-29','pageNo':'1','fields':'','qType':'0','orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
+          for i,v in enumerate(variants):
+              q=base.copy();q.update(v)
+              url='https://reportapi.eastmoney.com/report/list?'+urllib.parse.urlencode(q)
+              out=Path(f'diagnostics/api_{i}.txt')
+              p=subprocess.run(['curl','--http1.1','-L','--silent','--show-error','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','120','--user-agent','Mozilla/5.0','--referer','https://data.eastmoney.com/report/002030.html','--header','Accept-Encoding: identity',url,'-o',str(out)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              txt=out.read_text(encoding='utf-8',errors='ignore') if out.exists() else ''
+              print('VARIANT',i,v,'RC',p.returncode,'LEN',len(txt),'HEAD',txt[:500].replace('\n',' '))
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-eastmoney-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
