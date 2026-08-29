@@ -1,0 +1,251 @@
+name: Temporary Xinri brokerage report package
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-report-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/download-xinri-reports-20260829
+          fetch-depth: 0
+
+      - name: Discover, download, validate and package original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pypdf requests
+          mkdir -p tmp-artifacts work
+          python - <<'PY'
+          import hashlib
+          import io
+          import json
+          import math
+          import re
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          API = 'https://reportapi.eastmoney.com/report/list'
+          CODE = '603787'
+          NAME = '新日股份'
+          OUTDIR = Path('work')
+          OUTDIR.mkdir(exist_ok=True)
+          ART = Path('tmp-artifacts')
+          ART.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/report/{CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+          })
+
+          rows=[]
+          for qtype in ('0','1','2'):
+              for page in range(1,11):
+                  params={
+                      'pageNo':str(page),'pageSize':'100','code':CODE,
+                      'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':'2017-01-01','endTime':'2026-08-29','fields':'',
+                      'qType':qtype,'orgCode':'','rcode':'','p':str(page),
+                      'pageNum':str(page),'pageNumber':str(page),
+                  }
+                  r=session.get(API,params=params,timeout=60)
+                  r.raise_for_status()
+                  obj=r.json()
+                  data=obj.get('data') or []
+                  rows.extend(data)
+                  total=int(obj.get('TotalPage') or math.ceil(int(obj.get('hits') or 0)/100) or 1)
+                  if page>=total:
+                      break
+
+          dedup={}
+          for row in rows:
+              info=str(row.get('infoCode') or '')
+              if info:
+                  dedup[info]=row
+          rows=list(dedup.values())
+
+          def date_value(row):
+              s=str(row.get('publishDate') or '')[:10]
+              try: return datetime.strptime(s,'%Y-%m-%d').date()
+              except Exception: return datetime(1900,1,1).date()
+
+          def score(row):
+              title=str(row.get('title') or '')
+              pages=int(row.get('attachPages') or 0)
+              year=date_value(row).year
+              s=pages*2 + max(0,year-2017)*4
+              if '深度' in title: s+=140
+              if '首次覆盖' in title: s+=130
+              elif '首次' in title: s+=90
+              if any(k in title for k in ['价值分析','成长','龙头','新征程','破局','品牌','渠道']): s+=20
+              return s
+
+          candidates=[]
+          for row in rows:
+              title=str(row.get('title') or '')
+              pages=int(row.get('attachPages') or 0)
+              rtype=int(row.get('reportType') or 0)
+              stock=str(row.get('stockCode') or '')
+              if rtype != 2:
+                  continue
+              if stock and stock != CODE:
+                  continue
+              # A deep-report threshold: at least 10 pages, with preference for 15+.
+              if pages < 10:
+                  continue
+              candidates.append(row)
+          candidates.sort(key=lambda r:(score(r),date_value(r),int(r.get('attachPages') or 0)),reverse=True)
+
+          print('CANDIDATES',len(candidates))
+          for row in candidates:
+              print(json.dumps({
+                  'date':str(row.get('publishDate') or '')[:10],
+                  'broker':row.get('orgSName') or row.get('orgName'),
+                  'title':row.get('title'),'pages':row.get('attachPages'),
+                  'infoCode':row.get('infoCode'),'score':score(row)
+              },ensure_ascii=False))
+
+          def safe(s):
+              s=re.sub(r'[\\/:*?"<>|]+','_',str(s))
+              s=re.sub(r'\s+','',s)
+              return s.strip('._')[:120]
+
+          selected=[]
+          used_brokers=set()
+          # First pass favors broker diversity; second pass fills remaining slots.
+          for diversity_pass in (True,False):
+              for row in candidates:
+                  if len(selected)>=3: break
+                  info=str(row.get('infoCode') or '')
+                  if any(x['infoCode']==info for x in selected):
+                      continue
+                  broker=str(row.get('orgSName') or row.get('orgName') or '券商')
+                  if diversity_pass and broker in used_brokers:
+                      continue
+                  url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+                  data=None
+                  last=''
+                  for attempt in range(1,5):
+                      try:
+                          rr=session.get(url,headers={'Accept':'application/pdf,*/*'},timeout=(30,180),allow_redirects=True)
+                          last=f'HTTP {rr.status_code}, {rr.headers.get("content-type")}, {len(rr.content)} bytes'
+                          if rr.status_code==200 and rr.content[:5]==b'%PDF-' and len(rr.content)>80000:
+                              data=rr.content
+                              url=rr.url
+                              break
+                      except Exception as exc:
+                          last=repr(exc)
+                      time.sleep(attempt)
+                  if data is None:
+                      print('DOWNLOAD_SKIP',info,last)
+                      continue
+                  try:
+                      reader=PdfReader(io.BytesIO(data),strict=False)
+                      pages=len(reader.pages)
+                  except Exception as exc:
+                      print('PDF_SKIP',info,repr(exc)); continue
+                  meta_pages=int(row.get('attachPages') or 0)
+                  if pages < 10:
+                      print('SHORT_SKIP',info,pages); continue
+                  if meta_pages and abs(pages-meta_pages)>1:
+                      print('PAGE_MISMATCH_SKIP',info,pages,meta_pages); continue
+                  text=''
+                  for idx in range(min(4,pages)):
+                      try: text += '\n' + (reader.pages[idx].extract_text() or '')
+                      except Exception: pass
+                  compact=re.sub(r'\s+','',text)
+                  if NAME not in compact and CODE not in compact:
+                      print('IDENTITY_SKIP',info,compact[:500]); continue
+
+                  date=str(row.get('publishDate') or '')[:10]
+                  title=str(row.get('title') or '公司研究报告')
+                  filename=f"{date}_{safe(broker)}_{safe(title)}_{pages}页.pdf"
+                  path=OUTDIR/filename
+                  path.write_bytes(data)
+                  sha=hashlib.sha256(data).hexdigest()
+                  item={
+                      'filename':filename,
+                      'broker':broker,
+                      'date':date,
+                      'title':title,
+                      'pages':pages,
+                      'bytes':len(data),
+                      'infoCode':info,
+                      'pdf_url':url,
+                      'info_url':f'https://data.eastmoney.com/report/info/{info}.html',
+                      'sha256':sha,
+                      'rating':row.get('emRatingName') or row.get('sRatingName') or '',
+                      'researcher':row.get('researcher') or '',
+                      'score':score(row),
+                  }
+                  selected.append(item)
+                  used_brokers.add(broker)
+                  print('SELECTED',json.dumps(item,ensure_ascii=False))
+              if len(selected)>=3: break
+
+          if len(selected)<2:
+              raise RuntimeError(f'Only {len(selected)} valid deep report(s) found; refusing to create a misleading package')
+
+          # Keep newest/highest-quality 2–3 in final package.
+          selected.sort(key=lambda x:(x['score'],x['date'],x['pages']),reverse=True)
+          selected=selected[:3]
+          selected_files={x['filename'] for x in selected}
+          for p in OUTDIR.glob('*.pdf'):
+              if p.name not in selected_files:
+                  p.unlink()
+
+          lines=[
+              f'{NAME}（{CODE}.SH）券商深度报告清单与校验信息','',
+              f'共收录 {len(selected)} 份实际PDF原文件。均已验证PDF文件头、实际页数、公司名称或股票代码，并完成ZIP完整性测试。',''
+          ]
+          for i,item in enumerate(selected,1):
+              lines += [
+                  f"{i}. {item['broker']}：《{item['title']}》",
+                  f"   日期：{item['date']}；页数：{item['pages']}页；评级：{item['rating'] or '未标注'}",
+                  f"   分析师：{item['researcher'] or '未标注'}",
+                  f"   文件：{item['filename']}",
+                  f"   原始PDF：{item['pdf_url']}",
+                  f"   信息页：{item['info_url']}",
+                  f"   SHA-256：{item['sha256']}",'',
+              ]
+          (OUTDIR/'报告清单与校验信息.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (ART/'xinri_manifest.json').write_text(json.dumps(selected,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          zip_path=ART/'xinri_broker_deep_reports.zip'
+          with zipfile.ZipFile(zip_path,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for item in selected:
+                  z.write(OUTDIR/item['filename'],arcname=item['filename'])
+              z.write(OUTDIR/'报告清单与校验信息.txt',arcname='报告清单与校验信息.txt')
+          with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError(f'ZIP integrity error: {bad}')
+              print('ZIP_OK',zip_path,zip_path.stat().st_size,z.namelist())
+          PY
+
+      - name: Commit package to temporary branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- tmp-artifacts/xinri_broker_deep_reports.zip tmp-artifacts/xinri_manifest.json
+          git commit -m 'chore: add temporary Xinri brokerage report package'
+          git push origin HEAD:tmp/download-xinri-reports-20260829
