@@ -1,0 +1,37 @@
+name: Temporary Guosheng menu-only probe
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-menu-only.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query menus and one report list per menu
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          ep='https://research.gszq.com/graphql'
+          h={'User-Agent':'Mozilla/5.0','Origin':'https://research.gszq.com','Referer':'https://research.gszq.com/research','Content-Type':'application/json','Accept':'application/json'}
+          def q(query):
+            r=requests.post(ep,json={'query':query},headers=h,timeout=30); print('HTTP',r.status_code,'LEN',len(r.content)); print(r.text[:200000]); return r
+          r=q('query { reportMenus { id name } }')
+          try: menus=((r.json().get('data') or {}).get('reportMenus') or [])
+          except: menus=[]
+          for m in menus:
+            mid=str(m.get('id') or '')
+            if not mid: continue
+            query=f'''query {{ reports(menu_id: "{mid}", limit: 100, page: 1, start_time: 1598918400, end_time: 1601510400, keywords: "新日股份") {{ is_end total reports {{ rid type title brief authors custom catalog updated_time pic can_view }} }} }}'''
+            print('\nMENU',mid,m.get('name'))
+            q(query)
+          PY
