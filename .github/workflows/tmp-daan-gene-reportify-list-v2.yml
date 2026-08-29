@@ -1,0 +1,65 @@
+name: Temporary Daan Gene Reportify list v2
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-reportify-list-v2.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query Reportify company documents with valid page size
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          symbols=('SZ%3A002030' 'SZ:002030' 'CN%3A002030' 'CN:002030' 'SZ002030' '002030')
+          i=0
+          for symbol in "${symbols[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e 'https://reportify.cn/' -H 'Accept: application/json,*/*' \
+              -D "diagnostic/${i}.headers" \
+              "https://api.reportify.cn/companies/${symbol}/docs?page_num=1&page_size=100" \
+              -o "diagnostic/${i}.json" || true
+            echo "$symbol" > "diagnostic/${i}.symbol"
+          done
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          rows=[]
+          for p in sorted(Path('diagnostic').glob('[1-6].json')):
+              try: obj=json.loads(p.read_text(errors='replace'))
+              except Exception as exc:
+                  print(p.name,'ERROR',exc,p.read_text(errors='replace')[:1000]); continue
+              print('\n===',p.name,'===')
+              print(json.dumps(obj,ensure_ascii=False)[:30000])
+              def walk(v):
+                  if isinstance(v,dict):
+                      if v.get('report_id') or v.get('document_id'):
+                          vv=dict(v);vv['_source']=p.name;rows.append(vv)
+                      for x in v.values():walk(x)
+                  elif isinstance(v,list):
+                      for x in v:walk(x)
+              walk(obj)
+          uniq=[];seen=set()
+          for r in rows:
+              key=(str(r.get('report_id')),str(r.get('document_id')),str(r.get('report_title') or r.get('title')))
+              if key not in seen:seen.add(key);uniq.append(r)
+          Path('diagnostic/rows.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('\nROWS',len(uniq))
+          print(json.dumps(uniq,ensure_ascii=False,indent=2)[:200000])
+          PY
+      - name: Upload list response
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-reportify-list-v2
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
