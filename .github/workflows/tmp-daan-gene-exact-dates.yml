@@ -1,0 +1,69 @@
+name: Temporary Daan Gene exact-date report lookup
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-exact-dates-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Query narrow date windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          python - <<'PY'
+          import json,subprocess,urllib.parse
+          from pathlib import Path
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          API='https://reportapi.eastmoney.com/report/list'
+          windows=[
+            ('2020-07-14','2020-07-18'),
+            ('2020-08-29','2020-09-02'),
+            ('2020-10-28','2020-11-02'),
+            ('2020-04-13','2020-04-20'),
+            ('2020-01-01','2020-12-31'),
+          ]
+          exact_terms=['达安基因','上半年业绩超预期，公司发展迎里程碑拐点','后疫情时代新冠筛查从严','三季度业绩超预期，产能扩建有望延续新冠优势']
+          matches=[];seen=set();stats=[]
+          for wi,(begin,end) in enumerate(windows):
+              for page in range(1,6):
+                  params={'pageNo':str(page),'pageSize':'100','code':'*','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':begin,'endTime':end,'fields':'','qType':'0','orgCode':'','rcode':''}
+                  url=API+'?'+urllib.parse.urlencode(params)
+                  out=Path(f'diagnostics/w{wi}_p{page}.json')
+                  proc=subprocess.run(['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','120','--user-agent',UA,'--referer','https://data.eastmoney.com/report/','--header','Accept-Encoding: identity',url,'-o',str(out)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if proc.returncode: raise RuntimeError(proc.stderr[-1000:])
+                  s=out.read_text(encoding='utf-8',errors='ignore').strip()
+                  if s and s[0] not in '[{' and '(' in s and s.endswith(')'):s=s[s.find('(')+1:s.rfind(')')]
+                  obj=json.loads(s);rows=obj.get('data') or []
+                  total=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+                  stats.append({'window':[begin,end],'page':page,'rows':len(rows),'total_pages':total})
+                  for r in rows:
+                      sc=str(r.get('stockCode') or '')
+                      sn=str(r.get('stockName') or '')
+                      ti=str(r.get('title') or '')
+                      if sc=='002030' or sn=='达安基因' or any(term in ti for term in exact_terms):
+                          info=str(r.get('infoCode') or '')
+                          if info not in seen:
+                              seen.add(info);matches.append(r)
+                  if page>=total or not rows:break
+          Path('diagnostics/matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/stats.json').write_text(json.dumps(stats,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCH_COUNT',len(matches))
+          for r in matches:
+              print('MATCH',json.dumps({'date':r.get('publishDate'),'broker':r.get('orgSName'),'title':r.get('title'),'stockCode':r.get('stockCode'),'stockName':r.get('stockName'),'infoCode':r.get('infoCode')},ensure_ascii=False))
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-exact-date-results
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
