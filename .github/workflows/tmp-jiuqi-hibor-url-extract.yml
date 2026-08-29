@@ -1,0 +1,83 @@
+name: Temporary Jiuqi Hibor URL extraction
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-hibor-url-extract.yml
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Extract and test public view/download URLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import html,json,re,requests,urllib.parse
+          from bs4 import BeautifulSoup
+
+          targets={
+            '2016_aijian':'https://www.hibor.com.cn/docdetail_1763895.html',
+            '2011_huatai':'https://www.hibor.com.cn/docdetail_563758.html',
+            '2013_shenwan':'https://www.hibor.com.cn/docdetail_1127088.html',
+            '2009_shanghai':'https://www.hibor.com.cn/docdetail_206028.html',
+          }
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Accept':'text/html,application/json,application/pdf,*/*','X-Requested-With':'XMLHttpRequest'})
+          for label,url in targets.items():
+            r=s.get(url,timeout=60,allow_redirects=True)
+            text=r.text
+            m=re.search(r"var\s+ncid\s*=\s*['\"]([^'\"]+)['\"]",text)
+            ncid=m.group(1) if m else ''
+            endpoint=urllib.parse.urljoin(r.url,'/hiborweb/DocDetail/NewContent')
+            rr=s.post(endpoint,data={'ncid':ncid},headers={'Referer':r.url,'Origin':'https://www.hibor.com.cn','X-Requested-With':'XMLHttpRequest'},timeout=60)
+            body=html.unescape(rr.text)
+            soup=BeautifulSoup(body,'html.parser')
+            visible=' '.join(soup.get_text(' ',strip=True).split())
+            print('\n===',label,'===')
+            print('PAGE',r.url,'NCID',ncid,'NEWCONTENT',rr.status_code,len(rr.content))
+            # Extract JS variables and hidden fields that could identify the report file.
+            for name in ['viewUrl','downloadUrl','clientDownload','displayLoginLayer','loginLayerClose','metaTitle','metaKeywords','metaDescription','did','docId','fileUrl','pdfUrl','viewType']:
+              vals=[]
+              patterns=[
+                rf"(?:var\s+)?{re.escape(name)}\s*=\s*['\"]([^'\"]*)['\"]",
+                rf'id=["\']{re.escape(name)}["\'][^>]*value=["\']([^"\']*)["\']',
+                rf'name=["\']{re.escape(name)}["\'][^>]*value=["\']([^"\']*)["\']',
+              ]
+              for pat in patterns:
+                vals += re.findall(pat,body,re.I)
+              if vals: print('VAR',name,json.dumps(list(dict.fromkeys(vals)),ensure_ascii=False))
+            for field in ['研报页数','研报大小','研报出处','研报作者','推荐评级','分享时间','股票名称','股票代码']:
+              p=visible.find(field)
+              if p>=0: print('META',field,visible[p:p+220])
+            # All URL-like values mentioning file/view/download/pdf/report.
+            urls=set()
+            for pat in [
+              r'https?://[^\s"\'<>]+',
+              r'(?:href|src|action)=["\']([^"\']+)["\']',
+              r"['\"](/[^'\"]*(?:download|view|pdf|report|file|doc)[^'\"]*)['\"]",
+            ]:
+              for x in re.findall(pat,body,re.I):
+                if isinstance(x,tuple): x=x[0]
+                x=urllib.parse.urljoin(r.url,x)
+                if any(k in x.lower() for k in ['download','view','pdf','report','file','doc']): urls.add(x)
+            for u in sorted(urls): print('URL',u[:2000])
+            # Test only extracted view/download URLs without following redirects.
+            candidates=[]
+            for name in ['viewUrl','downloadUrl']:
+              for pat in [rf"(?:var\s+)?{name}\s*=\s*['\"]([^'\"]+)['\"]"]:
+                candidates += re.findall(pat,body,re.I)
+            for u in dict.fromkeys(candidates):
+              full=urllib.parse.urljoin(r.url,u)
+              try:
+                x=s.get(full,headers={'Referer':r.url,'Accept':'application/pdf,text/html,*/*'},timeout=60,allow_redirects=False)
+                print('TEST',full,'STATUS',x.status_code,'TYPE',x.headers.get('content-type'),'LEN',len(x.content),'LOC',x.headers.get('location'),'HEAD',x.content[:20])
+              except Exception as e: print('TEST_ERR',full,repr(e))
+          PY
