@@ -1,0 +1,117 @@
+name: Temporary Daan Gene 9fzt report API inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-9fzt-api.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query signed report API and inspect all fields
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/responses diagnostic/probes
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import hashlib, json, time, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          secret='sjdxfnqogbzoun13d971ckh8p'
+          base='https://api-hq.chongnengjihua.com'
+
+          def signed_get(path,params,name):
+              # JS signature: md5(secret + values in sorted-key order + timestamp)
+              ts=str(int(time.time()*1000))
+              payload=''.join(str(params[k]) for k in sorted(params))
+              sig=hashlib.md5((secret+payload+ts).encode()).hexdigest()
+              url=base+path+'?'+urlencode(params)
+              req=urllib.request.Request(url,headers={
+                  'User-Agent':UA,'Referer':'https://www.9fzt.com/',
+                  'signature':sig,'timestamp':ts,
+                  'Accept':'application/json, text/plain, */*',
+                  'Origin':'https://www.9fzt.com',
+              })
+              try:
+                  resp=urllib.request.urlopen(req,timeout=90)
+                  raw=resp.read()
+                  headers=dict(resp.headers.items())
+              except Exception as exc:
+                  Path(f'diagnostic/responses/{name}.error').write_text(repr(exc)+'\n'+url+'\n'+sig+'\n'+ts,encoding='utf-8')
+                  return None
+              Path(f'diagnostic/responses/{name}.body').write_bytes(raw)
+              Path(f'diagnostic/responses/{name}.json').write_text(json.dumps({'url':url,'signature':sig,'timestamp':ts,'headers':headers,'size':len(raw)},ensure_ascii=False,indent=2),encoding='utf-8')
+              try:
+                  obj=json.loads(raw.decode('utf-8','replace'))
+                  Path(f'diagnostic/responses/{name}.pretty.json').write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding='utf-8')
+                  print('\n===',name,'===')
+                  print(json.dumps(obj,ensure_ascii=False,indent=2)[:80000])
+                  return obj
+              except Exception:
+                  print(name,raw[:3000])
+                  return None
+
+          variants=[
+              {'market':'sz','symbol':'002030','page':0,'pageSize':100},
+              {'market':'SZ','symbol':'002030','page':0,'pageSize':100},
+              {'market':'sz','symbol':'002030','page':1,'pageSize':100},
+          ]
+          all_rows=[]
+          for i,p in enumerate(variants):
+              obj=signed_get('/news/api/1/stock/a/report/list',p,f'list_{i}')
+              if obj:
+                  def walk(x):
+                      if isinstance(x,dict):
+                          blob=' '.join(str(v) for v in x.values())
+                          if ('达安基因' in blob or '002030' in blob) and any(k in x for k in ['id','reportId','report_id','articleId','contentId']): all_rows.append(x)
+                          for v in x.values(): walk(v)
+                      elif isinstance(x,list):
+                          for v in x: walk(v)
+                  walk(obj)
+          # Deduplicate JSON objects.
+          uniq=[];seen=set()
+          for r in all_rows:
+              key=json.dumps(r,ensure_ascii=False,sort_keys=True)
+              if key not in seen: seen.add(key);uniq.append(r)
+          Path('diagnostic/rows.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('ROWS',len(uniq))
+          print(json.dumps(uniq,ensure_ascii=False,indent=2)[:120000])
+
+          # Probe likely detail/content endpoints for IDs returned by list.
+          ids=[]
+          for r in uniq:
+              for k in ['id','reportId','report_id','articleId','contentId','newsId']:
+                  v=r.get(k)
+                  if v not in (None,'') and str(v) not in ids: ids.append(str(v))
+          paths=[
+              '/news/api/1/stock/a/report/detail',
+              '/news/api/1/stock/a/report/info',
+              '/news/api/1/stock/a/report/content',
+              '/news/api/1/report/detail',
+              '/news/api/1/report/info',
+              '/news/api/1/report/content',
+              '/news/api/1/article/detail',
+              '/news/api/1/article/info',
+          ]
+          for idx,idv in enumerate(ids[:30]):
+              for pi,path in enumerate(paths):
+                  for key in ['id','reportId','articleId','contentId']:
+                      signed_get(path,{key:idv},f'probe_{idx}_{pi}_{key}')
+                      time.sleep(.05)
+          Path('diagnostic/ids.json').write_text(json.dumps(ids,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload API diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-9fzt-api-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
