@@ -1,0 +1,47 @@
+name: Temporary Xinri preview image artifact
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-preview-image-artifact.yml
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download public preview images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p preview
+          python - <<'PY'
+          import requests
+          urls = [
+            'https://img.xdyanbao.com/data/file/2022/07/17/29024_sjil_5789.png',
+            'https://img.xdyanbao.com/data/file/2022/07/17/29024_1yeq_4904.png',
+            'https://img.xdyanbao.com/data/file/2022/07/17/29024_2qjt_5443.png',
+            'https://img.xdyanbao.com/data/file/2022/07/17/29024_s6fk_9423.png',
+            'https://img.xdyanbao.com/data/file/2022/07/17/29024_yaea_7227.png',
+            'https://img.xdyanbao.com/data/file/2022/07/17/29024_xbk3_1360.png',
+            'https://img.xdyanbao.com/data/file/2022/07/17/29024_tzxo_8641.png',
+            'https://img.xdyanbao.com/data/file/2022/07/17/29024_3llr_2358.png',
+          ]
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://xdyanbao.com/doc/dezagtl9e3'}
+          for i,u in enumerate(urls,1):
+            r=requests.get(u,headers=h,timeout=90); r.raise_for_status()
+            if not r.content.startswith(b'\x89PNG'):
+              raise RuntimeError((i,r.status_code,r.headers.get('content-type'),r.content[:20]))
+            p=f'preview/{i:02d}.png'; open(p,'wb').write(r.content)
+            print('OK',p,len(r.content),u)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xinri-2020-preview-images
+          path: preview/
+          compression-level: 6
+          retention-days: 1
