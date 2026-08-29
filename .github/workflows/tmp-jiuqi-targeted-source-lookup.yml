@@ -1,0 +1,126 @@
+name: Temporary Jiuqi targeted source lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-targeted-source-lookup.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Search exact dates, archives and public page assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, math, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          CODE='002279'; NAME='久其软件'
+          H={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Referer':'https://data.eastmoney.com/report/'}
+          s=requests.Session(); s.headers.update(H)
+          api='https://reportapi.eastmoney.com/report/list'
+          windows=[
+              ('2014-12-18','2014-12-22'),
+              ('2015-05-22','2015-05-28'),
+              ('2016-02-16','2016-02-22'),
+              ('2016-04-01','2016-04-09'),
+          ]
+          keys=[NAME,CODE,'内生外延','执行力再证明','物流信息化金融支付闭环','司机驿站价值再解读']
+          matched=[]
+          for begin,end in windows:
+              for qtype in ('0','1','2'):
+                  first={'pageNo':'1','pageSize':'100','code':'','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':begin,'endTime':end,'fields':'','qType':qtype,'orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
+                  r=s.get(api,params=first,timeout=90); r.raise_for_status(); obj=r.json()
+                  pages=max(1,int(obj.get('TotalPage') or math.ceil(int(obj.get('hits') or 0)/100) or 1))
+                  print('EM_SCAN',begin,end,qtype,'HITS',obj.get('hits'),'PAGES',pages)
+                  for page in range(1,min(pages,50)+1):
+                      if page==1: rows=obj.get('data') or []
+                      else:
+                          p=dict(first); p.update({'pageNo':str(page),'p':str(page),'pageNum':str(page),'pageNumber':str(page)})
+                          rr=s.get(api,params=p,timeout=90); rr.raise_for_status(); rows=rr.json().get('data') or []
+                      for row in rows:
+                          blob=' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode','orgSName','researcher'])
+                          if any(k in blob for k in keys):
+                              info=row.get('infoCode')
+                              print('EM_MATCH',json.dumps(row,ensure_ascii=False))
+                              matched.append(row)
+                              if info:
+                                  url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+                                  try:
+                                      x=s.get(url,headers={**H,'Range':'bytes=0-4095','Accept':'application/pdf,*/*'},timeout=60,allow_redirects=True)
+                                      print('EM_PDF',info,x.status_code,x.headers.get('content-type'),x.headers.get('content-range'),len(x.content),x.content[:8],x.url)
+                                  except Exception as e: print('EM_PDF_ERR',info,repr(e))
+
+          # Targeted Hibor archive pages.
+          months=['201412','201505','201602','201604']
+          report_links=[]
+          for ym in months:
+              for base in ['https://p.hibor.com.cn/Archiver/','https://www.hibor.com.cn/archiver_houtai/','https://fxgroup.hibor.com.cn/archiver/']:
+                  url=base+ym+'.html'
+                  try:
+                      r=s.get(url,timeout=60,allow_redirects=True)
+                      print('\nARCHIVE',url,r.status_code,len(r.content),r.url)
+                      if r.status_code!=200: continue
+                      soup=BeautifulSoup(r.text,'html.parser')
+                      for a in soup.find_all('a',href=True):
+                          label=' '.join(a.get_text(' ',strip=True).split())
+                          blob=label+' '+a.get('href','')
+                          if NAME in blob or CODE in blob or any(k in blob for k in keys[2:]):
+                              href=urllib.parse.urljoin(r.url,a['href'])
+                              print('ARCHIVE_MATCH',json.dumps({'ym':ym,'label':label,'href':href},ensure_ascii=False))
+                              report_links.append((label,href))
+                  except Exception as e: print('ARCHIVE_ERR',url,repr(e))
+
+          # Known Hibor page plus all discovered links: inspect metadata and candidate assets.
+          report_links.append(('爱建证券-久其软件-内生外延把握行业发展大方向','https://www.hibor.com.cn/docdetail_1763895.html'))
+          seen=set()
+          for label,url in report_links:
+              if url in seen: continue
+              seen.add(url)
+              try:
+                  r=s.get(url,timeout=90,allow_redirects=True)
+                  print('\nREPORT',label,url,'HTTP',r.status_code,'LEN',len(r.content),'FINAL',r.url)
+                  text=r.text; soup=BeautifulSoup(text,'html.parser')
+                  visible=' '.join(soup.get_text(' ',strip=True).split())
+                  print('REPORT_TITLE',soup.title.get_text(' ',strip=True)[:1000] if soup.title else '')
+                  for needle in ['研报页数','研报大小','研报出处','研报作者','推荐评级','报告原文','PDF']:
+                      p=visible.find(needle)
+                      if p>=0: print('REPORT_CTX',needle,visible[max(0,p-200):p+1200])
+                  for pat in [r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',r'https?://[^\s"\'<>]+(?:download|file|attachment|preview|image|img)[^\s"\'<>]*']:
+                      for m in sorted(set(re.findall(pat,text,re.I))): print('REPORT_ASSET',m[:2000])
+                  for tag in soup.find_all(['a','img','iframe','embed','object','source']):
+                      blob=str(tag).lower()
+                      if any(k in blob for k in ['pdf','download','报告原文','preview','image']):
+                          vals={attr:urllib.parse.urljoin(r.url,tag.get(attr)) for attr in ['href','src','data','data-src','data-original'] if tag.get(attr)}
+                          if vals: print('REPORT_TAG',json.dumps({'tag':tag.name,'text':tag.get_text(' ',strip=True)[:300],'attrs':vals},ensure_ascii=False))
+              except Exception as e: print('REPORT_ERR',url,repr(e))
+
+          # Exact Sdyanbao title searches.
+          ss=requests.Session(); ss.headers.update({'User-Agent':H['User-Agent'],'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','Content-Type':'application/json;charset=UTF-8','Accept':'application/json,text/plain,*/*'})
+          queries=['内生外延，把握行业发展大方向','执行力再证明，新老业务均有爆发力','物流信息化金融支付闭环接近完成','司机驿站价值再解读']
+          for q in queries:
+              for page in range(1,4):
+                  payload={'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':page,'pageSize':100,'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':[],'industryIds':[]}
+                  try:
+                      r=ss.post('https://api.sdyanbao.com/api/file/search',json=payload,timeout=90)
+                      print('\nSDY',q,page,r.status_code,len(r.content))
+                      r.raise_for_status(); data=(r.json().get('data') or {}); files=data.get('files') or []
+                      print('SDY_COUNT',len(files),'TOTAL',data.get('total'))
+                      for f in files:
+                          name=str(f.get('name') or ''); stock=f.get('stock') or {}; content=str(f.get('content') or '')[:1000]
+                          blob=' '.join([name,str(stock.get('name') or ''),str(stock.get('code') or ''),content])
+                          if NAME in blob or CODE in blob or q.replace('，','')[:6] in name.replace('，',''):
+                              print('SDY_MATCH',json.dumps({'id':f.get('id'),'name':name,'date':f.get('time_text'),'pages':f.get('page_count'),'size':f.get('file_size'),'type':(f.get('type') or {}).get('name'),'organization':(f.get('organization') or {}).get('name'),'uuid':f.get('data_source_uuid'),'data_source':f.get('data_source'),'original_id':f.get('original_id'),'page_url':f.get('page_url'),'share_url':f.get('share_url'),'stock':stock},ensure_ascii=False))
+                      if not files or page*100>=int(data.get('total') or 0): break
+                  except Exception as e: print('SDY_ERR',q,page,repr(e))
+          PY
