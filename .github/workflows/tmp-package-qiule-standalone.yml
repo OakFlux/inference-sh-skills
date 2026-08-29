@@ -1,0 +1,28 @@
+name: Package Qiule Seeds reports standalone
+
+on:
+  push:
+    branches:
+      - tmp/qiule-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+      - name: Download, verify, and package reports
+        run: python .github/scripts/package_qiule_final.py
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: qiule-reports-standalone
+          path: 秋乐种业_全部年报_2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
