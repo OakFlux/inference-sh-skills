@@ -1,0 +1,74 @@
+name: Temporary Daan Gene dated report-code discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-date-probe-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query Eastmoney global index on known publication dates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/probe_dates.py <<'PY'
+          from __future__ import annotations
+          import json,subprocess,urllib.parse
+          from pathlib import Path
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          windows=[
+            ('2014-08-31','2014-09-03'),('2014-09-15','2014-09-17'),
+            ('2015-11-22','2015-11-24'),('2016-04-14','2016-04-17'),
+            ('2016-08-30','2016-09-02'),('2016-12-21','2016-12-23'),
+            ('2017-04-04','2017-04-06'),('2020-07-15','2020-07-17'),
+            ('2020-08-30','2020-09-02'),('2020-10-29','2020-10-31'),
+          ]
+          all_matches=[];summaries=[]
+          for i,(start,end) in enumerate(windows):
+            variants=[
+              {'beginTime':start,'endTime':end},
+              {'beginTime':start.replace('-',''),'endTime':end.replace('-','')},
+              {'beginTime':start+' 00:00:00','endTime':end+' 23:59:59'},
+            ]
+            for vi,v in enumerate(variants):
+              params={'industryCode':'*','pageSize':'5000','industry':'*','rating':'*','ratingchange':'*','pageNo':'1','fields':'','qType':'0',**v}
+              url='https://reportapi.eastmoney.com/report/list?'+urllib.parse.urlencode(params)
+              p=Path(f'diagnostics/window_{i}_{vi}.json')
+              r=subprocess.run(['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','180','--user-agent',UA,'--referer','https://data.eastmoney.com/report/stock.jshtml','--header','Accept-Encoding: identity',url,'-o',str(p)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              raw=p.read_bytes() if p.exists() else b''
+              try:obj=json.loads(raw.decode('utf-8','ignore'))
+              except Exception as exc:
+                summaries.append({'window':[start,end],'variant':v,'error':repr(exc),'head':raw[:300].decode('utf-8','ignore'),'curl_error':r.stderr[-500:]});continue
+              rows=obj.get('data') or []
+              dates=[str(x.get('publishDate') or '') for x in rows if isinstance(x,dict)]
+              matches=[]
+              for x in rows:
+                if not isinstance(x,dict):continue
+                if str(x.get('stockCode') or '')=='002030' or '达安基因' in str(x.get('stockName') or '') or '达安基因' in str(x.get('title') or ''):
+                  matches.append(x);all_matches.append(x)
+              summaries.append({'window':[start,end],'variant':v,'hits':obj.get('hits'),'size':obj.get('size'),'totalPage':obj.get('TotalPage'),'received':len(rows),'firstDate':dates[0] if dates else '', 'lastDate':dates[-1] if dates else '', 'matchCount':len(matches)})
+              print('SUMMARY',json.dumps(summaries[-1],ensure_ascii=False))
+              for x in matches:print('MATCH',json.dumps(x,ensure_ascii=False))
+          # dedup
+          uniq={str(x.get('infoCode') or ''):x for x in all_matches if x.get('infoCode')}
+          Path('diagnostics/matches.json').write_text(json.dumps(list(uniq.values()),ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/summaries.json').write_text(json.dumps(summaries,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('UNIQUE_MATCHES',len(uniq))
+          PY
+          python /tmp/probe_dates.py
+
+      - name: Upload probe results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-date-probe
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
