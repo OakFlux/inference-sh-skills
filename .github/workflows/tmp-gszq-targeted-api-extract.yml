@@ -1,0 +1,108 @@
+name: Temporary Guosheng targeted API extraction
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-targeted-api-extract.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Extract API base, report endpoints and query official service
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json, re, urllib.parse
+          import requests
+
+          origin='https://research.gszq.com/'
+          js_url=origin+'static/js/app.aecc7704.js'
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer':origin,
+              'Accept':'application/json,text/plain,*/*',
+          })
+          r=s.get(js_url,timeout=120); r.raise_for_status(); text=r.text
+          print('JS',r.status_code,len(text),js_url)
+
+          needles=[
+              'researchReport','getRecommendReports','getReport','reportDetail','downloadReport',
+              'download','attachment','fileUrl','pdfUrl','report?rid','baseURL','axios.create',
+              'searchReport','reportSearch','getReportList','getReportDetail','rid'
+          ]
+          for needle in needles:
+              starts=[m.start() for m in re.finditer(re.escape(needle),text,re.I)]
+              print('\nNEEDLE',needle,'COUNT',len(starts))
+              for p in starts[:30]:
+                  print('CTX',text[max(0,p-1600):p+5000].replace('\n',' ')[:6600])
+
+          quoted=re.findall(r'["\']([^"\']+)["\']',text)
+          endpoints=sorted({x for x in quoted if any(k in x.lower() for k in ['researchreport','report/','report?','download','attachment','pdf','file']) and len(x)<500})
+          hosts=sorted({x for x in quoted if x.startswith(('http://','https://','//')) and len(x)<500})
+          print('\nENDPOINTS')
+          for x in endpoints: print(x)
+          print('\nHOSTS')
+          for x in hosts: print(x)
+
+          # Determine plausible API origins from bundle strings plus current origin.
+          api_origins=[origin]
+          for h in hosts:
+              if h.startswith('//'): h='https:'+h
+              if h.startswith('http'):
+                  u=urllib.parse.urlsplit(h)
+                  root=f'{u.scheme}://{u.netloc}/'
+                  if root not in api_origins: api_origins.append(root)
+          # Known endpoint names discovered in bundle; try GET/POST with conservative search payloads.
+          paths=sorted({
+              x if x.startswith('/') else '/'+x
+              for x in endpoints
+              if ('researchreport' in x.lower() or 'report/' in x.lower()) and '?' not in x and not x.startswith('http')
+          })
+          paths += [
+              '/researchReport/getRecommendReports',
+              '/researchReport/getReportList',
+              '/researchReport/getReports',
+              '/researchReport/search',
+              '/researchReport/getReportDetail',
+              '/researchReport/getDetail',
+          ]
+          paths=list(dict.fromkeys(paths))
+          payloads=[
+              {'keyword':'新日股份','pageNum':1,'pageSize':50},
+              {'keyword':'603787','pageNum':1,'pageSize':50},
+              {'searchKey':'新日股份','pageNum':1,'pageSize':50},
+              {'reportName':'新日股份','pageNum':1,'pageSize':50},
+              {'stockCode':'603787','pageNum':1,'pageSize':50},
+              {'title':'电动两轮高景气，渠道+产品助力公司加速扩张','pageNum':1,'pageSize':50},
+              {'pageNum':1,'pageSize':50},
+          ]
+          print('\nPROBES')
+          for root in api_origins[:15]:
+              for path in paths[:80]:
+                  url=urllib.parse.urljoin(root,path.lstrip('/'))
+                  for payload in payloads:
+                      for method in ('GET','POST'):
+                          try:
+                              if method=='GET': rr=s.get(url,params=payload,timeout=30,allow_redirects=False)
+                              else: rr=s.post(url,json=payload,timeout=30,allow_redirects=False)
+                              ctype=rr.headers.get('content-type','')
+                              body=rr.text[:30000]
+                              low=body.lower()
+                              interesting=(rr.status_code not in (404,405) and ('json' in ctype.lower() or any(k in body for k in ['新日股份','603787','电动两轮高景气']) or len(body)>500 and not body.lstrip().startswith('<!DOCTYPE html')))
+                              if interesting:
+                                  print('\nRESULT',method,rr.status_code,ctype,len(rr.content),rr.url,'LOC',rr.headers.get('location'),'PAYLOAD',json.dumps(payload,ensure_ascii=False))
+                                  print(body)
+                          except Exception as e:
+                              pass
+          PY
