@@ -1,0 +1,123 @@
+name: Temporary Daan Gene Sina report discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-sina2-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Fetch Sina report lists and report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/lists diagnostics/reports
+          cat > /tmp/sina_daan.py <<'PY'
+          from __future__ import annotations
+          import html, json, re, subprocess, urllib.parse
+          from pathlib import Path
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          OUT=Path('diagnostics')
+          bases=[
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=sz002030&t1=all',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/company/index.phtml?symbol=sz002030&t1=all',
+            'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=sz002030&t1=all',
+            'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/company/index.phtml?symbol=sz002030&t1=all',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=002030&t1=all',
+          ]
+          def curl(url: str, path: Path) -> bool:
+            path.parent.mkdir(parents=True,exist_ok=True)
+            p=subprocess.run(['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','150','--user-agent',UA,'--header','Accept-Encoding: identity',url,'-o',str(path)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            return p.returncode==0 and path.exists() and path.stat().st_size>0
+
+          links={}
+          for bi,base in enumerate(bases):
+            for page in range(1,31):
+              sep='&' if '?' in base else '?'
+              url=f'{base}{sep}p={page}'
+              p=OUT/'lists'/f'base{bi}_p{page}.html'
+              if not curl(url,p):
+                continue
+              raw=p.read_bytes()
+              texts=[]
+              for enc in ('utf-8','gb18030','gbk'):
+                try: texts.append(raw.decode(enc,'ignore'))
+                except: pass
+              text=max(texts,key=lambda x:x.count('达安基因')+x.count('rptid'))
+              for m in re.finditer(r'href=["\']([^"\']*vReport_Show[^"\']*rptid/(\d+)[^"\']*)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+                href=html.unescape(m.group(1))
+                rid=m.group(2)
+                title=re.sub(r'<[^>]+>','',html.unescape(m.group(3)))
+                title=re.sub(r'\s+',' ',title).strip()
+                if href.startswith('//'): href='https:'+href
+                elif href.startswith('/'): href='https://stock.finance.sina.com.cn'+href
+                elif not href.startswith('http'): href=urllib.parse.urljoin(url,href)
+                links[rid]={'rptid':rid,'title_from_list':title,'url':href,'list_source':url}
+              # generic links, for pages where the anchor parser misses nested tags
+              for href,rid in re.findall(r'["\']([^"\']*vReport_Show[^"\']*rptid/(\d+)[^"\']*)["\']',text,re.I):
+                href=html.unescape(href)
+                if href.startswith('//'): href='https:'+href
+                elif href.startswith('/'): href='https://stock.finance.sina.com.cn'+href
+                elif not href.startswith('http'): href=urllib.parse.urljoin(url,href)
+                links.setdefault(rid,{'rptid':rid,'title_from_list':'','url':href,'list_source':url})
+
+          # Known indexed result from web search, ensure it is included.
+          links.setdefault('462906326607',{'rptid':'462906326607','title_from_list':'达安基因(002030)中报点评：投资达安就是投资个体化诊疗的大时代','url':'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/462906326607/index.phtml','list_source':'web-index'})
+
+          report_rows=[]
+          for rid,item in sorted(links.items(), key=lambda kv:int(kv[0]), reverse=True):
+            url=item['url']
+            p=OUT/'reports'/f'{rid}.html'
+            if not curl(url,p):
+              continue
+            raw=p.read_bytes()
+            candidates=[raw.decode(enc,'ignore') for enc in ('utf-8','gb18030','gbk')]
+            text=max(candidates,key=lambda x:x.count('达安基因')+x.count('类别：')+x.count('机构：'))
+            norm=html.unescape(text.replace('\\/','/'))
+            tm=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+            page_title=re.sub(r'<[^>]+>','',tm.group(1)).strip() if tm else ''
+            visible=re.sub(r'<script.*?</script>|<style.*?</style>',' ',norm,flags=re.I|re.S)
+            visible=re.sub(r'<[^>]+>',' ',visible)
+            visible=re.sub(r'\s+',' ',visible)
+            if '达安基因' not in visible and '002030' not in visible:
+              continue
+            broker=''; analyst=''; date=''
+            bm=re.search(r'机构[：:]\s*([^\s]{2,40}?)(?:\s+研究员|\s+日期)',visible)
+            if bm: broker=bm.group(1).strip()
+            am=re.search(r'研究员[：:]\s*(.*?)(?:\s+日期[：:]|\s{2,})',visible)
+            if am: analyst=am.group(1).strip()
+            dm=re.search(r'日期[：:]\s*(20\d{2}-\d{2}-\d{2})',visible)
+            if dm: date=dm.group(1)
+            urls=[]
+            for u in re.findall(r'https?://[^"\'<>\s]+',norm,re.I):
+              u=urllib.parse.unquote(u).rstrip('),;]')
+              if any(k in u.lower() for k in ['.pdf','download','attach','file','report']): urls.append(u)
+            # Relative PDF/attachment references
+            for u in re.findall(r'["\']([^"\']*(?:\.pdf|download|attach|file)[^"\']*)["\']',norm,re.I):
+              if not u.startswith('javascript:'):
+                urls.append(urllib.parse.urljoin(url,html.unescape(u)))
+            report_rows.append({**item,'page_title':page_title,'broker':broker,'analyst':analyst,'date':date,'candidate_urls':list(dict.fromkeys(urls))[:100],'text_prefix':visible[:1800]})
+
+          OUT.joinpath('sina_reports.json').write_text(json.dumps(report_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('sina_links.json').write_text(json.dumps(list(links.values()),ensure_ascii=False,indent=2),encoding='utf-8')
+          print('LINK_COUNT',len(links),'REPORT_COUNT',len(report_rows))
+          for r in report_rows:
+            print(json.dumps({k:r.get(k) for k in ('rptid','date','broker','page_title','title_from_list','url','candidate_urls')},ensure_ascii=False))
+          PY
+          python /tmp/sina_daan.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-sina-discovery
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
