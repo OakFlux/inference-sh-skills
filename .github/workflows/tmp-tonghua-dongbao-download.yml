@@ -1,0 +1,96 @@
+name: Temporary verified Tonghua Dongbao deep report package
+
+on:
+  push:
+    branches:
+      - tmp/download-tonghua-dongbao-reports-20260829
+    paths:
+      - .github/workflows/tmp-tonghua-dongbao-download.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and verify original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local pages="$3"
+            local expected="$4"
+            local stem="$5"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A "$UA" -e 'https://data.eastmoney.com/report/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "output/$dest"
+            test -s "output/$dest"
+            test "$(head -c 4 "output/$dest")" = '%PDF'
+            actual=$(pdfinfo "output/$dest" | awk '/^Pages:/ {print $2}')
+            test "$actual" -eq "$pages"
+            pdftotext -f 1 -l 3 "output/$dest" "previews/${stem}_text.txt"
+            grep -q "$expected" "previews/${stem}_text.txt"
+            pdftoppm -f 1 -singlefile -png -r 110 "output/$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 110 "output/$dest" "previews/${stem}_last" >/dev/null 2>&1
+            test -s "previews/${stem}_first.png"
+            test -s "previews/${stem}_last.png"
+          }
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202401251618089993_1.pdf' \
+            '01_Sinolink_Securities_Tonghua_Dongbao_Deep_Report_20240125_25p.pdf' \
+            25 '胰岛素国产替代有望加速' 'sinolink_20240125'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202312081613630576_1.pdf' \
+            '02_Minsheng_Securities_Tonghua_Dongbao_Deep_Report_20231208_32p.pdf' \
+            32 '创新产品加速企业转型' 'minsheng_20231208'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202309151598726421_1.pdf' \
+            '03_Southwest_Securities_Tonghua_Dongbao_Deep_Report_20230915_29p.pdf' \
+            29 '集采扰动基本出清' 'southwest_20230915'
+
+          cat > output/报告清单与核验说明.txt <<'EOF'
+          通化东宝（600867.SH）券商深度研究报告，共3份
+
+          1. 国金证券，2024-01-25，25页
+             《胰岛素国产替代有望加速，多领域创新+海外商业化带动远期增长》
+             类型：公司深度研究；覆盖胰岛素产品矩阵、创新管线、海外商业化及盈利预测。
+
+          2. 民生证券，2023-12-08，32页
+             《深度研究：创新产品加速企业转型，海外商业化蓄势待发》
+             类型：公司深度研究；系统分析胰岛素业务、创新药布局和国际化路径。
+
+          3. 西南证券，2023-09-15，29页
+             《集采扰动基本出清，创新管线打开成长空间》
+             类型：公司深度研究；重点分析集采影响、三代胰岛素、研发管线及估值。
+
+          三份均为原始、完整、可检索PDF，不是网页正文、摘要或预览页重制文件。
+          已核验PDF文件头、实际页数、首页标题文字，并成功渲染首页与末页。
+          仅供研究资料整理，不构成投资建议。
+          EOF
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output previews
+
+      - name: Upload verified original reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: tonghua-dongbao-broker-deep-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
