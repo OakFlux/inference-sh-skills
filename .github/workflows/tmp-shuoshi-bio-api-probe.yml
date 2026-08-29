@@ -1,0 +1,96 @@
+name: Temporary Shuoshi Bio report API probe
+
+on:
+  push:
+    branches:
+      - tmp/download-shuoshi-bio-reports-20260829
+    paths:
+      - .github/workflows/tmp-shuoshi-bio-api-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect public page state and unauthenticated endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept':'application/json,text/plain,text/html,application/pdf,*/*;q=0.8',
+              'Referer':'https://consult.pharnexcloud.com/report/detail/93917.html',
+              'Origin':'https://consult.pharnexcloud.com',
+              'X-Requested-With':'XMLHttpRequest',
+          })
+
+          page=s.get('https://consult.pharnexcloud.com/report/detail/93917.html',timeout=90)
+          print('PAGE',page.status_code,len(page.content),page.headers.get('content-type'))
+          text=page.text
+          soup=BeautifulSoup(text,'html.parser')
+          for ident in ['share-input','is_download','download-report','report-detail','download']:
+              print('\nID/CLASS',ident)
+              for tag in soup.find_all(id=ident)+soup.select('.'+ident):
+                  print(str(tag)[:5000].replace('\n',' '))
+          print('\nCONTEXTS')
+          for needle in ['93917','is_download','download-report','preview','pdf_url','file_url','report_url','oss-personal-public','yaorongyun-public']:
+              starts=[m.start() for m in re.finditer(re.escape(needle),text,re.I)]
+              print('NEEDLE',needle,'COUNT',len(starts))
+              for p in starts[:15]: print(text[max(0,p-700):p+1800].replace('\n',' ')[:2500])
+
+          js=s.get('https://consult.pharnexcloud.com/assets/js/consult/web/report-detail.js',timeout=60).text
+          print('\nREPORT DETAIL JS\n',js)
+          leaflet=s.get('https://consult.pharnexcloud.com/assets/js/common/request/leaflet.js',timeout=60).text
+          print('\nLEAFLET JS\n',leaflet)
+          # Check common.js/request wrapper to learn token/header semantics.
+          for u in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']',text,re.I):
+              full=urllib.parse.urljoin(page.url,u)
+              if any(x in full for x in ['request','common','report']):
+                  try:
+                      r=s.get(full,timeout=60)
+                      print('\nSCRIPT',full,r.status_code,len(r.content))
+                      for needle in ['/report/download','getUserToken','Authorization','token','leaflet.getReportUrl']:
+                          p=r.text.find(needle)
+                          if p>=0: print('CTX',needle,r.text[max(0,p-1200):p+3500])
+                  except Exception as e: print('ERR',full,repr(e))
+
+          endpoints=[
+              ('download_id', {'id':'93917'}),
+              ('download_report_id', {'report_id':'93917'}),
+              ('download_type', {'id':'93917','type':'1'}),
+              ('download_json', {'id':93917}),
+              ('download_detail', {'detail_id':'93917'}),
+              ('download_uuid', {'reportId':'93917'}),
+          ]
+          for name,data in endpoints:
+              print('\nPOST',name,data)
+              try:
+                  if name=='download_json':
+                      r=s.post('https://consult.pharnexcloud.com/report/download',json=data,timeout=60,allow_redirects=False)
+                  else:
+                      r=s.post('https://consult.pharnexcloud.com/report/download',data=data,timeout=60,allow_redirects=False)
+                  print('STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'LOC',r.headers.get('location'))
+                  print(r.text[:5000])
+              except Exception as e: print('ERROR',repr(e))
+          for u in [
+              'https://consult.pharnexcloud.com/report/download?id=93917',
+              'https://consult.pharnexcloud.com/report/93917/download',
+              'https://consult.pharnexcloud.com/api/report/93917',
+              'https://consult.pharnexcloud.com/api/report/detail/93917',
+          ]:
+              try:
+                  r=s.get(u,timeout=60,allow_redirects=False)
+                  print('\nGET',u,'STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'LOC',r.headers.get('location'))
+                  print(r.text[:3000])
+              except Exception as e: print('ERROR',u,repr(e))
+          PY
