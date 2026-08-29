@@ -1,0 +1,112 @@
+name: Temporary Jinbo Biopharma broker report catalog
+
+on:
+  push:
+    branches:
+      - tmp/download-jinbo-biopharma-reports-20260829
+    paths:
+      - .github/workflows/tmp-jinbo-catalog.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query public report catalogs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          import json, urllib.parse, urllib.request, pathlib, datetime
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          headers={'User-Agent':UA,'Referer':'https://data.eastmoney.com/report/'}
+          base='https://reportapi.eastmoney.com/report/list'
+          all_items={}
+          variants=[
+              ('832982','0'),('920982','0'),('锦波生物','0'),('锦波生物','1')
+          ]
+          for code,qtype in variants:
+              for page in range(1,8):
+                  params={
+                      'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':'2022-01-01','endTime':'2030-12-31','pageNo':str(page),'fields':'',
+                      'qType':qtype,'orgCode':'','code':code,'rcode':'','p':str(page),
+                      'pageNum':str(page),'pageNumber':str(page)
+                  }
+                  url=base+'?'+urllib.parse.urlencode(params)
+                  req=urllib.request.Request(url,headers=headers)
+                  try:
+                      raw=urllib.request.urlopen(req,timeout=60).read().decode('utf-8','replace')
+                  except Exception as exc:
+                      pathlib.Path(f'diagnostic/error_{code}_{qtype}_{page}.txt').write_text(repr(exc),encoding='utf-8')
+                      break
+                  pathlib.Path(f'diagnostic/em_{code}_{qtype}_{page}.json').write_text(raw,encoding='utf-8')
+                  text=raw.strip()
+                  if text.startswith('datatable(') and text.endswith(')'):
+                      text=text[len('datatable('):-1]
+                  try:
+                      obj=json.loads(text)
+                  except Exception:
+                      break
+                  data=obj.get('data') or []
+                  for x in data:
+                      blob=' '.join(str(x.get(k,'')) for k in ['stockName','stockCode','title'])
+                      if '锦波生物' in blob or str(x.get('stockCode')) in {'832982','920982'}:
+                          key=x.get('infoCode') or json.dumps(x,sort_keys=True,ensure_ascii=False)
+                          all_items[key]=x
+                  if len(data)<100:
+                      break
+
+          items=list(all_items.values())
+          items.sort(key=lambda x:(x.get('publishDate') or '',int(x.get('attachPages') or 0)),reverse=True)
+          pathlib.Path('diagnostic/eastmoney_relevant.json').write_text(json.dumps(items,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/eastmoney_summary.tsv','w',encoding='utf-8') as f:
+              f.write('publishDate\tstockCode\torgSName\tattachPages\treportType\tratingName\tinfoCode\ttitle\tpdf_url\n')
+              for x in items:
+                  info=x.get('infoCode','')
+                  pdf=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf' if info else ''
+                  row=[x.get('publishDate',''),x.get('stockCode',''),x.get('orgSName',''),x.get('attachPages',''),x.get('reportType',''),x.get('ratingName',''),info,x.get('title',''),pdf]
+                  f.write('\t'.join(str(v).replace('\t',' ').replace('\n',' ') for v in row)+'\n')
+
+          # Cross-check report titles/pages from a second public metadata source.
+          api='https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth'
+          body=json.dumps({'keywords':'锦波生物','pageIndex':1,'pageSize':100,'order':2,'nop':-1},ensure_ascii=False).encode('utf-8')
+          req=urllib.request.Request(api,data=body,headers={'User-Agent':UA,'Content-Type':'application/json'},method='POST')
+          try:
+              raw=urllib.request.urlopen(req,timeout=60).read().decode('utf-8','replace')
+              pathlib.Path('diagnostic/fxbaogao_search.json').write_text(raw,encoding='utf-8')
+              obj=json.loads(raw)
+              rows=(obj.get('data') or {}).get('dataList') or []
+          except Exception as exc:
+              rows=[]
+              pathlib.Path('diagnostic/fxbaogao_error.txt').write_text(repr(exc),encoding='utf-8')
+          with open('diagnostic/fxbaogao_summary.tsv','w',encoding='utf-8') as f:
+              f.write('pubDate\torgName\tpageNum\tdocId\ttitle\n')
+              for r in rows:
+                  ts=r.get('pubTime') or 0
+                  date=datetime.datetime.utcfromtimestamp(ts).strftime('%Y-%m-%d') if ts else ''
+                  f.write('\t'.join(str(v).replace('\t',' ').replace('\n',' ') for v in [date,r.get('orgName',''),r.get('pageNum',''),r.get('docId',''),r.get('title','')])+'\n')
+
+          deep=[]
+          for x in items:
+              title=x.get('title') or ''
+              pages=int(x.get('attachPages') or 0)
+              if pages>=10 or any(k in title for k in ['深度','首次覆盖','公司研究','重组胶原','全产业链']):
+                  deep.append(x)
+          pathlib.Path('diagnostic/deep_candidates.json').write_text(json.dumps(deep,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('EASTMONEY RELEVANT',len(items),'DEEP CANDIDATES',len(deep))
+          print(pathlib.Path('diagnostic/eastmoney_summary.tsv').read_text(encoding='utf-8')[:40000])
+          print('\nFXBAOGAO')
+          print(pathlib.Path('diagnostic/fxbaogao_summary.tsv').read_text(encoding='utf-8')[:30000])
+          PY
+
+      - name: Upload catalog diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinbo-biopharma-report-catalog
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
