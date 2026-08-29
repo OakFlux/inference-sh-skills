@@ -1,0 +1,200 @@
+name: Temporary Shuoshi Bio broker report package
+
+on:
+  push:
+    branches:
+      - tmp/download-shuoshi-bio-reports-20260829
+    paths:
+      - .github/workflows/tmp-shuoshi-bio-package.yml
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF verification tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --quiet pypdf requests
+
+      - name: Download, validate, render and package original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output verify
+          cat > /tmp/download_verify.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          VERIFY = Path('verify')
+          OUT.mkdir(exist_ok=True)
+          VERIFY.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '华鑫证券',
+                  'date': '2019-06-26',
+                  'title': '科创板医药生物系列之二十一：硕世生物',
+                  'info_code': 'AP201906261336509101',
+                  'expected_pages': 11,
+                  'filename': '01_华鑫证券_科创板医药生物系列之二十一_硕世生物_20190626_11页.pdf',
+                  'type': '科创板公司专题研究',
+              },
+              {
+                  'broker': '华鑫证券',
+                  'date': '2019-11-18',
+                  'title': '科创板询价报告之硕世生物',
+                  'info_code': 'AP201911181370845321',
+                  'expected_pages': 8,
+                  'filename': '02_华鑫证券_科创板询价报告之硕世生物_20191118_8页.pdf',
+                  'type': '科创板询价研究',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+          })
+
+          manifest = []
+          for index, report in enumerate(reports, 1):
+              url = f"https://pdf.dfcfw.com/pdf/H3_{report['info_code']}_1.pdf"
+              print(f'DOWNLOAD {index}: {url}')
+              response = None
+              last_error = None
+              for attempt in range(1, 7):
+                  try:
+                      response = session.get(url, timeout=(30, 240), allow_redirects=True)
+                      print(' attempt', attempt, 'status', response.status_code,
+                            'bytes', len(response.content), 'type', response.headers.get('content-type'),
+                            'final', response.url)
+                      if response.status_code == 200 and response.content[:5] == b'%PDF-' and len(response.content) > 50_000:
+                          break
+                      last_error = RuntimeError(
+                          f'invalid response status={response.status_code}, bytes={len(response.content)}, head={response.content[:30]!r}'
+                      )
+                  except Exception as exc:
+                      last_error = exc
+                  time.sleep(attempt * 2)
+              else:
+                  raise RuntimeError(f"Unable to download {report['filename']}: {last_error}")
+
+              content = response.content
+              path = OUT / report['filename']
+              path.write_bytes(content)
+
+              reader = PdfReader(io.BytesIO(content), strict=False)
+              pages = len(reader.pages)
+              print(' pages', pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(
+                      f"Page mismatch for {report['filename']}: expected {report['expected_pages']}, got {pages}"
+                  )
+
+              extracted_parts = []
+              for pageno in range(min(6, pages)):
+                  try:
+                      extracted_parts.append(reader.pages[pageno].extract_text() or '')
+                  except Exception as exc:
+                      extracted_parts.append(f'[extract error: {exc}]')
+              extracted = '\n'.join(extracted_parts)
+              compact = re.sub(r'\s+', '', extracted)
+              if not ('硕世生物' in compact or '688399' in compact):
+                  raise RuntimeError(f"Identity verification failed for {report['filename']}")
+
+              sha256 = hashlib.sha256(content).hexdigest()
+              (VERIFY / f'{index:02d}_first_pages_text.txt').write_text(extracted, encoding='utf-8')
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120',
+                  str(path), str(VERIFY / f'{index:02d}_page1')
+              ], check=True)
+              subprocess.run([
+                  'pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90',
+                  str(path), str(VERIFY / f'{index:02d}_last_page')
+              ], check=True)
+
+              manifest.append({
+                  'filename': report['filename'],
+                  'broker': report['broker'],
+                  'date': report['date'],
+                  'title': report['title'],
+                  'type': report['type'],
+                  'pages': pages,
+                  'source_url': response.url,
+                  'info_code': report['info_code'],
+                  'bytes': len(content),
+                  'sha256': sha256,
+                  'identity_check': '通过：前6页可识别“硕世生物”或“688399”',
+              })
+
+          lines = [
+              '硕世生物（688399.SH）券商研究报告清单与核验说明',
+              '',
+              '本压缩包包含2份可从公开文件地址直接取得的券商PDF原文件。',
+              '两份文件均已核验PDF文件头、实际页数、公司名称/股票代码，并成功渲染首页和末页。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              lines.extend([
+                  f"{i}. {item['broker']}｜{item['date']}｜{item['title']}",
+                  f"   类型：{item['type']}；页数：{item['pages']}页",
+                  f"   文件：{item['filename']}",
+                  f"   公开PDF：{item['source_url']}",
+                  f"   SHA256：{item['sha256']}",
+                  f"   身份核验：{item['identity_check']}",
+                  '',
+              ])
+          lines.extend([
+              '未纳入的较新长篇报告：',
+              '1. 东方证券，2024-10-23，《聚焦“妇幼健康+传染病”，研发实力突出》，首次覆盖，28页。',
+              '2. 浙商证券，2024-10-26，《分子诊断龙头，扰动出清，新周期起航》，公司深度，15页。',
+              '上述两份完整原始PDF的公开入口需要登录、下载额度或订阅授权，因此未绕过限制，也未以摘要网页或预览图冒充PDF。',
+              '',
+              '资料仅供研究参考，不构成投资建议。',
+          ])
+          (OUT / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (VERIFY / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (OUT / 'SHA256SUMS.txt').open('w', encoding='utf-8') as fh:
+              for item in manifest:
+                  fh.write(f"{item['sha256']}  {item['filename']}\n")
+
+          print('MANIFEST')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+          python /tmp/download_verify.py | tee verify/run.log
+          ls -lh output verify
+
+      - name: Upload final report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shuoshi-bio-broker-reports-2
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+
+      - name: Upload verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: shuoshi-bio-broker-reports-verification
+          path: verify/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
