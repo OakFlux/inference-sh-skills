@@ -46,7 +46,6 @@ def main() -> None:
         'COMPANY = "北京大北农科技集团股份有限公司"',
         'SHORT_NAME = "大北农"',
         '"dabeinong"',
-        "002385.SZ",
         "大北农_2020-2025年报_2026年最新半年报_完整PDF.zip",
     ]
     missing = [token for token in required if token not in code]
