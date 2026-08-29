@@ -20,6 +20,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
           python - <<'PY'
           import json, re, requests, urllib.parse
           from bs4 import BeautifulSoup
@@ -62,7 +63,6 @@ jobs:
                           'share_url':f.get('share_url'),'stock':f.get('stock'),
                       },ensure_ascii=False))
 
-          # Inspect the three known public pages with proper HTML parser installed.
           urls=[
               'https://www.vzkoo.com/read/2022102515f1189d784c8c2d45595bc5.html',
               'https://xdyanbao.com/doc/dezagtl9e3',
