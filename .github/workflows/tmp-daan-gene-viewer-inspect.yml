@@ -1,0 +1,108 @@
+name: Temporary Daan Gene report viewer inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-viewer-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch report viewer pages and APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/pages diagnostic/assets
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          ids=(508957738559 491555679136 494494626475 616814232209 648229670402 657799781946 684425869377)
+          for id in "${ids[@]}"; do
+            title="达安基因"
+            url="https://www.9fzt.com/others/report.html?pushChannel=9fztgw&contentType=article&page=view_the_article&contentId=${id}&content=${title}"
+            curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -e "https://www.9fzt.com/detail/sz_002030_10_${id}.html" \
+              -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+              -D "diagnostic/pages/${id}.headers" "$url" -o "diagnostic/pages/${id}.html" || true
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html, json, re, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          assets=[]; summaries=[]; hits=[]; urls=[]
+          for p in sorted(Path('diagnostic/pages').glob('*.html')):
+              text=p.read_text(errors='replace')
+              id=p.stem
+              m=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              title=html.unescape(re.sub('<[^>]+>',' ',m.group(1))).strip() if m else ''
+              summaries.append({'id':id,'size':p.stat().st_size,'title':title})
+              base=f'https://www.9fzt.com/others/report.html?contentId={id}'
+              for mm in re.finditer(r'(?:href|src)=["\']([^"\']+)["\']',text,re.I):
+                  u=html.unescape(mm.group(1))
+                  full=urljoin(base,u)
+                  if full.startswith('http'):
+                      urls.append({'id':id,'url':full})
+                      if '.js' in full: assets.append(full)
+              for pat in [r'https?://[^"\'<>\s]+',r'/api/[^"\'<>\s]+',r'[^"\'<>\s]*(?:pdf|download|attachment|fileUrl|pageUrl|reportId)[^"\'<>\s]*']:
+                  for mm in re.finditer(pat,text,re.I):
+                      hits.append({'file':p.name,'hit':mm.group(0)[:1500]})
+              for needle in ['contentId','reportId','pdf','PDF','download','attachment','fileUrl','pageUrl','article']:
+                  start=0
+                  while True:
+                      pos=text.find(needle,start)
+                      if pos<0: break
+                      hits.append({'file':p.name,'needle':needle,'context':text[max(0,pos-1500):pos+4000]})
+                      start=pos+len(needle)
+                      if len(hits)>5000: break
+                  if len(hits)>5000: break
+
+          assets=list(dict.fromkeys(assets))[:200]
+          for i,u in enumerate(assets):
+              try:
+                  req=urllib.request.Request(u,headers={'User-Agent':UA,'Referer':'https://www.9fzt.com/others/report.html'})
+                  raw=urllib.request.urlopen(req,timeout=60).read()
+                  if len(raw)>8_000_000: raw=raw[:8_000_000]
+                  Path(f'diagnostic/assets/{i:03d}.txt').write_bytes(raw)
+                  Path(f'diagnostic/assets/{i:03d}.url').write_text(u,encoding='utf-8')
+              except Exception as exc:
+                  Path(f'diagnostic/assets/{i:03d}.error').write_text(repr(exc),encoding='utf-8')
+
+          for p in Path('diagnostic/assets').glob('*.txt'):
+              text=p.read_text(errors='replace')
+              for pat in [r'https?://[^"\'<>\s]+',r'/api/[^"\'<>\s]+',r'[^"\'<>\s]*(?:pdf|download|attachment|fileUrl|pageUrl|reportId|contentId)[^"\'<>\s]*']:
+                  for mm in re.finditer(pat,text,re.I):
+                      h=mm.group(0)
+                      if any(k in h.lower() for k in ['pdf','download','attachment','fileurl','pageurl','report','contentid']):
+                          hits.append({'file':p.name,'hit':h[:2000]})
+              for needle in ['508957738559','contentId','reportId','pdfUrl','fileUrl','pageUrl','getReport','report/detail','report/view']:
+                  start=0
+                  while True:
+                      pos=text.find(needle,start)
+                      if pos<0: break
+                      hits.append({'file':p.name,'needle':needle,'context':text[max(0,pos-1800):pos+5000]})
+                      start=pos+len(needle)
+                      if len(hits)>12000: break
+                  if len(hits)>12000: break
+
+          Path('diagnostic/summaries.json').write_text(json.dumps(summaries,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/urls.json').write_text(json.dumps(urls,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/assets.json').write_text(json.dumps(assets,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/hits.json').write_text(json.dumps(hits[:12000],ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(summaries,ensure_ascii=False,indent=2))
+          print('URLS',len(urls),'ASSETS',len(assets),'HITS',len(hits))
+          print(json.dumps(hits[:400],ensure_ascii=False,indent=2)[:100000])
+          PY
+
+      - name: Upload viewer diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-viewer-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
