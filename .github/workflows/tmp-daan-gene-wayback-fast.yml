@@ -1,0 +1,126 @@
+name: Temporary Daan Gene Wayback fast PDF recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-wayback-fast.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Query archived NXNY downloads and identify Daan Gene PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/cdx diagnostic/files diagnostic/matches previews
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import hashlib, json, re, time, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          base='https://web.archive.org/cdx/search/cdx'
+          requests=[
+              ('vip_pdf','vip.nxny.com/DownLoad/DownLoad.aspx*','prefix',['statuscode:200','mimetype:application/pdf']),
+              ('vip_octet','vip.nxny.com/DownLoad/DownLoad.aspx*','prefix',['statuscode:200','mimetype:application/octet-stream']),
+              ('vip_unknown','vip.nxny.com/DownLoad/DownLoad.aspx*','prefix',['statuscode:200','mimetype:unknown']),
+              ('nxny_pdf','*.nxny.com/*.pdf','domain',['statuscode:200']),
+          ]
+          rows=[]
+          for name,url,match,filters in requests:
+              params=[('url',url),('output','json'),('fl','timestamp,original,statuscode,mimetype,length,digest,urlkey'),('collapse','digest'),('limit','5000')]
+              if match!='exact': params.append(('matchType',match))
+              for f in filters: params.append(('filter',f))
+              full=base+'?'+urlencode(params)
+              try:
+                  req=urllib.request.Request(full,headers={'User-Agent':UA})
+                  raw=urllib.request.urlopen(req,timeout=180).read()
+                  Path(f'diagnostic/cdx/{name}.json').write_bytes(raw)
+                  obj=json.loads(raw.decode('utf-8','replace'))
+              except Exception as exc:
+                  Path(f'diagnostic/cdx/{name}.error').write_text(repr(exc)+'\n'+full,encoding='utf-8')
+                  continue
+              if isinstance(obj,list) and len(obj)>1:
+                  hdr=obj[0]
+                  for row in obj[1:]:
+                      rec=dict(zip(hdr,row)); rec['query']=name; rows.append(rec)
+              time.sleep(.5)
+
+          # Dedupe by digest, prioritize likely PDFs and reasonable sizes.
+          unique={}
+          for r in rows:
+              unique[r.get('digest') or (r.get('timestamp','')+r.get('original',''))]=r
+          cand=list(unique.values())
+          def score(r):
+              mime=(r.get('mimetype') or '').lower(); length=int(r.get('length') or 0)
+              return (mime=='application/pdf', 100_000 <= length <= 20_000_000, r.get('timestamp',''))
+          cand.sort(key=score,reverse=True)
+          Path('diagnostic/cdx/candidates.json').write_text(json.dumps(cand,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CDX UNIQUE CANDIDATES',len(cand))
+          for r in cand[:200]: print(json.dumps(r,ensure_ascii=False))
+
+          downloaded=[]
+          # Download a bounded set. Most useful archived download responses should be PDF/octet-stream.
+          for i,r in enumerate(cand[:600]):
+              ts=r.get('timestamp'); orig=r.get('original')
+              if not ts or not orig: continue
+              snap=f'https://web.archive.org/web/{ts}id_/{orig}'
+              try:
+                  req=urllib.request.Request(snap,headers={'User-Agent':UA})
+                  resp=urllib.request.urlopen(req,timeout=120)
+                  raw=resp.read(25_000_000)
+                  ctype=resp.headers.get('Content-Type','')
+              except Exception as exc:
+                  Path(f'diagnostic/files/{i:04d}.error').write_text(repr(exc)+'\n'+snap,encoding='utf-8')
+                  continue
+              p=Path(f'diagnostic/files/{i:04d}.bin')
+              p.write_bytes(raw)
+              meta={'index':i,'record':r,'snapshot':snap,'size':len(raw),'content_type':ctype,'sha256':hashlib.sha256(raw).hexdigest(),'is_pdf':raw[:4]==b'%PDF'}
+              Path(f'diagnostic/files/{i:04d}.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+              downloaded.append(meta)
+              if raw[:4]==b'%PDF':
+                  Path(f'diagnostic/files/{i:04d}.pdf').write_bytes(raw)
+              time.sleep(.15)
+          Path('diagnostic/downloaded.json').write_text(json.dumps(downloaded,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('DOWNLOADED',len(downloaded),'PDFS',sum(x['is_pdf'] for x in downloaded))
+          PY
+
+          # Extract text from every recovered PDF and find target company/title.
+          shopt -s nullglob
+          for pdf in diagnostic/files/*.pdf; do
+            stem=$(basename "$pdf" .pdf)
+            pages=$(pdfinfo "$pdf" 2>/dev/null | awk '/^Pages:/ {print $2}' || true)
+            pdftotext -f 1 -l 5 "$pdf" "diagnostic/files/${stem}.txt" 2>/dev/null || true
+            if grep -Eqi '达安基因|002030|分子诊断行业待爆发|新冠筛查从严|三季度业绩超预期' "diagnostic/files/${stem}.txt"; then
+              cp "$pdf" "diagnostic/matches/${stem}_${pages}p.pdf"
+              cp "diagnostic/files/${stem}.txt" "diagnostic/matches/${stem}_${pages}p.txt"
+              pdftoppm -f 1 -singlefile -png -r 90 "$pdf" "previews/${stem}_first" >/dev/null 2>&1 || true
+              pdftoppm -f "$pages" -singlefile -png -r 90 "$pdf" "previews/${stem}_last" >/dev/null 2>&1 || true
+              echo "MATCH $stem pages=$pages"
+              head -80 "diagnostic/files/${stem}.txt" || true
+            fi
+          done
+          ls -lh diagnostic/matches previews || true
+
+      - name: Upload recovered PDFs and diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-wayback-fast-results
+          path: |
+            diagnostic/cdx/
+            diagnostic/downloaded.json
+            diagnostic/matches/
+            previews/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
