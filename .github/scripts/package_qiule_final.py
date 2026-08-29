@@ -100,14 +100,6 @@ def main() -> None:
         raise RuntimeError("Annual download line was not found")
     code = code.replace(original_download, replacement_download, 1)
 
-    original_note = '    note = "完整年度报告，不含摘要。"'
-    replacement_note = """    note = \"完整年度报告，不含摘要。\"
-    if year == 2018:
-        note += \"采用后续披露的更正后版本。\""" 
-    if original_note not in code:
-        raise RuntimeError("Annual note line was not found")
-    code = code.replace(original_note, replacement_note, 1)
-
     required = [
         'STOCK_ID = "920087"',
         'COMPANY = "河南秋乐种业科技股份有限公司"',
