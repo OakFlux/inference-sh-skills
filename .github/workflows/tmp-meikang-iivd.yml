@@ -1,0 +1,90 @@
+name: Temporary Meikang IIVD source inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/meikang-iivd-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch article and related search pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          urls=(
+            'https://www.iivd.net/article-8452-1.html'
+            'https://r.jina.ai/https://www.iivd.net/article-8452-1.html'
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            curl --http1.1 -L --fail --silent --show-error --retry 5 --retry-all-errors \
+              --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' "$url" -o "diagnostics/article_${i}.txt" || true
+            i=$((i+1))
+          done
+          for q in \
+            '"美康生物（300439.SZ）：医学实验室的全天候服务商"' \
+            '"全力布局集约化供应与医检中心，大检验时代下的IVD全产业链龙头隐现"' \
+            '"顺应分级诊疗趋势，发展IVD全产业链，建议关注" 美康生物' \
+            '"渠道扩张+区域检验中心，驱动公司高速增长"'; do
+            key=$(printf '%s' "$q" | sha256sum | cut -c1-10)
+            curl --http1.1 -L --fail --silent --show-error --retry 3 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" --get \
+              --data-urlencode "q=$q" 'https://html.duckduckgo.com/html/' \
+              -o "diagnostics/ddg_${key}.html" || true
+            curl --http1.1 -L --fail --silent --show-error --retry 3 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" --get \
+              --data-urlencode "q=$q" 'https://www.google.com/search' \
+              -o "diagnostics/google_${key}.html" || true
+            curl --http1.1 -L --fail --silent --show-error --retry 3 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" --get \
+              --data-urlencode "q=$q" 'https://www.bing.com/search' \
+              -o "diagnostics/bing_${key}.html" || true
+          done
+          python - <<'PY'
+          import html,re,urllib.parse
+          from pathlib import Path
+          hits=[]
+          for p in Path('diagnostics').glob('*'):
+              try: text=p.read_text(encoding='utf-8',errors='ignore')
+              except: continue
+              text=html.unescape(text.replace('\\/','/'))
+              for pat in [
+                  r'https?://[^"\'<> ]+\.pdf(?:\?[^"\'<> ]*)?',
+                  r'https?://[^"\'<> ]+(?:download|attachment|attach|file|report)[^"\'<> ]*',
+                  r'https?://[^"\'<> ]+',
+              ]:
+                  for u in re.findall(pat,text,re.I):
+                      u=urllib.parse.unquote(u).rstrip('),;]')
+                      if any(k in u.lower() for k in ['pdf','download','attach','report','iivd','meikang','300439']):
+                          hits.append((p.name,u))
+          seen=set(); out=[]
+          for x in hits:
+              if x not in seen:
+                  seen.add(x); out.append(x)
+          Path('diagnostics/url_hits.txt').write_text('\n'.join(f'{p}\t{u}' for p,u in out),encoding='utf-8')
+          # Extract IIVD image and attachment fields explicitly.
+          for p in Path('diagnostics').glob('article_*'):
+              text=p.read_text(encoding='utf-8',errors='ignore')
+              rel=[]
+              for line in text.splitlines():
+                  if re.search(r'pdf|attach|download|source|author|马帅|证券|研究所|image|img|src=',line,re.I):
+                      rel.append(line[:2000])
+              Path(f'diagnostics/{p.stem}_relevant.txt').write_text('\n'.join(rel),encoding='utf-8')
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: meikang-iivd-source-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
