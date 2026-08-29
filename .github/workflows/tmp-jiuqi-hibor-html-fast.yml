@@ -1,0 +1,52 @@
+name: Temporary Jiuqi Hibor HTML fast probe
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-hibor-html-fast.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Inspect report HTML and common public endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re,requests,urllib.parse
+          from bs4 import BeautifulSoup
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Accept':'text/html,application/json,application/pdf,*/*'})
+          u='https://www.hibor.com.cn/docdetail_1763895.html'
+          r=s.get(u,timeout=60,allow_redirects=True)
+          print('PAGE',r.status_code,len(r.content),r.url,r.headers.get('content-type'),s.cookies.get_dict())
+          text=r.text; soup=BeautifulSoup(text,'html.parser')
+          for tag in soup.find_all(['a','button','input','form','script']):
+              blob=str(tag).lower()
+              if any(k in blob for k in ['download','下载','报告原文','原文','pdf','1763895','docdetail']):
+                  print('NODE',str(tag)[:5000].replace('\n',' '))
+          for needle in ['报告原文','下载','download','1763895','vip','login','href','onclick']:
+              print('\nNEEDLE',needle)
+              for m in list(re.finditer(needle,text,re.I))[:30]:
+                  p=m.start(); print(text[max(0,p-700):p+1700].replace('\n',' ')[:2400])
+          tests=[
+            'https://www.hibor.com.cn/download.aspx?id=1763895',
+            'https://www.hibor.com.cn/Download.aspx?id=1763895',
+            'https://www.hibor.com.cn/DownLoadReport.aspx?id=1763895',
+            'https://www.hibor.com.cn/DocDownload.aspx?id=1763895',
+            'https://www.hibor.com.cn/docdownload_1763895.html',
+            'https://www.hibor.com.cn/ReportDownload/1763895',
+          ]
+          for x in tests:
+              try:
+                  y=s.get(x,timeout=30,allow_redirects=False,headers={'Referer':u})
+                  print('TEST',x,y.status_code,y.headers.get('content-type'),len(y.content),y.headers.get('location'),y.content[:100])
+              except Exception as e: print('ERR',x,repr(e))
+          PY
