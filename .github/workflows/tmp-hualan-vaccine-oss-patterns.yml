@@ -1,0 +1,86 @@
+name: Temporary Hualan Vaccine public asset pattern probe
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-oss-patterns.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Probe plausible public PDF asset URLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import itertools
+          import requests
+
+          reports = [
+            {'name':'huatai','y':'2022','m':'7','d':'8','id':'318784','uuid':'g4999986'},
+            {'name':'guojin','y':'2023','m':'7','d':'19','id':'572640','uuid':'g5350789'},
+            {'name':'citic','y':'2023','m':'10','d':'14','id':'715465','uuid':'g5440889'},
+            {'name':'industrial','y':'2023','m':'10','d':'18','id':'730364','uuid':'g5444241'},
+            {'name':'cicc','y':'2023','m':'10','d':'26','id':'','uuid':'g5456129'},
+          ]
+          domains=['https://oss.sdyanbao.com','https://static.sdyanbao.com']
+          dirs=['pdf','file','files','document','documents','report','reports','source','sources','download','downloads','origin','original','upload','uploads','attachment','attachments','doc']
+          candidates=[]
+          for r in reports:
+            parts=[r['y'],r['m'],r['d']]
+            names=[x for x in [r['id'],r['uuid'],f"{r['uuid']}.pdf" if r['uuid'] else '',f"{r['id']}.pdf" if r['id'] else ''] if x]
+            for domain in domains:
+              # page-adjacent patterns
+              if r['id']:
+                candidates += [
+                  (r['name'],f"{domain}/page/{r['y']}/{r['m']}/{r['d']}/{r['id']}.pdf"),
+                  (r['name'],f"{domain}/page/{r['y']}/{r['m']}/{r['d']}/{r['id']}/source.pdf"),
+                  (r['name'],f"{domain}/page/{r['y']}/{r['m']}/{r['d']}/{r['id']}/original.pdf"),
+                  (r['name'],f"{domain}/page/{r['y']}/{r['m']}/{r['d']}/{r['id']}/file.pdf"),
+                  (r['name'],f"{domain}/page/{r['y']}/{r['m']}/{r['d']}/{r['id']}/download.pdf"),
+                ]
+              for directory in dirs:
+                for n in names:
+                  stem=n[:-4] if n.lower().endswith('.pdf') else n
+                  candidates += [
+                    (r['name'],f"{domain}/{directory}/{r['y']}/{r['m']}/{r['d']}/{stem}.pdf"),
+                    (r['name'],f"{domain}/{directory}/{r['y']}/{r['m']}/{r['d']}/{stem}"),
+                    (r['name'],f"{domain}/{directory}/{stem}.pdf"),
+                    (r['name'],f"{domain}/{directory}/{stem}"),
+                  ]
+          # de-duplicate
+          seen=set(); dedup=[]
+          for item in candidates:
+            if item[1] not in seen:
+              seen.add(item[1]); dedup.append(item)
+          print('CANDIDATES',len(dedup))
+
+          def probe(item):
+            name,url=item
+            h={'User-Agent':'Mozilla/5.0','Referer':'https://www.sdyanbao.com/'}
+            try:
+              # Range keeps accidental downloads small while exposing magic bytes.
+              r=requests.get(url,headers={**h,'Range':'bytes=0-4095'},timeout=20,allow_redirects=True)
+              return name,url,r.status_code,len(r.content),r.headers.get('content-type'),r.headers.get('content-range'),r.url,r.content[:20]
+            except Exception as e:
+              return name,url,'ERR',0,'','',url,repr(e).encode()[:100]
+
+          hits=[]
+          with ThreadPoolExecutor(max_workers=40) as ex:
+            fs=[ex.submit(probe,x) for x in dedup]
+            for f in as_completed(fs):
+              res=f.result()
+              name,url,status,length,ctype,crange,final,head=res
+              if status not in (403,404) or head.startswith(b'%PDF-') or 'pdf' in str(ctype).lower():
+                hits.append(res)
+                print('HIT',name,status,length,ctype,crange,'HEAD',head,'URL',url,'FINAL',final)
+          print('TOTAL_HITS',len(hits))
+          PY
