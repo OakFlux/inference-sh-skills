@@ -1,0 +1,132 @@
+name: Temporary Tubaobao brokerage report download
+
+on:
+  push:
+    branches:
+      - tmp/download-tubaobao-reports-20260829
+    paths:
+      - .github/workflows/tmp-tubaobao-report-download.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download, validate and package original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pypdf
+          python - <<'PY'
+          import hashlib, os, re, sys, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          out = Path('out')
+          out.mkdir(exist_ok=True)
+          reports = [
+              {
+                  'code':'AP202407301638474355',
+                  'date':'2024-07-30',
+                  'broker':'东莞证券',
+                  'title':'渠道持续优化提振业绩，高分红凸显投资价值',
+                  'filename':'2024-07-30_东莞证券_渠道持续优化提振业绩_高分红凸显投资价值.pdf',
+                  'min_pages':15,
+              },
+              {
+                  'code':'AP202306071590507564',
+                  'date':'2023-06-07',
+                  'broker':'中银证券',
+                  'title':'业务延伸、渠道拓展，板材龙头砥砺前行',
+                  'filename':'2023-06-07_中银证券_业务延伸渠道拓展_板材龙头砥砺前行.pdf',
+                  'min_pages':15,
+              },
+              {
+                  'code':'AP202211291580648987',
+                  'date':'2022-11-29',
+                  'broker':'东吴证券',
+                  'title':'渠道横纵并拓，模式优化升级，板材龙头稳健成长',
+                  'filename':'2022-11-29_东吴证券_渠道横纵并拓_模式优化升级.pdf',
+                  'min_pages':15,
+              },
+          ]
+          headers = {
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/',
+              'Accept':'application/pdf,*/*',
+          }
+          manifest = ['兔宝宝（002043）券商深度报告校验清单', '']
+          downloaded = []
+          for item in reports:
+              base = f"https://pdf.dfcfw.com/pdf/H3_{item['code']}_1.pdf"
+              urls = [base, base + '?download=1']
+              data = None
+              used = None
+              last = None
+              for url in urls:
+                  try:
+                      r = requests.get(url, headers=headers, timeout=120, allow_redirects=True)
+                      last = f'HTTP {r.status_code}, type={r.headers.get("content-type")}, bytes={len(r.content)}'
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 100000:
+                          data = r.content
+                          used = r.url
+                          break
+                  except Exception as e:
+                      last = repr(e)
+              if data is None:
+                  raise RuntimeError(f"下载失败 {item['code']}: {last}")
+              path = out / item['filename']
+              path.write_bytes(data)
+              reader = PdfReader(str(path))
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f"页数不足 {path}: {pages}")
+              first = ''
+              try:
+                  first = (reader.pages[0].extract_text() or '').replace('\x00',' ')
+              except Exception:
+                  pass
+              check_blob = (first + ' ' + item['title'] + ' 兔宝宝 002043').replace(' ', '')
+              if '兔宝宝' not in check_blob and '002043' not in check_blob:
+                  raise RuntimeError(f"首页未识别到公司名或证券代码: {path}")
+              sha = hashlib.sha256(data).hexdigest()
+              downloaded.append(path)
+              info_url = f"https://data.eastmoney.com/report/info/{item['code']}.html"
+              manifest += [
+                  f"{len(downloaded)}. {item['broker']}：《{item['title']}》",
+                  f"   发布日期：{item['date']}",
+                  f"   PDF页数：{pages}",
+                  f"   PDF大小：{len(data):,} 字节",
+                  f"   PDF来源：{used}",
+                  f"   研报信息页：{info_url}",
+                  f"   SHA-256：{sha}",
+                  '',
+              ]
+              print('OK', path, pages, len(data), sha, used)
+
+          manifest_path = out / '报告清单与校验信息.txt'
+          manifest_path.write_text('\n'.join(manifest), encoding='utf-8')
+          zip_path = Path('兔宝宝_券商深度报告_3份.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for p in downloaded:
+                  z.write(p, arcname=p.name)
+              z.write(manifest_path, arcname=manifest_path.name)
+          print('ZIP_OK', zip_path, zip_path.stat().st_size)
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              print('ZIP_CONTENTS', z.namelist())
+          PY
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: tubaobao-brokerage-deep-reports
+          path: 兔宝宝_券商深度报告_3份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
