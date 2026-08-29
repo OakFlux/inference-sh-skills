@@ -1,0 +1,69 @@
+name: Temporary Xinri quick report package
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-quick-originals.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Download and package verified original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet pypdf requests
+          mkdir -p output
+          python - <<'PY'
+          import hashlib, io, json, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          reports=[
+            ('2023-04-18','太平洋证券','新日年报点评：豪华车型量价齐增拉升盈利，布局多渠道兼海外','AP202304181585537779',5,'01_太平洋证券_豪华车型量价齐增拉升盈利_20230418_5页.pdf'),
+            ('2017-04-07','华鑫证券','新股询价报告','AP201704070484692025',3,'02_华鑫证券_新股询价报告_20170407_3页.pdf'),
+            ('2017-04-07','东莞证券','新股网下申购询价建议报告（新日股份）','AP201704070483750898',2,'03_东莞证券_新股网下申购询价建议报告_20170407_2页.pdf'),
+          ]
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/603787.html','Accept':'application/pdf,*/*'})
+          items=[]
+          for date,broker,title,code,expected,name in reports:
+            url=f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf'
+            r=s.get(url,timeout=120,allow_redirects=True)
+            if r.status_code!=200 or not r.content.startswith(b'%PDF-') or len(r.content)<80000:
+              raise RuntimeError(f'download failed {url}: {r.status_code}, {len(r.content)}')
+            reader=PdfReader(io.BytesIO(r.content),strict=False)
+            pages=len(reader.pages)
+            if pages!=expected: raise RuntimeError(f'page mismatch {name}: {pages}!={expected}')
+            text=''.join((p.extract_text() or '') for p in reader.pages[:min(2,pages)]).replace(' ','').replace('\n','')
+            if '新日股份' not in text and '603787' not in text and expected>2:
+              raise RuntimeError(f'identity check failed {name}')
+            p=Path('output')/name; p.write_bytes(r.content)
+            items.append({'filename':name,'date':date,'broker':broker,'title':title,'pages':pages,'bytes':len(r.content),'sha256':hashlib.sha256(r.content).hexdigest(),'source':r.url})
+          readme=Path('output')/'报告清单与说明.txt'
+          readme.write_text('新日股份（603787.SH）券商研究报告\n\n本包包含3份可公开直接取得的原始PDF。需要说明：2023年文件为5页公司年报点评；2017年两份为新股询价报告，均不是标准20页以上公司深度。公开可确认的2020年24页首次覆盖和2022年23页公司深度，其完整原始PDF目前需要登录或下载权限，因此未绕过限制。\n',encoding='utf-8')
+          (Path('output')/'manifest.json').write_text(json.dumps(items,ensure_ascii=False,indent=2),encoding='utf-8')
+          zpath=Path('xinri_reports_working.zip')
+          with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(Path('output').iterdir()): z.write(p,arcname=p.name)
+          with zipfile.ZipFile(zpath) as z:
+            bad=z.testzip()
+            if bad: raise RuntimeError(bad)
+            print('ZIP_OK',zpath.stat().st_size,z.namelist())
+          PY
+      - name: Upload working package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinri-reports-working
+          path: xinri_reports_working.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
