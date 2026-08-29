@@ -1,0 +1,93 @@
+name: Temporary Fxbaogao API and source inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/fxbaogao-inspect-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect detail/view pages, scripts and API patterns
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/scripts diagnostics/pages
+          python -m pip install --disable-pip-version-check requests beautifulsoup4
+          cat > /tmp/inspect.py <<'PY'
+          import html,json,re,urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          S=requests.Session(); S.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'})
+          urls=[
+            'https://www.fxbaogao.com/detail/4810625',
+            'https://www.fxbaogao.com/view?id=4810625',
+            'https://www.fxbaogao.com/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+            'https://www.fxbaogao.com/search?keyword=600354',
+            'https://www.fxbaogao.com/',
+          ]
+          all_scripts=[]; pages=[]
+          for i,u in enumerate(urls):
+            try:
+              r=S.get(u,timeout=60,allow_redirects=True); raw=r.content
+              Path(f'diagnostics/pages/page_{i}.html').write_bytes(raw)
+              text=raw.decode(r.encoding or 'utf-8','ignore')
+              soup=BeautifulSoup(text,'html.parser')
+              title=soup.title.get_text(' ',strip=True) if soup.title else ''
+              scripts=[]
+              for s in soup.find_all('script',src=True):
+                src=urllib.parse.urljoin(r.url,html.unescape(s['src'])); scripts.append(src); all_scripts.append(src)
+              links=[]
+              for tag in soup.find_all(True):
+                for attr in ('href','src','content','data-url','data-src'):
+                  val=tag.get(attr)
+                  if isinstance(val,str):
+                    full=urllib.parse.urljoin(r.url,html.unescape(val))
+                    if any(k in full.lower() for k in ['pdf','report-image','download','api','file','view','detail']): links.append(full)
+              inline='\n'.join(s.get_text('\n') for s in soup.find_all('script') if not s.get('src'))
+              relevant=[]
+              for pat in [r'.{0,400}(?:report-image|pdf|download|fileUrl|pdfUrl|originUrl|api/|4810625).{0,900}']:
+                relevant.extend(re.findall(pat,text,re.I|re.S)[:100])
+                relevant.extend(re.findall(pat,inline,re.I|re.S)[:100])
+              pages.append({'url':u,'effective':r.url,'status':r.status_code,'size':len(raw),'title':title,'scripts':scripts,'links':list(dict.fromkeys(links)),'relevant':relevant[:100]})
+            except Exception as e:
+              pages.append({'url':u,'error':repr(e)})
+
+          all_scripts=list(dict.fromkeys(all_scripts))
+          script_rows=[]
+          for i,u in enumerate(all_scripts[:80]):
+            try:
+              r=S.get(u,timeout=60); raw=r.content; Path(f'diagnostics/scripts/{i:03d}.js').write_bytes(raw)
+              text=raw.decode(r.encoding or 'utf-8','ignore')
+              hits=[]
+              for m in re.finditer(r'(?:report-image|pdf|download|fileUrl|pdfUrl|originUrl|sourceUrl|/api/|search|detail|view\?id)',text,re.I):
+                a=max(0,m.start()-700); b=min(len(text),m.end()+1600); hits.append(text[a:b])
+                if len(hits)>=80: break
+              script_rows.append({'url':u,'status':r.status_code,'size':len(raw),'hits':hits})
+            except Exception as e:
+              script_rows.append({'url':u,'error':repr(e)})
+          Path('diagnostics/pages.json').write_text(json.dumps(pages,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/scripts.json').write_text(json.dumps(script_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PAGES')
+          for row in pages: print(json.dumps({k:row.get(k) for k in ('url','effective','status','size','title','scripts','links','relevant')},ensure_ascii=False)[:12000])
+          print('SCRIPTS',len(script_rows))
+          for row in script_rows:
+            if row.get('hits'): print(json.dumps({'url':row['url'],'hits':row['hits'][:8]},ensure_ascii=False)[:16000])
+          PY
+          python /tmp/inspect.py
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
