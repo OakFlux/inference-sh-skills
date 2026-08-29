@@ -1,0 +1,67 @@
+name: Temporary Meikang Sina report source inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/meikang-iivd-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch Sina report pages and inspect links
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sina_diag
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          declare -A urls=(
+            [report3503167]='https://vip.stock.finance.sina.com.cn/q/go.php/vReport_Show/kind/company/rptid/3503167/index.phtml'
+            [list1]='https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/company/index.phtml?symbol=sz300439&t1=all'
+            [list2]='https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/company/index.phtml?symbol=300439'
+            [legacy]='http://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/company/rptid/3503167/index.phtml'
+            [qianyan]='https://www.7hcn.com/article/296172-1.html'
+            [zhongtai]='https://www.7hcn.com/article/283640-1.html'
+          )
+          for k in "${!urls[@]}"; do
+            curl --http1.1 -L --silent --show-error --retry 4 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' "${urls[$k]}" -o "sina_diag/${k}.html" || true
+            curl --http1.1 -L --silent --show-error --retry 3 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' "https://r.jina.ai/${urls[$k]}" -o "sina_diag/${k}_jina.txt" || true
+          done
+          python - <<'PY'
+          import html,re,urllib.parse,json
+          from pathlib import Path
+          out=[]
+          for p in Path('sina_diag').glob('*'):
+              text=p.read_bytes().decode('gb18030','ignore') if p.suffix=='.html' else p.read_text(encoding='utf-8',errors='ignore')
+              text=html.unescape(text.replace('\\/','/'))
+              title=''
+              m=re.search(r'<title>(.*?)</title>',text,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>','',m.group(1)).strip()
+              urls=[]
+              for u in re.findall(r'https?://[^"\'<>\s]+',text,re.I):
+                  u=urllib.parse.unquote(u).rstrip('),;]')
+                  if any(x in u.lower() for x in ['pdf','download','report','rptid','attach','file']):
+                      urls.append(u)
+              rel=[]
+              for line in text.splitlines():
+                  if re.search(r'pdf|download|下载|全文|原文|report|rptid|美康生物|广发证券|中泰证券|上海证券',line,re.I):
+                      rel.append(re.sub(r'\s+',' ',line)[:2000])
+              out.append({'file':p.name,'title':title,'urls':list(dict.fromkeys(urls)),'relevant':rel[:500]})
+          Path('sina_diag/summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: meikang-sina-source-inspection
+          path: sina_diag/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
