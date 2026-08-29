@@ -1,0 +1,111 @@
+name: Temporary Hualan Vaccine Eastmoney global discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-eastmoney-global.yml
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query daily global report catalog and probe PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import datetime as dt
+          import json
+          import time
+          import requests
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept': 'application/json,text/plain,*/*',
+          })
+          api = 'https://reportapi.eastmoney.com/report/list'
+          candidates = [
+              ('2022-07-08', '天高任鸟飞', '华泰证券'),
+              ('2023-07-18', '疫苗行业龙头', '国金证券'),
+              ('2023-08-15', '深耕流感疫苗市场', '东北证券'),
+              ('2023-10-13', '国内领先流感疫苗制造商', '中信证券'),
+              ('2023-10-17', '拨云见日', '兴业证券'),
+              ('2023-10-25', '流感疫苗龙头', '中金公司'),
+          ]
+
+          def get_rows(params):
+              r = s.get(api, params=params, timeout=60)
+              print('REQUEST', r.status_code, len(r.content), r.url)
+              r.raise_for_status()
+              obj = r.json()
+              rows = obj.get('data') or []
+              return obj, rows
+
+          found = {}
+          for date_str, title_key, broker_key in candidates:
+              day = dt.date.fromisoformat(date_str)
+              print('\n############################')
+              print('TARGET', date_str, title_key, broker_key)
+              for offset in (-1, 0, 1):
+                  d = day + dt.timedelta(days=offset)
+                  ds = d.isoformat()
+                  for qtype in ('0', '1', '2'):
+                      for code in ('', '*', '301207'):
+                          params = {
+                              'pageNo':'1', 'pageSize':'500', 'code':code,
+                              'industryCode':'*', 'industry':'*', 'rating':'*', 'ratingChange':'*',
+                              'beginTime':ds, 'endTime':ds, 'fields':'', 'qType':qtype,
+                              'orgCode':'', 'rcode':'', 'p':'1', 'pageNum':'1', 'pageNumber':'1',
+                              '_':str(int(time.time()*1000)),
+                          }
+                          try:
+                              obj, rows = get_rows(params)
+                          except Exception as exc:
+                              print('ERROR', ds, qtype, repr(code), repr(exc))
+                              continue
+                          print('META', ds, 'q', qtype, 'code', repr(code), 'rows', len(rows), 'hits', obj.get('hits'), 'pages', obj.get('TotalPage'))
+                          for row in rows:
+                              title = str(row.get('title') or '')
+                              broker = str(row.get('orgSName') or row.get('orgName') or '')
+                              stock = str(row.get('stockName') or '')
+                              stock_code = str(row.get('stockCode') or '')
+                              if (title_key in title or '华兰疫苗' in title or stock == '华兰疫苗' or stock_code == '301207'):
+                                  info = {
+                                      'date': str(row.get('publishDate') or '')[:10],
+                                      'broker': broker,
+                                      'title': title,
+                                      'pages': row.get('attachPages'),
+                                      'infoCode': row.get('infoCode'),
+                                      'column': row.get('column'),
+                                      'rating': row.get('sRatingName') or row.get('emRatingName'),
+                                      'stockName': stock,
+                                      'stockCode': stock_code,
+                                      'qType': qtype,
+                                      'queryDate': ds,
+                                      'queryCode': code,
+                                  }
+                                  key = str(info.get('infoCode') or json.dumps(info, ensure_ascii=False, sort_keys=True))
+                                  found[key] = info
+                                  print('MATCH', json.dumps(info, ensure_ascii=False))
+
+          print('\n=== UNIQUE MATCHES ===')
+          for info in found.values():
+              print(json.dumps(info, ensure_ascii=False))
+              code = info.get('infoCode')
+              if not code:
+                  continue
+              url = f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf'
+              try:
+                  r = s.get(url, timeout=(20, 90), allow_redirects=True, headers={'Accept':'application/pdf,*/*'})
+                  print('PDF_PROBE', url, r.status_code, len(r.content), r.headers.get('content-type'), r.content[:8])
+              except Exception as exc:
+                  print('PDF_ERROR', url, repr(exc))
+          PY
