@@ -1,0 +1,441 @@
+name: Temporary Daye reports package
+
+on:
+  push:
+    branches:
+      - tmp-daye-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Query announcements, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_daye.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          STOCK = "300879"
+          COMPANY = "大叶股份"
+          COMPANY_FULL = "宁波大叶园林设备股份有限公司"
+          API = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+          OUT = Path("dist")
+          DOCS = OUT / "大叶股份_300879_2020-2025年报_最新半年报"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
+              "Referer": f"https://data.eastmoney.com/notices/stock/{STOCK}.html",
+          })
+
+          def compact(value: Any) -> str:
+              return (
+                  re.sub(r"\s+", "", str(value or ""))
+                  .replace("（", "(")
+                  .replace("）", ")")
+                  .replace("：", ":")
+              )
+
+          def title_of(row: dict[str, Any]) -> str:
+              return str(
+                  row.get("title")
+                  or row.get("announcement_title")
+                  or row.get("announcementTitle")
+                  or ""
+              ).strip()
+
+          def art_code_of(row: dict[str, Any]) -> str:
+              return str(
+                  row.get("art_code")
+                  or row.get("article_code")
+                  or row.get("id")
+                  or ""
+              ).strip()
+
+          def date_of(row: dict[str, Any]) -> str:
+              value = str(
+                  row.get("notice_date")
+                  or row.get("noticeDate")
+                  or row.get("display_time")
+                  or ""
+              ).strip()
+              match = re.search(r"20\d{2}-\d{2}-\d{2}", value)
+              return match.group(0) if match else value[:10]
+
+          def fetch_page(page: int) -> list[dict[str, Any]]:
+              params = {
+                  "sr": "-1",
+                  "page_size": "100",
+                  "page_index": str(page),
+                  "ann_type": "A",
+                  "client_source": "web",
+                  "stock_list": STOCK,
+                  "f_node": "0",
+                  "s_node": "0",
+              }
+              errors: list[str] = []
+              for attempt in range(6):
+                  try:
+                      response = session.get(API, params=params, timeout=(30, 180))
+                      print("API", page, response.status_code, len(response.content), response.url)
+                      response.raise_for_status()
+                      payload = response.json()
+                      data = payload.get("data") or {}
+                      rows = data.get("list") or data.get("announcements") or []
+                      if not isinstance(rows, list):
+                          raise RuntimeError(
+                              f"Unexpected API rows: {type(rows)}; payload keys={payload.keys()}"
+                          )
+                      if rows:
+                          print("API_SAMPLE", json.dumps(rows[0], ensure_ascii=False)[:1200])
+                      return rows
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      if attempt < 5:
+                          time.sleep(min(2 ** attempt, 12))
+              raise RuntimeError(f"Unable to query Eastmoney page {page}: {errors}")
+
+          announcements: list[dict[str, Any]] = []
+          seen: set[str] = set()
+          oldest_year = 9999
+          for page in range(1, 21):
+              rows = fetch_page(page)
+              if not rows:
+                  break
+              page_years: list[int] = []
+              for row in rows:
+                  if not isinstance(row, dict):
+                      continue
+                  code = art_code_of(row)
+                  if not code or code in seen:
+                      continue
+                  seen.add(code)
+                  announcements.append(row)
+                  match = re.search(r"(20\d{2})", date_of(row))
+                  if match:
+                      page_years.append(int(match.group(1)))
+              if page_years:
+                  oldest_year = min(oldest_year, min(page_years))
+              print("PAGE_ROWS", page, len(rows), "TOTAL", len(announcements), "OLDEST", oldest_year)
+              if page_years and min(page_years) <= 2019:
+                  break
+              time.sleep(0.3)
+
+          if not announcements:
+              raise RuntimeError("No Eastmoney announcements returned")
+
+          def report_tail(title: str) -> str:
+              normalized = compact(title)
+              tail = normalized.split(":", 1)[-1]
+              for prefix in (COMPANY_FULL, COMPANY, STOCK):
+                  if tail.startswith(prefix):
+                      tail = tail[len(prefix):]
+              return tail
+
+          revision_tokens = (
+              "更新版",
+              "更新后",
+              "修订版",
+              "修订稿",
+              "修订",
+              "修正",
+              "更正后",
+              "更正版",
+          )
+
+          def revision_score(title: str) -> int:
+              tail = report_tail(title)
+              return int(any(token in tail for token in revision_tokens))
+
+          revision_group = "(?:更新版|更新后|修订版|修订稿|修订|修正|更正后|更正版)"
+          annual_pattern = re.compile(
+              rf"^(20\d{{2}})(?:年)?年度报告(?:全文)?(?:\({revision_group}\)|{revision_group})?$"
+          )
+          half_pattern = re.compile(
+              rf"^(20\d{{2}})年半年度报告(?:全文)?(?:\({revision_group}\)|{revision_group})?$"
+          )
+
+          annual_candidates: dict[int, list[dict[str, Any]]] = {}
+          half_candidates: list[tuple[int, dict[str, Any]]] = []
+
+          for row in announcements:
+              title = title_of(row)
+              tail = report_tail(title)
+              annual_match = annual_pattern.fullmatch(tail)
+              if annual_match:
+                  year = int(annual_match.group(1))
+                  if year in range(2020, 2026):
+                      annual_candidates.setdefault(year, []).append(row)
+                  continue
+              half_match = half_pattern.fullmatch(tail)
+              if half_match:
+                  half_candidates.append((int(half_match.group(1)), row))
+
+          for row in announcements:
+              title = title_of(row)
+              if "年度报告" in title or "半年度报告" in title:
+                  print("CANDIDATE", date_of(row), art_code_of(row), title)
+
+          annual_by_year: dict[int, dict[str, Any]] = {}
+          for year in range(2020, 2026):
+              candidates = annual_candidates.get(year, [])
+              if not candidates:
+                  raise RuntimeError(f"Missing full annual report for {year}")
+              candidates.sort(
+                  key=lambda row: (
+                      revision_score(title_of(row)),
+                      date_of(row),
+                      art_code_of(row),
+                  ),
+                  reverse=True,
+              )
+              annual_by_year[year] = candidates[0]
+
+          if not half_candidates:
+              raise RuntimeError("No complete half-year report found")
+          half_candidates.sort(
+              key=lambda item: (
+                  item[0],
+                  revision_score(title_of(item[1])),
+                  date_of(item[1]),
+                  art_code_of(item[1]),
+              ),
+              reverse=True,
+          )
+          half_year, half_row = half_candidates[0]
+
+          selections: list[tuple[str, dict[str, Any], str, int, int]] = []
+          for year in range(2020, 2026):
+              row = annual_by_year[year]
+              suffix = "_后续版本" if revision_score(title_of(row)) else ""
+              selections.append(
+                  (
+                      f"大叶股份_300879_{year}年年度报告{suffix}.pdf",
+                      row,
+                      "年度报告",
+                      70,
+                      year,
+                  )
+              )
+          selections.append(
+              (
+                  f"大叶股份_300879_{half_year}年半年度报告.pdf",
+                  half_row,
+                  "半年度报告",
+                  40,
+                  half_year,
+              )
+          )
+
+          print("SELECTIONS")
+          for filename, row, kind, _, year in selections:
+              print(
+                  "SELECT",
+                  kind,
+                  year,
+                  filename,
+                  date_of(row),
+                  art_code_of(row),
+                  title_of(row),
+              )
+
+          def candidate_pdf_urls(art_code: str) -> list[str]:
+              return [
+                  f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.PDF",
+                  f"http://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf",
+              ]
+
+          def sha256_file(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def validate_pdf(
+              path: Path,
+              minimum_pages: int,
+              expected_year: int,
+              expected_kind: str,
+          ) -> tuple[int, int, str]:
+              size = path.stat().st_size
+              head = path.read_bytes()[:16]
+              if size < 100_000 or not head.startswith(b"%PDF-"):
+                  raise RuntimeError(
+                      f"Invalid PDF {path.name}: size={size}, head={head!r}"
+                  )
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(
+                      f"Unexpectedly short PDF {path.name}: {pages} pages"
+                  )
+
+              parts: list[str] = []
+              for page in reader.pages[:20]:
+                  try:
+                      parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", "", "".join(parts))
+              if COMPANY not in sample and COMPANY_FULL not in sample and "DAYE" not in sample.upper():
+                  print("WARNING company name not extracted", path.name)
+              if str(expected_year) not in sample:
+                  print("WARNING expected year not extracted", expected_year, path.name)
+              if expected_kind not in sample:
+                  print("WARNING report type phrase not extracted", expected_kind, path.name)
+
+              return size, pages, sha256_file(path)
+
+          def download_one(
+              filename: str,
+              row: dict[str, Any],
+              minimum_pages: int,
+              expected_year: int,
+              expected_kind: str,
+          ) -> tuple[str, int, int, str]:
+              art_code = art_code_of(row)
+              destination = DOCS / filename
+              referer = f"https://data.eastmoney.com/notices/detail/{STOCK}/{art_code}.html"
+              errors: list[str] = []
+              for url in candidate_pdf_urls(art_code):
+                  for attempt in range(5):
+                      try:
+                          with session.get(
+                              url,
+                              headers={
+                                  "Referer": referer,
+                                  "Accept": "application/pdf,application/octet-stream,*/*",
+                              },
+                              timeout=(30, 600),
+                              stream=True,
+                              allow_redirects=True,
+                          ) as response:
+                              print(
+                                  "DOWNLOAD",
+                                  art_code,
+                                  response.status_code,
+                                  response.url,
+                                  response.headers.get("content-type"),
+                                  response.headers.get("content-length"),
+                              )
+                              response.raise_for_status()
+                              with destination.open("wb") as output:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          output.write(chunk)
+                              final_url = response.url
+
+                          size, pages, digest = validate_pdf(
+                              destination,
+                              minimum_pages,
+                              expected_year,
+                              expected_kind,
+                          )
+                          return final_url, size, pages, digest
+                      except Exception as exc:
+                          destination.unlink(missing_ok=True)
+                          errors.append(f"{url} attempt {attempt + 1}: {exc!r}")
+                          if attempt < 4:
+                              time.sleep(min(2 ** attempt, 10))
+              raise RuntimeError("; ".join(errors))
+
+          manifest = [
+              "宁波大叶园林设备股份有限公司（300879.SZ）",
+              f"资料范围：2020—2025年年度报告全文及最新完整半年报（{half_year}年半年度报告）。",
+              "筛选规则：排除年度报告摘要、半年报摘要、披露提示公告和单独审计报告；如有修订或更新版本，优先采用后续版本。",
+              "文件来源：东方财富上市公司公告PDF镜像，公告内容为交易所披露文件。",
+              "",
+          ]
+
+          for filename, row, kind, minimum_pages, expected_year in selections:
+              used_url, size, pages, digest = download_one(
+                  filename,
+                  row,
+                  minimum_pages,
+                  expected_year,
+                  kind,
+              )
+              manifest.extend([
+                  filename,
+                  f"  文件类型：{kind}",
+                  f"  公告标题：{title_of(row)}",
+                  f"  披露日期：{date_of(row)}",
+                  f"  东方财富公告代码：{art_code_of(row)}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  PDF来源：{used_url}",
+                  "",
+              ])
+              print("OK", filename, pages, size, used_url)
+
+          (DOCS / "资料清单与来源.txt").write_text(
+              "\n".join(manifest), encoding="utf-8"
+          )
+
+          final_zip = OUT / "大叶股份_300879_2020-2025年报_最新半年报.zip"
+          with zipfile.ZipFile(
+              final_zip,
+              "w",
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=6,
+          ) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [
+                  name for name in archive.namelist() if name.lower().endswith(".pdf")
+              ]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdfs}")
+
+          print(f"HALF_YEAR={half_year}")
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              if path.suffix.lower() == ".pdf":
+                  reader = PdfReader(str(path), strict=False)
+                  print(path.name, path.stat().st_size, len(reader.pages))
+              else:
+                  print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_daye.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: daye-reports-final-zip
+          path: dist/大叶股份_300879_2020-2025年报_最新半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
