@@ -1,0 +1,107 @@
+name: Temporary Daan Gene company report API discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-company-api-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Query all historical Daan Gene company reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/responses
+          cat > /tmp/query_company_reports.py <<'PY'
+          from __future__ import annotations
+          import hashlib, json, math, subprocess, time, urllib.parse
+          from datetime import date, timedelta
+          from pathlib import Path
+
+          API='https://api-hq.chongnengjihua.com/news/api/1/company/report/list'
+          SECRET='dac3ef6859f44e439c88cbc28d65880a'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          REF='https://stock.9fzt.com/report/company.html'
+          OUT=Path('diagnostics')
+
+          def signature(params: dict[str, object], ts: str) -> str:
+              values=''.join(str(params[k]) for k in sorted(params))
+              return hashlib.md5((SECRET+values+ts).encode()).hexdigest()
+
+          def fetch(params: dict[str, object], path: Path, signed=True):
+              ts=str(int(time.time()*1000))
+              url=API+'?'+urllib.parse.urlencode(params)
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','180','--user-agent',UA,'--referer',REF,'--header','Accept-Encoding: identity','--header','Accept: application/json,text/plain,*/*']
+              if signed:
+                  cmd += ['--header','appcode: 9fztgw','--header','clienttype: h5','--header','serverId: 200','--header',f'signature: {signature(params,ts)}','--header',f'timestamp: {ts}']
+              cmd += [url,'-o',str(path)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              raw=path.read_bytes() if path.exists() else b''
+              return p.returncode,raw,p.stderr[-800:],url
+
+          start=date(2012,1,1); end=date(2026,8,29); window=timedelta(days=179)
+          reports={}; window_summaries=[]; wi=0
+          cur=start
+          while cur<=end:
+              to=min(cur+window,end)
+              base={'pageNo':0,'pageSize':100,'to':to.isoformat(),'from':cur.isoformat(),'market':'sz','symbol':'002030'}
+              p=OUT/'responses'/f'window_{wi:03d}_p000.json'
+              rc,raw,err,url=fetch(base,p,True)
+              if rc or not raw:
+                  rc,raw,err,url=fetch(base,p,False)
+              try: obj=json.loads(raw.decode('utf-8','ignore'))
+              except Exception as exc:
+                  window_summaries.append({'from':cur.isoformat(),'to':to.isoformat(),'error':repr(exc),'head':raw[:500].decode('utf-8','ignore'),'curl_error':err});cur=to+timedelta(days=1);wi+=1;continue
+              payload=obj.get('data') or {}
+              rows=payload.get('data') if isinstance(payload,dict) else []
+              count=payload.get('count',len(rows or [])) if isinstance(payload,dict) else len(rows or [])
+              rows=rows if isinstance(rows,list) else []
+              total_pages=max(1,math.ceil(int(count or 0)/100))
+              all_rows=list(rows)
+              for page_no in range(1,total_pages):
+                  params={**base,'pageNo':page_no}
+                  pp=OUT/'responses'/f'window_{wi:03d}_p{page_no:03d}.json'
+                  rc2,raw2,err2,url2=fetch(params,pp,True)
+                  if rc2 or not raw2:
+                      rc2,raw2,err2,url2=fetch(params,pp,False)
+                  try:o2=json.loads(raw2.decode('utf-8','ignore'));r2=(o2.get('data') or {}).get('data') or []
+                  except Exception:r2=[]
+                  if isinstance(r2,list):all_rows.extend(r2)
+              kept=0
+              for r in all_rows:
+                  if not isinstance(r,dict):continue
+                  sym=str(r.get('symbol') or '')
+                  name=str(r.get('stockName') or '')
+                  title=str(r.get('title') or '')
+                  if sym=='002030' or '达安基因' in name or '达安基因' in title:
+                      rid=str(r.get('reportId') or r.get('id') or '')
+                      if rid:
+                          reports[rid]=r;kept+=1
+              window_summaries.append({'from':cur.isoformat(),'to':to.isoformat(),'count':count,'received':len(all_rows),'kept':kept,'code':obj.get('code'),'message':obj.get('message')})
+              print('WINDOW',cur,to,'count',count,'received',len(all_rows),'kept',kept,'code',obj.get('code'),'message',obj.get('message'))
+              cur=to+timedelta(days=1);wi+=1
+
+          rows=list(reports.values())
+          rows.sort(key=lambda r:(int(r.get('publishDate') or 0),int(r.get('reportId') or 0)),reverse=True)
+          OUT.joinpath('daan_reports.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('windows.json').write_text(json.dumps(window_summaries,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL_REPORTS',len(rows))
+          for r in rows:
+              print('REPORT',json.dumps(r,ensure_ascii=False))
+          PY
+          python /tmp/query_company_reports.py
+
+      - name: Upload report catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-company-report-catalog
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
