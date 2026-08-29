@@ -1,0 +1,74 @@
+name: Temporary Xinri deep report source lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-deep-source-lookup.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Search Eastmoney catalog variants and exact dates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, requests
+          from datetime import date, timedelta
+
+          API='https://reportapi.eastmoney.com/report/list'
+          H={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Referer':'https://data.eastmoney.com/report/'}
+          keys=['新日股份','603787','电动两轮高景气','渠道+产品助力公司加速扩张','修炼内功','新日正东升']
+
+          def scan(params,label,max_pages=20):
+              p=dict(params)
+              p.setdefault('pageNo','1'); p.setdefault('pageSize','100')
+              p.setdefault('industryCode','*'); p.setdefault('industry','*')
+              p.setdefault('rating','*'); p.setdefault('ratingChange','*')
+              p.setdefault('fields',''); p.setdefault('orgCode',''); p.setdefault('rcode','')
+              p.setdefault('p','1'); p.setdefault('pageNum','1'); p.setdefault('pageNumber','1')
+              r=requests.get(API,params=p,headers=H,timeout=90); r.raise_for_status(); obj=r.json()
+              hits=int(obj.get('hits') or 0); pages=max(1,int(obj.get('TotalPage') or math.ceil(hits/int(p['pageSize'])) or 1))
+              print('\nSCAN',label,'HITS',hits,'PAGES',pages,'URL',r.url)
+              seen=set()
+              for page in range(1,min(pages,max_pages)+1):
+                  if page==1: rows=obj.get('data') or []
+                  else:
+                      pp=dict(p); pp.update({'pageNo':str(page),'p':str(page),'pageNum':str(page),'pageNumber':str(page)})
+                      rr=requests.get(API,params=pp,headers=H,timeout=90); rr.raise_for_status(); rows=rr.json().get('data') or []
+                  for row in rows:
+                      k=row.get('infoCode') or (row.get('title'),row.get('publishDate'),row.get('orgSName'))
+                      if k in seen: continue
+                      seen.add(k)
+                      blob=' '.join(str(row.get(x) or '') for x in ['title','stockName','stockCode','orgSName','researcher'])
+                      if any(key in blob for key in keys):
+                          print('MATCH',json.dumps(row,ensure_ascii=False))
+
+          # Exact stock-code queries using all qType and parameter variants.
+          for q in ['0','1','2']:
+              for code in ['603787','SH603787','sh603787','603787.SH']:
+                  scan({
+                      'code':code,'beginTime':'2015-01-01','endTime':'2026-08-29','qType':q,
+                      'pageNo':'1','pageSize':'200','p':'1','pageNum':'1','pageNumber':'1'
+                  },f'code={code},qType={q}',max_pages=10)
+
+          # Global searches on release windows for the two known deep reports.
+          windows=[
+              ('2020-09-10','2020-09-22','2020-report'),
+              ('2022-10-15','2022-11-05','2022-report'),
+          ]
+          for begin,end,label in windows:
+              for q in ['0','1','2']:
+                  scan({
+                      'code':'','beginTime':begin,'endTime':end,'qType':q,
+                      'pageNo':'1','pageSize':'100','p':'1','pageNum':'1','pageNumber':'1'
+                  },f'{label},qType={q}',max_pages=100)
+          PY
