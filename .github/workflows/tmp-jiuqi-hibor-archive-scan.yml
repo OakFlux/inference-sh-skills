@@ -1,0 +1,126 @@
+name: Temporary Jiuqi Hibor archive scan
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-hibor-archive-scan.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Scan public Hibor archive pages and exact-title catalogs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'})
+          found={}
+          for year in range(2012,2019):
+              for month in range(1,13):
+                  ym=f'{year}{month:02d}'
+                  urls=[
+                      f'https://www.hibor.com.cn/archiver_houtai/{ym}.html',
+                      f'https://p.hibor.com.cn/Archiver/{ym}.html',
+                      f'https://fxgroup.hibor.com.cn/archiver/{ym}.html',
+                  ]
+                  for url in urls:
+                      try:
+                          r=s.get(url,timeout=45,allow_redirects=True)
+                          if r.status_code!=200 or len(r.content)<1000: continue
+                          text=r.text
+                          if '久其软件' not in text: continue
+                          print('\nARCHIVE_HIT',ym,url,'HTTP',r.status_code,'LEN',len(r.content))
+                          soup=BeautifulSoup(text,'html.parser')
+                          for a in soup.find_all('a',href=True):
+                              label=' '.join(a.get_text(' ',strip=True).split())
+                              blob=label+' '+a['href']
+                              if '久其软件' in blob or '002279' in blob:
+                                  href=urllib.parse.urljoin(r.url,a['href'])
+                                  key=(label,href)
+                                  found[key]=1
+                                  print('ARCHIVE_LINK',json.dumps({'label':label,'href':href},ensure_ascii=False))
+                      except Exception as e:
+                          print('ARCHIVE_ERR',url,repr(e))
+
+          print('\nARCHIVE_TOTAL',len(found))
+          # Inspect each report page for metadata, page count, PDF and preview assets.
+          patterns=[
+              r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+              r'https?://[^\s"\'<>]+(?:download|file|attachment|preview|image)[^\s"\'<>]*',
+          ]
+          for label,href in found:
+              print('\nREPORT_PAGE',label,href)
+              try:
+                  r=s.get(href,timeout=60,allow_redirects=True)
+                  print('REPORT_HTTP',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+                  text=r.text
+                  for needle in ['研报页数','报告页数','研报大小','研报出处','推荐评级','PDF','报告原文']:
+                      p=text.find(needle)
+                      if p>=0: print('CTX',needle,' '.join(text[max(0,p-300):p+1200].split())[:1600])
+                  for pat in patterns:
+                      for m in sorted(set(re.findall(pat,text,re.I))): print('ASSET',m[:2000])
+                  soup=BeautifulSoup(text,'html.parser')
+                  title=soup.title.get_text(' ',strip=True) if soup.title else ''
+                  visible=' '.join(soup.get_text(' ',strip=True).split())
+                  print('PAGE_TITLE',title[:500])
+                  print('VISIBLE_HEAD',visible[:2500])
+              except Exception as e:
+                  print('REPORT_ERR',repr(e))
+
+          # Exact-title queries on Sdyanbao for the strongest known candidates.
+          ss=requests.Session()
+          ss.headers.update({
+              'User-Agent':s.headers['User-Agent'],'Origin':'https://www.sdyanbao.com',
+              'Referer':'https://www.sdyanbao.com/','Content-Type':'application/json;charset=UTF-8',
+              'Accept':'application/json,text/plain,*/*'
+          })
+          queries=[
+              '内生外延把握行业发展大方向',
+              '执行力再证明，新老业务均有爆发力',
+              '执行力再证明 新老业务均有爆发力',
+              '物流信息化金融支付闭环接近完成',
+              '司机驿站价值再解读',
+              '久其软件 002279 公司深度',
+              '久其软件 首次覆盖',
+          ]
+          seen=set()
+          for q in queries:
+              payload={'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':1,'pageSize':100,'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':[],'industryIds':[]}
+              try:
+                  r=ss.post('https://api.sdyanbao.com/api/file/search',json=payload,timeout=90)
+                  print('\nSDY_QUERY',q,r.status_code,len(r.content))
+                  r.raise_for_status(); data=(r.json().get('data') or {}); files=data.get('files') or []
+                  print('SDY_TOTAL',data.get('total'),'COUNT',len(files))
+                  for f in files:
+                      fid=f.get('id')
+                      if fid in seen: continue
+                      seen.add(fid)
+                      name=str(f.get('name') or '')
+                      stock=f.get('stock') or {}
+                      content=str(f.get('content') or '')[:1000]
+                      blob=' '.join([name,str(stock.get('name') or ''),str(stock.get('code') or ''),content])
+                      if '久其软件' in blob or '002279' in blob or any(x in name for x in ['内生外延','执行力再证明','物流信息化','司机驿站']):
+                          print('SDY_MATCH',json.dumps({
+                              'id':fid,'name':name,'date':f.get('time_text'),'pages':f.get('page_count'),
+                              'size':f.get('file_size'),'type':(f.get('type') or {}).get('name'),
+                              'organization':(f.get('organization') or {}).get('name'),
+                              'uuid':f.get('data_source_uuid'),'data_source':f.get('data_source'),
+                              'original_id':f.get('original_id'),'page_url':f.get('page_url'),
+                              'share_url':f.get('share_url'),'stock':stock,
+                          },ensure_ascii=False))
+              except Exception as e:
+                  print('SDY_ERR',q,repr(e))
+          PY
