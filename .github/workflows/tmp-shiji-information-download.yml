@@ -1,0 +1,345 @@
+name: Temporary verified Shiji Information broker deep reports
+
+on:
+  push:
+    branches:
+      - tmp/download-shiji-information-reports-20260829
+    paths:
+      - .github/workflows/tmp-shiji-information-download.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Discover, download, verify, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf output work
+          mkdir -p output work/raw work/text work/previews work/diagnostic
+
+          cat > work/fetch_reports.py <<'PY'
+          from __future__ import annotations
+
+          import datetime as dt
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import urllib.parse
+
+          ROOT = pathlib.Path('work')
+          OUT = pathlib.Path('output')
+          API = 'https://reportapi.eastmoney.com/report/list'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          # Known publication/upload dates of long-form Shiji Information reports,
+          # plus the latest 2026 deep report.
+          DATES = [
+              '2020-08-05',
+              '2021-09-28',
+              '2021-11-23',
+              '2022-05-16',
+              '2022-07-05',
+              '2022-09-09',
+              '2022-09-13',
+              '2022-11-15',
+              '2022-11-17',
+              '2022-12-13',
+              '2026-02-22',
+              '2026-02-23',
+          ]
+
+          def curl_bytes(url: str, *, referer: str, timeout: int = 180) -> bytes:
+              fd, tmp_name = tempfile.mkstemp(prefix='shiji_', suffix='.bin')
+              os.close(fd)
+              tmp = pathlib.Path(tmp_name)
+              try:
+                  cmd = [
+                      'curl', '--http1.1', '-L', '--fail', '--silent', '--show-error',
+                      '--retry', '6', '--retry-delay', '2', '--retry-all-errors',
+                      '--connect-timeout', '30', '--max-time', str(timeout), '--compressed',
+                      '--user-agent', UA, '--referer', referer,
+                      '--header', 'Accept-Encoding: identity',
+                      url, '-o', str(tmp),
+                  ]
+                  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  if proc.returncode:
+                      raise RuntimeError(proc.stderr[-1500:])
+                  return tmp.read_bytes()
+              finally:
+                  tmp.unlink(missing_ok=True)
+
+          def parse_json_payload(raw: bytes) -> dict:
+              text = raw.decode('utf-8', 'replace').strip()
+              if text.startswith('datatable(') and text.endswith(')'):
+                  text = text[len('datatable('):-1]
+              elif text and text[0] not in '[{' and '(' in text and text.endswith(')'):
+                  text = text[text.find('(') + 1:text.rfind(')')]
+              return json.loads(text)
+
+          def fetch_page(params: dict[str, str]) -> dict:
+              url = API + '?' + urllib.parse.urlencode(params)
+              return parse_json_payload(curl_bytes(url, referer='https://data.eastmoney.com/report/', timeout=150))
+
+          found: dict[str, dict] = {}
+          diagnostics: list[dict] = []
+
+          # Broad company-specific variants. Some API deployments respond to one
+          # form but not another, so retain all successful variants.
+          broad_variants = [
+              ('0', '002153'),
+              ('0', '石基信息'),
+              ('1', '石基信息'),
+          ]
+          for qtype, code in broad_variants:
+              for page in range(1, 8):
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2018-01-01', 'endTime': '2030-12-31',
+                      'pageNo': str(page), 'fields': '', 'qType': qtype,
+                      'orgCode': '', 'code': code, 'rcode': '',
+                      'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                  }
+                  try:
+                      obj = fetch_page(params)
+                  except Exception as exc:
+                      diagnostics.append({'mode':'broad','qType':qtype,'code':code,'page':page,'error':repr(exc)})
+                      break
+                  rows = obj.get('data') or []
+                  diagnostics.append({'mode':'broad','qType':qtype,'code':code,'page':page,'rows':len(rows),'hits':obj.get('hits')})
+                  for row in rows:
+                      title = str(row.get('title') or '')
+                      if str(row.get('stockCode') or '') == '002153' or str(row.get('stockName') or '') == '石基信息' or '石基信息' in title:
+                          key = str(row.get('infoCode') or json.dumps(row, ensure_ascii=False, sort_keys=True))
+                          found[key] = row
+                  if len(rows) < 100:
+                      break
+
+          # Exact-day global scans catch records omitted by the code-filter endpoint.
+          for day in DATES:
+              base_params = {
+                  'pageSize': '100', 'code': '*', 'industryCode': '*', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*', 'beginTime': day, 'endTime': day,
+                  'fields': '', 'qType': '0', 'orgCode': '', 'rcode': '',
+              }
+              try:
+                  first_params = dict(base_params, pageNo='1', p='1', pageNum='1', pageNumber='1')
+                  first = fetch_page(first_params)
+              except Exception as exc:
+                  diagnostics.append({'mode':'day','day':day,'page':1,'error':repr(exc)})
+                  continue
+              total_pages = int(first.get('TotalPage') or first.get('totalPage') or 1)
+              pages = [(1, first)]
+              for page in range(2, min(total_pages, 25) + 1):
+                  try:
+                      obj = fetch_page(dict(base_params, pageNo=str(page), p=str(page), pageNum=str(page), pageNumber=str(page)))
+                      pages.append((page, obj))
+                  except Exception as exc:
+                      diagnostics.append({'mode':'day','day':day,'page':page,'error':repr(exc)})
+                  time.sleep(0.08)
+              for page, obj in pages:
+                  rows = obj.get('data') or []
+                  diagnostics.append({'mode':'day','day':day,'page':page,'rows':len(rows),'hits':obj.get('hits'),'total_pages':total_pages})
+                  for row in rows:
+                      title = str(row.get('title') or '')
+                      stock_code = str(row.get('stockCode') or '')
+                      stock_name = str(row.get('stockName') or '')
+                      if stock_code == '002153' or stock_name == '石基信息' or '石基信息' in title:
+                          key = str(row.get('infoCode') or json.dumps(row, ensure_ascii=False, sort_keys=True))
+                          rr = dict(row)
+                          rr['_matched_day'] = day
+                          rr['_matched_page'] = page
+                          found[key] = rr
+
+          rows = list(found.values())
+          (ROOT / 'diagnostic' / 'catalog.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'diagnostic' / 'query_log.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def parse_date(row: dict) -> dt.datetime:
+              value = str(row.get('publishDate') or '')[:10]
+              try:
+                  return dt.datetime.strptime(value, '%Y-%m-%d')
+              except Exception:
+                  return dt.datetime(1900, 1, 1)
+
+          def metadata_pages(row: dict) -> int:
+              try:
+                  return int(row.get('attachPages') or 0)
+              except Exception:
+                  return 0
+
+          def deep_score(row: dict) -> tuple:
+              title = str(row.get('title') or '')
+              report_type = str(row.get('reportType') or '')
+              pages = metadata_pages(row)
+              keyword = sum(1 for k in ['深度', '首次覆盖', '首次评级', '公司研究', '酒店信息化', '云PMS', 'SaaS', '全球化', '乘云', '踏云'] if k in title or k in report_type)
+              return (keyword > 0, keyword, pages >= 15, pages, parse_date(row))
+
+          rows.sort(key=deep_score, reverse=True)
+
+          verified: list[dict] = []
+          attempted: list[dict] = []
+
+          def safe_ascii(text: str) -> str:
+              text = re.sub(r'[^A-Za-z0-9._-]+', '_', text)
+              text = re.sub(r'_+', '_', text).strip('._')
+              return text[:70] or 'report'
+
+          broker_map = {
+              '国海证券': 'Sealand', '国海': 'Sealand',
+              '开源证券': 'Kaiyuan', '开源': 'Kaiyuan',
+              '华安证券': 'Huaan', '华安': 'Huaan',
+              '国泰君安': 'Guotai_Junan', '国泰海通': 'Guotai_Haitong',
+              '民生证券': 'Minsheng', '民生': 'Minsheng',
+              '招商证券': 'CMB_International', '招商': 'CMB_International',
+              '国盛证券': 'Guosheng', '国盛': 'Guosheng',
+              '国联证券': 'Guolian', '国联': 'Guolian',
+          }
+
+          def broker_ascii(org: str) -> str:
+              for key, value in broker_map.items():
+                  if key in org:
+                      return value
+              return safe_ascii(org) or 'Broker'
+
+          for row in rows:
+              if len(verified) >= 8:
+                  break
+              info = str(row.get('infoCode') or '')
+              if not info:
+                  continue
+              meta_pages = metadata_pages(row)
+              title = str(row.get('title') or '')
+              org = str(row.get('orgSName') or row.get('orgName') or 'Broker')
+              url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              raw_path = ROOT / 'raw' / f'{info}.pdf'
+              status = {'infoCode':info,'title':title,'broker':org,'url':url,'metadata_pages':meta_pages}
+              try:
+                  data = curl_bytes(url, referer='https://data.eastmoney.com/report/', timeout=600)
+                  raw_path.write_bytes(data)
+                  if len(data) < 20000 or not data.startswith(b'%PDF'):
+                      raise RuntimeError(f'not a usable PDF ({len(data)} bytes)')
+                  pdfinfo = subprocess.check_output(['pdfinfo', str(raw_path)], text=True, errors='replace')
+                  match = re.search(r'^Pages:\s*(\d+)', pdfinfo, re.M)
+                  pages = int(match.group(1)) if match else 0
+                  if pages < 10:
+                      raise RuntimeError(f'only {pages} pages')
+                  text_path = ROOT / 'text' / f'{info}.txt'
+                  subprocess.run(['pdftotext','-f','1','-l',str(min(5,pages)),str(raw_path),str(text_path)], check=False)
+                  first_text = text_path.read_text(errors='replace') if text_path.exists() else ''
+                  compact = ''.join(first_text.split())
+                  if '石基信息' not in compact and '002153' not in compact:
+                      raise RuntimeError('company identity not found in first pages')
+                  status.update({'actual_pages':pages,'size_bytes':len(data),'ok':True})
+                  verified.append({'row':row,'path':raw_path,'pages':pages,'size_bytes':len(data),'pdf_url':url})
+              except Exception as exc:
+                  raw_path.unlink(missing_ok=True)
+                  status.update({'ok':False,'error':repr(exc)})
+              attempted.append(status)
+
+          (ROOT / 'diagnostic' / 'download_attempts.json').write_text(json.dumps(attempted, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(verified) < 2:
+              raise SystemExit(f'Only {len(verified)} verified long-form reports were downloadable')
+
+          # Rank verified items and select up to three, preferring distinct brokers.
+          verified.sort(key=lambda x: deep_score(x['row']), reverse=True)
+          selected: list[dict] = []
+          used_brokers: set[str] = set()
+          for item in verified:
+              org = str(item['row'].get('orgSName') or item['row'].get('orgName') or 'Broker')
+              if org in used_brokers:
+                  continue
+              selected.append(item)
+              used_brokers.add(org)
+              if len(selected) == 3:
+                  break
+          if len(selected) < 3:
+              for item in verified:
+                  if item in selected:
+                      continue
+                  selected.append(item)
+                  if len(selected) == 3:
+                      break
+
+          manifest = []
+          for index, item in enumerate(selected, start=1):
+              row = item['row']
+              org = str(row.get('orgSName') or row.get('orgName') or 'Broker')
+              title = str(row.get('title') or 'Company Deep Report')
+              date = str(row.get('publishDate') or '')[:10]
+              date_compact = date.replace('-', '') or 'unknown'
+              filename = f'{index:02d}_Shiji_Information_{broker_ascii(org)}_{date_compact}_{item["pages"]}p.pdf'
+              dest = OUT / filename
+              dest.write_bytes(item['path'].read_bytes())
+
+              # Rendering check for the first and final pages.
+              first_prefix = ROOT / 'previews' / f'{index:02d}_first'
+              last_prefix = ROOT / 'previews' / f'{index:02d}_last'
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','100',str(dest),str(first_prefix)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              subprocess.run(['pdftoppm','-f',str(item['pages']),'-singlefile','-png','-r','100',str(dest),str(last_prefix)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              if not first_prefix.with_suffix('.png').exists() or not last_prefix.with_suffix('.png').exists():
+                  raise RuntimeError(f'rendering failed for {filename}')
+
+              manifest.append({
+                  'index': index,
+                  'broker': org,
+                  'publishDate': date,
+                  'title': title,
+                  'pages': item['pages'],
+                  'rating': row.get('ratingName') or '',
+                  'reportType': row.get('reportType') or '',
+                  'infoCode': row.get('infoCode') or '',
+                  'pdf_url': item['pdf_url'],
+                  'filename': filename,
+                  'size_bytes': dest.stat().st_size,
+                  'sha256': hashlib.sha256(dest.read_bytes()).hexdigest(),
+              })
+
+          (OUT / 'manifest.json').write_text(json.dumps({'company':'石基信息','stock_code':'002153.SZ','count':len(manifest),'reports':manifest}, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (OUT / 'Report_List_and_Verification.txt').open('w', encoding='utf-8') as f:
+              f.write(f'Shiji Information (002153.SZ) broker research reports: {len(manifest)} files\n\n')
+              for r in manifest:
+                  f.write(f"{r['index']}. {r['broker']} | {r['publishDate']} | {r['pages']} pages\n")
+                  f.write(f"   {r['title']}\n")
+                  f.write(f"   Type: {r['reportType'] or 'company research'}; Rating: {r['rating'] or 'not stated'}\n")
+                  f.write(f"   Source: {r['pdf_url']}\n\n")
+              f.write('Verification: PDF signature, actual page count, company identity in first pages, first/last-page rendering, SHA-256, and ZIP integrity.\n')
+              f.write('For research use only; not investment advice.\n')
+
+          with (OUT / 'SHA256SUMS.txt').open('w', encoding='utf-8') as f:
+              for r in manifest:
+                  f.write(f"{r['sha256']}  {r['filename']}\n")
+
+          print(json.dumps({'selected':manifest,'catalog_count':len(rows),'verified_downloads':len(verified)}, ensure_ascii=False, indent=2))
+          PY
+
+          python3 work/fetch_reports.py
+          (cd output && zip -q -9 Shiji_Information_Broker_Deep_Reports_Verified.zip ./*.pdf ./manifest.json ./Report_List_and_Verification.txt ./SHA256SUMS.txt)
+          unzip -t output/Shiji_Information_Broker_Deep_Reports_Verified.zip
+          ls -lh output work/previews work/diagnostic
+
+      - name: Upload verified report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shiji-information-broker-deep-reports
+          path: |
+            output/
+            work/diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
