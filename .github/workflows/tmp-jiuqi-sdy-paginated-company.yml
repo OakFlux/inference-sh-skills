@@ -1,0 +1,56 @@
+name: Temporary Jiuqi paginated company research lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-sdy-paginated-company.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Enumerate exact company research rows
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/',
+              'Content-Type':'application/json;charset=UTF-8','Accept':'application/json,text/plain,*/*'
+          })
+          seen=set(); matches=[]
+          for q in ['002279','久其软件']:
+              for page in range(1,30):
+                  payload={'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':page,'pageSize':100,'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':[],'industryIds':[]}
+                  r=s.post('https://api.sdyanbao.com/api/file/search',json=payload,timeout=90)
+                  print('PAGE',q,page,r.status_code,len(r.content))
+                  r.raise_for_status(); data=(r.json().get('data') or {}); files=data.get('files') or []
+                  print('TOTAL',data.get('total'),'COUNT',len(files))
+                  if not files: break
+                  for f in files:
+                      fid=f.get('id')
+                      if fid in seen: continue
+                      seen.add(fid)
+                      stock=f.get('stock') or {}
+                      name=str(f.get('name') or '')
+                      content=str(f.get('content') or '')[:3000]
+                      exact=(stock.get('code')=='002279' or '久其软件' in name or '002279' in name or '久其软件' in content)
+                      company=((f.get('type') or {}).get('name')=='公司研究')
+                      if exact and company:
+                          row={'id':fid,'name':name,'date':f.get('time_text'),'pages':f.get('page_count'),'size':f.get('file_size'),'type':(f.get('type') or {}).get('name'),'organization':(f.get('organization') or {}).get('name'),'stock':stock,'uuid':f.get('data_source_uuid'),'data_source':f.get('data_source'),'original_id':f.get('original_id'),'page_url':f.get('page_url'),'share_url':f.get('share_url'),'summary':str(f.get('summary') or '')[:500]}
+                          matches.append(row)
+                          print('COMPANY_REPORT',json.dumps(row,ensure_ascii=False))
+                  if page*100>=int(data.get('total') or 0): break
+          print('MATCH_COUNT',len(matches))
+          for row in sorted(matches,key=lambda x:(str(x.get('date') or ''),int(x.get('pages') or 0)),reverse=True):
+              print('SORTED',json.dumps(row,ensure_ascii=False))
+          PY
