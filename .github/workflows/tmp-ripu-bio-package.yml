@@ -1,0 +1,202 @@
+name: Temporary Ripro Bio broker report package
+
+on:
+  push:
+    branches:
+      - tmp/download-ripu-bio-reports-20260829
+    paths:
+      - .github/workflows/tmp-ripu-bio-package.yml
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF verification tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --quiet pypdf requests
+
+      - name: Download, validate, render and package original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output verify
+          cat > /tmp/download_verify.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          VERIFY = Path('verify')
+          OUT.mkdir(exist_ok=True)
+          VERIFY.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '华鑫证券',
+                  'date': '2025-10-13',
+                  'title': '公司深度报告：禽畜药苗擎旗固本，宠物板块振翼拓新',
+                  'info_code': 'AP202510131761186843',
+                  'expected_pages': 29,
+                  'filename': '01_华鑫证券_禽畜药苗擎旗固本_宠物板块振翼拓新_20251013_29页.pdf',
+                  'type': '公司深度报告',
+              },
+              {
+                  'broker': '国信证券',
+                  'date': '2024-06-12',
+                  'title': '畜禽动保业务规模领先，宠物动保业务进入收获期',
+                  'info_code': 'AP202406121636014992',
+                  'expected_pages': 34,
+                  'filename': '02_国信证券_畜禽动保业务规模领先_宠物动保业务进入收获期_20240612_34页.pdf',
+                  'type': '公司深度报告',
+              },
+              {
+                  'broker': '华安证券',
+                  'date': '2023-04-10',
+                  'title': '缔造禽用疫苗领导品牌，宠物药品布局渐入佳境',
+                  'info_code': 'AP202304101585263085',
+                  'expected_pages': 51,
+                  'filename': '03_华安证券_缔造禽用疫苗领导品牌_宠物药品布局渐入佳境_20230410_51页.pdf',
+                  'type': '公司深度报告',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+          })
+
+          manifest = []
+          for index, report in enumerate(reports, 1):
+              url = f"https://pdf.dfcfw.com/pdf/H3_{report['info_code']}_1.pdf"
+              print(f'DOWNLOAD {index}: {url}')
+              response = None
+              last_error = None
+              for attempt in range(1, 7):
+                  try:
+                      response = session.get(url, timeout=(30, 240), allow_redirects=True)
+                      print(' attempt', attempt, 'status', response.status_code,
+                            'bytes', len(response.content), 'type', response.headers.get('content-type'),
+                            'final', response.url)
+                      if response.status_code == 200 and response.content[:5] == b'%PDF-' and len(response.content) > 100_000:
+                          break
+                      last_error = RuntimeError(
+                          f'invalid response status={response.status_code}, bytes={len(response.content)}, head={response.content[:30]!r}'
+                      )
+                  except Exception as exc:
+                      last_error = exc
+                  time.sleep(attempt * 2)
+              else:
+                  raise RuntimeError(f"Unable to download {report['filename']}: {last_error}")
+
+              content = response.content
+              path = OUT / report['filename']
+              path.write_bytes(content)
+
+              reader = PdfReader(io.BytesIO(content), strict=False)
+              pages = len(reader.pages)
+              print(' pages', pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(
+                      f"Page mismatch for {report['filename']}: expected {report['expected_pages']}, got {pages}"
+                  )
+
+              extracted_parts = []
+              for pageno in range(min(8, pages)):
+                  try:
+                      extracted_parts.append(reader.pages[pageno].extract_text() or '')
+                  except Exception as exc:
+                      extracted_parts.append(f'[extract error: {exc}]')
+              extracted = '\n'.join(extracted_parts)
+              compact = re.sub(r'\s+', '', extracted)
+              if not ('瑞普生物' in compact or '300119' in compact):
+                  raise RuntimeError(f"Identity verification failed for {report['filename']}")
+
+              sha256 = hashlib.sha256(content).hexdigest()
+              (VERIFY / f'{index:02d}_first_pages_text.txt').write_text(extracted, encoding='utf-8')
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120',
+                  str(path), str(VERIFY / f'{index:02d}_page1')
+              ], check=True)
+              subprocess.run([
+                  'pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90',
+                  str(path), str(VERIFY / f'{index:02d}_last_page')
+              ], check=True)
+
+              manifest.append({
+                  'filename': report['filename'],
+                  'broker': report['broker'],
+                  'date': report['date'],
+                  'title': report['title'],
+                  'type': report['type'],
+                  'pages': pages,
+                  'source_url': response.url,
+                  'info_code': report['info_code'],
+                  'bytes': len(content),
+                  'sha256': sha256,
+                  'identity_check': '通过：前8页可识别“瑞普生物”或“300119”',
+              })
+
+          lines = [
+              '瑞普生物（300119.SZ）券商深度报告清单与核验说明',
+              '',
+              '本压缩包包含3份公开可直接取得的券商深度报告PDF原文件。',
+              '所有文件均已核验PDF文件头、实际页数、公司名称/股票代码，并成功渲染首页和末页。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              lines.extend([
+                  f"{i}. {item['broker']}｜{item['date']}｜{item['title']}",
+                  f"   类型：{item['type']}；页数：{item['pages']}页",
+                  f"   文件：{item['filename']}",
+                  f"   公开PDF：{item['source_url']}",
+                  f"   SHA256：{item['sha256']}",
+                  f"   身份核验：{item['identity_check']}",
+                  '',
+              ])
+          lines.append('资料仅供研究参考，不构成投资建议。')
+          (OUT / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (VERIFY / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (OUT / 'SHA256SUMS.txt').open('w', encoding='utf-8') as fh:
+              for item in manifest:
+                  fh.write(f"{item['sha256']}  {item['filename']}\n")
+
+          print('MANIFEST')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+          python /tmp/download_verify.py | tee verify/run.log
+          ls -lh output verify
+
+      - name: Upload final report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripu-bio-broker-deep-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+
+      - name: Upload verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ripu-bio-broker-deep-reports-verification
+          path: verify/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
