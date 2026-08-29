@@ -1,0 +1,119 @@
+name: Temporary Dunhuang Seed Sina attachment URL inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-url-inspect-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Fetch and inspect attachment landing pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/scripts
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for rid in 365771252125 365499152875 336478009061 616733300399; do
+            page="https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/${rid}/index.phtml"
+            link="https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/${rid}/url"
+            curl --http1.1 -L --silent --show-error --retry 4 --retry-all-errors \
+              --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' \
+              --cookie-jar "diagnostics/${rid}.cookies" \
+              --dump-header "diagnostics/${rid}_page.headers" \
+              "$page" -o "diagnostics/${rid}_page.html"
+            curl --http1.1 -L --silent --show-error --retry 4 --retry-all-errors \
+              --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+              --referer "$page" --header 'Accept-Encoding: identity' \
+              --cookie "diagnostics/${rid}.cookies" \
+              --dump-header "diagnostics/${rid}_url.headers" \
+              "$link" -o "diagnostics/${rid}_url.html"
+          done
+          python - <<'PY'
+          import html,json,re,subprocess,urllib.parse
+          from pathlib import Path
+
+          base='https://stock.finance.sina.com.cn'
+          report=[]; all_scripts=[]; all_candidates=[]
+          for p in sorted(Path('diagnostics').glob('*_url.html')):
+              rid=p.stem.split('_')[0]
+              raw=p.read_bytes()
+              texts=[raw.decode(enc,'ignore') for enc in ('utf-8','gb18030','gbk')]
+              text=max(texts,key=lambda x:x.lower().count('pdf')+x.lower().count('download')+x.count('下载')+x.count('敦煌种业'))
+              norm=html.unescape(text.replace('\\/','/'))
+              tm=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+              title=re.sub(r'<[^>]+>','',tm.group(1)).strip() if tm else ''
+              hrefs=[]; scripts=[]; forms=[]; candidates=[]
+              for u in re.findall(r'(?:href|src|action)=["\']([^"\']+)["\']',norm,re.I):
+                  full=urllib.parse.urljoin(f'{base}/stock/go.php/vReport_Show/kind/search/rptid/{rid}/url',html.unescape(u))
+                  hrefs.append(full)
+                  if re.search(r'\.js(?:\?|$)',full,re.I): scripts.append(full)
+                  if re.search(r'pdf|download|attach|file|url|report|rptid',full,re.I): candidates.append(full)
+              for pat in [
+                  r'https?://[^"\'<>\s]+',
+                  r'(?:window\.)?location(?:\.href)?\s*=\s*["\']([^"\']+)',
+                  r'(?:window\.)?open\s*\(\s*["\']([^"\']+)',
+                  r'url\s*[:=]\s*["\']([^"\']+)',
+                  r'file(?:Url|url|Path|path)?\s*[:=]\s*["\']([^"\']+)',
+              ]:
+                  for match in re.findall(pat,norm,re.I):
+                      u=match if isinstance(match,str) else match[0]
+                      full=urllib.parse.urljoin(f'{base}/stock/go.php/vReport_Show/kind/search/rptid/{rid}/url',urllib.parse.unquote(html.unescape(u)).rstrip('),;]'))
+                      if re.search(r'pdf|download|attach|file|url|report|rptid|http',full,re.I): candidates.append(full)
+              for fm in re.findall(r'<form\b.*?</form>',norm,re.I|re.S):
+                  forms.append(re.sub(r'\s+',' ',fm)[:3000])
+              relevant=[]
+              for line in norm.splitlines():
+                  if re.search(r'pdf|download|下载|attach|file|url|rptid|location|window\.open|验证码|登录|原文',line,re.I):
+                      relevant.append(re.sub(r'\s+',' ',line).strip()[:5000])
+              report.append({
+                  'rid':rid,'size':len(raw),'title':title,
+                  'headers':Path(f'diagnostics/{rid}_url.headers').read_text(encoding='utf-8',errors='ignore'),
+                  'hrefs':list(dict.fromkeys(hrefs)),
+                  'scripts':list(dict.fromkeys(scripts)),
+                  'forms':forms,
+                  'candidates':list(dict.fromkeys(candidates)),
+                  'relevant':relevant[:300],
+                  'prefix':norm[:5000],
+              })
+              all_scripts.extend(scripts); all_candidates.extend(candidates)
+
+          all_scripts=list(dict.fromkeys(all_scripts))
+          for i,u in enumerate(all_scripts[:100]):
+              out=Path(f'diagnostics/scripts/{i:03d}.js')
+              proc=subprocess.run([
+                  'curl','--http1.1','-L','--silent','--show-error','--retry','3','--retry-all-errors',
+                  '--connect-timeout','15','--max-time','120','--user-agent','Mozilla/5.0',
+                  '--header','Accept-Encoding: identity',u,'-o',str(out)
+              ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if proc.returncode: out.unlink(missing_ok=True)
+
+          script_hits=[]
+          for p in Path('diagnostics/scripts').glob('*.js'):
+              text=p.read_text(encoding='utf-8',errors='ignore')
+              for m in re.finditer(r'pdf|download|attach|file|vReport_Show|rptid|location|window\.open',text,re.I):
+                  a=max(0,m.start()-700); b=min(len(text),m.end()+1800)
+                  script_hits.append(f'===== {p.name} =====\n{text[a:b]}')
+                  if len(script_hits)>300: break
+          Path('diagnostics/inspection.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/script_hits.txt').write_text('\n\n'.join(script_hits),encoding='utf-8')
+          Path('diagnostics/all_candidates.txt').write_text('\n'.join(dict.fromkeys(all_candidates)),encoding='utf-8')
+          for row in report:
+              print('===',row['rid'],row['size'],row['title'])
+              for c in row['candidates'][:40]: print('CANDIDATE',c)
+              for line in row['relevant'][:30]: print('LINE',line[:2000])
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-sina-url-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
