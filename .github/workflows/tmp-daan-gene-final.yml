@@ -1,0 +1,298 @@
+name: Temporary Daan Gene final broker deep reports package
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-final-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Download, validate, select and package original reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/package_daan_gene.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          REFERER = 'https://emweb.eastmoney.com/PC_HSF10/ResearchReport/Index?code=SZ002030&type=soft'
+
+          # Exact historical company-research records returned by Eastmoney HSF10.
+          candidates = [
+              {
+                  'art_code': 'AP201602170013501528',
+                  'date': '2016-02-17',
+                  'broker': '广证恒生',
+                  'title': '深度报告：分子诊断行业待爆发，龙头达安笑傲江湖',
+                  'base_score': 2200,
+              },
+              {
+                  'art_code': 'AP201409010006859843',
+                  'date': '2014-09-02',
+                  'broker': '东兴证券',
+                  'title': '投资达安就是投资个体化诊疗的大时代',
+                  'base_score': 1250,
+              },
+              {
+                  'art_code': 'AP201409160007008220',
+                  'date': '2014-09-16',
+                  'broker': '东莞证券',
+                  'title': '分子诊断龙头，想象空间较大',
+                  'base_score': 1200,
+              },
+              {
+                  'art_code': 'AP201609010017441394',
+                  'date': '2016-09-01',
+                  'broker': '华金证券',
+                  'title': '服务类产品收入大幅提升，积极布局基因诊断',
+                  'base_score': 850,
+              },
+              {
+                  'art_code': 'AP201411060007567240',
+                  'date': '2014-11-06',
+                  'broker': '东兴证券',
+                  'title': '取得高通量测序证书，看好行业发展空间',
+                  'base_score': 720,
+              },
+              {
+                  'art_code': 'AP201410280007460597',
+                  'date': '2014-10-29',
+                  'broker': '东兴证券',
+                  'title': '主营业务大幅增长，继续看好长期投资价值',
+                  'base_score': 650,
+              },
+              {
+                  'art_code': 'AP201503300008991903',
+                  'date': '2015-03-30',
+                  'broker': '东兴证券',
+                  'title': '2014年报点评：关注公司大格局，把握个体化诊疗给公司带来的投资机会',
+                  'base_score': 250,
+              },
+              {
+                  'art_code': 'AP201604010014195337',
+                  'date': '2016-04-01',
+                  'broker': '上海证券',
+                  'title': '2015年年报点评：各项业务保持平稳增长',
+                  'base_score': 150,
+              },
+              {
+                  'art_code': 'AP201404300005626138',
+                  'date': '2014-05-04',
+                  'broker': '东兴证券',
+                  'title': '主业发力，一季报释放积极信号',
+                  'base_score': 120,
+              },
+          ]
+
+          def safe_name(value: str, limit: int = 78) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', '', value).strip(' ._')
+              return (value or '报告')[:limit]
+
+          def fetch_pdf(url: str, destination: Path) -> tuple[bool, str]:
+              destination.unlink(missing_ok=True)
+              proc = subprocess.run(
+                  [
+                      'curl', '--http1.1', '--location', '--fail', '--silent', '--show-error',
+                      '--retry', '7', '--retry-all-errors', '--retry-delay', '1',
+                      '--connect-timeout', '20', '--max-time', '360',
+                      '--user-agent', UA, '--referer', REFERER,
+                      '--header', 'Accept-Encoding: identity',
+                      '--header', 'Accept: application/pdf,application/octet-stream,*/*',
+                      '--output', str(destination), url,
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+              )
+              return proc.returncode == 0, proc.stderr[-1800:]
+
+          results: list[dict] = []
+          failures: list[dict] = []
+          seen_hashes: set[str] = set()
+          temp = DIST / '_candidate.pdf'
+
+          for item in candidates:
+              code = item['art_code']
+              stamp = int(time.time() * 1000)
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{stamp}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{code}.pdf',
+                  f'http://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+              ]
+              accepted = False
+              errors: list[str] = []
+              for url in urls:
+                  ok, err = fetch_pdf(url, temp)
+                  if not ok:
+                      errors.append(f'{url}: {err}')
+                      continue
+                  try:
+                      raw = temp.read_bytes()
+                      if len(raw) < 100_000 or not raw.startswith(b'%PDF-'):
+                          raise RuntimeError(f'invalid or too small PDF: {len(raw)} bytes')
+                      digest = hashlib.sha256(raw).hexdigest()
+                      if digest in seen_hashes:
+                          raise RuntimeError('duplicate PDF')
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < 5:
+                          raise RuntimeError(f'only {pages} pages')
+                      sample_parts: list[str] = []
+                      for page in reader.pages[: min(12, pages)]:
+                          try:
+                              sample_parts.append(page.extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = re.sub(r'\s+', '', ' '.join(sample_parts))
+                      identity = ('达安基因' in compact or '002030' in compact or 'DAANGENE' in compact.upper())
+                      if not identity:
+                          raise RuntimeError('company identity not found in first twelve pages')
+                      filename = f'{item["date"]}_{safe_name(item["broker"], 18)}_{safe_name(item["title"])}_{pages}页.pdf'
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+                      score = int(item['base_score']) + min(pages, 80) * 12
+                      record = {
+                          **item,
+                          'filename': filename,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': digest,
+                          'url': url,
+                          'score': score,
+                      }
+                      results.append(record)
+                      seen_hashes.add(digest)
+                      print('VALIDATED', json.dumps(record, ensure_ascii=False))
+                      accepted = True
+                      break
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+                  finally:
+                      temp.unlink(missing_ok=True)
+              if not accepted:
+                  failures.append({**item, 'errors': errors})
+
+          DIAG.joinpath('validated_reports.json').write_text(
+              json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          DIAG.joinpath('download_failures.json').write_text(
+              json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          if len(results) < 2:
+              raise RuntimeError(f'Only {len(results)} validated original reports downloaded')
+
+          # Select genuine long-form coverage first, while preferring different brokers.
+          results.sort(key=lambda x: (x['score'], x['pages'], x['date']), reverse=True)
+          long_form = [x for x in results if x['pages'] >= 10]
+          pool = long_form if len(long_form) >= 2 else results
+          selected: list[dict] = []
+          used_brokers: set[str] = set()
+          for item in pool:
+              if item['broker'] in used_brokers:
+                  continue
+              selected.append(item)
+              used_brokers.add(item['broker'])
+              if len(selected) == 3:
+                  break
+          for item in pool:
+              if len(selected) == 3:
+                  break
+              if item not in selected:
+                  selected.append(item)
+          if len(selected) < 2:
+              raise RuntimeError('Fewer than two suitable reports after long-form selection')
+
+          keep = {x['filename'] for x in selected}
+          for path in REPORTS.glob('*.pdf'):
+              if path.name not in keep:
+                  path.unlink()
+
+          manifest = [
+              '达安基因（002030）券商深度报告资料包',
+              '筛选规则：优先公司深度、行业龙头专题和长篇公司研究；不以短篇季报、年报点评凑数。',
+              '所有PDF均为公开来源的原始文件，并已核验PDF文件头、公司名称、实际页数和SHA-256。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(selected, 1):
+              manifest.extend([
+                  f'{index}. {item["title"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   日期：{item["date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   公开来源：{item["url"]}',
+                  '',
+              ])
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+          DIAG.joinpath('selected_reports.json').write_text(
+              json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          final_zip = DIST / f'达安基因_券商深度报告_{len(selected)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(selected):
+                  raise RuntimeError(f'PDF count mismatch: {pdfs}')
+
+          print('SELECTED_REPORTS')
+          for item in selected:
+              print(json.dumps(item, ensure_ascii=False))
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/package_daan_gene.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-final-original-deep-reports
+          path: dist/达安基因_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-final-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
