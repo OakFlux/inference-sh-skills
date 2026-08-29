@@ -1,0 +1,91 @@
+name: Temporary Jiuqi old archive scan
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-old-archive-scan.yml
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Scan Hibor monthly archives and detail metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'})
+          matches={}
+          # Target likely listing/coverage periods first, then all months 2009-2013.
+          months=['200907','200908','201108','201109']+[f'{y}{m:02d}' for y in range(2009,2014) for m in range(1,13)]
+          seen_month=set()
+          for ym in months:
+              if ym in seen_month: continue
+              seen_month.add(ym)
+              for base in ['https://p.hibor.com.cn/Archiver/','https://www.hibor.com.cn/archiver_houtai/']:
+                  url=base+ym+'.html'
+                  try:
+                      r=s.get(url,timeout=45,allow_redirects=True)
+                      if r.status_code!=200 or len(r.content)<500: continue
+                      # Archives are often GBK/GB18030 regardless of HTTP declaration.
+                      candidates=[]
+                      for enc in ['utf-8','gb18030','gbk']:
+                          try:
+                              text=r.content.decode(enc,errors='replace')
+                              score=text.count('久其软件')+text.count('002279')
+                              candidates.append((score,enc,text))
+                          except Exception: pass
+                      score,enc,text=max(candidates,key=lambda x:x[0])
+                      if score<=0: continue
+                      print('\nMONTH_HIT',ym,base,'ENC',enc,'SCORE',score,'LEN',len(text))
+                      soup=BeautifulSoup(text,'html.parser')
+                      for a in soup.find_all('a',href=True):
+                          label=' '.join(a.get_text(' ',strip=True).split())
+                          blob=label+' '+a['href']
+                          if '久其软件' in blob or '002279' in blob:
+                              href=urllib.parse.urljoin(r.url,a['href'])
+                              key=(label,href)
+                              matches[key]=ym
+                              print('LINK',json.dumps({'ym':ym,'label':label,'href':href},ensure_ascii=False))
+                  except Exception as e: print('MONTH_ERR',ym,base,repr(e))
+
+          print('\nTOTAL_LINKS',len(matches))
+          for (label,url),ym in matches.items():
+              print('\nDETAIL',ym,label,url)
+              try:
+                  r=s.get(url,timeout=60,allow_redirects=True)
+                  print('HTTP',r.status_code,'BYTES',len(r.content),'FINAL',r.url)
+                  dec=[]
+                  for enc in ['utf-8','gb18030','gbk']:
+                      try:
+                          t=r.content.decode(enc,errors='replace')
+                          score=sum(t.count(k) for k in ['久其软件','研报页数','研报出处','研报作者','推荐评级'])
+                          dec.append((score,enc,t))
+                      except Exception: pass
+                  score,enc,text=max(dec,key=lambda x:x[0])
+                  soup=BeautifulSoup(text,'html.parser')
+                  visible=' '.join(soup.get_text(' ',strip=True).split())
+                  title=soup.title.get_text(' ',strip=True) if soup.title else label
+                  meta={'ym':ym,'label':label,'url':r.url,'title':title,'encoding':enc,'bytes':len(r.content)}
+                  for field in ['研报页数','研报大小','研报出处','研报作者','推荐评级','分享时间']:
+                      p=visible.find(field)
+                      if p>=0: meta[field]=visible[p:p+200]
+                  # Robust page count pattern.
+                  pm=re.search(r'研报页数[：:\s]*(\d+)\s*页',visible)
+                  if pm: meta['pages']=int(pm.group(1))
+                  print('META',json.dumps(meta,ensure_ascii=False))
+                  # Print candidate asset and action elements.
+                  for pat in [r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',r'https?://[^\s"\'<>]+(?:download|down|file|attachment|pdf)[^\s"\'<>]*']:
+                      for x in sorted(set(re.findall(pat,text,re.I))): print('ASSET',x[:1500])
+              except Exception as e: print('DETAIL_ERR',url,repr(e))
+          PY
