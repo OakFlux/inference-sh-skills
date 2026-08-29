@@ -1,0 +1,296 @@
+name: Temporary Kanghua Biological broker reports package
+
+on:
+  push:
+    branches:
+      - 'tmp/kanghua-bio-reports-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Discover, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/package_kanghua.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import unquote
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('dist')
+          REPORT_DIR = OUT / 'reports'
+          DIAG = Path('diagnostics')
+          REPORT_DIR.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          api = (
+              'https://reportapi.eastmoney.com/report/list'
+              '?industryCode=*&pageSize=100&industry=*&rating=*&ratingChange=*'
+              '&beginTime=2020-01-01&endTime=2026-08-29&pageNo=1&fields=&qType=0'
+              '&orgCode=&code=300841&rcode=&p=1&pageNum=1&pageNumber=1'
+          )
+          r = session.get(api, headers={'Referer': 'https://data.eastmoney.com/report/300841.html'}, timeout=90)
+          r.raise_for_status()
+          DIAG.joinpath('eastmoney_api_raw.txt').write_bytes(r.content)
+          text = r.text.strip()
+          if text.startswith('callback'):
+              text = text[text.find('(') + 1:text.rfind(')')]
+          elif text and text[0] != '{' and '(' in text and text.rstrip().endswith(')'):
+              text = text[text.find('(') + 1:text.rfind(')')]
+          payload = json.loads(text)
+          records = payload.get('data') or payload.get('result', {}).get('data') or []
+          if not isinstance(records, list):
+              raise RuntimeError(f'Unexpected Eastmoney payload keys: {payload.keys()}')
+
+          def compact(s: str) -> str:
+              return re.sub(r'\s+', '', s or '')
+
+          metadata_lines = []
+          for rec in records:
+              metadata_lines.append(json.dumps(rec, ensure_ascii=False, sort_keys=True))
+          DIAG.joinpath('all_records.jsonl').write_text('\n'.join(metadata_lines), encoding='utf-8')
+
+          targets = [
+              {
+                  'keywords': ['人二倍体狂犬疫苗龙头创新升级', '上实系国资入主'],
+                  'fallback_title': '人二倍体狂犬疫苗龙头创新升级，上实系国资入主开启增长新篇章',
+                  'broker': '方正证券',
+                  'date': '2025-11-25',
+                  'expected_min_pages': 20,
+                  'out': '01_方正证券_康华生物_人二倍体狂犬疫苗龙头创新升级_上实系国资入主开启增长新篇章_2025-11-25.pdf',
+              },
+              {
+                  'keywords': ['单品放量', '动保启航'],
+                  'fallback_title': '深度报告：单品放量、动保启航',
+                  'broker': '浙商证券',
+                  'date': '2022-09-27',
+                  'expected_min_pages': 20,
+                  'out': '02_浙商证券_康华生物_单品放量_动保启航_2022-09-27.pdf',
+              },
+              {
+                  'keywords': ['人用狂苗产能释放', '领先布局犬用狂苗'],
+                  'fallback_title': '人用狂苗产能释放，领先布局犬用狂苗',
+                  'broker': '华安证券',
+                  'date': '2022-07-22',
+                  'expected_min_pages': 20,
+                  'out': '03_华安证券_康华生物_人用狂苗产能释放_领先布局犬用狂苗_2022-07-22.pdf',
+              },
+          ]
+
+          # Known Eastmoney ID for the 2022 Huaan deep report; the other IDs are resolved from the API.
+          known_ids = {'人用狂苗产能释放': 'AP202207221576470478'}
+
+          def find_record(target):
+              for rec in records:
+                  title = compact(str(rec.get('title') or rec.get('reportTitle') or ''))
+                  if all(compact(k) in title for k in target['keywords']):
+                      return rec
+              # Looser match when punctuation or subtitle formatting differs.
+              for rec in records:
+                  title = compact(str(rec.get('title') or rec.get('reportTitle') or ''))
+                  if any(compact(k) in title for k in target['keywords']):
+                      return rec
+              return None
+
+          def record_code(rec):
+              if not rec:
+                  return None
+              for key in ('infoCode', 'infocode', 'info_code'):
+                  value = rec.get(key)
+                  if value:
+                      return str(value)
+              return None
+
+          def extract_pdf_links(html_text: str) -> list[str]:
+              normalized = html_text.replace('\\/', '/').replace('&amp;', '&')
+              hits = re.findall(r'https?://pdf\.dfcfw\.com/pdf/[^"\'<>\\ ]+', normalized, re.I)
+              result = []
+              for hit in hits:
+                  hit = unquote(hit).rstrip(');,')
+                  if hit not in result:
+                      result.append(hit)
+              return result
+
+          def candidate_urls(info_code: str) -> list[str]:
+              urls = []
+              detail = f'https://data.eastmoney.com/report/info/{info_code}.html'
+              try:
+                  resp = session.get(detail, headers={'Referer': 'https://data.eastmoney.com/report/'}, timeout=60)
+                  DIAG.joinpath(f'{info_code}_detail.html').write_bytes(resp.content)
+                  if resp.ok:
+                      urls.extend(extract_pdf_links(resp.text))
+              except Exception as exc:
+                  DIAG.joinpath(f'{info_code}_detail_error.txt').write_text(repr(exc), encoding='utf-8')
+              urls.extend([
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf?{int(time.time() * 1000)}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf?{info_code}.pdf',
+              ])
+              dedup = []
+              for u in urls:
+                  if u not in dedup:
+                      dedup.append(u)
+              return dedup
+
+          def download_valid_pdf(info_code: str, destination: Path, minimum_pages: int):
+              errors = []
+              for url in candidate_urls(info_code):
+                  for attempt in range(2):
+                      try:
+                          resp = session.get(
+                              url,
+                              headers={
+                                  'Referer': f'https://data.eastmoney.com/report/info/{info_code}.html',
+                                  'Accept': 'application/pdf,application/octet-stream,*/*',
+                              },
+                              timeout=180,
+                              allow_redirects=True,
+                          )
+                          raw = resp.content
+                          if resp.status_code != 200:
+                              raise RuntimeError(f'HTTP {resp.status_code}')
+                          if len(raw) < 100_000 or not raw.startswith(b'%PDF-'):
+                              raise RuntimeError(f'not a complete PDF: {len(raw)} bytes, type={resp.headers.get("content-type")}, head={raw[:20]!r}')
+                          destination.write_bytes(raw)
+                          reader = PdfReader(str(destination), strict=False)
+                          pages = len(reader.pages)
+                          if pages < minimum_pages:
+                              raise RuntimeError(f'only {pages} pages')
+                          sample = ''
+                          for page in reader.pages[:5]:
+                              try:
+                                  sample += ' ' + (page.extract_text() or '')
+                              except Exception:
+                                  pass
+                          sample_compact = compact(sample)
+                          if '康华生物' not in sample_compact and '300841' not in sample_compact:
+                              raise RuntimeError('company identity not found in first five pages')
+                          return {
+                              'url': resp.url,
+                              'pages': pages,
+                              'size': len(raw),
+                              'sha256': hashlib.sha256(raw).hexdigest(),
+                          }
+                      except Exception as exc:
+                          destination.unlink(missing_ok=True)
+                          errors.append(f'{url} attempt {attempt + 1}: {exc!r}')
+                          time.sleep(1)
+              raise RuntimeError('; '.join(errors))
+
+          results = []
+          failures = []
+          for target in targets:
+              rec = find_record(target)
+              title = target['fallback_title']
+              broker = target['broker']
+              date = target['date']
+              info_code = record_code(rec)
+              if rec:
+                  title = str(rec.get('title') or rec.get('reportTitle') or title)
+                  broker = str(rec.get('orgSName') or rec.get('orgName') or broker)
+                  date = str(rec.get('publishDate') or rec.get('publishTime') or date)[:10]
+              if not info_code:
+                  for key, value in known_ids.items():
+                      if key in target['fallback_title']:
+                          info_code = value
+                          break
+              if not info_code:
+                  failures.append({'target': target, 'reason': 'No Eastmoney infoCode found', 'record': rec})
+                  continue
+              destination = REPORT_DIR / target['out']
+              try:
+                  meta = download_valid_pdf(info_code, destination, target['expected_min_pages'])
+                  results.append({
+                      'filename': destination.name,
+                      'title': title,
+                      'broker': broker,
+                      'date': date,
+                      'infoCode': info_code,
+                      **meta,
+                  })
+                  print('OK', destination.name, meta)
+              except Exception as exc:
+                  failures.append({'target': target, 'infoCode': info_code, 'record': rec, 'reason': repr(exc)})
+                  print('FAILED', target['out'], repr(exc))
+
+          DIAG.joinpath('results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          DIAG.joinpath('failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(results) < 2:
+              raise RuntimeError(f'Only {len(results)} validated reports downloaded; see diagnostics/failures.json')
+
+          manifest = [
+              '康华生物（300841）券商深度报告资料包',
+              '筛选规则：优先收录公司深度/首次覆盖类报告；仅保留可完整打开且不少于20页的原始PDF。',
+              '资料仅供研究参考，请遵守报告版权声明及使用限制。',
+              '',
+          ]
+          for item in results:
+              manifest.extend([
+                  item['filename'],
+                  f"  券商：{item['broker']}",
+                  f"  日期：{item['date']}",
+                  f"  标题：{item['title']}",
+                  f"  页数：{item['pages']}",
+                  f"  文件大小：{item['size']} bytes",
+                  f"  SHA-256：{item['sha256']}",
+                  f"  公开来源：{item['url']}",
+                  '',
+              ])
+          REPORT_DIR.joinpath('资料清单.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = OUT / f'康华生物_券商深度报告_{len(results)}份_完整PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(REPORT_DIR.iterdir()):
+                  zf.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/package_kanghua.py
+
+      - name: Upload final ZIP
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghua-biological-broker-reports
+          path: dist/*.zip
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghua-biological-report-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
