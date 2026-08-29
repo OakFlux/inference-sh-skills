@@ -1,0 +1,109 @@
+name: Temporary Daan Gene fast final report package
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-fast-final-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Download and package three exact long-form reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/fast_daan.py <<'PY'
+          from __future__ import annotations
+          import hashlib,json,re,subprocess,time,zipfile
+          from concurrent.futures import ThreadPoolExecutor,as_completed
+          from pathlib import Path
+          from pypdf import PdfReader
+
+          DIST=Path('dist');REPORTS=DIST/'reports';DIAG=Path('diagnostics')
+          REPORTS.mkdir(parents=True,exist_ok=True);DIAG.mkdir(parents=True,exist_ok=True)
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          REF='https://emweb.eastmoney.com/PC_HSF10/ResearchReport/Index?code=SZ002030&type=soft'
+          items=[
+            {'art_code':'AP201602170013501528','date':'2016-02-17','broker':'广证恒生','title':'深度报告：分子诊断行业待爆发，龙头达安笑傲江湖'},
+            {'art_code':'AP201409010006859843','date':'2014-09-02','broker':'东兴证券','title':'投资达安就是投资个体化诊疗的大时代'},
+            {'art_code':'AP201409160007008220','date':'2014-09-16','broker':'东莞证券','title':'分子诊断龙头，想象空间较大'},
+          ]
+          def safe(s,n=80):
+            s=re.sub(r'[\\/:*?"<>|\r\n]+','_',s);s=re.sub(r'\s+','',s).strip(' ._');return s[:n]
+          def worker(item):
+            code=item['art_code'];tmp=DIST/f'{code}.pdf';errors=[]
+            stamp=int(time.time()*1000)
+            urls=[f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{stamp}.pdf',f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf']
+            for url in urls:
+              tmp.unlink(missing_ok=True)
+              p=subprocess.run(['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','3','--retry-all-errors','--retry-delay','1','--connect-timeout','15','--max-time','120','--user-agent',UA,'--referer',REF,'--header','Accept-Encoding: identity','--header','Accept: application/pdf,application/octet-stream,*/*','-o',str(tmp),url],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode:
+                errors.append(f'{url}: {p.stderr[-600:]}');continue
+              try:
+                raw=tmp.read_bytes()
+                if len(raw)<100000 or not raw.startswith(b'%PDF-'):raise RuntimeError(f'invalid {len(raw)}')
+                reader=PdfReader(str(tmp),strict=False);pages=len(reader.pages)
+                text=''
+                for pg in reader.pages[:min(12,pages)]:
+                  try:text+=' '+(pg.extract_text() or '')
+                  except:pass
+                compact=re.sub(r'\s+','',text)
+                if '达安基因' not in compact and '002030' not in compact and 'DAANGENE' not in compact.upper():raise RuntimeError('identity missing')
+                name=f'{item["date"]}_{safe(item["broker"],18)}_{safe(item["title"])}_{pages}页.pdf'
+                out=REPORTS/name;out.write_bytes(raw);tmp.unlink(missing_ok=True)
+                return {**item,'filename':name,'pages':pages,'size':len(raw),'sha256':hashlib.sha256(raw).hexdigest(),'url':url}
+              except Exception as exc:
+                errors.append(f'{url}: {exc!r}');tmp.unlink(missing_ok=True)
+            return {**item,'errors':errors}
+          results=[];failures=[]
+          with ThreadPoolExecutor(max_workers=3) as ex:
+            futs=[ex.submit(worker,x) for x in items]
+            for fut in as_completed(futs):
+              r=fut.result()
+              if 'filename' in r:results.append(r);print('OK',json.dumps(r,ensure_ascii=False))
+              else:failures.append(r);print('FAIL',json.dumps(r,ensure_ascii=False))
+          results.sort(key=lambda x:(x['pages'],x['date']),reverse=True)
+          DIAG.joinpath('results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          DIAG.joinpath('failures.json').write_text(json.dumps(failures,ensure_ascii=False,indent=2),encoding='utf-8')
+          if len(results)<2:raise RuntimeError(f'Only {len(results)} reports downloaded')
+          manifest=['达安基因（002030）券商深度报告资料包','优先收录公司深度和分子诊断龙头专题研究。','所有PDF均已核验文件头、公司名称、实际页数和SHA-256。','资料仅供研究参考，请遵守原报告版权声明和使用限制。','']
+          for i,x in enumerate(results,1):
+            manifest += [f'{i}. {x["title"]}',f'   券商：{x["broker"]}',f'   日期：{x["date"]}',f'   页数：{x["pages"]}',f'   文件：{x["filename"]}',f'   SHA-256：{x["sha256"]}',f'   公开来源：{x["url"]}','']
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(manifest),encoding='utf-8')
+          final=DIST/f'达安基因_券商深度报告_{len(results)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(REPORTS.iterdir()):z.write(p,p.name)
+          with zipfile.ZipFile(final) as z:
+            if z.testzip():raise RuntimeError('ZIP integrity failure')
+            if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=len(results):raise RuntimeError('PDF count mismatch')
+          print('FINAL',final,final.stat().st_size)
+          PY
+          python /tmp/fast_daan.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-fast-final-original-reports
+          path: dist/达安基因_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-fast-final-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
