@@ -1,0 +1,67 @@
+name: Dunhuang Hibor dynamic content retry
+on:
+  push:
+    branches: ['tmp/dunhuang-hibor-content2-20260829']
+permissions:
+  contents: read
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Reproduce browser request chain
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+          START='https://www.hibor.com.cn/docdetail_548523.html'
+          EFFECTIVE=$(curl --http1.1 -L --fail --silent --show-error --retry 5 --retry-all-errors \
+            --connect-timeout 20 --max-time 180 --user-agent "$UA" \
+            --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' \
+            --header 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+            --compressed --cookie-jar out/cookies.txt \
+            --dump-header out/page.headers --output out/page.html \
+            --write-out '%{url_effective}' "$START")
+          NCID=$(python - <<'PY'
+          import re
+          t=open('out/page.html',encoding='utf-8',errors='ignore').read()
+          print(re.search(r"var ncid = '([^']+)'",t).group(1))
+          PY
+          )
+          echo "EFFECTIVE=$EFFECTIVE"
+          echo "NCID=$NCID"
+          END='https://www.hibor.com.cn/hiborweb/DocDetail/NewContent'
+          common=(--http1.1 -L --silent --show-error --retry 3 --retry-all-errors \
+            --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+            --referer "$EFFECTIVE" --cookie out/cookies.txt --cookie-jar out/cookies.txt \
+            --header 'Origin: https://www.hibor.com.cn' \
+            --header 'X-Requested-With: XMLHttpRequest' \
+            --header 'Accept: */*' \
+            --header 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+            --compressed)
+          curl "${common[@]}" \
+            --header 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+            --data "ncid=$NCID" --dump-header out/form.headers "$END" -o out/form.body || true
+          curl "${common[@]}" \
+            --header 'Content-Type: application/x-www-form-urlencoded; charset=UTF-8' \
+            --data "ncid=$NCID&_=1" --dump-header out/form2.headers "$END" -o out/form2.body || true
+          curl "${common[@]}" \
+            --header 'Content-Type: application/json; charset=UTF-8' \
+            --data "{\"ncid\":\"$NCID\"}" --dump-header out/json.headers "$END" -o out/json.body || true
+          python - <<'PY'
+          from pathlib import Path
+          for p in sorted(Path('out').iterdir()):
+              if p.is_file():
+                  raw=p.read_bytes()
+                  print('FILE',p.name,len(raw))
+                  if p.name.endswith('.body'):
+                      print(raw[:5000].decode('utf-8','ignore').replace('\n',' ')[:5000])
+          PY
+      - name: Upload retry results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-hibor-content-retry
+          path: out/
+          retention-days: 2
+          compression-level: 9
