@@ -59,10 +59,22 @@ def main() -> None:
         code = code.replace(old, new)
 
     original_extract = "    raw_url, detail_url, context = extract_pdf_from_detail(record)"
-    replacement_extract = """    if year == 2014:
-        raw_url = \"https://www.neeq.com.cn/disclosure/2015/2015-04-23/1429788302_905419.pdf\"
+    replacement_extract = """    legacy_paths = {
+        2014: \"/disclosure/2015/2015-04-23/1429788302_905419.pdf\",
+        2015: \"/disclosure/2016/2016-04-19/1461035033_733658.pdf\",
+        2016: \"/disclosure/2017/2017-04-18/1492513077_864396.pdf\",
+        2017: \"/disclosure/2018/2018-03-30/1522391050_110718.pdf\",
+        2018: \"/disclosure/2020/2020-08-28/1598581152_197119.pdf\",
+        2019: \"/disclosure/2020/2020-04-28/1588064524_541340.pdf\",
+        2020: \"/disclosure/2021/2021-04-28/1619584409_432835.pdf\",
+        2021: \"/disclosure/2022/2022-03-31/1648726375_007257.pdf\",
+        2022: \"/disclosure/2023/2023-03-29/1680096104_495556.pdf\",
+    }
+    if year in legacy_paths:
+        legacy_path = legacy_paths[year]
+        raw_url = \"https://www.neeq.com.cn\" + legacy_path
         detail_url = \"https://www.neeq.com.cn/disclosure/announcement.html?companyCode=831087\"
-        context = \"全国股转系统官方附件：秋乐种业2014年年度报告，披露日期2015-04-23\"
+        context = f\"全国股转系统官方原始附件：秋乐种业{year}年年度报告\"
     else:
         raw_url, detail_url, context = extract_pdf_from_detail(record)"""
     if original_extract not in code:
@@ -72,8 +84,8 @@ def main() -> None:
     original_download = (
         "    used_url = download_pdf(download_candidates(raw_url), target, detail_url)"
     )
-    replacement_download = """    if year == 2014:
-        legacy_path = \"/disclosure/2015/2015-04-23/1429788302_905419.pdf\"
+    replacement_download = """    if year in legacy_paths:
+        legacy_path = legacy_paths[year]
         annual_candidates = [
             \"https://www.neeq.com.cn\" + legacy_path,
             \"https://static.neeq.com.cn\" + legacy_path,
@@ -88,21 +100,30 @@ def main() -> None:
         raise RuntimeError("Annual download line was not found")
     code = code.replace(original_download, replacement_download, 1)
 
+    original_note = '    note = "完整年度报告，不含摘要。"'
+    replacement_note = """    note = \"完整年度报告，不含摘要。\"
+    if year == 2018:
+        note += \"采用后续披露的更正后版本。\""" 
+    if original_note not in code:
+        raise RuntimeError("Annual note line was not found")
+    code = code.replace(original_note, replacement_note, 1)
+
     required = [
         'STOCK_ID = "920087"',
         'COMPANY = "河南秋乐种业科技股份有限公司"',
         'SHORT_NAME = "秋乐种业"',
         "range(2014, 2026)",
         "list(range(2014, 2026))",
-        "1429788302_905419.pdf",
+        "1598581152_197119.pdf",
+        "1680096104_495556.pdf",
         "秋乐种业_全部年报_2026年最新半年报_完整PDF.zip",
     ]
     missing = [token for token in required if token not in code]
     if missing:
         raise RuntimeError(f"Required transformations missing: {missing}")
 
-    compile(code, "qiule_generated_packaging.py", "exec")
-    exec(compile(code, "qiule_generated_packaging.py", "exec"), {"__name__": "__main__"})
+    compiled = compile(code, "qiule_generated_packaging.py", "exec")
+    exec(compiled, {"__name__": "__main__"})
 
 
 if __name__ == "__main__":
