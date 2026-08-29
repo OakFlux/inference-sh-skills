@@ -1,0 +1,152 @@
+name: Temporary Dunhuang Seed Sdyanbao public search
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-sdy-search-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query public search and detail APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/responses diagnostics/previews diagnostics/files
+          cat > /tmp/sdy_search.py <<'PY'
+          from __future__ import annotations
+          import html, json, os, re, subprocess, tempfile, urllib.parse
+          from pathlib import Path
+
+          OUT=Path('diagnostics')
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          keywords=[
+            '敦煌种业','600354','先玉高增','敦煌先锋产销激增','业绩快速回升',
+            '聚焦种业发展机遇','加工减亏 盈利可期','驱动盈利稳定增长',
+          ]
+
+          def request(method: str, url: str, body: dict|None=None, out: Path|None=None, referer: str|None=None):
+            if out is None:
+              fd,name=tempfile.mkstemp(prefix='sdy_',suffix='.bin'); os.close(fd); out=Path(name); temp=True
+            else: temp=False
+            cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','180','--user-agent',UA,'--header','Accept-Encoding: identity']
+            if referer: cmd += ['--referer',referer]
+            if method=='POST':
+              cmd += ['--request','POST','--header','Content-Type: application/json','--data',json.dumps(body,ensure_ascii=False)]
+            cmd += ['--dump-header',str(out)+'.headers','--write-out','%{url_effective}\n%{http_code}\n%{content_type}',url,'--output',str(out)]
+            p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            result={'ok':p.returncode==0,'stderr':p.stderr[-1000:],'meta':p.stdout,'path':str(out)}
+            if temp: result['_temp']=True
+            return result
+
+          queries=[]; all_files={}
+          for only_title in (1,0):
+            for keyword in keywords:
+              payload={
+                'device':1,'hideTrader':0,'onlyTitle':only_title,'order':0,'page':1,'pageSize':100,
+                'keyword':keyword,'pageCount':0,'dateRange':0,'startTime':'','endTime':'',
+                'typeIds':'','industryIds':''
+              }
+              key=f'{only_title}_{len(queries):02d}'
+              path=OUT/'responses'/f'search_{key}.json'
+              r=request('POST','https://www.sdyanbao.com/api/file/search',payload,path,'https://www.sdyanbao.com/report')
+              rec={'keyword':keyword,'onlyTitle':only_title,'request':payload,**{k:v for k,v in r.items() if not k.startswith('_')}}
+              if r['ok']:
+                text=path.read_text(encoding='utf-8',errors='ignore')
+                rec['prefix']=text[:1000]
+                try:
+                  obj=json.loads(text); rec['response']=obj
+                  data=obj.get('data') or {}
+                  files=data.get('files') or data.get('data') or []
+                  if isinstance(files,list):
+                    for f in files:
+                      if isinstance(f,dict) and f.get('id') is not None:
+                        all_files[str(f['id'])]=f
+                except Exception as exc: rec['parse_error']=repr(exc)
+              queries.append(rec)
+
+          details=[]
+          for fid,file_obj in all_files.items():
+            p=OUT/'responses'/f'detail_{fid}.json'
+            r=request('POST','https://www.sdyanbao.com/api/file/detail',{'id':fid},p,f'https://www.sdyanbao.com/detail/{fid}')
+            rec={'id':fid,'search_object':file_obj,**{k:v for k,v in r.items() if not k.startswith('_')}}
+            if r['ok']:
+              text=p.read_text(encoding='utf-8',errors='ignore')
+              try: rec['response']=json.loads(text)
+              except Exception as exc: rec['prefix']=text[:1000]; rec['parse_error']=repr(exc)
+            details.append(rec)
+
+          # Inspect public preview pages and all URL-looking values returned by search/detail APIs.
+          candidate_urls=[]
+          def harvest(value, source):
+            if isinstance(value,dict):
+              for k,v in value.items(): harvest(v,source+'.'+str(k))
+            elif isinstance(value,list):
+              for i,v in enumerate(value): harvest(v,source+f'[{i}]')
+            elif isinstance(value,str):
+              if value.startswith('http') or value.startswith('/'):
+                if re.search(r'pdf|file|online|download|preview|attach|report|oss|cos|cloud|weiyun|sdyanbao',value,re.I):
+                  candidate_urls.append({'url':value,'source':source})
+          for rec in queries: harvest(rec.get('response'),f'search:{rec["keyword"]}:{rec["onlyTitle"]}')
+          for rec in details: harvest(rec.get('response'),f'detail:{rec["id"]}')
+
+          for fid in all_files:
+            preview=f'https://www.sdyanbao.com/preview/{fid}'
+            p=OUT/'previews'/f'{fid}.html'
+            r=request('GET',preview,None,p,f'https://www.sdyanbao.com/detail/{fid}')
+            rec={'url':preview,'source':f'preview:{fid}','ok':r['ok'],'meta':r['meta'],'stderr':r['stderr']}
+            if r['ok']:
+              raw=p.read_bytes(); texts=[raw.decode(enc,'ignore') for enc in ('utf-8','gb18030','gbk')]
+              text=max(texts,key=lambda x:x.lower().count('.pdf')+x.lower().count('online_url')+x.count('敦煌种业'))
+              norm=html.unescape(text.replace('\\/','/'))
+              for u in re.findall(r'https?://[^"\'<>\s]+',norm,re.I):
+                if re.search(r'pdf|file|online|download|preview|attach|oss|cos|cloud',u,re.I): candidate_urls.append({'url':urllib.parse.unquote(u).rstrip('),;]'),'source':f'preview:{fid}'})
+              for u in re.findall(r'(?:href|src|data-url|fileurl|url)=["\']([^"\']+)["\']',norm,re.I):
+                full=urllib.parse.urljoin(preview,html.unescape(u))
+                if re.search(r'pdf|file|online|download|preview|attach|oss|cos|cloud',full,re.I): candidate_urls.append({'url':full,'source':f'preview:{fid}'})
+              rec['contains_company']='敦煌种业' in norm or '600354' in norm
+              rec['bytes']=len(raw)
+            details.append({'preview':rec})
+
+          # Deduplicate and probe candidate public URLs. Never call the authenticated download API.
+          dedup=[]; seen=set()
+          for item in candidate_urls:
+            u=item['url']
+            if u.startswith('/'):
+              u=urllib.parse.urljoin('https://www.sdyanbao.com',u)
+            if u in seen: continue
+            seen.add(u); dedup.append({'url':u,'source':item['source']})
+          probes=[]
+          for i,item in enumerate(dedup[:300]):
+            p=OUT/'files'/f'{i:03d}.bin'
+            r=request('GET',item['url'],None,p,'https://www.sdyanbao.com/')
+            raw=p.read_bytes() if p.exists() else b''
+            probes.append({**item,'ok':r['ok'],'meta':r['meta'],'stderr':r['stderr'],'bytes':len(raw),'head':raw[:24].hex(),'is_pdf':raw.startswith(b'%PDF-')})
+
+          OUT.joinpath('queries.json').write_text(json.dumps(queries,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('details.json').write_text(json.dumps(details,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('candidate_urls.json').write_text(json.dumps(dedup,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('probes.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('QUERIES',len(queries),'UNIQUE_FILES',len(all_files),'CANDIDATE_URLS',len(dedup),'PROBES',len(probes))
+          for fid,f in all_files.items():
+            print('FILE',fid,json.dumps(f,ensure_ascii=False))
+          for p in probes:
+            if p['is_pdf'] or p['bytes']>100000:
+              print('PROBE',json.dumps(p,ensure_ascii=False))
+          PY
+          python /tmp/sdy_search.py
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-sdy-search
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
