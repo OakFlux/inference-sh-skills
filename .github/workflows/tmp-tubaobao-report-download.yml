@@ -21,7 +21,7 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet pypdf
           python - <<'PY'
-          import hashlib, os, re, sys, zipfile
+          import hashlib, zipfile
           from pathlib import Path
           import requests
           from pypdf import PdfReader
@@ -30,12 +30,20 @@ jobs:
           out.mkdir(exist_ok=True)
           reports = [
               {
-                  'code':'AP202407301638474355',
-                  'date':'2024-07-30',
-                  'broker':'东莞证券',
-                  'title':'渠道持续优化提振业绩，高分红凸显投资价值',
-                  'filename':'2024-07-30_东莞证券_渠道持续优化提振业绩_高分红凸显投资价值.pdf',
-                  'min_pages':15,
+                  'code':'AP202510281770527047',
+                  'date':'2025-10-28',
+                  'broker':'国金证券',
+                  'title':'现金奶牛，自我革新',
+                  'filename':'2025-10-28_国金证券_现金奶牛_自我革新.pdf',
+                  'expected_pages':20,
+              },
+              {
+                  'code':'AP202407311638786476',
+                  'date':'2024-07-31',
+                  'broker':'民生证券',
+                  'title':'家居新势力，现金奶牛、弯道超车',
+                  'filename':'2024-07-31_民生证券_家居新势力_现金奶牛弯道超车.pdf',
+                  'expected_pages':33,
               },
               {
                   'code':'AP202306071590507564',
@@ -43,15 +51,7 @@ jobs:
                   'broker':'中银证券',
                   'title':'业务延伸、渠道拓展，板材龙头砥砺前行',
                   'filename':'2023-06-07_中银证券_业务延伸渠道拓展_板材龙头砥砺前行.pdf',
-                  'min_pages':15,
-              },
-              {
-                  'code':'AP202211291580648987',
-                  'date':'2022-11-29',
-                  'broker':'东吴证券',
-                  'title':'渠道横纵并拓，模式优化升级，板材龙头稳健成长',
-                  'filename':'2022-11-29_东吴证券_渠道横纵并拓_模式优化升级.pdf',
-                  'min_pages':15,
+                  'expected_pages':37,
               },
           ]
           headers = {
@@ -79,20 +79,23 @@ jobs:
                       last = repr(e)
               if data is None:
                   raise RuntimeError(f"下载失败 {item['code']}: {last}")
+
               path = out / item['filename']
               path.write_bytes(data)
               reader = PdfReader(str(path))
               pages = len(reader.pages)
-              if pages < item['min_pages']:
-                  raise RuntimeError(f"页数不足 {path}: {pages}")
+              if pages != item['expected_pages']:
+                  raise RuntimeError(f"页数与研报元数据不符 {path}: 实际 {pages}, 预期 {item['expected_pages']}")
+
               first = ''
               try:
                   first = (reader.pages[0].extract_text() or '').replace('\x00',' ')
               except Exception:
                   pass
-              check_blob = (first + ' ' + item['title'] + ' 兔宝宝 002043').replace(' ', '')
-              if '兔宝宝' not in check_blob and '002043' not in check_blob:
-                  raise RuntimeError(f"首页未识别到公司名或证券代码: {path}")
+              normalized = first.replace(' ', '').replace('\n', '')
+              if '兔宝宝' not in normalized and '002043' not in normalized:
+                  raise RuntimeError(f"首页未识别到兔宝宝或002043: {path}")
+
               sha = hashlib.sha256(data).hexdigest()
               downloaded.append(path)
               info_url = f"https://data.eastmoney.com/report/info/{item['code']}.html"
@@ -115,17 +118,16 @@ jobs:
               for p in downloaded:
                   z.write(p, arcname=p.name)
               z.write(manifest_path, arcname=manifest_path.name)
-          print('ZIP_OK', zip_path, zip_path.stat().st_size)
           with zipfile.ZipFile(zip_path) as z:
               bad = z.testzip()
               if bad:
                   raise RuntimeError(f'ZIP integrity failure: {bad}')
-              print('ZIP_CONTENTS', z.namelist())
+              print('ZIP_OK', zip_path, zip_path.stat().st_size, z.namelist())
           PY
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: tubaobao-brokerage-deep-reports
+          name: tubaobao-brokerage-deep-reports-final
           path: 兔宝宝_券商深度报告_3份.zip
           if-no-files-found: error
           compression-level: 0
