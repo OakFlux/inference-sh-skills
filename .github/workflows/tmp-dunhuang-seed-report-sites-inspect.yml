@@ -1,0 +1,297 @@
+name: Temporary Dunhuang Seed report-site API inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-report-sites-inspect-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Install browser tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check selenium
+          which google-chrome || true
+          which chromium || true
+          which chromedriver || true
+
+      - name: Inspect raw pages, scripts, browser network and search/download actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/raw diagnostics/scripts diagnostics/browser
+          cat > /tmp/inspect_sites.py <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import urllib.parse
+          from pathlib import Path
+
+          from selenium import webdriver
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.common.keys import Keys
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.support.ui import WebDriverWait
+
+          OUT = Path('diagnostics')
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          seeds = [
+              ('sdy_report', 'https://www.sdyanbao.com/report'),
+              ('sdy_detail', 'https://www.sdyanbao.com/detail/969090'),
+              ('fx_home', 'https://www.fxbaogao.com/'),
+              ('fx_detail', 'https://www.fxbaogao.com/detail/4810625'),
+          ]
+
+          def curl(url: str, path: Path, referer: str | None = None) -> tuple[bool, str]:
+              cmd = [
+                  'curl', '--http1.1', '-L', '--fail', '--silent', '--show-error',
+                  '--retry', '4', '--retry-all-errors', '--retry-delay', '1',
+                  '--connect-timeout', '20', '--max-time', '150',
+                  '--user-agent', UA, '--header', 'Accept-Encoding: identity',
+              ]
+              if referer:
+                  cmd += ['--referer', referer]
+              cmd += [url, '-o', str(path)]
+              proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return proc.returncode == 0 and path.exists() and path.stat().st_size > 0, proc.stderr[-1200:]
+
+          raw_summary = []
+          script_urls: list[str] = []
+          for name, url in seeds:
+              path = OUT / 'raw' / f'{name}.html'
+              ok, err = curl(url, path)
+              row = {'name': name, 'url': url, 'ok': ok, 'error': err}
+              if not ok:
+                  raw_summary.append(row)
+                  continue
+              raw = path.read_bytes()
+              row['bytes'] = len(raw)
+              texts = [raw.decode(enc, 'ignore') for enc in ('utf-8', 'gb18030', 'gbk')]
+              text = max(texts, key=lambda x: x.count('立即下载') + x.count('敦煌种业') + x.lower().count('/api/'))
+              norm = html.unescape(text.replace('\\/', '/'))
+              row['title'] = ''
+              m = re.search(r'<title>(.*?)</title>', norm, re.I | re.S)
+              if m:
+                  row['title'] = re.sub(r'<[^>]+>', '', m.group(1)).strip()
+              forms = []
+              for fm in re.findall(r'<form\b.*?</form>', norm, re.I | re.S):
+                  forms.append(re.sub(r'\s+', ' ', fm)[:5000])
+              row['forms'] = forms[:20]
+              row['next_data'] = ''
+              m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', norm, re.I | re.S)
+              if m:
+                  row['next_data'] = m.group(1)[:100000]
+              links = []
+              for src in re.findall(r'<script[^>]+src=["\']([^"\']+)', norm, re.I):
+                  full = urllib.parse.urljoin(url, html.unescape(src))
+                  links.append(full)
+                  script_urls.append(full)
+              for href in re.findall(r'(?:href|src|action|data-url|download-url)=["\']([^"\']+)["\']', norm, re.I):
+                  full = urllib.parse.urljoin(url, html.unescape(href))
+                  if re.search(r'api|download|search|report|detail|pdf|file|attach', full, re.I):
+                      links.append(full)
+              row['interesting_links'] = list(dict.fromkeys(links))[:300]
+              relevant = []
+              for line in norm.splitlines():
+                  if re.search(r'立即下载|download|/api/|axios|fetch\(|ajax|搜索|search|report|detail|pdf|file|attach', line, re.I):
+                      relevant.append(re.sub(r'\s+', ' ', line).strip()[:8000])
+              row['relevant'] = relevant[:300]
+              raw_summary.append(row)
+
+          script_urls = list(dict.fromkeys(script_urls))[:150]
+          script_index = []
+          for i, url in enumerate(script_urls):
+              path = OUT / 'scripts' / f'{i:03d}.js'
+              ok, err = curl(url, path)
+              script_index.append({'index': i, 'url': url, 'ok': ok, 'error': err, 'bytes': path.stat().st_size if path.exists() else 0})
+          script_hits = []
+          endpoint_candidates = []
+          for item in script_index:
+              if not item['ok']:
+                  continue
+              p = OUT / 'scripts' / f"{item['index']:03d}.js"
+              text = p.read_text(encoding='utf-8', errors='ignore')
+              for m in re.finditer(r'download|立即下载|/api/|axios|fetch\(|ajax|report|search|detail|fileUrl|file_url|pdfUrl|pdf_url', text, re.I):
+                  a = max(0, m.start() - 1000)
+                  b = min(len(text), m.end() + 3000)
+                  script_hits.append(f"===== {item['index']:03d} {item['url']} =====\n{text[a:b]}")
+                  if len(script_hits) > 600:
+                      break
+              for pat in [
+                  r'["\'](https?://[^"\']+)["\']',
+                  r'["\'](/[^"\']*(?:api|download|search|report|detail|file|pdf)[^"\']*)["\']',
+              ]:
+                  for value in re.findall(pat, text, re.I):
+                      if re.search(r'api|download|search|report|detail|file|pdf', value, re.I):
+                          endpoint_candidates.append(value)
+
+          (OUT / 'raw_summary.json').write_text(json.dumps(raw_summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'script_index.json').write_text(json.dumps(script_index, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'script_hits.txt').write_text('\n\n'.join(script_hits), encoding='utf-8')
+          (OUT / 'endpoint_candidates.txt').write_text('\n'.join(dict.fromkeys(endpoint_candidates)), encoding='utf-8')
+
+          chrome = shutil.which('google-chrome') or shutil.which('chromium') or shutil.which('chromium-browser')
+          options = Options()
+          if chrome:
+              options.binary_location = chrome
+          options.add_argument('--headless=new')
+          options.add_argument('--no-sandbox')
+          options.add_argument('--disable-dev-shm-usage')
+          options.add_argument('--disable-gpu')
+          options.add_argument('--window-size=1440,1200')
+          options.add_argument(f'--user-agent={UA}')
+          options.set_capability('goog:loggingPrefs', {'performance': 'ALL', 'browser': 'ALL'})
+          prefs = {
+              'download.default_directory': str((OUT / 'browser').resolve()),
+              'download.prompt_for_download': False,
+              'plugins.always_open_pdf_externally': True,
+          }
+          options.add_experimental_option('prefs', prefs)
+
+          browser_results = []
+          driver = webdriver.Chrome(options=options)
+          try:
+              try:
+                  driver.execute_cdp_cmd('Page.setDownloadBehavior', {'behavior': 'allow', 'downloadPath': str((OUT / 'browser').resolve())})
+              except Exception:
+                  pass
+
+              def collect(label: str):
+                  perf = driver.get_log('performance')
+                  requests = []
+                  responses = []
+                  for entry in perf:
+                      try:
+                          message = json.loads(entry['message'])['message']
+                      except Exception:
+                          continue
+                      method = message.get('method')
+                      params = message.get('params', {})
+                      if method == 'Network.requestWillBeSent':
+                          req = params.get('request', {})
+                          requests.append({'url': req.get('url'), 'method': req.get('method'), 'postData': req.get('postData'), 'type': params.get('type')})
+                      elif method == 'Network.responseReceived':
+                          resp = params.get('response', {})
+                          responses.append({'url': resp.get('url'), 'status': resp.get('status'), 'mimeType': resp.get('mimeType'), 'headers': resp.get('headers')})
+                  browser_results.append({
+                      'label': label,
+                      'current_url': driver.current_url,
+                      'title': driver.title,
+                      'requests': requests,
+                      'responses': responses,
+                      'browser_logs': driver.get_log('browser'),
+                  })
+                  (OUT / 'browser' / f'{label}.html').write_text(driver.page_source, encoding='utf-8')
+
+              # Sdyanbao report search
+              driver.get('https://www.sdyanbao.com/report')
+              time.sleep(4)
+              collect('sdy_report_loaded')
+              searched = False
+              for selector in [
+                  (By.CSS_SELECTOR, 'input[placeholder*="搜索"]'),
+                  (By.CSS_SELECTOR, 'input[placeholder*="关键词"]'),
+                  (By.XPATH, '//input[contains(@placeholder,"搜索") or contains(@placeholder,"关键词")]'),
+              ]:
+                  try:
+                      el = driver.find_element(*selector)
+                      el.clear(); el.send_keys('敦煌种业'); el.send_keys(Keys.ENTER)
+                      searched = True; break
+                  except Exception:
+                      pass
+              time.sleep(7)
+              collect('sdy_search_dunhuang')
+
+              # Known detail download click
+              driver.get('https://www.sdyanbao.com/detail/969090')
+              time.sleep(4)
+              collect('sdy_detail_loaded')
+              clicked = False
+              for xpath in ['//*[normalize-space(text())="立即下载"]', '//*[contains(text(),"立即下载")]']:
+                  try:
+                      elements = driver.find_elements(By.XPATH, xpath)
+                      for el in elements:
+                          if el.is_displayed():
+                              driver.execute_script('arguments[0].click();', el)
+                              clicked = True; break
+                      if clicked: break
+                  except Exception:
+                      pass
+              time.sleep(6)
+              collect('sdy_detail_after_download')
+
+              # Fxbaogao homepage/search
+              driver.get('https://www.fxbaogao.com/')
+              time.sleep(5)
+              collect('fx_home_loaded')
+              for selector in [
+                  (By.CSS_SELECTOR, 'input[placeholder*="搜索"]'),
+                  (By.CSS_SELECTOR, 'input[placeholder*="发现"]'),
+                  (By.XPATH, '//input[contains(@placeholder,"搜索") or contains(@placeholder,"发现")]'),
+              ]:
+                  try:
+                      el = driver.find_element(*selector)
+                      el.clear(); el.send_keys('敦煌种业'); el.send_keys(Keys.ENTER)
+                      break
+                  except Exception:
+                      pass
+              time.sleep(7)
+              collect('fx_search_dunhuang')
+
+              driver.get('https://www.fxbaogao.com/detail/4810625')
+              time.sleep(5)
+              collect('fx_detail_loaded')
+              for xpath in ['//*[contains(text(),"下载")]', '//a[contains(@href,"download")]']:
+                  try:
+                      elements = driver.find_elements(By.XPATH, xpath)
+                      for el in elements:
+                          if el.is_displayed():
+                              driver.execute_script('arguments[0].click();', el)
+                              clicked = True; break
+                      if clicked: break
+                  except Exception:
+                      pass
+              time.sleep(6)
+              collect('fx_detail_after_download')
+          finally:
+              driver.quit()
+
+          (OUT / 'browser_results.json').write_text(json.dumps(browser_results, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('RAW_PAGES', len(raw_summary), 'SCRIPTS', len(script_index), 'BROWSER_STAGES', len(browser_results))
+          for stage in browser_results:
+              interesting = []
+              for req in stage['requests']:
+                  u = req.get('url') or ''
+                  if re.search(r'api|download|search|report|detail|file|pdf|login', u, re.I):
+                      interesting.append(req)
+              print('===', stage['label'], stage['current_url'], stage['title'])
+              for req in interesting[:100]:
+                  print('REQ', json.dumps(req, ensure_ascii=False))
+              for resp in stage['responses']:
+                  u = resp.get('url') or ''
+                  if re.search(r'api|download|search|report|detail|file|pdf|login', u, re.I):
+                      print('RESP', json.dumps({k: resp.get(k) for k in ('url','status','mimeType')}, ensure_ascii=False))
+          PY
+          python /tmp/inspect_sites.py
+
+      - name: Upload inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-report-sites-inspection
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
