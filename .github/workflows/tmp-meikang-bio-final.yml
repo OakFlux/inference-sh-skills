@@ -1,0 +1,209 @@
+name: Temporary Meikang Biotech final broker deep reports package
+
+on:
+  push:
+    branches:
+      - 'tmp/meikang-bio-final-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Download, validate and package exact reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/meikang_bio_final.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          candidates = [
+              {
+                  'infoCode': 'AP201804261130680967',
+                  'date': '2018-04-26',
+                  'broker': '国金证券',
+                  'title': '具备产品和服务双线竞争力的优秀体外诊断企业',
+                  'min_pages': 15,
+              },
+              {
+                  'infoCode': 'AP201804201127028078',
+                  'date': '2018-04-20',
+                  'broker': '西南证券',
+                  'title': '渠道扩张+区域检验中心，驱动公司高速增长',
+                  'min_pages': 15,
+              },
+              {
+                  'infoCode': 'AP201708310841668804',
+                  'date': '2017-08-31',
+                  'broker': '华金证券',
+                  'title': '渠道布局持续展开，医检所前期高投入短期拖累业绩增长',
+                  'min_pages': 12,
+              },
+          ]
+
+          def safe(value: str, limit: int = 72) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', '', value).strip(' ._')
+              return (value or '报告')[:limit]
+
+          def curl_pdf(url: str, dest: Path, referer: str) -> tuple[bool, str]:
+              dest.unlink(missing_ok=True)
+              proc = subprocess.run([
+                  'curl', '--http1.1', '--location', '--fail', '--silent', '--show-error',
+                  '--retry', '5', '--retry-all-errors', '--retry-delay', '1',
+                  '--connect-timeout', '20', '--max-time', '240',
+                  '--user-agent', UA, '--referer', referer,
+                  '--header', 'Accept-Encoding: identity',
+                  '--header', 'Accept: application/pdf,application/octet-stream,*/*',
+                  '--output', str(dest), url,
+              ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return proc.returncode == 0, proc.stderr[-1500:]
+
+          def urls(code: str):
+              stamp = int(time.time() * 1000)
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{stamp}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{code}.pdf',
+              ]
+
+          results = []
+          failures = []
+          hashes = set()
+          temp = DIST / '_candidate.pdf'
+
+          for item in candidates:
+              code = item['infoCode']
+              accepted = False
+              errors = []
+              for url in urls(code):
+                  ok, error = curl_pdf(url, temp, f'https://data.eastmoney.com/report/info/{code}.html')
+                  if not ok:
+                      errors.append(f'{url}: {error}')
+                      continue
+                  try:
+                      raw = temp.read_bytes()
+                      if len(raw) < 150_000 or not raw.startswith(b'%PDF-'):
+                          raise RuntimeError(f'invalid PDF: {len(raw)} bytes')
+                      digest = hashlib.sha256(raw).hexdigest()
+                      if digest in hashes:
+                          raise RuntimeError('duplicate PDF')
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < item['min_pages']:
+                          raise RuntimeError(f'only {pages} pages, expected >= {item["min_pages"]}')
+                      sample = ''
+                      for page in reader.pages[:8]:
+                          try:
+                              sample += ' ' + (page.extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = re.sub(r'\s+', '', sample)
+                      if '美康生物' not in compact and '300439' not in compact:
+                          raise RuntimeError('company identity not found in first eight pages')
+                      filename = f'{item["date"]}_{safe(item["broker"],18)}_{safe(item["title"])}_{pages}页.pdf'
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+                      hashes.add(digest)
+                      record = {
+                          **item,
+                          'filename': filename,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': digest,
+                          'url': url,
+                      }
+                      results.append(record)
+                      print('OK', json.dumps(record, ensure_ascii=False))
+                      accepted = True
+                      break
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+                  finally:
+                      temp.unlink(missing_ok=True)
+              if not accepted:
+                  failures.append({**item, 'errors': errors})
+
+          DIAG.joinpath('results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          DIAG.joinpath('failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+          if len(results) < 2:
+              raise RuntimeError(f'Only {len(results)} validated complete reports downloaded')
+
+          manifest = [
+              '美康生物（300439）券商深度报告资料包',
+              '公开可获取的完整公司深度/长篇研究主要集中在2017—2018年。',
+              '筛选规则：优先公司深度和长篇公司研究，不以短篇业绩点评凑数。',
+              '所有PDF均已核验文件头、实际页数、公司名称和SHA-256。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          for idx, item in enumerate(results, 1):
+              manifest += [
+                  f'{idx}. {item["title"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   日期：{item["date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   公开来源：{item["url"]}',
+                  '',
+              ]
+          (REPORTS / '资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = DIST / f'美康生物_券商深度报告_{len(results)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(results):
+                  raise RuntimeError(f'PDF count mismatch: {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/meikang_bio_final.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: meikang-biotech-final-deep-reports
+          path: dist/美康生物_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meikang-biotech-final-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
