@@ -1,0 +1,129 @@
+name: Temporary Dunhuang Seed archive URL index scan
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-archive-index-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query Common Crawl and Wayback URL indexes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/archive_scan.py <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess, tempfile, urllib.parse
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          OUT=Path('diagnostics')
+          UA='Mozilla/5.0'
+          domains=[
+            'pdf.dfcfw.com','file.iyanbao.com','www.iyanbao.com','www.fxbaogao.com','file.fxbaogao.com',
+            'www.sdyanbao.com','file.sdyanbao.com','www.nxny.com','doc.mbalib.com','down.mbalib.com',
+            'pdf.hexun.com','yanbao.stock.hexun.com','file.hibor.com.cn','www.hibor.com.cn',
+            'research.tfzq.com','www.tfzq.com','research.gtja.com','www.gtja.com','www.zts.com.cn',
+            'www.swsresearch.com','www.sws.com.cn','www.chinastock.com.cn','www.docin.com','wenku.baidu.com',
+            'stock.finance.sina.com.cn','vip.stock.finance.sina.com.cn'
+          ]
+          needles=['600354','365771252125','365499152875','336478009061','616733300399','dunhuang']
+
+          def curl_text(url: str, timeout: int=60) -> tuple[bool,str,str]:
+            fd,name=tempfile.mkstemp(prefix='arc_',suffix='.txt'); os.close(fd)
+            try:
+              p=subprocess.run(['curl','--http1.1','-L','--silent','--show-error','--retry','3','--retry-all-errors','--connect-timeout','15','--max-time',str(timeout),'--user-agent',UA,'--header','Accept-Encoding: identity',url,'-o',name],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              text=Path(name).read_text(encoding='utf-8',errors='ignore') if Path(name).exists() else ''
+              return p.returncode==0,text,p.stderr[-500:]
+            finally:
+              Path(name).unlink(missing_ok=True)
+
+          ok,text,err=curl_text('https://index.commoncrawl.org/collinfo.json',60)
+          indexes=[]
+          if ok:
+            try: indexes=[x['cdx-api'] for x in json.loads(text)[:15]]
+            except Exception: pass
+          if not indexes:
+            indexes=['https://index.commoncrawl.org/CC-MAIN-2026-30-index']
+
+          jobs=[]
+          for idx in indexes:
+            for domain in domains:
+              for needle in needles:
+                pattern=f'{domain}/*{needle}*'
+                url=idx+'?'+urllib.parse.urlencode({'url':pattern,'output':'json','filter':['status:200'],'collapse':'digest','pageSize':'500'})
+                jobs.append(('cc',idx,domain,needle,url))
+          # Wayback queries for the most likely domains only
+          for domain in domains[:21]:
+            for needle in needles:
+              pattern=f'{domain}/*{needle}*'
+              params={'url':pattern,'output':'json','filter':'statuscode:200','fl':'timestamp,original,mimetype,statuscode,digest,length','collapse':'digest','limit':'500'}
+              jobs.append(('wb','wayback',domain,needle,'https://web.archive.org/cdx/search/cdx?'+urllib.parse.urlencode(params)))
+
+          def run(job):
+            kind,idx,domain,needle,url=job
+            ok,text,err=curl_text(url,50)
+            return {'kind':kind,'index':idx,'domain':domain,'needle':needle,'url':url,'ok':ok,'bytes':len(text),'error':err,'text':text}
+
+          raw=[]
+          with ThreadPoolExecutor(max_workers=18) as pool:
+            futs=[pool.submit(run,j) for j in jobs]
+            for fut in as_completed(futs): raw.append(fut.result())
+
+          records=[]; summaries=[]
+          for item in raw:
+            text=item.pop('text')
+            count=0
+            if item['kind']=='cc' and item['ok']:
+              for line in text.splitlines():
+                try: rec=json.loads(line)
+                except Exception: continue
+                records.append({'source':'commoncrawl','index':item['index'],'needle':item['needle'],**rec}); count+=1
+            elif item['kind']=='wb' and item['ok']:
+              try:
+                rows=json.loads(text)
+                if rows and isinstance(rows[0],list):
+                  hdr=rows[0]
+                  for row in rows[1:]:
+                    rec=dict(zip(hdr,row)); records.append({'source':'wayback','needle':item['needle'],**rec}); count+=1
+              except Exception: pass
+            summaries.append({**item,'records':count,'prefix':text[:300]})
+
+          # Deduplicate, rank likely PDFs/reports
+          unique={}
+          for r in records:
+            u=r.get('url') or r.get('original') or ''
+            key=(r.get('source'),u,r.get('digest'))
+            unique[key]=r
+          records=list(unique.values())
+          def score(r):
+            u=(r.get('url') or r.get('original') or '').lower(); m=(r.get('mime') or r.get('mimetype') or '').lower()
+            s=0
+            if '.pdf' in u or 'application/pdf' in m:s+=1000
+            if '600354' in u:s+=300
+            if any(x in u for x in ['report','yanbao','baogao','research','download','file']):s+=100
+            return s
+          records.sort(key=score,reverse=True)
+          OUT.joinpath('records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          OUT.joinpath('summary.json').write_text(json.dumps(summaries,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('INDEXES',len(indexes),'JOBS',len(jobs),'RECORDS',len(records))
+          for r in records[:300]: print(json.dumps(r,ensure_ascii=False))
+          PY
+          python /tmp/archive_scan.py
+
+      - name: Upload archive scan
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-archive-index-scan
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
