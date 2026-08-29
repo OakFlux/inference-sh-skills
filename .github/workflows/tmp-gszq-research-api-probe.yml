@@ -1,0 +1,59 @@
+name: Temporary Guosheng research API probe
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-research-api-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect official site links, scripts and APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Accept':'text/html,application/json,text/javascript,*/*;q=0.8'})
+          urls=['https://www.gszq.com/','https://www.gszq.com/home']
+          patterns=[r'https?://[^\s"\'<>]+',r'[/A-Za-z0-9_.-]*(?:research|report|yanbao|api)[/A-Za-z0-9_?&=.%:-]*']
+          scripts=set()
+          for url in urls:
+            r=s.get(url,timeout=90,allow_redirects=True)
+            print('\nPAGE',url,r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+            print(r.text[:5000])
+            soup=BeautifulSoup(r.text,'html.parser')
+            for a in soup.find_all('a',href=True):
+              text=' '.join(a.get_text(' ',strip=True).split())
+              href=urllib.parse.urljoin(r.url,a['href'])
+              if any(k in (text+href).lower() for k in ['研究','research','研报','report']): print('LINK',text,href)
+            for tag in soup.find_all('script',src=True): scripts.add(urllib.parse.urljoin(r.url,tag['src']))
+            for pat in patterns:
+              for x in sorted(set(re.findall(pat,r.text,re.I))):
+                if any(k in x.lower() for k in ['research','report','yanbao','api']): print('PAGE_MATCH',x[:2000])
+          print('SCRIPTS',len(scripts))
+          for u in sorted(scripts):
+            try:
+              r=s.get(u,timeout=90)
+              text=r.text
+              if any(k in text.lower() for k in ['research','report','yanbao','国盛研究','研报']):
+                print('\nSCRIPT',u,r.status_code,len(r.content))
+                for needle in ['国盛研究','research','report','yanbao','api/']:
+                  for m in list(re.finditer(re.escape(needle),text,re.I))[:20]:
+                    p=m.start(); print('CTX',needle,text[max(0,p-1000):p+3000].replace('\n',' ')[:4000])
+                for pat in patterns:
+                  for x in sorted(set(re.findall(pat,text,re.I))):
+                    if any(k in x.lower() for k in ['research','report','yanbao','api']): print('SCRIPT_MATCH',x[:2000])
+            except Exception as e: print('SCRIPT_ERR',u,repr(e))
+          PY
