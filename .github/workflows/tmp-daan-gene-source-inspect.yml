@@ -1,0 +1,119 @@
+name: Temporary Daan Gene source inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-source-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect report listing sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/pages diagnostic/assets
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          urls=(
+            'https://stock.9fzt.com/list/sz_002030_3.html'
+            'https://news.futunn.com/en/stock/002030-SZ/research'
+            'https://news.futunn.com/stock/002030-SZ/research'
+            'https://stock.qianzhan.com/hs/sourcefiles_002030.sz.html'
+            'https://xueqiu.com/S/SZ002030'
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            i=$((i+1))
+            curl -L --compressed --retry 4 --retry-all-errors --connect-timeout 30 --max-time 180 \
+              -A "$UA" -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+              -D "diagnostic/pages/page_${i}.headers" "$url" -o "diagnostic/pages/page_${i}.html" || true
+            echo "$url" > "diagnostic/pages/page_${i}.url"
+          done
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html, json, re, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          pages=[]
+          assets=[]
+          for p in sorted(Path('diagnostic/pages').glob('page_*.html')):
+              num=p.stem.split('_')[-1]
+              url=Path(f'diagnostic/pages/page_{num}.url').read_text().strip()
+              text=p.read_text(errors='replace')
+              pages.append({'file':p.name,'url':url,'size':p.stat().st_size,'title':(re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S).group(1).strip() if re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S) else '')})
+              for m in re.finditer(r'<script[^>]+src=["\']([^"\']+)', text, re.I):
+                  src=html.unescape(m.group(1))
+                  assets.append(urljoin(url,src))
+              for m in re.finditer(r'<link[^>]+href=["\']([^"\']+)', text, re.I):
+                  href=html.unescape(m.group(1))
+                  if '.js' in href: assets.append(urljoin(url,href))
+
+          assets=list(dict.fromkeys(assets))[:200]
+          for idx,url in enumerate(assets):
+              try:
+                  req=urllib.request.Request(url,headers={'User-Agent':UA,'Referer':'https://stock.9fzt.com/'})
+                  raw=urllib.request.urlopen(req,timeout=60).read()
+                  if len(raw)>5_000_000: raw=raw[:5_000_000]
+                  Path(f'diagnostic/assets/asset_{idx:03d}.txt').write_bytes(raw)
+                  Path(f'diagnostic/assets/asset_{idx:03d}.url').write_text(url,encoding='utf-8')
+              except Exception as exc:
+                  Path(f'diagnostic/assets/asset_{idx:03d}.error').write_text(repr(exc),encoding='utf-8')
+
+          patterns=[
+              r'https?://[^"\'<>\s]+',
+              r'/api/[^"\'<>\s]+',
+              r'[A-Za-z0-9_./-]*(?:report|research|yanbao|研报)[A-Za-z0-9_?&=./%-]*',
+          ]
+          hits=[]
+          for root in [Path('diagnostic/pages'),Path('diagnostic/assets')]:
+              for p in root.glob('*'):
+                  if p.suffix in {'.headers','.url','.error'}: continue
+                  try: text=p.read_text(errors='replace')
+                  except Exception: continue
+                  for pat in patterns:
+                      for m in re.finditer(pat,text,re.I):
+                          s=m.group(0)
+                          if any(k.lower() in s.lower() for k in ['report','research','yanbao','研报','002030','daan','达安']):
+                              hits.append({'file':str(p),'hit':s[:1000]})
+          # Extract human-readable surrounding text for company name.
+          contexts=[]
+          for root in [Path('diagnostic/pages'),Path('diagnostic/assets')]:
+              for p in root.glob('*'):
+                  if p.suffix in {'.headers','.url','.error'}: continue
+                  try: text=p.read_text(errors='replace')
+                  except Exception: continue
+                  for needle in ['达安基因','002030','Daan Gene','DAAN GENE']:
+                      start=0
+                      while True:
+                          pos=text.lower().find(needle.lower(),start)
+                          if pos<0: break
+                          contexts.append({'file':str(p),'needle':needle,'context':text[max(0,pos-800):pos+1800]})
+                          start=pos+len(needle)
+                          if len(contexts)>500: break
+                      if len(contexts)>500: break
+                  if len(contexts)>500: break
+              if len(contexts)>500: break
+
+          Path('diagnostic/pages.json').write_text(json.dumps(pages,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/assets.json').write_text(json.dumps(assets,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/hits.json').write_text(json.dumps(hits[:5000],ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/contexts.json').write_text(json.dumps(contexts,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PAGES',json.dumps(pages,ensure_ascii=False,indent=2))
+          print('ASSETS',len(assets),'HITS',len(hits),'CONTEXTS',len(contexts))
+          print(json.dumps(contexts[:40],ensure_ascii=False,indent=2)[:50000])
+          PY
+
+      - name: Upload source diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-source-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
