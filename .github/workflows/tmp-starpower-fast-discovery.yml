@@ -1,0 +1,52 @@
+name: Temporary StarPower fast report discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-starpower-reports-20260829
+    paths:
+      - .github/workflows/tmp-starpower-fast-discovery.yml
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query Eastmoney public report catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, requests
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/603290.html'})
+          rows=[]
+          for page in range(1,20):
+              p={'pageNo':str(page),'pageSize':'100','code':'603290','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':'2020-01-01','endTime':'2026-08-29','fields':'','qType':'0','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+              r=s.get('https://reportapi.eastmoney.com/report/list',params=p,timeout=60)
+              print('HTTP',page,r.status_code,len(r.content))
+              r.raise_for_status(); obj=r.json(); data=obj.get('data') or []
+              rows.extend(data)
+              total=int(obj.get('TotalPage') or math.ceil(int(obj.get('hits') or 0)/100) or 1)
+              if page>=total: break
+          dedup={}
+          for row in rows:
+              dedup[row.get('infoCode') or (row.get('title'),row.get('publishDate'),row.get('orgSName'))]=row
+          rows=sorted(dedup.values(),key=lambda x:str(x.get('publishDate') or ''),reverse=True)
+          print('TOTAL',len(rows))
+          for row in rows:
+              pages=int(row.get('attachPages') or 0)
+              title=str(row.get('title') or '')
+              if pages>=10 or any(k in title for k in ['深度','首次覆盖','首次','专题']):
+                  info=row.get('infoCode')
+                  print('CANDIDATE',json.dumps({'date':str(row.get('publishDate') or '')[:10],'broker':row.get('orgSName'),'title':title,'pages':pages,'size':row.get('attachSize'),'infoCode':info,'rating':row.get('emRatingName') or row.get('sRatingName'),'researcher':row.get('researcher')},ensure_ascii=False))
+                  if info:
+                      u=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+                      try:
+                          x=s.get(u,headers={'Range':'bytes=0-4095','Accept':'application/pdf,*/*'},timeout=45,allow_redirects=True)
+                          print('PDF',info,x.status_code,x.headers.get('content-type'),x.headers.get('content-range'),len(x.content),x.content[:8],x.url)
+                      except Exception as e: print('PDFERR',info,repr(e))
+          PY
