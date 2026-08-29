@@ -1,0 +1,17 @@
+name: Query official Qiule Seeds reports
+
+on:
+  push:
+    branches:
+      - tmp/qiule-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python .github/scripts/query_qiule_neeq.py
