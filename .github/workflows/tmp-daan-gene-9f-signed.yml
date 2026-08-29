@@ -1,0 +1,111 @@
+name: Temporary Daan Gene signed 9F report API discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-9f-signed-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Reproduce website request signature and query report APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/signed9f.py <<'PY'
+          from __future__ import annotations
+          import hashlib,json,re,subprocess,time,urllib.parse
+          from pathlib import Path
+
+          SECRET='dac3ef6859f44e439c88cbc28d65880a'
+          APPCODE='9fztgw'
+          SERVER_ID='200'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          REFERER='https://www.9fzt.com/detail/sz_002030_10_508957738559.html'
+          HOST='https://api-hq.chongnengjihua.com'
+          GW='https://gateway.chongnengjihua.com/rjhy-news/api/1'
+
+          def sign_params(params: dict, ts: str) -> str:
+              joined=''.join(str(params[k]) for k in sorted(params))
+              return hashlib.md5((SECRET+joined+ts).encode()).hexdigest()
+
+          def fetch(base: str, path: Path, params: dict | None=None, signed=True):
+              params=params or {}
+              query=urllib.parse.urlencode(params)
+              url=base+('?' + query if query else '')
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','5','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','180','--user-agent',UA,'--referer',REFERER,'--header','Accept-Encoding: identity','--header','Accept: application/json,text/plain,*/*']
+              if signed:
+                  ts=str(int(time.time()*1000));sig=sign_params(params,ts)
+                  cmd += ['--header',f'appcode: {APPCODE}','--header','clienttype: h5','--header',f'serverId: {SERVER_ID}','--header',f'signature: {sig}','--header',f'timestamp: {ts}']
+              cmd += [url,'-o',str(path)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              raw=path.read_bytes() if path.exists() else b''
+              return {'url':url,'params':params,'signed':signed,'rc':p.returncode,'size':len(raw),'head':raw[:1200].decode('utf-8','ignore'),'error':p.stderr[-1000:]}
+
+          probes=[]; list_items=[]
+          for page in range(0,8):
+              params={'market':'sz','symbol':'002030','page':page,'pageSize':100}
+              p=Path(f'diagnostics/list_{page}.json')
+              meta=fetch(HOST+'/news/api/1/stock/a/report/list',p,params);probes.append(meta)
+              try: obj=json.loads(p.read_text(encoding='utf-8',errors='ignore'))
+              except Exception: continue
+              data=obj.get('data')
+              if isinstance(data,list): list_items.extend(data)
+              elif isinstance(data,dict):
+                  for key in ('list','items','rows','data'):
+                      if isinstance(data.get(key),list): list_items.extend(data[key])
+          Path('diagnostics/list_items.json').write_text(json.dumps(list_items,ensure_ascii=False,indent=2),encoding='utf-8')
+          ids={'508957738559'}
+          def walk(x):
+              if isinstance(x,dict):
+                  for k,v in x.items():
+                      if k.lower() in {'id','reportid','report_id','newsid','news_id','articleid','article_id','contentid','content_id'} and isinstance(v,(str,int)): ids.add(str(v))
+                      walk(v)
+              elif isinstance(x,list):
+                  for v in x: walk(v)
+          walk(list_items)
+          print('LIST_COUNT',len(list_items),'IDS',sorted(ids))
+          for item in list_items:
+              print('ITEM',json.dumps(item,ensure_ascii=False))
+
+          templates=[
+              (HOST+'/news/api/1/stock/a/report/detail',lambda rid:{'id':rid}),
+              (HOST+'/news/api/1/stock/a/report/detail',lambda rid:{'reportId':rid}),
+              (HOST+'/news/api/1/stock/a/report/info',lambda rid:{'id':rid}),
+              (HOST+'/news/api/1/stock/a/report/info',lambda rid:{'reportId':rid}),
+              (HOST+'/news/api/1/stock/a/report/content',lambda rid:{'id':rid}),
+              (HOST+'/news/api/1/stock/a/report/get',lambda rid:{'id':rid}),
+              (HOST+'/news/api/1/report/detail',lambda rid:{'id':rid}),
+              (HOST+'/news/api/1/report/info',lambda rid:{'id':rid}),
+              (HOST+'/news/api/1/report/content',lambda rid:{'id':rid}),
+              (GW+'/stock/a/report/detail',lambda rid:{'id':rid}),
+              (GW+'/stock/a/report/info',lambda rid:{'id':rid}),
+              (GW+'/stock/a/report/content',lambda rid:{'id':rid}),
+              (GW+'/report/detail',lambda rid:{'id':rid}),
+              (GW+'/report/info',lambda rid:{'id':rid}),
+          ]
+          for rid in sorted(ids)[:100]:
+              for i,(base,maker) in enumerate(templates):
+                  p=Path(f'diagnostics/detail_{rid}_{i}.bin')
+                  probes.append(fetch(base,p,maker(rid)))
+          Path('diagnostics/probes.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2),encoding='utf-8')
+          for x in probes:
+              h=x['head'].replace('\n',' ')[:700]
+              if x['size'] and ('签名错误' not in h or x['size']>200): print('PROBE',x['rc'],x['size'],x['url'],h)
+          PY
+          python /tmp/signed9f.py
+
+      - name: Upload signed API results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-9f-signed-api
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
