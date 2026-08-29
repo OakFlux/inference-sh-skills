@@ -1,0 +1,56 @@
+name: Temporary Jiuqi Huiyunyan legacy TLS inspection
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-huiyunyan-hashes-insecure.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Inspect metadata, page images and public download calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 urllib3
+          python - <<'PY'
+          import json,re,requests,urllib.parse,urllib3
+          from bs4 import BeautifulSoup
+          urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+          hashes={
+            '2009_shanghai':'25ad9bad49e81a1883c642c31f5e59bd',
+            '2011_huatai':'154087e698172b8f5225048a614a4782',
+            '2013_shenwan':'6d29d9e0bfb56bb1e6bb9ad7a13ff294',
+          }
+          s=requests.Session(); s.verify=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/json,application/pdf,image/*,*/*;q=0.8'})
+          for label,h in hashes.items():
+            u=f'https://www.huiyunyan.com/doc-{h}.html'
+            print('\n===',label,u,'===')
+            r=s.get(u,timeout=60,allow_redirects=True)
+            print('PAGE',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+            text=r.text; soup=BeautifulSoup(text,'html.parser')
+            print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+            visible=' '.join(soup.get_text(' ',strip=True).split())
+            print('VISIBLE',visible[:5000])
+            for tag in soup.find_all(['a','button','input','form','img','iframe','embed','object','source']):
+              blob=str(tag).lower()
+              if any(k in blob for k in ['download','下载','原文','pdf',h,'preview','page','image']):
+                attrs={k:v for k,v in tag.attrs.items() if k in ['href','src','data','data-src','data-original','onclick','id','class','name','value','action','method']}
+                if attrs or tag.name in ['button','form']:
+                  print('NODE',json.dumps({'tag':tag.name,'text':tag.get_text(' ',strip=True)[:300],'attrs':attrs},ensure_ascii=False))
+            for pat in [
+              r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+              r'https?://[^\s"\'<>]+\.(?:png|jpg|jpeg|webp)(?:\?[^\s"\'<>]*)?',
+              r'https?://[^\s"\'<>]+(?:download|down|file|attachment|preview|page)[^\s"\'<>]*',
+              r'[/A-Za-z0-9_.?=&%-]+(?:download|down|file|attachment|pdf|preview|page)[/A-Za-z0-9_.?=&%-]*',
+            ]:
+              for x in sorted(set(re.findall(pat,text,re.I))): print('ASSET',x[:1800])
+          PY
