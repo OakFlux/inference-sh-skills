@@ -1,0 +1,226 @@
+name: Temporary Xinri final brokerage report package
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-final-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF and image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --quiet pypdf pillow img2pdf requests
+
+      - name: Download, reconstruct, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output verify/pages2022 verify/render
+          cat > /tmp/build.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          VER = Path('verify')
+          PAGE_DIR = VER / 'pages2022'
+          OUT.mkdir(exist_ok=True)
+          PAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept': 'image/png,image/*;q=0.9,application/pdf,*/*;q=0.8',
+              'Referer': 'https://www.sdyanbao.com/detail/304932',
+          })
+
+          # 1) 招商证券 2022 公司深度：公开页面共23页，逐页下载后无损合成为PDF。
+          page_files = []
+          page_meta = []
+          for index in range(23):
+              url = f'https://oss.sdyanbao.com/page/2022/10/25/377228/{index}.png'
+              r = session.get(url, timeout=90, allow_redirects=True)
+              if r.status_code != 200 or not r.content.startswith(b'\x89PNG\r\n\x1a\n') or len(r.content) < 30_000:
+                  raise RuntimeError(f'页面下载失败：{index + 1}/23, HTTP={r.status_code}, bytes={len(r.content)}, head={r.content[:16]!r}')
+              page_path = PAGE_DIR / f'{index + 1:02d}.png'
+              page_path.write_bytes(r.content)
+              with Image.open(io.BytesIO(r.content)) as im:
+                  width, height = im.size
+                  mode = im.mode
+                  if width < 700 or height < 900:
+                      raise RuntimeError(f'页面分辨率异常：{index + 1}, {width}x{height}')
+              page_files.append(str(page_path))
+              page_meta.append({'page': index + 1, 'url': r.url, 'bytes': len(r.content), 'size': [width, height], 'mode': mode})
+              print('PAGE_OK', index + 1, len(r.content), width, height, r.url)
+
+          deep_name = '01_招商证券_修炼内功聚焦份额新日正东升_20221025_23页_公开页面版.pdf'
+          deep_path = OUT / deep_name
+          deep_path.write_bytes(img2pdf.convert(page_files))
+          deep_reader = PdfReader(str(deep_path), strict=False)
+          if len(deep_reader.pages) != 23:
+              raise RuntimeError(f'深度报告合成页数异常：{len(deep_reader.pages)}')
+
+          # 2) 太平洋证券 2023 年报点评：直接下载原始PDF。
+          short_url = 'https://pdf.dfcfw.com/pdf/H3_AP202304181585537779_1.pdf'
+          r = session.get(short_url, timeout=120, allow_redirects=True, headers={
+              'User-Agent': session.headers['User-Agent'],
+              'Accept': 'application/pdf,*/*',
+              'Referer': 'https://data.eastmoney.com/report/603787.html',
+          })
+          if r.status_code != 200 or not r.content.startswith(b'%PDF-') or len(r.content) < 100_000:
+              raise RuntimeError(f'公司点评PDF下载失败：HTTP={r.status_code}, bytes={len(r.content)}, head={r.content[:16]!r}')
+          follow_name = '02_太平洋证券_豪华车型量价齐增拉升盈利_20230418_5页_公司点评.pdf'
+          follow_path = OUT / follow_name
+          follow_path.write_bytes(r.content)
+          follow_reader = PdfReader(str(follow_path), strict=False)
+          if len(follow_reader.pages) != 5:
+              raise RuntimeError(f'公司点评页数异常：{len(follow_reader.pages)}')
+          extracted = '\n'.join((p.extract_text() or '') for p in follow_reader.pages[:2])
+          compact = ''.join(extracted.split())
+          if '新日股份' not in compact and '603787' not in compact:
+              raise RuntimeError('公司点评身份核验失败：前两页未识别到新日股份或603787')
+
+          # Render first and last pages of both PDFs for visual inspection evidence.
+          render_jobs = [
+              (deep_path, 1, VER / 'render' / '01_deep_first'),
+              (deep_path, 23, VER / 'render' / '01_deep_last'),
+              (follow_path, 1, VER / 'render' / '02_follow_first'),
+              (follow_path, 5, VER / 'render' / '02_follow_last'),
+          ]
+          (VER / 'render').mkdir(parents=True, exist_ok=True)
+          for pdf, page, prefix in render_jobs:
+              subprocess.run(['pdftoppm', '-f', str(page), '-l', str(page), '-singlefile', '-png', '-r', '110', str(pdf), str(prefix)], check=True)
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          manifest = {
+              'company': '新日股份',
+              'stock_code': '603787.SH',
+              'reports': [
+                  {
+                      'filename': deep_name,
+                      'broker': '招商证券',
+                      'date': '2022-10-25',
+                      'title': '修炼内功，聚焦份额，“新日”正东升',
+                      'type': '公司深度研究',
+                      'pages': 23,
+                      'container_note': '由公开逐页PNG无损合成为PDF；内容页完整，但不是券商原始PDF文件容器。',
+                      'metadata_page': 'https://www.vzkoo.com/read/2022102515f1189d784c8c2d45595bc5.html',
+                      'public_page_root': 'https://oss.sdyanbao.com/page/2022/10/25/377228',
+                      'sha256': sha256(deep_path),
+                      'bytes': deep_path.stat().st_size,
+                  },
+                  {
+                      'filename': follow_name,
+                      'broker': '太平洋证券',
+                      'date': '2023-04-18',
+                      'title': '豪华车型量价齐增拉升盈利，布局多渠道兼海外',
+                      'type': '公司年报点评（补充材料，不属于标准长篇深度）',
+                      'pages': 5,
+                      'source_pdf': r.url,
+                      'sha256': sha256(follow_path),
+                      'bytes': follow_path.stat().st_size,
+                  },
+              ],
+              'verified_but_not_included': [
+                  {
+                      'date': '2020-09-15',
+                      'title': '电动两轮高景气，渠道+产品助力公司加速扩张',
+                      'type': '首次覆盖报告',
+                      'pages': 24,
+                      'reason': '公开入口要求登录或积分下载，仅有不完整预览页；未绕过访问限制，也未将预览冒充完整报告。',
+                  }
+              ],
+              'page_image_checks': page_meta,
+          }
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (VER / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          lines = [
+              '新日股份（603787.SH）券商研究报告清单',
+              '',
+              '1. 招商证券：《修炼内功，聚焦份额，“新日”正东升》',
+              '   日期：2022-10-25；类型：公司深度研究；页数：23页。',
+              '   文件说明：由公开逐页页面无损合成为PDF，23页齐全；并非券商原始PDF文件容器。',
+              f'   SHA-256：{manifest["reports"][0]["sha256"]}',
+              '',
+              '2. 太平洋证券：《豪华车型量价齐增拉升盈利，布局多渠道兼海外》',
+              '   日期：2023-04-18；类型：公司年报点评；页数：5页。',
+              '   文件说明：公开原始PDF，作为较新的公司跟踪材料补充；不属于标准长篇深度。',
+              f'   SHA-256：{manifest["reports"][1]["sha256"]}',
+              '',
+              '另已确认：2020-09-15《电动两轮高景气，渠道+产品助力公司加速扩张》，首次覆盖，24页。',
+              '其完整PDF公开入口要求登录或积分权限，仅有不完整预览，因此未绕过限制、未放入压缩包。',
+              '',
+              '两份已收录文件均已核验PDF结构、实际页数、公司名称/股票代码，并完成首末页渲染。',
+              '资料仅供研究参考，不构成投资建议。',
+          ]
+          list_path = OUT / '报告清单与核验说明.txt'
+          list_path.write_text('\n'.join(lines), encoding='utf-8')
+
+          sums = OUT / 'SHA256SUMS.txt'
+          sums.write_text(
+              f'{manifest["reports"][0]["sha256"]}  {deep_name}\n'
+              f'{manifest["reports"][1]["sha256"]}  {follow_name}\n',
+              encoding='utf-8'
+          )
+
+          zip_path = Path('新日股份_券商研究报告_2份.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for path in [deep_path, follow_path, list_path, OUT / 'manifest.json', sums]:
+                  z.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP完整性测试失败：{bad}')
+              print('ZIP_OK', zip_path.stat().st_size, z.namelist())
+
+          # ASCII-name duplicate for clients that mishandle Chinese filenames.
+          Path('xinri_broker_reports_2.zip').write_bytes(zip_path.read_bytes())
+          PY
+          python /tmp/build.py | tee verify/build.log
+          ls -lh output verify/render *.zip
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinri-broker-reports-final
+          path: |
+            新日股份_券商研究报告_2份.zip
+            xinri_broker_reports_2.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+      - name: Upload verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinri-broker-reports-verification
+          path: verify/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 1
