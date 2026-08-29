@@ -1,0 +1,83 @@
+name: Capture NEEQ disclosure browser requests
+
+on:
+  push:
+    branches:
+      - tmp/jinbo-bio-complete-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Playwright
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@latest --silent
+          npx playwright install chromium --with-deps
+
+      - name: Capture disclosure requests
+        shell: bash
+        run: |
+          cat > capture.mjs <<'JS'
+          import { chromium } from 'playwright';
+
+          const browser = await chromium.launch({headless: true});
+          const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            locale: 'zh-CN',
+          });
+          const page = await context.newPage();
+
+          const seen = [];
+          page.on('request', req => {
+            if (req.url().includes('companyAnnouncement.do')) {
+              console.log('REQUEST_URL', req.url());
+              console.log('REQUEST_METHOD', req.method());
+              console.log('REQUEST_POSTDATA', req.postData());
+              seen.push(req.url());
+            }
+          });
+          page.on('response', async res => {
+            if (res.url().includes('companyAnnouncement.do')) {
+              console.log('RESPONSE_STATUS', res.status(), res.url());
+              try {
+                const text = await res.text();
+                console.log('RESPONSE_TEXT', text.slice(0, 5000).replace(/\n/g, ' '));
+              } catch (e) {
+                console.log('RESPONSE_ERROR', String(e));
+              }
+            }
+          });
+
+          await page.goto('https://www.neeq.com.cn/disclosure/announcement.html', {waitUntil: 'networkidle', timeout: 120000});
+          console.log('PAGE_LOADED', await page.title());
+          console.log('INPUTS', await page.locator('input').evaluateAll(els => els.map(e => ({id:e.id,name:e.name,type:e.type,value:e.value,placeholder:e.placeholder,class:e.className}))));
+          console.log('BUTTONS', await page.locator('button,a').evaluateAll(els => els.map(e => ({tag:e.tagName,id:e.id,class:e.className,text:(e.textContent||'').trim().slice(0,80)})).filter(x => /查询|搜索|go/i.test(x.text+' '+x.class))));
+
+          // Attempt to fill the company code and a broad period using detected IDs.
+          const assignments = [
+            ['#companyCode', '832982'],
+            ['#startTime', '2015-01-01'],
+            ['#endTime', '2017-12-31'],
+            ['#keyword', '年度报告'],
+          ];
+          for (const [selector, value] of assignments) {
+            const count = await page.locator(selector).count();
+            console.log('FIELD', selector, 'count=', count);
+            if (count) {
+              await page.locator(selector).fill(value);
+            }
+          }
+          const go = page.locator('.go');
+          console.log('GO_COUNT', await go.count());
+          if (await go.count()) {
+            await go.first().click();
+            await page.waitForTimeout(8000);
+          }
+          console.log('SEEN_REQUESTS', seen);
+          await browser.close();
+          JS
+          node capture.mjs
