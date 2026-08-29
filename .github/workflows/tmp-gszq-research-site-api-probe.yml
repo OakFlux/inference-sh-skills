@@ -1,0 +1,136 @@
+name: Temporary Guosheng research site API probe
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-research-site-api-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect official research site HTML, scripts and public APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json
+          import re
+          import urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          base = 'https://research.gszq.com/'
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/json,text/plain,application/pdf,*/*;q=0.8',
+              'Referer': base,
+          })
+
+          def fetch(url):
+              try:
+                  r = s.get(url, timeout=90, allow_redirects=True)
+                  print('\nFETCH', url, 'HTTP', r.status_code, 'LEN', len(r.content), 'TYPE', r.headers.get('content-type'), 'FINAL', r.url)
+                  return r
+              except Exception as e:
+                  print('\nFETCH_ERR', url, repr(e))
+                  return None
+
+          roots = [
+              base,
+              urllib.parse.urljoin(base, 'research'),
+              urllib.parse.urljoin(base, 'research/report'),
+              urllib.parse.urljoin(base, 'research/report?rid=1'),
+          ]
+          scripts = set()
+          html_pages = []
+          for url in roots:
+              r = fetch(url)
+              if r is None:
+                  continue
+              if 'html' in (r.headers.get('content-type') or '').lower() or r.text.lstrip().startswith('<'):
+                  text = r.text
+                  html_pages.append((r.url, text))
+                  print('HTML_HEAD', text[:6000].replace('\n', ' '))
+                  soup = BeautifulSoup(text, 'html.parser')
+                  for tag in soup.find_all('script', src=True):
+                      scripts.add(urllib.parse.urljoin(r.url, tag['src']))
+                  for tag in soup.find_all(['a','link','iframe'], href=True):
+                      href = urllib.parse.urljoin(r.url, tag['href'])
+                      blob = (tag.get_text(' ', strip=True) + ' ' + href).lower()
+                      if any(k in blob for k in ['report','research','研报','研究','pdf','download']):
+                          print('LINK', tag.get_text(' ', strip=True)[:200], href)
+                  for tag in soup.find_all(['iframe','embed','object','source'], src=True):
+                      print('EMBED', urllib.parse.urljoin(r.url, tag['src']))
+
+          print('\nSCRIPT_COUNT', len(scripts))
+          all_js = []
+          interesting = [
+              'api', 'report', 'research', 'download', 'pdf', 'keyword', 'search', 'rid',
+              'title', 'stock', 'securities', 'attachment', 'file', 'content-disposition'
+          ]
+          path_pattern = re.compile(r'["\']((?:https?:)?//[^"\']+|/(?:api|research|report|download|file|attachment)[^"\']*)["\']', re.I)
+          for u in sorted(scripts):
+              r = fetch(u)
+              if r is None or r.status_code != 200:
+                  continue
+              text = r.text
+              all_js.append((u, text))
+              low = text.lower()
+              if any(k in low for k in interesting):
+                  print('\nSCRIPT_INTERESTING', u, 'LEN', len(text))
+                  for m in path_pattern.finditer(text):
+                      val = m.group(1)
+                      if any(k in val.lower() for k in interesting):
+                          print('PATH', val[:2000])
+                  for needle in ['新日股份','603787','电动两轮高景气','download','pdf','report?rid','/api/','apiHost','baseURL','keyword','search']:
+                      starts = [m.start() for m in re.finditer(re.escape(needle), text, re.I)]
+                      if starts:
+                          print('NEEDLE', needle, 'COUNT', len(starts))
+                          for p in starts[:12]:
+                              print('CTX', needle, text[max(0,p-1200):p+3200].replace('\n',' ')[:4400])
+
+          # Save deduplicated endpoint-like strings to logs.
+          endpoints = set()
+          for _, text in html_pages + all_js:
+              for m in path_pattern.finditer(text):
+                  val = m.group(1)
+                  if any(k in val.lower() for k in interesting):
+                      endpoints.add(val)
+          print('\nENDPOINTS')
+          for x in sorted(endpoints):
+              print(x)
+
+          # Probe conservative/common public endpoints. These are read-only GETs.
+          candidates = [
+              '/api/report/list', '/api/report/search', '/api/research/report/list',
+              '/api/research/report', '/api/research/report/search', '/api/reports',
+              '/api/report', '/api/report/detail', '/api/report/info',
+              '/research/api/report/list', '/research/api/report/search',
+          ]
+          params_sets = [
+              {'keyword':'新日股份','page':1,'pageSize':20},
+              {'keyword':'603787','page':1,'pageSize':20},
+              {'search':'新日股份','page':1,'size':20},
+              {'title':'新日股份','page':1,'limit':20},
+          ]
+          for path in candidates:
+              for params in params_sets:
+                  url = urllib.parse.urljoin(base, path.lstrip('/'))
+                  try:
+                      r = s.get(url, params=params, timeout=45, allow_redirects=False)
+                      if r.status_code not in (404, 405) or len(r.content) > 500:
+                          print('\nAPI_PROBE', r.status_code, r.headers.get('content-type'), len(r.content), r.url, 'LOC', r.headers.get('location'))
+                          print(r.text[:12000])
+                  except Exception as e:
+                      print('API_ERR', url, repr(e))
+          PY
