@@ -1,0 +1,107 @@
+name: Temporary Daan Gene 9F source inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-9fzt-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect 9F report page, APIs and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/inspect9f.py <<'PY'
+          from __future__ import annotations
+          import html,json,re,subprocess,urllib.parse
+          from pathlib import Path
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          base='https://www.9fzt.com/detail/sz_002030_10_508957738559.html'
+          seed_urls=[
+            base,
+            'https://r.jina.ai/'+base,
+            'https://www.9fzt.com/detail/sz_002030_10_508957738559',
+          ]
+          def curl(url,path,referer=None):
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','5','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','180','--user-agent',UA,'--header','Accept-Encoding: identity']
+              if referer: cmd += ['--referer',referer]
+              cmd += [url,'-o',str(path)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              return p.returncode,p.stderr
+          pages=[]; scripts=[]; candidate_urls=[]
+          for i,url in enumerate(seed_urls):
+              p=Path(f'diagnostics/page_{i}.html')
+              rc,err=curl(url,p)
+              raw=p.read_bytes() if p.exists() else b''
+              texts=[raw.decode(e,'ignore') for e in ('utf-8','gb18030','gbk')]
+              text=max(texts,key=lambda x:x.count('达安基因')+x.count('508957738559')+x.lower().count('download')) if texts else ''
+              norm=html.unescape(text.replace('\\/','/'))
+              title=''; m=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>','',m.group(1)).strip()
+              for u in re.findall(r'(?:src|href|action)=["\']([^"\']+)',norm,re.I):
+                  u=html.unescape(u); full=urllib.parse.urljoin(base,u)
+                  if u.lower().endswith('.js') or '.js?' in u.lower(): scripts.append(full)
+                  if any(k in full.lower() for k in ['download','pdf','file','attach','report','508957738559','detail']): candidate_urls.append(full)
+              for u in re.findall(r'https?://[^"\'<>\s]+',norm,re.I):
+                  u=urllib.parse.unquote(u).rstrip('),;]')
+                  if any(k in u.lower() for k in ['download','pdf','file','attach','report','508957738559','detail']): candidate_urls.append(u)
+              relevant=[]
+              for line in norm.splitlines():
+                  if re.search(r'508957738559|达安基因|download|下载|pdf|fileurl|reporturl|attach|api|研报',line,re.I):
+                      relevant.append(re.sub(r'\s+',' ',line)[:4000])
+              pages.append({'url':url,'rc':rc,'size':len(raw),'title':title,'error':err[-500:],'relevant':relevant[:1000]})
+          scripts=list(dict.fromkeys(scripts)); candidate_urls=list(dict.fromkeys(candidate_urls))
+          Path('diagnostics/pages_summary.json').write_text(json.dumps(pages,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/candidate_urls.txt').write_text('\n'.join(candidate_urls),encoding='utf-8')
+          print('PAGES',[(x['url'],x['rc'],x['size'],x['title']) for x in pages])
+          print('SCRIPTS',len(scripts))
+          for i,u in enumerate(scripts[:100]):
+              p=Path(f'diagnostics/script_{i}.js')
+              rc,err=curl(u,p,base)
+              print('SCRIPT',i,rc,p.stat().st_size if p.exists() else 0,u)
+          hits=[]; urls=[]
+          patterns=re.compile(r'508957738559|download|pdf|fileUrl|reportUrl|attach|research|研报|reportId|articleId|detail',re.I)
+          for p in Path('diagnostics').glob('script_*.js'):
+              t=p.read_text(encoding='utf-8',errors='ignore')
+              for m in patterns.finditer(t):
+                  a=max(0,m.start()-800);b=min(len(t),m.end()+1800)
+                  hits.append(f'===== {p.name} =====\n{t[a:b]}')
+                  if len(hits)>500: break
+              for u in re.findall(r'https?://[^"\'<>\s]+',t,re.I):
+                  if any(k in u.lower() for k in ['download','pdf','file','report','research','detail']): urls.append(u.rstrip('),;]'))
+          Path('diagnostics/script_hits.txt').write_text('\n\n'.join(hits),encoding='utf-8')
+          Path('diagnostics/script_urls.txt').write_text('\n'.join(dict.fromkeys(urls)),encoding='utf-8')
+          # Probe common API shapes discovered from page/report id.
+          probes=[]
+          probe_urls=[
+            'https://www.9fzt.com/api/detail/sz_002030_10_508957738559',
+            'https://www.9fzt.com/api/report/508957738559',
+            'https://www.9fzt.com/api/research/508957738559',
+            'https://www.9fzt.com/api/detail?id=508957738559',
+            'https://www.9fzt.com/detail/api?id=508957738559',
+            'https://www.9fzt.com/report/download?id=508957738559',
+            'https://www.9fzt.com/download/508957738559',
+          ]
+          for i,u in enumerate(probe_urls):
+              p=Path(f'diagnostics/probe_{i}.bin'); rc,err=curl(u,p,base)
+              raw=p.read_bytes() if p.exists() else b''
+              probes.append({'url':u,'rc':rc,'size':len(raw),'head':raw[:300].decode('utf-8','ignore'),'error':err[-500:]})
+          Path('diagnostics/probes.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/inspect9f.py
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-9fzt-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
