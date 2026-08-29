@@ -1,0 +1,138 @@
+name: Temporary Changchun High-Tech report discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-changchun-gaoxin-reports-20260829
+    paths:
+      - .github/workflows/tmp-changchun-gaoxin-discovery.yml
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install discovery dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+
+      - name: Query public report catalogs and inspect download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          cat > /tmp/discover.py <<'PY'
+          import json, re, sys, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          out = Path('diagnostic')
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept': 'application/json,text/html,application/xhtml+xml,application/pdf,*/*;q=0.8',
+          })
+
+          def save(name, r):
+              (out / f'{name}.headers.txt').write_text('\n'.join(f'{k}: {v}' for k,v in r.headers.items()), encoding='utf-8')
+              (out / f'{name}.body.bin').write_bytes(r.content)
+              try:
+                  (out / f'{name}.body.txt').write_text(r.text, encoding='utf-8')
+              except Exception:
+                  pass
+
+          print('=== EASTMONEY REPORT API ===')
+          api='https://reportapi.eastmoney.com/report/list'
+          for qtype in range(0,5):
+              for variant in range(1,4):
+                  params={
+                      'pageNo':'1','pageSize':'100','code':'000661','industryCode':'*','industry':'*',
+                      'rating':'*','ratingChange':'*','beginTime':'2010-01-01','endTime':'2030-12-31',
+                      'fields':'','qType':str(qtype),'orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'
+                  }
+                  if variant==2: params['cb']='datatable'
+                  if variant==3:
+                      params.pop('code',None); params['stockCode']='000661'; params['secuCode']='000661.SZ'
+                  try:
+                      r=s.get(api, params=params, headers={'Referer':'https://data.eastmoney.com/report/'}, timeout=60)
+                      print('API',qtype,variant,r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+                      save(f'eastmoney_q{qtype}_v{variant}',r)
+                      txt=r.text.strip()
+                      m=re.search(r'^[^(]*\((\{.*\})\)\s*;?$',txt,re.S)
+                      if m: txt=m.group(1)
+                      try: obj=json.loads(txt)
+                      except Exception as e:
+                          print(' JSON_FAIL',repr(e),txt[:300]); continue
+                      print(' TOP_KEYS', list(obj)[:30] if isinstance(obj,dict) else type(obj).__name__)
+                      def walk(x,path=''):
+                          if isinstance(x,dict):
+                              blob=json.dumps(x,ensure_ascii=False)
+                              if ('长春高新' in blob or '000661' in blob) and any(k in x for k in ['title','infoCode','stockName','orgSName','publishDate']):
+                                  print(' ROW',path,blob[:5000])
+                              for k,v in x.items(): walk(v,f'{path}/{k}')
+                          elif isinstance(x,list):
+                              for i,v in enumerate(x): walk(v,f'{path}[{i}]')
+                      walk(obj)
+                  except Exception as e:
+                      print('API_ERR',qtype,variant,repr(e))
+
+          print('\n=== IDIGITAL DIRECTORY ===')
+          dirurl='https://aigc.idigital.com.cn/djyanbao/'
+          try:
+              r=s.get(dirurl,timeout=120)
+              print('DIR',r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+              save('idigital_index',r)
+              html=r.text
+              soup=BeautifulSoup(html,'html.parser')
+              matches=[]
+              for a in soup.find_all('a',href=True):
+                  text=a.get_text(' ',strip=True)
+                  href=urllib.parse.urljoin(r.url,a['href'])
+                  blob=text+' '+href
+                  if any(x in blob for x in ['长春高新','大单品驱动增长型企业进入转型关键期','百亿生长激素龙头主业有望企稳','创新持续投入，多元驱动转型']):
+                      matches.append((text,href))
+              print('DIR_MATCHES',len(matches))
+              for x in matches: print(' DIR_MATCH',repr(x[0]),x[1])
+              (out/'idigital_matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          except Exception as e: print('DIR_ERR',repr(e))
+
+          print('\n=== WATERDROP DETAIL ===')
+          detail='https://www.sdyanbao.com/detail/919282'
+          try:
+              r=s.get(detail,timeout=60)
+              print('DETAIL',r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+              save('sdyanbao_detail',r)
+              html=r.text
+              pats=[r'https?://[^"\'<> ]+\.pdf(?:\?[^"\'<> ]*)?',r'https?://[^"\'<> ]+(?:download|file)[^"\'<> ]*',r'[^"\']+\.pdf(?:\?[^"\']*)?']
+              for pat in pats:
+                  for m in sorted(set(re.findall(pat,html,re.I))): print(' DETAIL_URL',m[:1000])
+              soup=BeautifulSoup(html,'html.parser')
+              for tag in soup.find_all(['script','a','button']):
+                  blob=str(tag)
+                  if any(x in blob.lower() for x in ['download','pdf','919282']):
+                      print(' DETAIL_TAG',blob[:2000].replace('\n',' '))
+              for script in soup.find_all('script',src=True):
+                  u=urllib.parse.urljoin(r.url,script['src'])
+                  try:
+                      rr=s.get(u,timeout=40)
+                      if any(x in rr.text.lower() for x in ['download','pdf','919282']):
+                          print(' JS',u,rr.status_code,len(rr.content))
+                          (out/('js_'+re.sub(r'[^A-Za-z0-9_.-]+','_',u)[-120:]+'.txt')).write_text(rr.text,encoding='utf-8',errors='ignore')
+                          for pat in pats:
+                              for m in sorted(set(re.findall(pat,rr.text,re.I))): print(' JS_URL',u,m[:1000])
+                  except Exception as e: print(' JS_ERR',u,repr(e))
+          except Exception as e: print('DETAIL_ERR',repr(e))
+
+          print('\n=== DONE ===')
+          PY
+          python /tmp/discover.py | tee diagnostic/discovery.log
+
+      - name: Upload discovery diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: changchun-gaoxin-report-discovery
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
