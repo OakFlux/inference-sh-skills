@@ -1,0 +1,35 @@
+name: Temporary Jiuqi exact metadata fast lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-sdy-exact-fast.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Print exact report rows only
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','Content-Type':'application/json;charset=UTF-8','Accept':'application/json,text/plain,*/*'})
+          queries=['内生外延把握行业发展大方向','内生外延，把握行业发展大方向','司机驿站价值再解读','执行力再证明，新老业务均有爆发力','执行力再证明 新老业务均有爆发力','物流信息化金融支付闭环接近完成']
+          for q in queries:
+              payload={'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':1,'pageSize':20,'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':[],'industryIds':[]}
+              r=s.post('https://api.sdyanbao.com/api/file/search',json=payload,timeout=60)
+              print('QUERY',q,'HTTP',r.status_code,'LEN',len(r.content))
+              r.raise_for_status(); data=(r.json().get('data') or {}); files=data.get('files') or []
+              print('TOTAL',data.get('total'),'COUNT',len(files))
+              for f in files:
+                  print('ROW',json.dumps({'id':f.get('id'),'name':f.get('name'),'date':f.get('time_text'),'pages':f.get('page_count'),'size':f.get('file_size'),'type':(f.get('type') or {}).get('name'),'organization':(f.get('organization') or {}).get('name'),'stock':f.get('stock'),'uuid':f.get('data_source_uuid'),'data_source':f.get('data_source'),'original_id':f.get('original_id'),'page_url':f.get('page_url'),'share_url':f.get('share_url')},ensure_ascii=False))
+          PY
