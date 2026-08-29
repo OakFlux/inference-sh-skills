@@ -1,0 +1,150 @@
+name: Temporary Kanghua final deep reports package
+
+on:
+  push:
+    branches:
+      - 'tmp/kanghua-bio-reports-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF dependency
+        run: python -m pip install --disable-pip-version-check pypdf requests
+
+      - name: Download, validate and package original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports
+          cat > /tmp/package.py <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import time
+          import zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          root = Path('dist/reports')
+          root.mkdir(parents=True, exist_ok=True)
+          reports = [
+              {
+                  'info': 'AP202207221576470478',
+                  'filename': '01_华安证券_康华生物_人用狂苗产能释放_领先布局犬用狂苗_2022-07-22_24页.pdf',
+                  'broker': '华安证券',
+                  'date': '2022-07-22',
+                  'title': '人用狂苗产能释放，领先布局犬用狂苗',
+                  'min_pages': 24,
+              },
+              {
+                  'info': 'AP202011101428041975',
+                  'filename': '02_西南证券_康华生物_人二倍体狂苗产能扩张可期_在研品种逐步推进_2020-11-10_16页.pdf',
+                  'broker': '西南证券',
+                  'date': '2020-11-10',
+                  'title': '人二倍体狂苗产能扩张可期，在研品种逐步推进',
+                  'min_pages': 16,
+              },
+          ]
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+          manifest = [
+              '康华生物（300841）券商深度报告资料包',
+              '收录规则：仅保留可完整打开、公司身份可核验且页数较长的原始PDF；未用短篇业绩点评凑数。',
+              '资料仅供研究参考，请遵守原报告版权声明及使用限制。',
+              '',
+          ]
+          for item in reports:
+              info = item['info']
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?{int(time.time()*1000)}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+              ]
+              dest = root / item['filename']
+              errors = []
+              meta = None
+              for url in urls:
+                  for attempt in range(3):
+                      try:
+                          r = s.get(url, headers={
+                              'Referer': f'https://data.eastmoney.com/report/info/{info}.html',
+                              'Accept': 'application/pdf,application/octet-stream,*/*',
+                          }, timeout=240, allow_redirects=True)
+                          raw = r.content
+                          if r.status_code != 200:
+                              raise RuntimeError(f'HTTP {r.status_code}')
+                          if len(raw) < 100_000 or not raw.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF: {len(raw)} bytes, type={r.headers.get("content-type")}, head={raw[:20]!r}')
+                          dest.write_bytes(raw)
+                          reader = PdfReader(str(dest), strict=False)
+                          pages = len(reader.pages)
+                          if pages < item['min_pages']:
+                              raise RuntimeError(f'page count {pages} < {item["min_pages"]}')
+                          sample = ''
+                          for page in reader.pages[:6]:
+                              try:
+                                  sample += ' ' + (page.extract_text() or '')
+                              except Exception:
+                                  pass
+                          compact = ''.join(sample.split())
+                          if '康华生物' not in compact and '300841' not in compact:
+                              raise RuntimeError('company identity not found in first six pages')
+                          meta = {
+                              'pages': pages,
+                              'size': len(raw),
+                              'sha256': hashlib.sha256(raw).hexdigest(),
+                              'url': r.url,
+                          }
+                          break
+                      except Exception as e:
+                          dest.unlink(missing_ok=True)
+                          errors.append(f'{url} attempt {attempt+1}: {e!r}')
+                          time.sleep(1 + attempt)
+                  if meta:
+                      break
+              if not meta:
+                  raise RuntimeError(f'Failed {item["title"]}: ' + '; '.join(errors))
+              manifest.extend([
+                  item['filename'],
+                  f"  券商：{item['broker']}",
+                  f"  日期：{item['date']}",
+                  f"  标题：{item['title']}",
+                  f"  页数：{meta['pages']}",
+                  f"  文件大小：{meta['size']} bytes",
+                  f"  SHA-256：{meta['sha256']}",
+                  f"  公开PDF来源：{meta['url']}",
+                  '',
+              ])
+              print('OK', item['filename'], meta)
+
+          (root / '资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+          final_zip = Path('dist/康华生物_券商深度报告_2份_完整原始PDF.zip')
+          with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+              for p in sorted(root.iterdir()):
+                  z.write(p, arcname=p.name)
+          with zipfile.ZipFile(final_zip, 'r') as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 2:
+                  raise RuntimeError(f'Expected two PDFs, got {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/package.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghua-biological-final-deep-reports
+          path: dist/康华生物_券商深度报告_2份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
