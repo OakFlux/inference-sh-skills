@@ -1,0 +1,357 @@
+name: Temporary Citic Bo broker deep reports package
+
+on:
+  push:
+    branches:
+      - 'tmp/citicsolar-reports-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Fetch Eastmoney report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p metadata diagnostics dist/reports
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for page in $(seq 1 12); do
+            curl --http1.1 --location --fail --silent --show-error \
+              --retry 7 --retry-all-errors --retry-delay 1 \
+              --connect-timeout 20 --max-time 180 \
+              --user-agent "$UA" \
+              --referer 'https://data.eastmoney.com/report/688408.html' \
+              --header 'Accept-Encoding: identity' \
+              --get 'https://reportapi.eastmoney.com/report/list' \
+              --data-urlencode 'industryCode=*' \
+              --data-urlencode 'pageSize=100' \
+              --data-urlencode 'industry=*' \
+              --data-urlencode 'rating=*' \
+              --data-urlencode 'ratingChange=*' \
+              --data-urlencode 'beginTime=2018-01-01' \
+              --data-urlencode 'endTime=2026-08-29' \
+              --data-urlencode "pageNo=$page" \
+              --data-urlencode 'fields=' \
+              --data-urlencode 'qType=0' \
+              --data-urlencode 'orgCode=' \
+              --data-urlencode 'code=688408' \
+              --data-urlencode 'rcode=' \
+              --data-urlencode "p=$page" \
+              --data-urlencode "pageNum=$page" \
+              --data-urlencode "pageNumber=$page" \
+              --output "metadata/page_${page}.txt"
+          done
+
+      - name: Download, validate, select and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_citicsolar.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          from pypdf import PdfReader
+
+          META = Path('metadata')
+          DIAG = Path('diagnostics')
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          def parse_payload(text: str):
+              text = text.strip()
+              if text and text[0] not in '[{' and '(' in text and text.rstrip().endswith(')'):
+                  text = text[text.find('(') + 1:text.rfind(')')]
+              return json.loads(text)
+
+          records = []
+          seen_codes = set()
+          for path in sorted(META.glob('page_*.txt')):
+              try:
+                  payload = parse_payload(path.read_text(encoding='utf-8', errors='ignore'))
+              except Exception as exc:
+                  print('BAD_METADATA', path, repr(exc))
+                  continue
+              rows = payload.get('data') or payload.get('result', {}).get('data') or []
+              if not isinstance(rows, list):
+                  continue
+              new_count = 0
+              for row in rows:
+                  code = str(row.get('infoCode') or row.get('infocode') or row.get('info_code') or '')
+                  if code and code not in seen_codes:
+                      seen_codes.add(code)
+                      records.append(row)
+                      new_count += 1
+              if rows and new_count == 0:
+                  break
+
+          if not records:
+              raise RuntimeError('No Eastmoney records found for 688408')
+
+          def compact(value) -> str:
+              return re.sub(r'\s+', '', str(value or ''))
+
+          def info_code(row) -> str:
+              return str(row.get('infoCode') or row.get('infocode') or row.get('info_code') or '')
+
+          def title(row) -> str:
+              return str(row.get('title') or row.get('reportTitle') or '')
+
+          def broker(row) -> str:
+              return str(row.get('orgSName') or row.get('orgName') or row.get('orgNameCn') or '券商')
+
+          def publish_date(row) -> str:
+              raw = str(row.get('publishDate') or row.get('publishTime') or row.get('publishDateTime') or '')
+              match = re.search(r'20\d{2}-\d{2}-\d{2}', raw)
+              return match.group(0) if match else raw[:10]
+
+          positive_terms = (
+              '深度', '首次覆盖', '公司深度', '首次', '光伏支架执牛耳者', '跟踪系统向阳而生',
+              '跟踪支架龙头', '光伏跟踪支架龙头', '全球跟踪支架', '全球化', '海外市场',
+              '市占率领先', '在手订单充沛', '成长空间广阔', '行业龙头', '龙头',
+              '扬帆海外', '向阳而生', '支架龙头', '全球领先', '价值重估', '高速成长',
+          )
+          negative_terms = (
+              '一季报点评', '中报点评', '半年报点评', '年报点评', '三季报点评', '季报点评',
+              '业绩点评', '事件点评', '公告点评', '点评报告', '点评：', '业绩快报',
+              '公司信息更新', '信息更新报告', '跟踪点评', '简评',
+          )
+
+          def score(row) -> int:
+              text = compact(title(row))
+              value = 0
+              if '深度' in text:
+                  value += 360
+              if '首次覆盖' in text:
+                  value += 340
+              if '公司深度' in text:
+                  value += 120
+              for term in positive_terms:
+                  if compact(term) in text:
+                      value += 55
+              for term in negative_terms:
+                  if compact(term) in text:
+                      value -= 260
+              try:
+                  year = int(publish_date(row)[:4])
+              except Exception:
+                  year = 0
+              value += {2026: 85, 2025: 75, 2024: 65, 2023: 55, 2022: 45, 2021: 35, 2020: 25, 2019: 15, 2018: 10}.get(year, 0)
+              return value
+
+          ranked = sorted(records, key=lambda row: (score(row), publish_date(row)), reverse=True)
+          DIAG.joinpath('ranked_candidates.json').write_text(
+              json.dumps([
+                  {
+                      'score': score(row),
+                      'date': publish_date(row),
+                      'broker': broker(row),
+                      'title': title(row),
+                      'infoCode': info_code(row),
+                  }
+                  for row in ranked
+              ], ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          def safe(value: str, limit: int = 76) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', '', value).strip(' ._')
+              return (value or '报告')[:limit]
+
+          def curl_download(url: str, destination: Path, referer: str) -> tuple[bool, str]:
+              destination.unlink(missing_ok=True)
+              proc = subprocess.run([
+                  'curl', '--http1.1', '--location', '--fail', '--silent', '--show-error',
+                  '--retry', '6', '--retry-all-errors', '--retry-delay', '1',
+                  '--connect-timeout', '20', '--max-time', '300',
+                  '--user-agent', UA, '--referer', referer,
+                  '--header', 'Accept-Encoding: identity',
+                  '--header', 'Accept: application/pdf,application/octet-stream,*/*',
+                  '--output', str(destination), url,
+              ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return proc.returncode == 0, proc.stderr[-1600:]
+
+          def candidate_urls(code: str):
+              stamp = int(time.time() * 1000)
+              return [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{stamp}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{code}.pdf',
+              ]
+
+          successes = []
+          failures = []
+          digests = set()
+          temp = DIST / '_candidate.pdf'
+
+          promising = [row for row in ranked if score(row) >= 40]
+          ordered = promising + [row for row in ranked if row not in promising]
+
+          for row in ordered[:60]:
+              if len(successes) >= 10:
+                  break
+              code = info_code(row)
+              errors = []
+              accepted = False
+              for url in candidate_urls(code):
+                  ok, err = curl_download(url, temp, f'https://data.eastmoney.com/report/info/{code}.html')
+                  if not ok:
+                      errors.append(f'{url}: {err}')
+                      continue
+                  try:
+                      raw = temp.read_bytes()
+                      if len(raw) < 180_000 or not raw.startswith(b'%PDF-'):
+                          raise RuntimeError(f'invalid or too small PDF: {len(raw)} bytes')
+                      digest = hashlib.sha256(raw).hexdigest()
+                      if digest in digests:
+                          raise RuntimeError('duplicate PDF')
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < 18:
+                          raise RuntimeError(f'only {pages} pages')
+                      sample = ''
+                      for page in reader.pages[:min(8, pages)]:
+                          try:
+                              sample += ' ' + (page.extract_text() or '')
+                          except Exception:
+                              pass
+                      sample_compact = compact(sample)
+                      if '中信博' not in sample_compact and '688408' not in sample_compact:
+                          raise RuntimeError('company identity not found in first eight pages')
+                      filename = f'{publish_date(row)}_{safe(broker(row),18)}_{safe(title(row))}_{pages}页.pdf'
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+                      item = {
+                          'filename': filename,
+                          'title': title(row),
+                          'broker': broker(row),
+                          'date': publish_date(row),
+                          'infoCode': code,
+                          'base_score': score(row),
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': digest,
+                          'url': url,
+                      }
+                      successes.append(item)
+                      digests.add(digest)
+                      print('DOWNLOADED', json.dumps(item, ensure_ascii=False))
+                      accepted = True
+                      break
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+                  finally:
+                      temp.unlink(missing_ok=True)
+              if not accepted:
+                  failures.append({
+                      'title': title(row),
+                      'broker': broker(row),
+                      'date': publish_date(row),
+                      'infoCode': code,
+                      'score': score(row),
+                      'errors': errors[-5:],
+                  })
+
+          DIAG.joinpath('downloaded_candidates.json').write_text(json.dumps(successes, ensure_ascii=False, indent=2), encoding='utf-8')
+          DIAG.joinpath('download_failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(successes) < 2:
+              raise RuntimeError(f'Only {len(successes)} complete long-form reports downloaded')
+
+          for item in successes:
+              item['selection_score'] = item['base_score'] + min(item['pages'], 60) * 2
+          successes.sort(key=lambda item: (item['selection_score'], item['date'], item['pages']), reverse=True)
+
+          selected = []
+          used_brokers = set()
+          for item in successes:
+              if item['broker'] in used_brokers:
+                  continue
+              selected.append(item)
+              used_brokers.add(item['broker'])
+              if len(selected) == 3:
+                  break
+          for item in successes:
+              if len(selected) == 3:
+                  break
+              if item not in selected:
+                  selected.append(item)
+
+          keep = {item['filename'] for item in selected}
+          for path in REPORTS.glob('*.pdf'):
+              if path.name not in keep:
+                  path.unlink()
+
+          manifest = [
+              '中信博（688408）券商深度报告资料包',
+              '筛选规则：优先公司深度、首次覆盖和长篇公司研究；排除短篇定期报告点评。',
+              '所有PDF均已核验文件头、实际页数、公司名称和SHA-256。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(selected, 1):
+              manifest += [
+                  f'{index}. {item["title"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   日期：{item["date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   公开来源：{item["url"]}',
+                  '',
+              ]
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+          DIAG.joinpath('selected_reports.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          final_zip = DIST / f'中信博_券商深度报告_{len(selected)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(selected):
+                  raise RuntimeError(f'PDF count mismatch: {pdfs}')
+
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          print('SELECTED_REPORTS', json.dumps(selected, ensure_ascii=False))
+          PY
+          python /tmp/package_citicsolar.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: citic-bo-final-deep-reports
+          path: dist/中信博_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: citic-bo-report-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
