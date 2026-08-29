@@ -1,0 +1,84 @@
+name: Temporary Daan Gene Sina report inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-sina-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch Sina company research lists and report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/lists diagnostics/reports
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for p in $(seq 1 30); do
+            curl --http1.1 -L --silent --show-error --retry 5 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' \
+              "https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/company/index.phtml?symbol=sz002030&t1=all&p=$p" \
+              -o "diagnostics/lists/page_${p}.html" || true
+          done
+          python - <<'PY'
+          import html,json,re,subprocess
+          from pathlib import Path
+          rows=[]; seen=set()
+          for p in sorted(Path('diagnostics/lists').glob('page_*.html')):
+              raw=p.read_bytes()
+              text=raw.decode('gb18030','ignore')
+              # report links commonly include rptid/<id>
+              pattern=r'href=["\']([^"\']*vReport_Show/kind/company/rptid/(\d+)/index\.phtml[^"\']*)["\'][^>]*>(.*?)</a>'
+              for href,rid,label in re.findall(pattern,text,re.I|re.S):
+                  label=re.sub(r'<[^>]+>','',html.unescape(label)).strip()
+                  if rid in seen: continue
+                  seen.add(rid)
+                  if href.startswith('//'): href='https:'+href
+                  elif href.startswith('/'): href='https://vip.stock.finance.sina.com.cn'+href
+                  elif not href.startswith('http'): href='https://vip.stock.finance.sina.com.cn/q/go.php/'+href.lstrip('./')
+                  rows.append({'rptid':rid,'title':label,'url':href,'list_file':p.name})
+          Path('diagnostics/list_rows.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('REPORT_IDS',len(rows))
+          for r in rows: print(json.dumps(r,ensure_ascii=False))
+          # fetch all unique report pages
+          for i,r in enumerate(rows):
+              out=Path('diagnostics/reports')/f'{r["rptid"]}.html'
+              proc=subprocess.run(['curl','--http1.1','-L','--silent','--show-error','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','120','--user-agent','Mozilla/5.0','--header','Accept-Encoding: identity',r['url'],'-o',str(out)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if proc.returncode: print('FETCH_ERROR',r['rptid'],proc.stderr[-500:])
+          # parse report pages for title/date/broker/pdf/download references
+          details=[]
+          for r in rows:
+              p=Path('diagnostics/reports')/f'{r["rptid"]}.html'
+              if not p.exists(): continue
+              text=p.read_bytes().decode('gb18030','ignore')
+              title=''; broker=''; date=''
+              m=re.search(r'<title>(.*?)</title>',text,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>','',html.unescape(m.group(1))).strip()
+              # collect all potentially useful URLs and relevant lines
+              urls=[]
+              for u in re.findall(r'https?://[^"\'<>\s]+',html.unescape(text.replace('\\/','/')),re.I):
+                  u=u.rstrip('),;]')
+                  if any(k in u.lower() for k in ['pdf','download','attach','file','report','rptid']): urls.append(u)
+              relevant=[]
+              for line in text.splitlines():
+                  if re.search(r'pdf|下载|原文|全文|证券|研究所|发布日期|报告日期|评级|分析师|作者',line,re.I):
+                      relevant.append(re.sub(r'\s+',' ',line)[:1500])
+              details.append({**r,'page_title':title,'urls':list(dict.fromkeys(urls))[:100],'relevant':relevant[:100]})
+          Path('diagnostics/report_details.json').write_text(json.dumps(details,ensure_ascii=False,indent=2),encoding='utf-8')
+          for d in details:
+              print('DETAIL',json.dumps({'rptid':d['rptid'],'title':d['title'],'page_title':d['page_title'],'urls':d['urls'][:10]},ensure_ascii=False))
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-sina-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
