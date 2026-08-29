@@ -1,0 +1,87 @@
+name: Temporary Guosheng menu reports Xinri lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-gszq-menu-reports-xinri.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query public GraphQL menus and report lists
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json, requests, itertools
+          from datetime import datetime, timezone
+
+          ep='https://research.gszq.com/graphql'
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Origin':'https://research.gszq.com','Referer':'https://research.gszq.com/research',
+              'Accept':'application/json,text/plain,*/*','Content-Type':'application/json'
+          })
+
+          def post(label, query):
+              r=s.post(ep,json={'query':query},timeout=120)
+              print('\n===',label,'HTTP',r.status_code,'LEN',len(r.content),'===')
+              print(r.text[:200000])
+              return r
+
+          menus_q='''query { reportMenus { id name reports(limit: 3) { title pic updated_time authors catalog type rid } } }'''
+          r=post('MENUS',menus_q)
+          try:
+              obj=r.json(); menus=((obj.get('data') or {}).get('reportMenus') or [])
+          except Exception:
+              menus=[]
+          print('MENU_COUNT',len(menus))
+          print('MENUS_PARSED',json.dumps(menus,ensure_ascii=False,indent=2))
+
+          # Report resolver accepts required menu_id and likely these optional args, matching route filters.
+          start=datetime(2020,9,1,tzinfo=timezone.utc).timestamp()
+          end=datetime(2020,10,1,tzinfo=timezone.utc).timestamp()
+          candidate_queries=[]
+          for menu in menus:
+              mid=str(menu.get('id') or '')
+              if not mid: continue
+              for kw in ['新日股份','603787','电动两轮高景气','渠道+产品助力公司加速扩张','']:
+                  kw_escaped=kw.replace('\\','\\\\').replace('"','\\"')
+                  # Try likely output shapes and args; GraphQL validation messages reveal mismatches.
+                  candidate_queries.append((mid,kw,'shape1',f'''query {{ reports(menu_id: "{mid}", limit: 100, page: 1, start_time: {start}, end_time: {end}, keywords: "{kw_escaped}") {{ is_end total reports {{ rid type title brief authors custom catalog updated_time pic can_view }} }} }}'''))
+                  candidate_queries.append((mid,kw,'shape2',f'''query {{ reports(menu_id: "{mid}", limit: 100, page: 1, start_time: {start}, end_time: {end}, keywords: "{kw_escaped}") {{ next_batch is_end total reports {{ rid type title brief authors custom catalog updated_time pic can_view }} }} }}'''))
+              # Exact date-wide list without keyword.
+              candidate_queries.append((mid,'','minimal',f'''query {{ reports(menu_id: "{mid}", limit: 100, page: 1, start_time: {start}, end_time: {end}) {{ total reports {{ rid type title authors updated_time catalog }} }} }}'''))
+
+          seen_responses=set()
+          hits=[]
+          for mid,kw,shape,q in candidate_queries:
+              r=s.post(ep,json={'query':q},timeout=120)
+              text=r.text
+              sig=(r.status_code,text[:1000])
+              interesting=('新日股份' in text or '603787' in text or '电动两轮高景气' in text or '渠道+产品' in text)
+              valid=(r.status_code==200 and '"data"' in text and '"reports"' in text and 'errors' not in text)
+              if interesting or valid or ('Unknown argument' not in text and 'Cannot query field' not in text and 'required' not in text and r.status_code!=400):
+                  print('\nREPORT_QUERY','menu',mid,'kw',kw,'shape',shape,'HTTP',r.status_code,'LEN',len(r.content))
+                  print(text[:200000])
+              if interesting:
+                  hits.append((mid,kw,shape,text))
+              # Print each unique validation error only once.
+              if r.status_code==400 and text not in seen_responses:
+                  seen_responses.add(text)
+                  print('\nVALIDATION_SAMPLE','menu',mid,'kw',kw,'shape',shape)
+                  print(text[:20000])
+
+          print('\nHIT_COUNT',len(hits))
+          for mid,kw,shape,text in hits:
+              print('HIT',mid,kw,shape,text[:200000])
+          PY
