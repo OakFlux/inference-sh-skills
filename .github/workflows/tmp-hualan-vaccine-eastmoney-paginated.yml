@@ -1,0 +1,87 @@
+name: Temporary Hualan Vaccine paginated report lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-eastmoney-paginated.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Paginate global report catalog around candidate dates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from datetime import date, timedelta
+          import json, math, requests
+
+          api='https://reportapi.eastmoney.com/report/list'
+          targets=[
+            ('2022-07-08','天高任鸟飞'),
+            ('2023-07-18','疫苗行业龙头'),
+            ('2023-08-15','深耕流感疫苗市场'),
+            ('2023-10-13','国内领先流感疫苗制造商'),
+            ('2023-10-17','拨云见日'),
+            ('2023-10-25','流感疫苗龙头'),
+          ]
+          days=sorted({(date.fromisoformat(d)+timedelta(days=o)).isoformat() for d,_ in targets for o in range(-2,4)})
+          keys=['华兰疫苗','301207','天高任鸟飞','疫苗行业龙头','深耕流感疫苗市场','国内领先流感疫苗制造商','拨云见日','流感疫苗龙头']
+
+          def request(d,page,q='0'):
+            params={
+              'pageNo':str(page),'pageSize':'100','code':'',
+              'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+              'beginTime':d,'endTime':d,'fields':'','qType':q,
+              'orgCode':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)
+            }
+            r=requests.get(api,params=params,timeout=45,headers={
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/'
+            })
+            r.raise_for_status()
+            return r.json()
+
+          page_tasks=[]
+          for d in days:
+            for q in ('0','1','2'):
+              try:
+                obj=request(d,1,q)
+              except Exception as e:
+                print('FIRST_ERROR',d,q,repr(e)); continue
+              rows=obj.get('data') or []
+              hits=int(obj.get('hits') or len(rows) or 0)
+              total=int(obj.get('TotalPage') or math.ceil(hits/100) or 1)
+              total=max(1,min(total,20))
+              print('FIRST',d,q,'hits',hits,'pages',total,'rows',len(rows))
+              for row in rows:
+                blob=' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode','orgSName'])
+                if any(k in blob for k in keys):
+                  print('MATCH',json.dumps(row,ensure_ascii=False))
+              for p in range(2,total+1): page_tasks.append((d,p,q))
+
+          def worker(task):
+            d,p,q=task
+            return task,request(d,p,q)
+
+          with ThreadPoolExecutor(max_workers=24) as ex:
+            fs=[ex.submit(worker,t) for t in page_tasks]
+            for f in as_completed(fs):
+              try:
+                (d,p,q),obj=f.result()
+              except Exception as e:
+                print('PAGE_ERROR',repr(e)); continue
+              rows=obj.get('data') or []
+              for row in rows:
+                blob=' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode','orgSName'])
+                if any(k in blob for k in keys):
+                  print('MATCH',json.dumps(row,ensure_ascii=False))
+          PY
