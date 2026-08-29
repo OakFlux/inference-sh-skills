@@ -1,0 +1,86 @@
+name: Temporary Kanghua report source discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/kanghua-bio-reports-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch candidate pages and inspect public file endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/js
+          python - <<'PY'
+          from __future__ import annotations
+          import html
+          import json
+          import re
+          import urllib.parse
+          from pathlib import Path
+          import requests
+
+          out=Path('diagnostics')
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          pages={
+            'hibor_2025':'https://www.hibor.com.cn/repinfodetail_4708700.html',
+            'hibor_wap_2025':'https://wap.hibor.com.cn/repinfodetail_4708700.html',
+            'sgpjbg_2022':'https://www.sgpjbg.com/baogao/101016.html',
+            'sgpjbg_bg_2022':'https://bg.sgpjbg.com/baogao/101016.html',
+            'sgpjbg_info_2020':'https://www.sgpjbg.com/info/18680.html',
+            'sina_2022':'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/717709904923/index.phtml',
+            'baogaobox_2025':'https://www.baogaobox.com/reports/251127000084980.html',
+            'vzkoo_2025':'https://www.vzkoo.com/read/202511277edb9af20e77328bd4a2efce.html',
+            'book118_2025':'https://max.book118.com/html/2025/1126/7111012014011015.shtm',
+          }
+          all_urls=[]
+          errors=[]
+          for key,url in pages.items():
+            try:
+              r=s.get(url,timeout=90,allow_redirects=True)
+              out.joinpath(f'{key}.html').write_bytes(r.content)
+              out.joinpath(f'{key}_meta.json').write_text(json.dumps({'status':r.status_code,'url':r.url,'headers':dict(r.headers)},ensure_ascii=False,indent=2),encoding='utf-8')
+              text=r.text.replace('\\/','/').replace('&amp;','&')
+              for m in re.findall(r'https?://[^"\'<>\\\s]+',text,re.I): all_urls.append((key,html.unescape(m).rstrip(');,]')))
+              for m in re.findall(r'(?:href|src|action)=["\']([^"\']+)',text,re.I): all_urls.append((key,urllib.parse.urljoin(r.url,html.unescape(m))))
+              # Fetch same-site JS assets for endpoint discovery.
+              for i,src in enumerate(re.findall(r'<script[^>]+src=["\']([^"\']+)',text,re.I)):
+                jsurl=urllib.parse.urljoin(r.url,html.unescape(src))
+                if urllib.parse.urlparse(jsurl).netloc != urllib.parse.urlparse(r.url).netloc: continue
+                try:
+                  jr=s.get(jsurl,timeout=60)
+                  out.joinpath('js',f'{key}_{i:02d}.js').write_bytes(jr.content)
+                  jt=jr.text.replace('\\/','/')
+                  for m in re.findall(r'https?://[^"\'<>\\\s]+',jt,re.I): all_urls.append((key+'_js',html.unescape(m).rstrip(');,]')))
+                  for m in re.findall(r'["\'](/[^"\']*(?:pdf|download|down|file|report|preview|attachment)[^"\']*)["\']',jt,re.I): all_urls.append((key+'_js',urllib.parse.urljoin(jsurl,html.unescape(m))))
+                except Exception as e:
+                  errors.append((jsurl,repr(e)))
+            except Exception as e:
+              errors.append((url,repr(e)))
+          seen=set(); lines=[]
+          for key,u in all_urls:
+            if (key,u) in seen: continue
+            seen.add((key,u))
+            if re.search(r'pdf|download|down|file|report|preview|attachment|101016|4708700|717709904923|848980',u,re.I):
+              lines.append(f'{key}\t{u}')
+          out.joinpath('candidate_urls.txt').write_text('\n'.join(sorted(lines)),encoding='utf-8')
+          out.joinpath('errors.txt').write_text('\n'.join(f'{u}\t{e}' for u,e in errors),encoding='utf-8')
+          PY
+          grep -RIEon 'pdf|download|downurl|fileurl|filepath|attachment|101016|4708700|717709904923|251127000084980' diagnostics > diagnostics/keyword_hits.txt || true
+
+      - name: Upload discovery diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghua-report-source-discovery
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
