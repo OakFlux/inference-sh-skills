@@ -1,0 +1,76 @@
+name: Diagnose Jinbo Bio NEEQ API v3
+
+on:
+  push:
+    branches:
+      - tmp/jinbo-bio-complete-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Probe parameter combinations
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import requests
+
+          s = requests.Session()
+          s.headers.update({
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+              "Referer": "https://www.neeq.com.cn/disclosure/announcement.html",
+              "X-Requested-With": "XMLHttpRequest",
+          })
+          fields = [
+              "companyCd", "companyName", "disclosureTitle", "disclosurePostTitle",
+              "destFilePath", "publishDate", "xxfcbj", "fileExt", "xxzrlx"
+          ]
+          base = "https://www.neeq.com.cn/disclosureInfoController/companyAnnouncement.do"
+
+          for code in ("832982", "920982"):
+              for xxfcbj in ("0", "1", "2", "3"):
+                  params = [
+                      ("callback", "cb"),
+                      ("page", "0"),
+                      ("companyCd", code),
+                      ("isNewThree", "1"),
+                      ("startTime", "2016-02-01"),
+                      ("endTime", "2016-02-10"),
+                      ("keyword", ""),
+                      ("xxfcbj", xxfcbj),
+                      ("hyType", ""),
+                      ("siteId", "1"),
+                  ]
+                  params.extend(("needFields", f) for f in fields)
+                  try:
+                      r = s.get(base, params=params, timeout=30)
+                      r.encoding = r.apparent_encoding or "utf-8"
+                      print("QUERY", code, xxfcbj, r.status_code, len(r.content), r.url)
+                      print(r.text[:5000].replace("\n", " "))
+                  except Exception as exc:
+                      print("ERROR", code, xxfcbj, repr(exc))
+
+          print("=== BROAD MULTI-XXFCBJ ===")
+          for code in ("832982", "920982"):
+              params = [
+                  ("callback", "cb"), ("page", "0"), ("companyCd", code),
+                  ("isNewThree", "1"), ("startTime", "2015-01-01"),
+                  ("endTime", "2017-12-31"), ("keyword", "年度报告"),
+                  ("hyType", ""), ("siteId", "1"),
+              ]
+              for v in ("0", "1", "2", "3"):
+                  params.append(("xxfcbj", v))
+              params.extend(("needFields", f) for f in fields)
+              try:
+                  r = s.get(base, params=params, timeout=30)
+                  r.encoding = r.apparent_encoding or "utf-8"
+                  print("MULTI", code, r.status_code, len(r.content), r.url)
+                  print(r.text[:10000].replace("\n", " "))
+              except Exception as exc:
+                  print("MULTI ERROR", code, repr(exc))
+          PY
