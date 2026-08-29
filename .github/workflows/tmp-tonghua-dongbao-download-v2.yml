@@ -1,0 +1,96 @@
+name: Temporary Tonghua Dongbao report downloader v2
+
+on:
+  push:
+    branches:
+      - tmp/download-tonghua-dongbao-reports-20260829
+    paths:
+      - .github/workflows/tmp-tonghua-dongbao-download-v2.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and inspect original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local stem="$3"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A "$UA" -e 'https://data.eastmoney.com/report/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "output/$dest"
+            test -s "output/$dest"
+            test "$(head -c 4 "output/$dest")" = '%PDF'
+            actual=$(pdfinfo "output/$dest" | awk '/^Pages:/ {print $2}')
+            echo "$dest\t$actual" >> output/PAGE_COUNTS.tsv
+            pdftotext -f 1 -l 3 "output/$dest" "previews/${stem}_text.txt" || true
+            pdftoppm -f 1 -singlefile -png -r 110 "output/$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$actual" -singlefile -png -r 110 "output/$dest" "previews/${stem}_last" >/dev/null 2>&1
+            test -s "previews/${stem}_first.png"
+            test -s "previews/${stem}_last.png"
+          }
+
+          printf 'filename\tpages\n' > output/PAGE_COUNTS.tsv
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202401251618089993_1.pdf' \
+            '01_Sinolink_Securities_Tonghua_Dongbao_Deep_Report_20240125.pdf' \
+            'sinolink_20240125'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202312081613630576_1.pdf' \
+            '02_Minsheng_Securities_Tonghua_Dongbao_Deep_Report_20231208.pdf' \
+            'minsheng_20231208'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202309151598726421_1.pdf' \
+            '03_Southwest_Securities_Tonghua_Dongbao_Deep_Report_20230915.pdf' \
+            'southwest_20230915'
+
+          cat > output/报告清单.txt <<'EOF'
+          通化东宝（600867.SH）券商深度研究报告，共3份
+
+          1. 国金证券，2024-01-25
+             《胰岛素国产替代有望加速，多领域创新+海外商业化带动远期增长》
+
+          2. 民生证券，2023-12-08
+             《深度研究：创新产品加速企业转型，海外商业化蓄势待发》
+
+          3. 西南证券，2023-09-15
+             《集采扰动基本出清，创新管线打开成长空间》
+
+          三份均为原始、可检索PDF。实际页数见 PAGE_COUNTS.tsv。
+          EOF
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          echo 'PAGE COUNTS:'
+          cat output/PAGE_COUNTS.tsv
+          echo 'FIRST-PAGE TEXT:'
+          for f in previews/*_text.txt; do echo "===== $f ====="; sed -n '1,80p' "$f"; done
+          ls -lh output previews
+
+      - name: Upload downloaded reports and diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: tonghua-dongbao-broker-deep-reports-v2
+          path: |
+            output/
+            previews/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
