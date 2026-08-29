@@ -1,0 +1,96 @@
+name: Temporary verified Jinbo Biopharma deep report package
+
+on:
+  push:
+    branches:
+      - tmp/download-jinbo-biopharma-reports-20260829
+    paths:
+      - .github/workflows/tmp-jinbo-download.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and verify original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          download_pdf() {
+            local url="$1"
+            local dest="$2"
+            local pages="$3"
+            local expected="$4"
+            local stem="$5"
+            curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 600 --compressed \
+              -A "$UA" -e 'https://data.eastmoney.com/report/' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              "$url" -o "output/$dest"
+            test -s "output/$dest"
+            test "$(head -c 4 "output/$dest")" = '%PDF'
+            actual=$(pdfinfo "output/$dest" | awk '/^Pages:/ {print $2}')
+            test "$actual" -eq "$pages"
+            pdftotext -f 1 -l 3 "output/$dest" "previews/${stem}_text.txt"
+            grep -q "$expected" "previews/${stem}_text.txt"
+            pdftoppm -f 1 -singlefile -png -r 110 "output/$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 110 "output/$dest" "previews/${stem}_last" >/dev/null 2>&1
+            test -s "previews/${stem}_first.png"
+            test -s "previews/${stem}_last.png"
+          }
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202502231643415410_1.pdf' \
+            '01_Hualong_Securities_Jinbo_Biopharma_Deep_Report_20250223_25p.pdf' \
+            25 '专注重组胶原蛋白领域' 'hualong_20250223'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202411261641069821_1.pdf' \
+            '02_Sinolink_Securities_Jinbo_Biopharma_Deep_Report_20241126_18p.pdf' \
+            18 '薇旖美放量确定性高' 'sinolink_20241126'
+
+          download_pdf \
+            'https://pdf.dfcfw.com/pdf/H3_AP202407111637795589_1.pdf' \
+            '03_Kaiyuan_Securities_Jinbo_Biopharma_Initiation_20240711_33p.pdf' \
+            33 '重组胶原蛋白' 'kaiyuan_20240711'
+
+          {
+            echo '锦波生物（920982.BJ，原832982）券商深度报告，共3份'
+            echo
+            echo '1. 华龙证券，2025-02-23，25页'
+            echo '   《公司深度研究报告：专注重组胶原蛋白领域，构建起全方位产业链》'
+            echo '   研究员：孙伯文；评级：买入。'
+            echo
+            echo '2. 国金证券，2024-11-26，18页'
+            echo '   《薇旖美放量确定性高，多剂型+多型别+多适应症蓄力中长期成长》'
+            echo '   研究员：罗晓婷、赵中平；评级：买入。'
+            echo
+            echo '3. 开源证券，2024-07-11，33页'
+            echo '   《北交所首次覆盖报告：重组胶原蛋白“小巨人”，薇旖美高增长生物蛋白市场广阔》'
+            echo '   研究员：诸海滨；评级：增持。'
+            echo
+            echo '三份均为原始、完整、可检索PDF，不是网页正文、摘要或预览页重制文件。'
+            echo '已核验PDF文件头、实际页数、首页标题文字，并成功渲染首页与末页。'
+            echo '仅供研究资料整理，不构成投资建议。'
+          } > output/报告清单与核验说明.txt
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          ls -lh output previews
+
+      - name: Upload verified original reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinbo-biopharma-broker-deep-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
