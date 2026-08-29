@@ -1,0 +1,65 @@
+name: Dunhuang Hibor legacy endpoint variants
+on:
+  push:
+    branches: ['tmp/dunhuang-hibor-variants-20260829']
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Test legacy and mobile endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cat > out/urls.txt <<'EOF'
+          http://www.hibor.com.cn/docdetail_548523.html
+          http://p.hibor.com.cn/docdetail_548523.html
+          https://p.hibor.com.cn/docdetail_548523.html
+          http://fxgroup.hibor.com.cn/docdetail_548523.html
+          https://fxgroup.hibor.com.cn/docdetail_548523.html
+          https://www.hibor.com.cn/wap_detail.aspx?id=548523
+          https://m.hibor.com.cn/wap_detail.aspx?id=548523
+          https://wap.hibor.com.cn/wap_detail.aspx?id=548523
+          https://m.hibor.com.cn/docdetail_548523.html
+          https://wap.hibor.com.cn/docdetail_548523.html
+          https://www.hibor.com.cn/wap_detail.aspx?id=548523&from=archive
+          EOF
+          python - <<'PY'
+          import html,json,re,subprocess
+          from pathlib import Path
+          ua='Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 Version/17.6 Mobile/15E148 Safari/604.1'
+          rows=[]
+          for i,url in enumerate(Path('out/urls.txt').read_text().splitlines()):
+              url=url.strip()
+              if not url:continue
+              body=Path(f'out/{i:02d}.body'); head=Path(f'out/{i:02d}.headers')
+              p=subprocess.run([
+                  'curl','--http1.1','-L','--silent','--show-error','--retry','4','--retry-all-errors',
+                  '--connect-timeout','20','--max-time','150','--user-agent',ua,
+                  '--header','Accept-Encoding: identity','--dump-header',str(head),
+                  '--output',str(body),'--write-out','%{http_code}\t%{url_effective}\t%{content_type}',url
+              ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              raw=body.read_bytes() if body.exists() else b''
+              texts=[raw.decode(e,'ignore') for e in ('utf-8','gb18030','gbk')]
+              text=max(texts,key=lambda s:s.count('敦煌种业')+s.count('报告原文')+s.lower().count('pdf')) if texts else ''
+              norm=html.unescape(text.replace('\\/','/'))
+              title='';m=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>',' ',m.group(1)).strip()
+              links=[]
+              for u in re.findall(r'(?:href|src|action)=["\']([^"\']+)["\']',norm,re.I):
+                  if re.search(r'pdf|rar|download|down|attach|file|original|原文',u,re.I):links.append(html.unescape(u))
+              row={'i':i,'url':url,'curl':p.stdout,'rc':p.returncode,'err':p.stderr[-500:],'size':len(raw),'title':title,'dunhuang':norm.count('敦煌种业'),'report_original':norm.count('报告原文'),'links':list(dict.fromkeys(links))[:50]}
+              rows.append(row)
+              print(json.dumps(row,ensure_ascii=False))
+          Path('out/results.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-hibor-legacy-variants
+          path: out/
+          retention-days: 2
+          compression-level: 9
