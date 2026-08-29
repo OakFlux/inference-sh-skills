@@ -1,0 +1,88 @@
+name: Temporary Anxu Bio deep report download
+
+on:
+  push:
+    branches:
+      - tmp/download-anxu-bio-reports-20260829
+    paths:
+      - .github/workflows/tmp-anxu-bio-download.yml
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF verification tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download and validate report
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output verify
+          url='https://pdf.dfcfw.com/pdf/H3_AP202201121539917897_1.pdf'
+          file='output/01_上海证券_安旭生物_原料自主可控引领POCT检测发展_20220112_40页.pdf'
+
+          curl -L --fail --retry 6 --retry-delay 2 --retry-all-errors \
+            --connect-timeout 30 --max-time 600 --compressed \
+            -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36' \
+            -e 'https://data.eastmoney.com/report/' \
+            -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+            "$url" -o "$file"
+
+          test -s "$file"
+          test "$(head -c 4 "$file")" = '%PDF'
+          pages="$(pdfinfo "$file" | awk '/^Pages:/ {print $2}')"
+          test "$pages" = '40'
+          pdftotext -f 1 -l 7 "$file" verify/first7pages.txt
+          grep -Eq '安旭生物|688075' verify/first7pages.txt
+          pdftoppm -f 1 -singlefile -png -r 130 "$file" verify/page1 >/dev/null 2>&1
+          pdftoppm -f 40 -singlefile -png -r 100 "$file" verify/page40 >/dev/null 2>&1
+          sha256sum "$file" > output/SHA256SUMS.txt
+
+          cat > output/报告清单与检索说明.txt <<'TXT'
+          安旭生物（688075.SH）券商深度报告
+
+          1. 上海证券：《原料自主可控，引领POCT检测发展》
+             日期：2022-01-12
+             类型：公司深度报告 / 首次覆盖
+             页数：40页
+             评级：买入
+             原始公开PDF：https://pdf.dfcfw.com/pdf/H3_AP202201121539917897_1.pdf
+
+          检索说明：公开券商研报目录中仅核验到这一份完整、明确面向安旭生物的公司深度报告。其他页面主要为同一报告的重复转载、3-5页财报点评、公司公告或非券商材料，未用重复文件或短篇点评凑数。
+
+          风险提示：该报告后来因“分析结论的合理依据不够充分、发布前质量控制存在不足”等问题受到监管关注。阅读时应结合公司公告、后续财报及其他独立信息进行交叉核验。
+
+          资料仅供研究参考，不构成投资建议。
+          TXT
+
+          printf '%s\n' \
+            '文件格式：PDF' \
+            "实际页数：${pages}" \
+            '主体核验：前7页可识别“安旭生物”或“688075”' \
+            '渲染核验：首页及末页均成功渲染' \
+            > verify/核验结果.txt
+
+          ls -lh output verify
+
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: anxu-bio-broker-deep-report
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+
+      - name: Upload verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: anxu-bio-broker-deep-report-verification
+          path: verify/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
