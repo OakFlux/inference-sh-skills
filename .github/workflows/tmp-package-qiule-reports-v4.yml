@@ -1,0 +1,106 @@
+name: Package verified Qiule Seeds reports v4
+
+on:
+  push:
+    branches:
+      - tmp/qiule-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+
+      - name: Build complete verified package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import requests
+          import textwrap
+
+          source_url = "https://raw.githubusercontent.com/OakFlux/inference-sh-skills/e78cdf29c3a2721979d2ee1a81123fbf0a37dee3/.github/workflows/tmp-package-foxit-reports.yml"
+          response = requests.get(source_url, timeout=120)
+          response.raise_for_status()
+          workflow = response.text
+
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n"
+          if start_marker not in workflow or end_marker not in workflow:
+              raise RuntimeError("Unable to extract embedded Python packaging script")
+
+          block = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
+          code = textwrap.dedent(block)
+
+          replacements = [
+              ("foxit_verified_package", "qiule_verified_package"),
+              ('STOCK_ID = "688095"', 'STOCK_ID = "920087"'),
+              ('COMPANY = "福建福昕软件开发股份有限公司"', 'COMPANY = "河南秋乐种业科技股份有限公司"'),
+              ('SHORT_NAME = "福昕软件"', 'SHORT_NAME = "秋乐种业"'),
+              ("福建福昕软件开发股份有限公司", "河南秋乐种业科技股份有限公司"),
+              ("福昕软件", "秋乐种业"),
+              ('"foxit"', '"qiule"'),
+              ("688095.SH", "920087.BJ"),
+              ('f"{STOCK_ID}.SH"', 'f"{STOCK_ID}.BJ"'),
+              ("static.sse.com.cn", "static.bse.cn"),
+              ("01_年度报告_2020-2025", "01_年度报告_2014-2025"),
+              ("2020—2025", "2014—2025"),
+              ("range(2020, 2026)", "range(2014, 2026)"),
+              ("共6份完整年度报告", "共12份完整年度报告"),
+              ("len(documents) != 7", "len(documents) != 13"),
+              ("Expected 7 documents", "Expected 13 documents"),
+              ("list(range(2020, 2026))", "list(range(2014, 2026))"),
+              ("len(pdfs) != 7", "len(pdfs) != 13"),
+              ("Expected 7 PDFs", "Expected 13 PDFs"),
+              ('minimum_pages = {"annual": 100, "half": 60}[kind]', 'minimum_pages = {"annual": 55, "half": 60}[kind]'),
+              ("秋乐种业_2020-2025年报_2026年最新半年报_完整PDF.zip", "秋乐种业_全部年报_2026年最新半年报_完整PDF.zip"),
+          ]
+          for old, new in replacements:
+              code = code.replace(old, new)
+
+          helper_block = base64.b64decode("ZGVmIHBhcnNlX25lZXFfanNvbnAodGV4dDogc3RyKSAtPiBkaWN0W3N0ciwgQW55XToKICAgIHN0YXJ0ID0gdGV4dC5maW5kKCIoIikKICAgIGVuZCA9IHRleHQucmZpbmQoIikiKQogICAgaWYgc3RhcnQgPCAwIG9yIGVuZCA8PSBzdGFydDoKICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoIkludmFsaWQgTkVFUSBKU09OUCByZXNwb25zZSIpCiAgICBwYXlsb2FkID0ganNvbi5sb2Fkcyh0ZXh0W3N0YXJ0ICsgMTplbmRdKQogICAgaWYgaXNpbnN0YW5jZShwYXlsb2FkLCBsaXN0KToKICAgICAgICBpZiBub3QgcGF5bG9hZDoKICAgICAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJFbXB0eSBORUVRIEpTT05QIHJlc3BvbnNlIikKICAgICAgICBwYXlsb2FkID0gcGF5bG9hZFswXQogICAgaWYgbm90IGlzaW5zdGFuY2UocGF5bG9hZCwgZGljdCk6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKCJVbmV4cGVjdGVkIE5FRVEgcGF5bG9hZCB0eXBlIikKICAgIHJldHVybiBwYXlsb2FkCgoKZGVmIGdldF9uZWVxXzIwMTRfcmVwb3J0KCkgLT4gdHVwbGVbc3RyLCBzdHIsIHN0cl06CiAgICBlbmRwb2ludCA9ICJodHRwczovL3d3dy5uZWVxLmNvbS5jbi9kaXNjbG9zdXJlSW5mb0NvbnRyb2xsZXIvY29tcGFueUFubm91bmNlbWVudC5kbyIKICAgIG5lZWRfZmllbGRzID0gWwogICAgICAgICJjb21wYW55Q2QiLCAiY29tcGFueU5hbWUiLCAiZGlzY2xvc3VyZVRpdGxlIiwgImRpc2Nsb3N1cmVQb3N0VGl0bGUiLAogICAgICAgICJkZXN0RmlsZVBhdGgiLCAicHVibGlzaERhdGUiLCAieHhmY2JqIiwgImZpbGVFeHQiLCAieHh6cmx4IiwKICAgIF0KICAgIGVycm9yczogbGlzdFtzdHJdID0gW10KICAgIGFsbF9yZWNvcmRzOiBsaXN0W2RpY3Rbc3RyLCBBbnldXSA9IFtdCiAgICBmb3IgY29tcGFueV9jb2RlIGluICgiODMxMDg3IiwgIjkyMDA4NyIpOgogICAgICAgIHRyeToKICAgICAgICAgICAgcGFnZV9udW1iZXIgPSAwCiAgICAgICAgICAgIHRvdGFsX3BhZ2VzID0gMQogICAgICAgICAgICB3aGlsZSBwYWdlX251bWJlciA8IHRvdGFsX3BhZ2VzOgogICAgICAgICAgICAgICAgZGF0YTogbGlzdFt0dXBsZVtzdHIsIHN0cl1dID0gWwogICAgICAgICAgICAgICAgICAgICgibm90aWNlVHlwZVtdIiwgIjUiKSwKICAgICAgICAgICAgICAgICAgICAoImRpc2Nsb3N1cmVUeXBlW10iLCAiNSIpLAogICAgICAgICAgICAgICAgICAgICgiZGlzY2xvc3VyZVN1YnR5cGVbXSIsICIiKSwKICAgICAgICAgICAgICAgICAgICAoInBhZ2UiLCAiIiBpZiBwYWdlX251bWJlciA9PSAwIGVsc2Ugc3RyKHBhZ2VfbnVtYmVyKSksCiAgICAgICAgICAgICAgICAgICAgKCJjb21wYW55Q2QiLCBjb21wYW55X2NvZGUpLAogICAgICAgICAgICAgICAgICAgICgiaXNOZXdUaHJlZSIsICIxIiksCiAgICAgICAgICAgICAgICAgICAgKCJrZXl3b3JkIiwgIjIwMTTlubTlubTluqbmiqXlkYoiKSwKICAgICAgICAgICAgICAgICAgICAoInh4ZmNialtdIiwgIjMiKSwKICAgICAgICAgICAgICAgICAgICAoImh5VHlwZVtdIiwgIiIpLAogICAgICAgICAgICAgICAgXQogICAgICAgICAgICAgICAgZGF0YS5leHRlbmQoKCJuZWVkRmllbGRzW10iLCBmaWVsZCkgZm9yIGZpZWxkIGluIG5lZWRfZmllbGRzKQogICAgICAgICAgICAgICAgZGF0YS5leHRlbmQoWwogICAgICAgICAgICAgICAgICAgICgic2l0ZUlkIiwgIjEiKSwKICAgICAgICAgICAgICAgICAgICAoInNvcnRmaWVsZCIsICJ4eHNzZHEiKSwKICAgICAgICAgICAgICAgICAgICAoInNvcnR0eXBlIiwgImFzYyIpLAogICAgICAgICAgICAgICAgXSkKICAgICAgICAgICAgICAgIHJlc3BvbnNlID0gc2Vzc2lvbi5wb3N0KAogICAgICAgICAgICAgICAgICAgIGVuZHBvaW50LAogICAgICAgICAgICAgICAgICAgIHBhcmFtcz17ImNhbGxiYWNrIjogInFpdWxlQ2FsbGJhY2sifSwKICAgICAgICAgICAgICAgICAgICBkYXRhPWRhdGEsCiAgICAgICAgICAgICAgICAgICAgaGVhZGVycz17CiAgICAgICAgICAgICAgICAgICAgICAgICJSZWZlcmVyIjogImh0dHBzOi8vd3d3Lm5lZXEuY29tLmNuL2Rpc2Nsb3N1cmUvYW5ub3VuY2VtZW50Lmh0bWwiLAogICAgICAgICAgICAgICAgICAgICAgICAiWC1SZXF1ZXN0ZWQtV2l0aCI6ICJYTUxIdHRwUmVxdWVzdCIsCiAgICAgICAgICAgICAgICAgICAgICAgICJBY2NlcHQiOiAidGV4dC9qYXZhc2NyaXB0LCBhcHBsaWNhdGlvbi9qYXZhc2NyaXB0LCAqLyo7IHE9MC4wMSIsCiAgICAgICAgICAgICAgICAgICAgfSwKICAgICAgICAgICAgICAgICAgICB0aW1lb3V0PSgyNSwgMTIwKSwKICAgICAgICAgICAgICAgICkKICAgICAgICAgICAgICAgIHJlc3BvbnNlLnJhaXNlX2Zvcl9zdGF0dXMoKQogICAgICAgICAgICAgICAgcGF5bG9hZCA9IHBhcnNlX25lZXFfanNvbnAocmVzcG9uc2UudGV4dCkKICAgICAgICAgICAgICAgIGxpc3RfaW5mbyA9IHBheWxvYWQuZ2V0KCJsaXN0SW5mbyIpIG9yIHt9CiAgICAgICAgICAgICAgICBjb250ZW50ID0gbGlzdF9pbmZvLmdldCgiY29udGVudCIpIG9yIFtdCiAgICAgICAgICAgICAgICBpZiBub3QgaXNpbnN0YW5jZShjb250ZW50LCBsaXN0KToKICAgICAgICAgICAgICAgICAgICByYWlzZSBSdW50aW1lRXJyb3IoIkludmFsaWQgTkVFUSBjb250ZW50IGxpc3QiKQogICAgICAgICAgICAgICAgYWxsX3JlY29yZHMuZXh0ZW5kKGNvbnRlbnQpCiAgICAgICAgICAgICAgICB0b3RhbF9wYWdlcyA9IGludChsaXN0X2luZm8uZ2V0KCJ0b3RhbFBhZ2VzIikgb3IgMSkKICAgICAgICAgICAgICAgIHBhZ2VfbnVtYmVyICs9IDEKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGV4YzoKICAgICAgICAgICAgZXJyb3JzLmFwcGVuZChmImNvbXBhbnlDZD17Y29tcGFueV9jb2RlfToge2V4Y30iKQoKICAgIGNhbmRpZGF0ZXM6IGxpc3RbdHVwbGVbZmxvYXQsIGRpY3Rbc3RyLCBBbnldXV0gPSBbXQogICAgZm9yIHJlY29yZCBpbiBhbGxfcmVjb3JkczoKICAgICAgICB0aXRsZSA9IG5vcm1hbGl6ZSgKICAgICAgICAgICAgc3RyKHJlY29yZC5nZXQoImRpc2Nsb3N1cmVUaXRsZSIpIG9yICIiKQogICAgICAgICAgICArIHN0cihyZWNvcmQuZ2V0KCJkaXNjbG9zdXJlUG9zdFRpdGxlIikgb3IgIiIpCiAgICAgICAgKQogICAgICAgIGlmICLnp4vkuZDnp43kuJoiIG5vdCBpbiB0aXRsZSBhbmQgIuays+WNl+eni+S5kOenjeS4muenkeaKgCIgbm90IGluIHRpdGxlOgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIGlmICIyMDE05bm05bm05bqm5oql5ZGKIiBub3QgaW4gdGl0bGUgYW5kICIyMDE05bm05bqm5oql5ZGKIiBub3QgaW4gdGl0bGU6CiAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgaWYgIuaRmOimgSIgaW4gdGl0bGUgb3IgIuWPlua2iCIgaW4gdGl0bGU6CiAgICAgICAgICAgIGNvbnRpbnVlCiAgICAgICAgZGVzdCA9IHN0cihyZWNvcmQuZ2V0KCJkZXN0RmlsZVBhdGgiKSBvciAiIikuc3RyaXAoKQogICAgICAgIGlmIG5vdCBkZXN0OgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIHNjb3JlID0gMTAwLjAKICAgICAgICBpZiBhbnkobWFya2VyIGluIHRpdGxlIGZvciBtYXJrZXIgaW4gKCLkv67orqIiLCAi5pu05q2j5ZCOIiwgIuabtOaWsOWQjiIpKToKICAgICAgICAgICAgc2NvcmUgKz0gMTAwLjAKICAgICAgICBwdWJsaXNoX2RhdGUgPSBzdHIocmVjb3JkLmdldCgicHVibGlzaERhdGUiKSBvciAiIikucmVwbGFjZSgiLSIsICIiKQogICAgICAgIGlmIHB1Ymxpc2hfZGF0ZS5pc2RpZ2l0KCk6CiAgICAgICAgICAgIHNjb3JlICs9IGludChwdWJsaXNoX2RhdGUpIC8gMTAwXzAwMF8wMDAKICAgICAgICBjYW5kaWRhdGVzLmFwcGVuZCgoc2NvcmUsIHJlY29yZCkpCgogICAgaWYgbm90IGNhbmRpZGF0ZXM6CiAgICAgICAgcmFpc2UgUnVudGltZUVycm9yKAogICAgICAgICAgICAiTm8gTkVFUSAyMDE0IGFubnVhbCByZXBvcnQgZm91bmQ7IGVycm9ycz0iICsgIiB8ICIuam9pbihlcnJvcnMpCiAgICAgICAgICAgICsgIjsgcmVjb3Jkcz0iICsganNvbi5kdW1wcyhhbGxfcmVjb3JkcywgZW5zdXJlX2FzY2lpPUZhbHNlKVs6MTAwMDBdCiAgICAgICAgKQogICAgY2FuZGlkYXRlcy5zb3J0KGtleT1sYW1iZGEgaXRlbTogaXRlbVswXSwgcmV2ZXJzZT1UcnVlKQogICAgcmVjb3JkID0gY2FuZGlkYXRlc1swXVsxXQogICAgcGF0aF9vcl91cmwgPSBodG1sX2xpYi51bmVzY2FwZSgKICAgICAgICBzdHIocmVjb3JkLmdldCgiZGVzdEZpbGVQYXRoIikgb3IgIiIpCiAgICApLnJlcGxhY2UoIlxcLyIsICIvIikKICAgIGRldGFpbF91cmwgPSAiaHR0cHM6Ly93d3cubmVlcS5jb20uY24vZGlzY2xvc3VyZS9hbm5vdW5jZW1lbnQuaHRtbD9jb21wYW55Q29kZT04MzEwODciCiAgICBjb250ZXh0ID0ganNvbi5kdW1wcyhyZWNvcmQsIGVuc3VyZV9hc2NpaT1GYWxzZSkKICAgIHByaW50KCJTZWxlY3RlZCBvZmZpY2lhbCBORUVRIDIwMTQgcmVwb3J0OiIsIGNvbnRleHQpCiAgICByZXR1cm4gcGF0aF9vcl91cmwsIGRldGFpbF91cmwsIGNvbnRleHQKCgpkZWYgbmVlcV9kb3dubG9hZF91cmxzKHBhdGhfb3JfdXJsOiBzdHIpIC0+IGxpc3Rbc3RyXToKICAgIHBhdGhfb3JfdXJsID0gaHRtbF9saWIudW5lc2NhcGUocGF0aF9vcl91cmwpLnJlcGxhY2UoIlxcLyIsICIvIikKICAgIGlmIHBhdGhfb3JfdXJsLnN0YXJ0c3dpdGgoImh0dHA6Ly8iKSBvciBwYXRoX29yX3VybC5zdGFydHN3aXRoKCJodHRwczovLyIpOgogICAgICAgIHVybHMgPSBbcGF0aF9vcl91cmxdCiAgICBlbHNlOgogICAgICAgIGlmIG5vdCBwYXRoX29yX3VybC5zdGFydHN3aXRoKCIvIik6CiAgICAgICAgICAgIHBhdGhfb3JfdXJsID0gIi8iICsgcGF0aF9vcl91cmwKICAgICAgICB1cmxzID0gWwogICAgICAgICAgICAiaHR0cHM6Ly93d3cubmVlcS5jb20uY24iICsgcGF0aF9vcl91cmwsCiAgICAgICAgICAgICJodHRwczovL3N0YXRpYy5uZWVxLmNvbS5jbiIgKyBwYXRoX29yX3VybCwKICAgICAgICAgICAgImh0dHBzOi8vd3d3LmJzZS5jbiIgKyBwYXRoX29yX3VybCwKICAgICAgICAgICAgImh0dHBzOi8vc3RhdGljLmJzZS5jbiIgKyBwYXRoX29yX3VybCwKICAgICAgICAgICAgImh0dHA6Ly93d3cubmVlcS5jb20uY24iICsgcGF0aF9vcl91cmwsCiAgICAgICAgXQogICAgcmV0dXJuIGxpc3QoZGljdC5mcm9ta2V5cyh1cmxzKSk=").decode("utf-8")[0m
+2026-08-29T11:26:41.0069276Z [36;1mreplacement_extract = base64.b64decode("ICAgIGlmIHllYXIgPT0gMjAxNDoKICAgICAgICByYXdfdXJsLCBkZXRhaWxfdXJsLCBjb250ZXh0ID0gZ2V0X25lZXFfMjAxNF9yZXBvcnQoKQogICAgZWxzZToKICAgICAgICByYXdfdXJsLCBkZXRhaWxfdXJsLCBjb250ZXh0ID0gZXh0cmFjdF9wZGZfZnJvbV9kZXRhaWwocmVjb3JkKQ==").decode("utf-8")[0m
+2026-08-29T11:26:41.0072891Z [36;1mreplacement_download = base64.b64decode("ICAgIGFubnVhbF91cmxzID0gbmVlcV9kb3dubG9hZF91cmxzKHJhd191cmwpIGlmIHllYXIgPT0gMjAxNCBlbHNlIGRvd25sb2FkX2NhbmRpZGF0ZXMocmF3X3VybCkKICAgIHVzZWRfdXJsID0gZG93bmxvYWRfcGRmKGFubnVhbF91cmxzLCB0YXJnZXQsIGRldGFpbF91cmwp").decode("utf-8")[0m
+2026-08-29T11:26:41.0074776Z [36;1m[0m
+2026-08-29T11:26:41.0075160Z [36;1mmarker = "documents: list[dict[str, Any]] = []"[0m
+2026-08-29T11:26:41.0075648Z [36;1mif marker not in code:[0m
+2026-08-29T11:26:41.0076170Z [36;1m    raise RuntimeError("Unable to locate document-list marker")[0m
+2026-08-29T11:26:41.0076824Z [36;1mcode = code.replace(marker, helper_block + "\\n\\n" + marker, 1)[0m
+2026-08-29T11:26:41.0077341Z [36;1m[0m
+2026-08-29T11:26:41.0077854Z [36;1moriginal_extract = 'raw_url, detail_url, context = extract_pdf_from_detail(record)'[0m
+2026-08-29T11:26:41.0078488Z [36;1mif original_extract not in code:[0m
+2026-08-29T11:26:41.0079053Z [36;1m    raise RuntimeError("Unable to locate annual PDF extraction line")[0m
+2026-08-29T11:26:41.0079724Z [36;1mcode = code.replace(original_extract, replacement_extract, 1)[0m
+2026-08-29T11:26:41.0080241Z [36;1m[0m
+2026-08-29T11:26:41.0080965Z [36;1moriginal_download = 'used_url = download_pdf(download_candidates(raw_url), target, detail_url)'[0m
+2026-08-29T11:26:41.0081798Z [36;1mif original_download not in code:[0m
+2026-08-29T11:26:41.0082341Z [36;1m    raise RuntimeError("Unable to locate annual download line")[0m
+2026-08-29T11:26:41.0082992Z [36;1mcode = code.replace(original_download, replacement_download, 1)[0m
+2026-08-29T11:26:41.0083511Z [36;1m[0m
+2026-08-29T11:26:41.0083839Z [36;1mrequired_tokens = [[0m
+2026-08-29T11:26:41.0084221Z [36;1m    'STOCK_ID = "920087"',[0m
+2026-08-29T11:26:41.0084630Z [36;1m    'COMPANY = "河南秋乐种业科技股份有限公司"',[0m
+2026-08-29T11:26:41.0085057Z [36;1m    'SHORT_NAME = "秋乐种业"',[0m
+2026-08-29T11:26:41.0085440Z [36;1m    'range(2014, 2026)',[0m
+2026-08-29T11:26:41.0085828Z [36;1m    'get_neeq_2014_report()',[0m
+2026-08-29T11:26:41.0086261Z [36;1m    '秋乐种业_全部年报_2026年最新半年报_完整PDF.zip',[0m
+2026-08-29T11:26:41.0086671Z [36;1m][0m
+2026-08-29T11:26:41.0087124Z [36;1mmissing = [token for token in required_tokens if token not in code][0m
+2026-08-29T11:26:41.0087694Z [36;1mif missing:[0m
+2026-08-29T11:26:41.0088198Z [36;1m    raise RuntimeError(f"Required transformations missing: {missing}")[0m
+2026-08-29T11:26:41.0088745Z [36;1m[0m
+2026-08-29T11:26:41.0089234Z [36;1mexec(compile(code, "qiule_packaging_v3.py", "exec"), {"__name__": "__main__"})[0m
+2026-08-29T11:26:41.0089790Z [36;1mPY[0m
+2026-08-29T11:26:41.0130770Z shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}
+2026-08-29T11:26:41.0131286Z ##[endgroup]
+2026-08-29T11:26:41.3310564Z Traceback (most recent call last):
+2026-08-29T11:26:41.3311089Z   File "<stdin>", line 13, in <module>
+2026-08-29T11:26:41.3311913Z RuntimeError: Unable to extract embedded Python packaging script
+2026-08-29T11:26:41.3513633Z ##[error]Process completed with exit code 1.
+2026-08-29T11:26:41.3616189Z Cleaning up orphan processes
