@@ -1,0 +1,94 @@
+name: Temporary Daan Gene broker report metadata discovery v2
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-meta2-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and rank broker report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for page in $(seq 1 10); do
+            curl --http1.1 --location --fail --silent --show-error \
+              --retry 7 --retry-all-errors --retry-delay 1 \
+              --connect-timeout 20 --max-time 180 \
+              --user-agent "$UA" \
+              --referer 'https://data.eastmoney.com/report/002030.html' \
+              --header 'Accept-Encoding: identity' \
+              --get 'https://reportapi.eastmoney.com/report/list' \
+              --data-urlencode 'pageNo='"$page" \
+              --data-urlencode 'pageSize=100' \
+              --data-urlencode 'code=002030' \
+              --data-urlencode 'industryCode=*' \
+              --data-urlencode 'industry=*' \
+              --data-urlencode 'rating=*' \
+              --data-urlencode 'ratingchange=*' \
+              --data-urlencode 'beginTime=2010-01-01' \
+              --data-urlencode 'endTime=2026-08-29' \
+              --data-urlencode 'fields=' \
+              --data-urlencode 'qType=0' \
+              --output "diagnostics/page_${page}.txt"
+          done
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          def parse(s):
+              s=s.strip()
+              if s and s[0] not in '[{' and '(' in s and s.endswith(')'):
+                  s=s[s.find('(')+1:s.rfind(')')]
+              return json.loads(s)
+          rows=[]; seen=set()
+          for p in sorted(Path('diagnostics').glob('page_*.txt')):
+              try: obj=parse(p.read_text(encoding='utf-8',errors='ignore'))
+              except Exception as e:
+                  print('BAD',p,e); continue
+              data=obj.get('data') or obj.get('result',{}).get('data') or []
+              if not isinstance(data,list): continue
+              added=0
+              for r in data:
+                  c=str(r.get('infoCode') or r.get('infocode') or r.get('info_code') or '')
+                  if c and c not in seen:
+                      seen.add(c); rows.append(r); added+=1
+              if data and added==0: break
+          def title(r): return str(r.get('title') or r.get('reportTitle') or '')
+          def broker(r): return str(r.get('orgSName') or r.get('orgName') or r.get('orgNameCn') or '')
+          def date(r):
+              x=str(r.get('publishDate') or r.get('publishTime') or r.get('publishDateTime') or '')
+              m=re.search(r'20\d{2}-\d{2}-\d{2}',x); return m.group(0) if m else x[:10]
+          def code(r): return str(r.get('infoCode') or r.get('infocode') or r.get('info_code') or '')
+          pos=['深度','首次覆盖','公司深度','研究报告','分子诊断','核酸检测','体外诊断','IVD','检验龙头','诊断龙头','全产业链','平台型','产业链','龙头企业','新冠检测','核酸试剂','公共卫生','医学检验','基因检测','护城河','价值重估','成长空间','国产替代','渠道优势','研发平台','规模效应']
+          neg=['一季报点评','中报点评','半年报点评','年报点评','三季报点评','季报点评','业绩点评','事件点评','公告点评','点评报告','业绩快报','公司信息更新','信息更新报告','定期报告点评','跟踪点评','简评']
+          def score(r):
+              x=re.sub(r'\s+','',title(r)); v=0
+              if '深度' in x:v+=380
+              if '首次覆盖' in x:v+=350
+              if '公司深度' in x:v+=140
+              v+=sum(55 for k in pos if re.sub(r'\s+','',k) in x)
+              v-=sum(270 for k in neg if re.sub(r'\s+','',k) in x)
+              try:y=int(date(r)[:4])
+              except:y=0
+              v+={2026:90,2025:80,2024:70,2023:60,2022:50,2021:40,2020:30,2019:25,2018:20,2017:15,2016:10}.get(y,0)
+              return v
+          out=sorted([{'score':score(r),'date':date(r),'broker':broker(r),'title':title(r),'infoCode':code(r)} for r in rows],key=lambda x:(x['score'],x['date']),reverse=True)
+          Path('diagnostics/candidates.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL',len(rows))
+          for x in out[:100]: print(json.dumps(x,ensure_ascii=False))
+          PY
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-report-metadata-v2
+          path: diagnostics/candidates.json
+          if-no-files-found: error
+          retention-days: 2
