@@ -1,0 +1,61 @@
+{
+  "company": "久其软件",
+  "stock_code": "002279.SZ",
+  "selected_reports": [
+    {
+      "filename": "2017-11-27_民生证券_拟配股收购上海移通，数字传播整合进程提速_5页.pdf",
+      "path": "jiuqi-output/2017-11-27_民生证券_拟配股收购上海移通，数字传播整合进程提速_5页.pdf",
+      "broker": "民生证券",
+      "date": "2017-11-27",
+      "title": "拟配股收购上海移通，数字传播整合进程提速",
+      "pages": 5,
+      "category": "公司跟踪/点评",
+      "score": -158,
+      "infoCode": "AP201711271058435367",
+      "pdf_url": "https://pdf.dfcfw.com/pdf/H3_AP201711271058435367_1.pdf",
+      "info_url": "https://data.eastmoney.com/report/info/AP201711271058435367.html",
+      "rating": "强烈推荐",
+      "researcher": "郑平,孙业亮",
+      "bytes": 576065,
+      "sha256": "e259efc08e2d112dbbf2f3aab5638d9ce0768be0c1f95601c4054b0432d19bde",
+      "identity_check": "通过（PDF前5页可解析公司名/代码）"
+    },
+    {
+      "filename": "2017-04-07_太平洋_四大业务协同驱动，资源整合战略领先_5页.pdf",
+      "path": "jiuqi-output/2017-04-07_太平洋_四大业务协同驱动，资源整合战略领先_5页.pdf",
+      "broker": "太平洋",
+      "date": "2017-04-07",
+      "title": "四大业务协同驱动，资源整合战略领先",
+      "pages": 5,
+      "category": "公司跟踪/点评",
+      "score": -158,
+      "infoCode": "AP201704070483410298",
+      "pdf_url": "https://pdf.dfcfw.com/pdf/H3_AP201704070483410298_1.pdf",
+      "info_url": "https://data.eastmoney.com/report/info/AP201704070483410298.html",
+      "rating": "增持",
+      "researcher": "李冰桓",
+      "bytes": 597212,
+      "sha256": "40b0dc12a77cb99e4086f6a99dfef751facba757ba26a9d0800f2822f166ea6f",
+      "identity_check": "通过（PDF前5页可解析公司名/代码）"
+    },
+    {
+      "filename": "2017-11-26_民生证券_内生表现平稳，数字传播整合发力促业绩高增_5页.pdf",
+      "path": "jiuqi-output/2017-11-26_民生证券_内生表现平稳，数字传播整合发力促业绩高增_5页.pdf",
+      "broker": "民生证券",
+      "date": "2017-11-26",
+      "title": "内生表现平稳，数字传播整合发力促业绩高增",
+      "pages": 5,
+      "category": "公司跟踪/点评",
+      "score": -158,
+      "infoCode": "AP201711261058412950",
+      "pdf_url": "https://pdf.dfcfw.com/pdf/H3_AP201711261058412950_1.pdf",
+      "info_url": "https://data.eastmoney.com/report/info/AP201711261058412950.html",
+      "rating": "强烈推荐",
+      "researcher": "郑平,孙业亮",
+      "bytes": 578736,
+      "sha256": "91f8f7370605ea1515d8ff518c3581a78a85b9b9836cfe4c517a17f745eab24a",
+      "identity_check": "通过（PDF前5页可解析公司名/代码）"
+    }
+  ],
+  "all_valid_reports_count": 5
+}
