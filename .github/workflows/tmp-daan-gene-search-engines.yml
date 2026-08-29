@@ -1,0 +1,100 @@
+name: Temporary Daan Gene report search engines
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-search-engines.yml
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search public web indexes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/html
+          python3 - <<'PY'
+          from pathlib import Path
+          import html, json, re, urllib.parse, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          queries=[
+              '"达安基因" 研报 PDF',
+              '"达安基因" 深度报告 券商',
+              '"达安基因" 002030 证券研究报告',
+              'site:pdf.dfcfw.com 达安基因',
+              'site:hangyan.co/reports 达安基因',
+              'site:sdyanbao.com/detail 达安基因',
+              'site:sgpjbg.com 达安基因 研报',
+              'site:fxbaogao.com/detail 达安基因',
+              'filetype:pdf 达安基因 公司研究',
+          ]
+          engines={
+              'bing':'https://www.bing.com/search?q={q}&count=50',
+              'duckduckgo':'https://html.duckduckgo.com/html/?q={q}',
+              'baidu':'https://www.baidu.com/s?wd={q}&rn=50',
+          }
+          links=[]
+          for ei,(ename,tpl) in enumerate(engines.items()):
+              for qi,q in enumerate(queries):
+                  url=tpl.format(q=urllib.parse.quote(q))
+                  req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+                  try:
+                      raw=urllib.request.urlopen(req,timeout=60).read()
+                      text=raw.decode('utf-8','replace')
+                  except Exception as exc:
+                      Path(f'diagnostic/html/{ename}_{qi}_error.txt').write_text(repr(exc),encoding='utf-8')
+                      continue
+                  Path(f'diagnostic/html/{ename}_{qi}.html').write_text(text,encoding='utf-8')
+                  # Extract all HTTP URLs and common wrapped result URLs.
+                  candidates=set(re.findall(r'https?://[^"<>\s]+', text))
+                  for m in re.finditer(r'(?:href|url)=?["\']([^"\']+)["\']', text, re.I):
+                      candidates.add(html.unescape(m.group(1)))
+                  for href in candidates:
+                      href=html.unescape(href).replace('&amp;','&')
+                      if href.startswith('//'): href='https:'+href
+                      # DuckDuckGo redirect.
+                      if 'uddg=' in href:
+                          try:
+                              href=urllib.parse.parse_qs(urllib.parse.urlparse(href).query).get('uddg',[href])[0]
+                          except Exception: pass
+                      # Bing redirect query values.
+                      p=urllib.parse.urlparse(href)
+                      qs=urllib.parse.parse_qs(p.query)
+                      for key in ('url','u','r'):
+                          if key in qs and qs[key]:
+                              val=qs[key][0]
+                              if val.startswith('http'): href=val
+                      low=href.lower()
+                      if any(term in href for term in ['达安基因','002030']) or any(domain in low for domain in ['dfcfw.com','eastmoney.com','hangyan.co','sdyanbao.com','sgpjbg.com','fxbaogao.com','pdf','report']):
+                          links.append({'engine':ename,'query':q,'url':href})
+
+          # Deduplicate and retain useful URLs.
+          out=[]; seen=set()
+          for x in links:
+              u=x['url'].rstrip(').,;\'"')
+              if u in seen: continue
+              seen.add(u)
+              x['url']=u
+              out.append(x)
+          Path('diagnostic/search_links.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/search_links.tsv','w',encoding='utf-8') as f:
+              f.write('engine\tquery\turl\n')
+              for x in out:
+                  f.write('\t'.join([x['engine'],x['query'],x['url'].replace('\t',' ')])+'\n')
+          print('LINKS',len(out))
+          print(Path('diagnostic/search_links.tsv').read_text(encoding='utf-8')[:50000])
+          PY
+
+      - name: Upload search diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-search-engine-results
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
