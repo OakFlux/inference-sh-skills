@@ -1,0 +1,81 @@
+name: Temporary Daan Gene Hibor inspection
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-hibor-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect Hibor report pages and Daan index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          declare -A urls=(
+            [index]='https://wap.hibor.com.cn/repinfodetail_175583.html'
+            [doc103239]='https://www.hibor.com.cn/docdetail_103239.html'
+            [doc77649]='https://www.hibor.com.cn/docdetail_77649.html'
+            [doc102864]='https://www.hibor.com.cn/docdetail_102864.html'
+          )
+          for k in "${!urls[@]}"; do
+            curl --http1.1 -L --silent --show-error --retry 5 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' "${urls[$k]}" -o "diagnostics/${k}.html" || true
+            curl --http1.1 -L --silent --show-error --retry 3 --retry-all-errors \
+              --connect-timeout 20 --max-time 120 --user-agent "$UA" \
+              --header 'Accept-Encoding: identity' "https://r.jina.ai/${urls[$k]}" -o "diagnostics/${k}_jina.txt" || true
+          done
+          python - <<'PY'
+          import html,json,re,urllib.parse
+          from pathlib import Path
+          out=[]
+          for p in Path('diagnostics').glob('*'):
+              if not p.is_file(): continue
+              raw=p.read_bytes()
+              for enc in ('utf-8','gb18030'):
+                  try:
+                      text=raw.decode(enc)
+                      break
+                  except Exception:
+                      text=raw.decode(enc,'ignore')
+              text=html.unescape(text.replace('\\/','/'))
+              title=''
+              m=re.search(r'<title>(.*?)</title>',text,re.I|re.S)
+              if m:title=re.sub(r'<[^>]+>','',m.group(1)).strip()
+              urls=[]
+              for u in re.findall(r'https?://[^"\'<>\s]+',text,re.I):
+                  u=urllib.parse.unquote(u).rstrip('),;]')
+                  if any(k in u.lower() for k in ['pdf','download','down','attach','file','docdetail','report','repinfo']):
+                      urls.append(u)
+              relative=[]
+              for u in re.findall(r'(?:href|src)=["\']([^"\']+)["\']',text,re.I):
+                  u=html.unescape(u)
+                  if any(k in u.lower() for k in ['pdf','download','down','attach','file','docdetail','report','repinfo']):
+                      relative.append(u)
+              relevant=[]
+              for line in text.splitlines():
+                  if re.search(r'pdf|下载|浏览报告原文|docdetail|download|attach|报告页数|研报出处|达安基因',line,re.I):
+                      relevant.append(re.sub(r'\s+',' ',line)[:2500])
+              out.append({'file':p.name,'title':title,'urls':list(dict.fromkeys(urls))[:500],'relative':list(dict.fromkeys(relative))[:500],'relevant':relevant[:500]})
+          Path('diagnostics/summary.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          for x in out:
+              print('PAGE',x['file'],x['title'])
+              for u in (x['urls']+x['relative'])[:100]: print('URL',u)
+              for l in x['relevant'][:30]: print('REL',l)
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-hibor-inspection
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
