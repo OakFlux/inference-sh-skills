@@ -1,0 +1,471 @@
+name: Temporary Dunhuang Seed Fxbaogao original PDF package
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-fx-final-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check requests pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils >/dev/null
+
+      - name: Search exact historical reports, download and validate original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics/responses diagnostics/renders
+          cat > /tmp/dunhuang_fx_final.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          RESP = DIAG / 'responses'
+          RENDERS = DIAG / 'renders'
+          for path in (REPORTS, RESP, RENDERS):
+              path.mkdir(parents=True, exist_ok=True)
+
+          API = 'https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'application/json, text/plain, */*',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Origin': 'https://www.fxbaogao.com',
+              'Referer': 'https://www.fxbaogao.com/rp?order=2&nop=-1&keywords=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+          })
+
+          targets = [
+              {
+                  'query': '敦煌种业 先玉高增 加工减亏 盈利可期',
+                  'tokens': ['先玉高增', '加工减亏', '盈利可期'],
+                  'broker_aliases': ['国泰君安', '国泰海通'],
+                  'expected_date': '2011-08-04',
+                  'expected_title': '深度研究：先玉高增，加工减亏，盈利可期',
+              },
+              {
+                  'query': '敦煌种业 敦煌先锋产销激增 驱动盈利稳定增长',
+                  'tokens': ['产销激增', '盈利稳定增长'],
+                  'broker_aliases': ['齐鲁证券', '中泰证券'],
+                  'expected_date': '2011-08-01',
+                  'expected_title': '深度研究：敦煌先锋产销激增，驱动盈利稳定增长',
+              },
+              {
+                  'query': '敦煌种业 业绩快速回升 敦煌先锋持续快速扩张',
+                  'tokens': ['业绩快速回升', '持续快速扩张'],
+                  'broker_aliases': ['申银万国', '申万宏源'],
+                  'expected_date': '2010-08-30',
+                  'expected_title': '深度报告：业绩快速回升，敦煌先锋持续快速扩张，公司本部业务亏损减少',
+              },
+              {
+                  'query': '敦煌种业 聚焦种业发展机遇 并购打开成长空间',
+                  'tokens': ['聚焦种业发展机遇', '并购打开成长空间'],
+                  'broker_aliases': ['天风证券'],
+                  'expected_date': '2017-01-05',
+                  'expected_title': '聚焦种业发展机遇，并购打开成长空间',
+              },
+              {
+                  'query': '敦煌种业 政策春风 孕育历史之机遇',
+                  'tokens': ['政策春风', '历史之机遇'],
+                  'broker_aliases': ['华宝证券'],
+                  'expected_date': '2011-09-26',
+                  'expected_title': '政策春风，孕育历史之机遇',
+              },
+              {
+                  'query': '敦煌种业 打消悲观预期 期待改善来临',
+                  'tokens': ['打消悲观预期', '期待改善来临'],
+                  'broker_aliases': ['国泰君安', '国泰海通'],
+                  'expected_date': '2011-11-08',
+                  'expected_title': '调研报告：打消悲观预期，期待改善来临',
+              },
+              {
+                  'query': '敦煌种业 看好先锋系列继续扩张 期待母公司经营调整',
+                  'tokens': ['先锋系列继续扩张', '母公司经营调整'],
+                  'broker_aliases': ['长江证券'],
+                  'expected_date': '2011-08-03',
+                  'expected_title': '调研报告：看好先锋系列继续扩张，期待母公司经营调整',
+              },
+              {
+                  'query': '敦煌种业 借力政策 公司坚定专业化道路',
+                  'tokens': ['借力政策', '专业化道路'],
+                  'broker_aliases': ['华龙证券'],
+                  'expected_date': '2014-12-15',
+                  'expected_title': '2015年投资策略报告：借力政策，公司坚定专业化道路',
+              },
+              {
+                  'query': '敦煌种业 进一步聚焦种业 公司业绩有望回升',
+                  'tokens': ['进一步聚焦种业', '业绩有望回升'],
+                  'broker_aliases': ['华龙证券'],
+                  'expected_date': '2015-03-20',
+                  'expected_title': '2014年年报点评：进一步聚焦种业，公司业绩有望回升',
+              },
+          ]
+
+          def strip_tags(value: object) -> str:
+              return re.sub(r'<[^>]+>', '', html.unescape(str(value or ''))).strip()
+
+          def compact(value: object) -> str:
+              return re.sub(r'\s+', '', strip_tags(value))
+
+          def safe_name(value: str, limit: int = 92) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', '', value).strip(' ._')
+              return (value or '敦煌种业公司研究报告')[:limit]
+
+          def search(payload: dict, label: str) -> list[dict]:
+              for attempt in range(6):
+                  response = session.post(API, json=payload, timeout=90)
+                  text = response.text
+                  (RESP / f'{label}_attempt_{attempt+1}.json').write_text(text, encoding='utf-8', errors='ignore')
+                  if response.status_code != 200:
+                      time.sleep(2 + attempt)
+                      continue
+                  try:
+                      obj = response.json()
+                  except Exception:
+                      time.sleep(2 + attempt)
+                      continue
+                  if obj.get('code') == 1025:
+                      time.sleep(8 + attempt * 3)
+                      continue
+                  if obj.get('code') not in (0, '0', 200, '200'):
+                      print('SEARCH_CODE', label, obj.get('code'), obj.get('msg'))
+                      time.sleep(1 + attempt)
+                      continue
+                  data = obj.get('data') or {}
+                  return data.get('dataList') or []
+              return []
+
+          candidates_by_id: dict[int, dict] = {}
+
+          def add_candidate(row: dict, target: dict, query_index: int) -> None:
+              try:
+                  doc_id = int(row.get('docId'))
+              except Exception:
+                  return
+              title = strip_tags(row.get('title'))
+              org = strip_tags(row.get('orgName'))
+              stocks = row.get('stocks') or []
+              stock_hit = any(str(s.get('key')) == '600354' for s in stocks if isinstance(s, dict))
+              title_compact = compact(title)
+              score = 0
+              if stock_hit:
+                  score += 300
+              if '敦煌种业' in title or '600354' in title:
+                  score += 300
+              token_hits = sum(1 for token in target['tokens'] if compact(token) in title_compact)
+              score += token_hits * 220
+              if token_hits == len(target['tokens']):
+                  score += 500
+              if any(alias in org for alias in target['broker_aliases']):
+                  score += 180
+              if row.get('isDeep') is True:
+                  score += 300
+              pages = int(row.get('pageNum') or 0)
+              score += min(pages, 80)
+              if row.get('isNotBroker') is True or org in ('财报', '未知机构', ''):
+                  score -= 500
+              record = dict(row)
+              record.update({
+                  '_title': title,
+                  '_org': org,
+                  '_score': score,
+                  '_target': target,
+                  '_query_index': query_index,
+                  '_stock_hit': stock_hit,
+              })
+              previous = candidates_by_id.get(doc_id)
+              if previous is None or score > previous['_score']:
+                  candidates_by_id[doc_id] = record
+
+          for index, target in enumerate(targets):
+              rows = search({'keywords': target['query'], 'pageNum': 1, 'pageSize': 20}, f'exact_{index:02d}')
+              print('EXACT_QUERY', index, target['query'], 'ROWS', len(rows))
+              for row in rows:
+                  add_candidate(row, target, index)
+              time.sleep(1.2)
+
+          # Broad pages catch reports whose indexed titles omit punctuation or older broker names.
+          for page in range(1, 21):
+              rows = search({'keywords': '敦煌种业', 'pageNum': page, 'pageSize': 20}, f'broad_{page:02d}')
+              print('BROAD_PAGE', page, 'ROWS', len(rows))
+              for row in rows:
+                  title = strip_tags(row.get('title'))
+                  org = strip_tags(row.get('orgName'))
+                  stocks = row.get('stocks') or []
+                  stock_hit = any(str(s.get('key')) == '600354' for s in stocks if isinstance(s, dict))
+                  for index, target in enumerate(targets):
+                      title_compact = compact(title)
+                      if (stock_hit and ('敦煌种业' in title or any(compact(t) in title_compact for t in target['tokens']))) or all(compact(t) in title_compact for t in target['tokens']):
+                          add_candidate(row, target, index)
+              time.sleep(1.1)
+
+          candidates = sorted(candidates_by_id.values(), key=lambda x: (x['_score'], int(x.get('pageNum') or 0)), reverse=True)
+          serializable = []
+          for item in candidates:
+              copy = {k: v for k, v in item.items() if k != '_target'}
+              copy['_target'] = item['_target']
+              serializable.append(copy)
+          (DIAG / 'candidate_metadata.json').write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('CANDIDATE_COUNT', len(candidates))
+          for item in candidates[:80]:
+              print('CANDIDATE', json.dumps({
+                  'docId': item.get('docId'), 'title': item['_title'], 'org': item['_org'],
+                  'pages': item.get('pageNum'), 'pdfPath': item.get('pdfPath'),
+                  'isDeep': item.get('isDeep'), 'reportType': item.get('reportType'),
+                  'score': item['_score'], 'stockHit': item['_stock_hit'],
+              }, ensure_ascii=False))
+
+          def download(url: str, referer: str) -> tuple[bytes | None, str, str]:
+              try:
+                  response = session.get(
+                      url,
+                      headers={
+                          'Accept': 'application/pdf,application/octet-stream,*/*',
+                          'Referer': referer,
+                      },
+                      timeout=180,
+                      allow_redirects=True,
+                      stream=True,
+                  )
+                  chunks = bytearray()
+                  for chunk in response.iter_content(131072):
+                      if chunk:
+                          chunks.extend(chunk)
+                          if len(chunks) > 80_000_000:
+                              raise RuntimeError('file too large')
+                  return bytes(chunks), response.url, response.headers.get('content-type') or ''
+              except Exception as exc:
+                  return None, '', repr(exc)
+
+          validated = []
+          seen_hashes = set()
+          failures = []
+
+          for rank, item in enumerate(candidates):
+              if len(validated) >= 8:
+                  break
+              doc_id = int(item['docId'])
+              title = item['_title']
+              org = item['_org'] or '券商'
+              pdf_path = str(item.get('pdfPath') or '').lstrip('/')
+              detail_url = f'https://www.fxbaogao.com/detail/{doc_id}'
+              encoded_name = urllib.parse.quote(title + '.pdf')
+              urls = []
+              if pdf_path:
+                  urls.extend([
+                      'https://public.fxbaogao.com/' + pdf_path,
+                      'https://file.fxbaogao.com/' + pdf_path,
+                      'https://pdf.fxbaogao.com/' + pdf_path,
+                      'https://api.fxbaogao.com/' + pdf_path,
+                  ])
+              urls.extend([
+                  f'https://www.fxbaogao.com/download?id={doc_id}&name={encoded_name}',
+                  f'https://api.fxbaogao.com/mofoun/report/report/downloadNoAuth?id={doc_id}',
+                  f'https://api.fxbaogao.com/mofoun/report/searchReport/downloadNoAuth?id={doc_id}',
+              ])
+              accepted = False
+              errors = []
+              for url in dict.fromkeys(urls):
+                  raw, effective, content_type = download(url, detail_url)
+                  if not raw:
+                      errors.append({'url': url, 'error': content_type})
+                      continue
+                  if len(raw) < 100_000 or not raw.startswith(b'%PDF-'):
+                      errors.append({
+                          'url': url,
+                          'effective': effective,
+                          'size': len(raw),
+                          'contentType': content_type,
+                          'head': repr(raw[:80]),
+                      })
+                      continue
+                  digest = hashlib.sha256(raw).hexdigest()
+                  if digest in seen_hashes:
+                      errors.append({'url': url, 'error': 'duplicate PDF'})
+                      continue
+                  temp = DIST / f'_candidate_{doc_id}.pdf'
+                  temp.write_bytes(raw)
+                  try:
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < 6:
+                          raise RuntimeError(f'only {pages} pages')
+                      text_parts = []
+                      for pdf_page in reader.pages[:min(18, pages)]:
+                          try:
+                              text_parts.append(pdf_page.extract_text() or '')
+                          except Exception:
+                              pass
+                      sample = compact(' '.join(text_parts))
+                      if '敦煌种业' not in sample and '600354' not in sample:
+                          raise RuntimeError('company identity not found')
+                      target = item['_target']
+                      date = target['expected_date']
+                      final_title = target['expected_title'] if sum(compact(t) in compact(title) for t in target['tokens']) >= 1 else title
+                      final_broker = org
+                      if final_broker in ('券商', '未知机构') or not final_broker:
+                          final_broker = target['broker_aliases'][0]
+                      filename = f'{date}_{safe_name(final_broker, 26)}_{safe_name(final_title)}_{pages}页.pdf'
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+                      record = {
+                          'docId': doc_id,
+                          'filename': filename,
+                          'title': final_title,
+                          'sourceTitle': title,
+                          'broker': final_broker,
+                          'date': date,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': digest,
+                          'isDeep': bool(item.get('isDeep')),
+                          'reportType': item.get('reportType'),
+                          'pdfPath': item.get('pdfPath'),
+                          'sourceUrl': url,
+                          'effectiveUrl': effective,
+                          'score': item['_score'] + (300 if item.get('isDeep') else 0) + pages,
+                      }
+                      validated.append(record)
+                      seen_hashes.add(digest)
+                      print('VALIDATED', json.dumps(record, ensure_ascii=False))
+                      accepted = True
+                      break
+                  except Exception as exc:
+                      errors.append({'url': url, 'effective': effective, 'error': repr(exc)})
+                  finally:
+                      temp.unlink(missing_ok=True)
+              if not accepted:
+                  failures.append({
+                      'docId': doc_id,
+                      'title': title,
+                      'org': org,
+                      'pages': item.get('pageNum'),
+                      'pdfPath': item.get('pdfPath'),
+                      'score': item['_score'],
+                      'errors': errors,
+                  })
+
+          (DIAG / 'validated.json').write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding='utf-8')
+          (DIAG / 'download_failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(validated) < 2:
+              raise RuntimeError(f'Only {len(validated)} complete original PDFs validated')
+
+          validated.sort(key=lambda x: (x['isDeep'], x['score'], x['pages']), reverse=True)
+          selected = []
+          used_brokers = set()
+          for item in validated:
+              broker_key = re.sub(r'（.*?）|\(.*?\)', '', item['broker'])
+              if broker_key in used_brokers:
+                  continue
+              selected.append(item)
+              used_brokers.add(broker_key)
+              if len(selected) == 3:
+                  break
+          for item in validated:
+              if len(selected) == 3:
+                  break
+              if item not in selected:
+                  selected.append(item)
+
+          keep = {item['filename'] for item in selected}
+          for path in REPORTS.glob('*.pdf'):
+              if path.name not in keep:
+                  path.unlink()
+
+          # Render first and last pages as required for PDF verification.
+          for index, item in enumerate(selected, 1):
+              pdf = REPORTS / item['filename']
+              for page_no, label in ((1, 'first'), (item['pages'], 'last')):
+                  prefix = RENDERS / f'{index:02d}_{label}'
+                  subprocess.run([
+                      'pdftoppm', '-f', str(page_no), '-l', str(page_no),
+                      '-png', '-r', '120', str(pdf), str(prefix),
+                  ], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              images = list(RENDERS.glob(f'{index:02d}_*.png'))
+              if len(images) < 2 or any(image.stat().st_size < 10_000 for image in images):
+                  raise RuntimeError(f'render verification failed: {item["filename"]}')
+
+          (DIAG / 'selected.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          manifest = [
+              '敦煌种业（600354）券商深度报告资料包',
+              '文件来自发现报告公开静态原始PDF路径，非网页打印版或图片重制版。',
+              '已核验PDF文件头、公司名称、实际页数、SHA-256，并渲染检查首页和末页。',
+              '由于公开深度覆盖主要集中在历史年份，包内报告日期可能较早。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(selected, 1):
+              manifest += [
+                  f'{index}. {item["title"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   日期：{item["date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   公开来源：{item["effectiveUrl"] or item["sourceUrl"]}',
+                  '',
+              ]
+          (REPORTS / '资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = DIST / f'敦煌种业_券商深度报告_{len(selected)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(selected):
+                  raise RuntimeError(f'PDF count mismatch: {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          print('SELECTED', json.dumps(selected, ensure_ascii=False))
+          PY
+          python /tmp/dunhuang_fx_final.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-final-original-pdfs
+          path: dist/敦煌种业_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-fx-final-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
