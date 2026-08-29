@@ -1,0 +1,558 @@
+name: Temporary Daan Gene public PDF discovery and package
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-autodiscovery-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 lxml pypdf rapidfuzz
+
+      - name: Discover public sources, validate original PDFs, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics/pages diagnostics/search diagnostics/scripts diagnostics/downloads
+          cat > /tmp/daan_autodiscovery.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from collections import deque
+          from pathlib import Path
+          from typing import Iterable
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from rapidfuzz.fuzz import ratio
+
+          ROOT = Path('.')
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          PAGES = DIAG / 'pages'
+          SEARCH = DIAG / 'search'
+          SCRIPTS = DIAG / 'scripts'
+          DOWNLOADS = DIAG / 'downloads'
+          for p in (REPORTS, PAGES, SEARCH, SCRIPTS, DOWNLOADS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7'})
+
+          TARGETS = [
+              {
+                  'broker': '广证恒生',
+                  'date': '2016-02-16',
+                  'title': '分子诊断行业待爆发，龙头达安笑傲江湖',
+                  'expected_pages': 43,
+                  'keywords': ['分子诊断行业待爆发', '龙头达安笑傲江湖'],
+              },
+              {
+                  'broker': '银河证券',
+                  'date': '2016-12-22',
+                  'title': '独立实验室新业态崛起，未来高增长可期',
+                  'expected_pages': None,
+                  'keywords': ['独立实验室新业态崛起', '未来高增长可期'],
+              },
+              {
+                  'broker': '东兴证券',
+                  'date': '2014-08-28',
+                  'title': '投资达安就是投资个体化诊疗的大时代',
+                  'expected_pages': None,
+                  'keywords': ['投资达安就是投资个体化诊疗的大时代'],
+              },
+              {
+                  'broker': '华创证券',
+                  'date': '2017-04-05',
+                  'title': '业绩整体平稳增长，业务结构性变化是行业变化风向标',
+                  'expected_pages': None,
+                  'keywords': ['业务结构性变化是行业变化风向标'],
+              },
+              {
+                  'broker': '国海证券',
+                  'date': '2020-08-31',
+                  'title': '后疫情时代新冠筛查从严，下半年业绩持续受益',
+                  'expected_pages': 6,
+                  'keywords': ['后疫情时代新冠筛查从严', '下半年业绩持续受益'],
+              },
+              {
+                  'broker': '国海证券',
+                  'date': '2020-07-16',
+                  'title': '上半年业绩超预期，公司发展迎里程碑拐点',
+                  'expected_pages': 5,
+                  'keywords': ['上半年业绩超预期', '里程碑拐点'],
+              },
+          ]
+
+          SEEDED = [
+              'https://www.nxny.com/report/view_3189898.html',
+              'https://www.nxny.com/report/view_3189923.html',
+              'https://www.nxny.com/report/view_3423061.html',
+              'https://www.nxny.com/report/view_3491455.html',
+              'https://www.nxny.com/report/view_4461177.html',
+              'https://www.nxny.com/report/view_4414374.html',
+              'https://www.9fzt.com/detail/sz_002030_1_508957738559.html',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/2899056/index.phtml',
+              'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/company/index.phtml?symbol=sz002030&t1=all',
+              'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/company/index.phtml?symbol=002030',
+          ]
+
+          SEARCH_QUERIES = [
+              '"达安基因" "深度报告" filetype:pdf',
+              '"分子诊断行业待爆发" pdf',
+              '"龙头达安笑傲江湖" pdf',
+              '"广证恒生" "达安基因" 43页',
+              '"独立实验室新业态崛起" pdf',
+              '"未来高增长可期" "达安基因" pdf',
+              '"投资达安就是投资个体化诊疗的大时代" pdf',
+              '"业务结构性变化是行业变化风向标" pdf',
+              '"后疫情时代新冠筛查从严" pdf',
+              '"上半年业绩超预期" "达安基因" pdf',
+              '达安基因 002030 券商 深度 研报 PDF',
+              '达安基因 43页 研报',
+              '3189898 达安基因 PDF',
+              '2899056 达安基因 PDF',
+              'site:pdf.dfcfw.com 达安基因',
+              'site:file.iyanbao.com 达安基因 pdf',
+              'site:fxbaogao.com 达安基因 深度',
+              'site:sgpjbg.com 达安基因 深度报告',
+              'site:hangyan.co 达安基因 研报',
+          ]
+
+          TRACKER_HOSTS = {
+              'google.com', 'www.google.com', 'bing.com', 'www.bing.com', 'cn.bing.com',
+              'duckduckgo.com', 'html.duckduckgo.com', 'baidu.com', 'www.baidu.com',
+              'so.com', 'www.so.com', 'search.yahoo.com',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[\s\u3000，。、“”‘’：；（）()【】\[\]《》<>：:·,_\-—+]+', '', value or '').lower()
+
+          def safe_name(value: str, limit: int = 80) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value or '')
+              value = re.sub(r'\s+', '', value).strip(' ._')
+              return (value or '达安基因研究报告')[:limit]
+
+          def run_curl(url: str, path: Path, referer: str | None = None, max_time: int = 150) -> tuple[bool, str]:
+              path.unlink(missing_ok=True)
+              cmd = [
+                  'curl', '--http1.1', '--location', '--fail', '--silent', '--show-error',
+                  '--retry', '4', '--retry-all-errors', '--retry-delay', '1',
+                  '--connect-timeout', '20', '--max-time', str(max_time),
+                  '--user-agent', UA, '--header', 'Accept-Encoding: identity',
+              ]
+              if referer:
+                  cmd += ['--referer', referer]
+              cmd += ['--output', str(path), url]
+              proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return proc.returncode == 0 and path.exists(), proc.stderr[-1600:]
+
+          def decode_bytes(raw: bytes) -> str:
+              candidates = []
+              for enc in ('utf-8', 'gb18030', 'gbk', 'big5', 'latin1'):
+                  try:
+                      candidates.append(raw.decode(enc, errors='ignore'))
+                  except Exception:
+                      pass
+              return max(candidates, key=lambda t: t.count('达安基因') + t.count('002030') + t.lower().count('.pdf') + t.lower().count('download')) if candidates else ''
+
+          def unwrap_url(url: str) -> list[str]:
+              url = html.unescape(urllib.parse.unquote(url.strip().strip('"\'<>')))
+              out = [url]
+              p = urllib.parse.urlparse(url)
+              qs = urllib.parse.parse_qs(p.query)
+              for key in ('url', 'u', 'uddg', 'target', 'r', 'dest', 'destination', 'redirect', 'q'):
+                  for v in qs.get(key, []):
+                      if v.startswith('http'):
+                          out.append(urllib.parse.unquote(v))
+              return out
+
+          def normalize_url(base: str, value: str) -> list[str]:
+              value = html.unescape(value.replace('\\/', '/').strip())
+              if value.startswith('//'):
+                  value = 'https:' + value
+              full = urllib.parse.urljoin(base, value)
+              return unwrap_url(full)
+
+          def extract_urls(base: str, text: str) -> set[str]:
+              norm = html.unescape(text.replace('\\/', '/').replace('\\u0026', '&').replace('\\u003d', '='))
+              values: list[str] = []
+              values.extend(re.findall(r'(?:href|src|action|data-url|data-href|data-src|content)\s*=\s*["\']([^"\']+)', norm, re.I))
+              values.extend(re.findall(r'https?://[^"\'<>\s\\]+', norm, re.I))
+              values.extend(re.findall(r'["\']([^"\']+(?:\.pdf|download|DownLoad|attachment|attach|file|report)[^"\']*)["\']', norm, re.I))
+              values.extend(re.findall(r'(?:pdfUrl|pdf_url|fileUrl|file_url|downloadUrl|download_url|attachmentUrl|reportUrl|url)\s*[=:]\s*["\']([^"\']+)', norm, re.I))
+              found: set[str] = set()
+              for v in values:
+                  if v.startswith(('javascript:', 'mailto:', '#')):
+                      continue
+                  for u in normalize_url(base, v):
+                      if not u.startswith(('http://', 'https://')):
+                          continue
+                      u = u.rstrip('),;]}>')
+                      if len(u) <= 2000:
+                          found.add(u)
+              return found
+
+          def search_engine_urls(query: str, idx: int) -> set[str]:
+              encoded = urllib.parse.quote_plus(query)
+              urls = [
+                  f'https://www.bing.com/search?q={encoded}&count=50',
+                  f'https://www.bing.com/search?format=rss&q={encoded}',
+                  f'https://cn.bing.com/search?q={encoded}&count=50',
+                  f'https://html.duckduckgo.com/html/?q={encoded}',
+                  f'https://lite.duckduckgo.com/lite/?q={encoded}',
+                  f'https://www.google.com/search?q={encoded}&num=50&filter=0',
+                  f'https://www.baidu.com/s?wd={encoded}&rn=50',
+                  f'https://www.so.com/s?q={encoded}',
+                  f'https://r.jina.ai/http://www.google.com/search?q={encoded}',
+                  f'https://r.jina.ai/http://www.bing.com/search?q={encoded}',
+              ]
+              found: set[str] = set()
+              for j, url in enumerate(urls):
+                  p = SEARCH / f'q{idx:02d}_{j:02d}.html'
+                  ok, err = run_curl(url, p, max_time=100)
+                  if not ok:
+                      continue
+                  raw = p.read_bytes()
+                  text = decode_bytes(raw)
+                  found |= extract_urls(url, text)
+              return found
+
+          all_urls: set[str] = set(SEEDED)
+          search_map: dict[str, list[str]] = {}
+          for i, q in enumerate(SEARCH_QUERIES):
+              try:
+                  hits = search_engine_urls(q, i)
+              except Exception as exc:
+                  hits = set()
+                  print('SEARCH_ERROR', q, repr(exc))
+              search_map[q] = sorted(hits)
+              all_urls |= hits
+              print('SEARCH', i, len(hits), q)
+          DIAG.joinpath('search_url_map.json').write_text(json.dumps(search_map, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          # Search Internet Archive metadata for exact titles.
+          for i, target in enumerate(TARGETS):
+              q = urllib.parse.quote(f'title:("{target["title"]}") OR description:("{target["title"]}")')
+              url = f'https://archive.org/advancedsearch.php?q={q}&fl[]=identifier,title,description&rows=100&page=1&output=json'
+              p = SEARCH / f'archive_{i}.json'
+              ok, _ = run_curl(url, p, max_time=120)
+              if ok:
+                  try:
+                      obj = json.loads(p.read_text(encoding='utf-8', errors='ignore'))
+                      for doc in obj.get('response', {}).get('docs', []):
+                          identifier = str(doc.get('identifier') or '')
+                          if identifier:
+                              all_urls.add(f'https://archive.org/metadata/{identifier}')
+                              all_urls.add(f'https://archive.org/download/{identifier}/{identifier}.pdf')
+                  except Exception:
+                      pass
+
+          # Convert known report IDs and Eastmoney info codes into likely URLs.
+          for u in list(all_urls):
+              for info in re.findall(r'AP\d{15,24}', u, re.I):
+                  all_urls.add(f'https://pdf.dfcfw.com/pdf/H3_{info.upper()}_1.pdf')
+              m = re.search(r'(?:rptid|reportid|report_id)[=/](\d{5,12})', u, re.I)
+              if m:
+                  rid = m.group(1)
+                  all_urls.add(f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml')
+
+          # Breadth-first public-page crawl. Do not submit forms or authenticate.
+          queue = deque(sorted(all_urls))
+          visited: set[str] = set()
+          direct_candidates: set[str] = set()
+          page_records: list[dict] = []
+          max_pages = 350
+          while queue and len(visited) < max_pages:
+              url = queue.popleft()
+              if url in visited:
+                  continue
+              visited.add(url)
+              parsed = urllib.parse.urlparse(url)
+              host = parsed.netloc.lower().split(':')[0]
+              low = url.lower()
+              if host in TRACKER_HOSTS:
+                  continue
+              if any(low.endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.gif', '.svg', '.css', '.woff', '.woff2', '.mp4', '.mp3')):
+                  continue
+              if '.pdf' in low or any(k in low for k in ('download', 'attachment', 'attachfile', '/file/', 'fileurl=')):
+                  direct_candidates.add(url)
+                  continue
+              out = PAGES / f'{len(visited):04d}_{hashlib.sha1(url.encode()).hexdigest()[:12]}.html'
+              ok, err = run_curl(url, out, max_time=100)
+              if not ok:
+                  page_records.append({'url': url, 'error': err[-300:]})
+                  continue
+              raw = out.read_bytes()
+              if raw.startswith(b'%PDF-'):
+                  direct_candidates.add(url)
+                  out.rename(out.with_suffix('.pdf'))
+                  continue
+              if len(raw) > 8_000_000:
+                  continue
+              text = decode_bytes(raw)
+              title = ''
+              try:
+                  soup = BeautifulSoup(text, 'lxml')
+                  title = soup.title.get_text(' ', strip=True) if soup.title else ''
+              except Exception:
+                  pass
+              relevant = ('达安基因' in text or '002030' in text or any(compact(t['title'])[:12] in compact(text) for t in TARGETS))
+              found = extract_urls(url, text)
+              # Construct Eastmoney PDF URLs from any infoCode seen in page HTML/JS/JSON.
+              for info in re.findall(r'AP\d{15,24}', text, re.I):
+                  found.add(f'https://pdf.dfcfw.com/pdf/H3_{info.upper()}_1.pdf')
+              # Archive.org metadata may expose original files.
+              if 'archive.org/metadata/' in url:
+                  try:
+                      obj = json.loads(text)
+                      identifier = str(obj.get('metadata', {}).get('identifier') or '')
+                      for f in obj.get('files', []):
+                          name = str(f.get('name') or '')
+                          if name.lower().endswith('.pdf') and identifier:
+                              found.add(f'https://archive.org/download/{identifier}/{urllib.parse.quote(name)}')
+                  except Exception:
+                      pass
+              page_records.append({'url': url, 'title': title, 'size': len(raw), 'relevant': relevant, 'found': len(found)})
+              # Save scripts from relevant pages and extract their URLs/endpoints.
+              if relevant:
+                  for fu in found:
+                      fl = fu.lower()
+                      if fl.endswith('.js') or '.js?' in fl:
+                          sp = SCRIPTS / f'{hashlib.sha1(fu.encode()).hexdigest()[:16]}.js'
+                          if not sp.exists():
+                              sok, _ = run_curl(fu, sp, referer=url, max_time=100)
+                              if sok and sp.stat().st_size < 8_000_000:
+                                  st = decode_bytes(sp.read_bytes())
+                                  script_found = extract_urls(fu, st)
+                                  for sf in script_found:
+                                      if any(k in sf.lower() for k in ('pdf', 'download', 'attach', 'file', 'report')):
+                                          direct_candidates.add(sf)
+              for fu in found:
+                  fhost = urllib.parse.urlparse(fu).netloc.lower().split(':')[0]
+                  fl = fu.lower()
+                  if fhost in TRACKER_HOSTS:
+                      continue
+                  if '.pdf' in fl or any(k in fl for k in ('download', 'attachment', 'attachfile', 'fileurl=', 'pdfurl=')):
+                      direct_candidates.add(fu)
+                  elif relevant and len(queue) < 1200 and fhost and (fhost == host or any(domain in fhost for domain in ('9fzt', 'nxny', 'sina', 'iyanbao', 'fxbaogao', 'sgpjbg', 'hangyan', 'reportify', 'dfcfw', 'eastmoney', 'archive.org'))):
+                      if fu not in visited:
+                          queue.append(fu)
+
+          DIAG.joinpath('page_records.json').write_text(json.dumps(page_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          DIAG.joinpath('all_direct_candidates.txt').write_text('\n'.join(sorted(direct_candidates)), encoding='utf-8')
+
+          # Add host-specific URL patterns and known public report mirrors.
+          extra_candidates = set()
+          for u in list(direct_candidates) + list(all_urls):
+              norm = html.unescape(urllib.parse.unquote(u)).replace('\\/', '/')
+              for info in re.findall(r'AP\d{15,24}', norm, re.I):
+                  extra_candidates.add(f'https://pdf.dfcfw.com/pdf/H3_{info.upper()}_1.pdf')
+              # Sometimes a search result gives a relative /pdf/... path.
+              m = re.search(r'(?:https?://)?(?:file\.)?iyanbao\.com/(pdf/[^?#\s]+)', norm, re.I)
+              if m:
+                  extra_candidates.add('https://file.iyanbao.com/' + m.group(1))
+          direct_candidates |= extra_candidates
+
+          # Probe candidate URLs and accept only genuine PDFs about 达安基因.
+          validated: list[dict] = []
+          seen_hashes: set[str] = set()
+          probe_records: list[dict] = []
+          for idx, url in enumerate(sorted(direct_candidates)):
+              if idx >= 900 or len(validated) >= 12:
+                  break
+              low = url.lower()
+              if any(x in low for x in ('login', 'signin', 'register', 'javascript:')):
+                  continue
+              p = DOWNLOADS / f'{idx:04d}.bin'
+              ok, err = run_curl(url, p, referer='https://www.baidu.com/', max_time=180)
+              if not ok:
+                  probe_records.append({'url': url, 'error': err[-300:]})
+                  continue
+              raw = p.read_bytes()
+              if len(raw) < 80_000 or not raw.startswith(b'%PDF-'):
+                  # A download endpoint may return HTML containing another URL.
+                  if len(raw) < 5_000_000:
+                      text = decode_bytes(raw)
+                      for nu in extract_urls(url, text):
+                          if '.pdf' in nu.lower() and nu not in direct_candidates:
+                              direct_candidates.add(nu)
+                  p.unlink(missing_ok=True)
+                  continue
+              digest = hashlib.sha256(raw).hexdigest()
+              if digest in seen_hashes:
+                  p.unlink(missing_ok=True)
+                  continue
+              try:
+                  reader = PdfReader(str(p), strict=False)
+                  pages = len(reader.pages)
+                  parts = []
+                  sample_indices = list(range(min(10, pages)))
+                  if pages > 10:
+                      sample_indices += [pages - 1]
+                  for pi in sample_indices:
+                      try:
+                          parts.append(reader.pages[pi].extract_text() or '')
+                      except Exception:
+                          pass
+                  text = ' '.join(parts)
+                  ct = compact(text)
+                  if '达安基因' not in text and '002030' not in text and 'daan' not in ct:
+                      raise RuntimeError('company identity not found')
+                  if pages < 4:
+                      raise RuntimeError(f'too short: {pages}')
+                  scores = []
+                  for t in TARGETS:
+                      title_score = ratio(compact(t['title']), ct)
+                      keyword_score = max([ratio(compact(k), ct) for k in t['keywords']] or [0])
+                      page_bonus = 0
+                      if t['expected_pages'] and pages == t['expected_pages']:
+                          page_bonus = 40
+                      elif pages >= 20:
+                          page_bonus = 20
+                      broker_bonus = 20 if compact(t['broker']) in ct else 0
+                      scores.append((title_score + keyword_score + page_bonus + broker_bonus, t))
+                  best_score, best_target = max(scores, key=lambda x: x[0])
+                  # Preserve any PDF with company identity; target match and length drive final ranking.
+                  depth_bonus = 100 if pages >= 20 else 20 if pages >= 10 else 0
+                  validated.append({
+                      'source_url': url,
+                      'path': str(p),
+                      'sha256': digest,
+                      'size': len(raw),
+                      'pages': pages,
+                      'best_score': best_score + depth_bonus,
+                      'target': best_target,
+                      'text_prefix': text[:1500],
+                  })
+                  seen_hashes.add(digest)
+                  print('VALID_PDF', pages, best_score, url)
+              except Exception as exc:
+                  probe_records.append({'url': url, 'error': repr(exc), 'size': len(raw)})
+                  p.unlink(missing_ok=True)
+
+          DIAG.joinpath('probe_records.json').write_text(json.dumps(probe_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          DIAG.joinpath('validated.json').write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(validated) < 2:
+              raise RuntimeError(f'Only {len(validated)} public original PDFs validated; see diagnostics')
+
+          validated.sort(key=lambda x: (x['best_score'], x['pages'], x['size']), reverse=True)
+          selected: list[dict] = []
+          used_hashes: set[str] = set()
+          used_titles: set[str] = set()
+          used_brokers: set[str] = set()
+          # First select long and distinct reports.
+          for item in validated:
+              target = item['target']
+              key = compact(target['title'])
+              if item['sha256'] in used_hashes or key in used_titles:
+                  continue
+              if selected and item['pages'] < 8 and any(x['pages'] >= 20 for x in selected):
+                  continue
+              selected.append(item)
+              used_hashes.add(item['sha256'])
+              used_titles.add(key)
+              used_brokers.add(target['broker'])
+              if len(selected) == 3:
+                  break
+          if len(selected) < 2:
+              for item in validated:
+                  if item['sha256'] in used_hashes:
+                      continue
+                  selected.append(item)
+                  used_hashes.add(item['sha256'])
+                  if len(selected) == 2:
+                      break
+
+          manifest = [
+              '达安基因（002030）券商公司研究报告资料包',
+              '筛选原则：优先公司深度/首次覆盖与较长公司研究；不以网页摘要或重制版冒充原始PDF。',
+              '所有文件均来自无需登录即可访问的公开链接，并已核验PDF文件头、公司名称、页数和SHA-256。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          final_records = []
+          for i, item in enumerate(selected, 1):
+              t = item['target']
+              src = Path(item['path'])
+              filename = f'{t["date"]}_{safe_name(t["broker"], 20)}_{safe_name(t["title"])}_{item["pages"]}页.pdf'
+              dest = REPORTS / filename
+              dest.write_bytes(src.read_bytes())
+              record = {
+                  'filename': filename,
+                  'broker': t['broker'],
+                  'date': t['date'],
+                  'title': t['title'],
+                  'pages': item['pages'],
+                  'size': item['size'],
+                  'sha256': item['sha256'],
+                  'source_url': item['source_url'],
+                  'match_score': item['best_score'],
+              }
+              final_records.append(record)
+              manifest += [
+                  f'{i}. {record["title"]}',
+                  f'   券商：{record["broker"]}',
+                  f'   日期：{record["date"]}',
+                  f'   页数：{record["pages"]}',
+                  f'   文件：{record["filename"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  f'   公开来源：{record["source_url"]}',
+                  '',
+              ]
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+          DIAG.joinpath('final_records.json').write_text(json.dumps(final_records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          final_zip = DIST / f'达安基因_券商深度报告_{len(final_records)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for p in sorted(REPORTS.iterdir()):
+                  zf.write(p, arcname=p.name)
+          with zipfile.ZipFile(final_zip, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(final_records):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          print('FINAL_RECORDS', json.dumps(final_records, ensure_ascii=False))
+          PY
+          python /tmp/daan_autodiscovery.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-final-original-reports
+          path: dist/达安基因_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-autodiscovery-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
