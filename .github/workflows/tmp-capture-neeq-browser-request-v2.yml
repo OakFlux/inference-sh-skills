@@ -1,0 +1,120 @@
+name: Capture exact NEEQ disclosure search request v2
+
+on:
+  push:
+    branches:
+      - tmp/jinbo-bio-complete-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install Playwright
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@latest --silent
+          npx playwright install chromium --with-deps
+
+      - name: Capture request and response
+        shell: bash
+        run: |
+          cat > capture-v2.mjs <<'JS'
+          import { chromium } from 'playwright';
+
+          const browser = await chromium.launch({ headless: true });
+          const context = await browser.newContext({
+            userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            locale: 'zh-CN',
+          });
+          const page = await context.newPage();
+          page.setDefaultTimeout(30000);
+
+          const seen = [];
+          page.on('request', req => {
+            if (req.url().includes('companyAnnouncement.do')) {
+              console.log('REQUEST_URL', req.url());
+              console.log('REQUEST_METHOD', req.method());
+              console.log('REQUEST_POSTDATA', req.postData());
+              console.log('REQUEST_HEADERS', JSON.stringify(req.headers()));
+              seen.push({url: req.url(), method: req.method(), postData: req.postData()});
+            }
+          });
+          page.on('response', async res => {
+            if (res.url().includes('companyAnnouncement.do')) {
+              console.log('RESPONSE_STATUS', res.status(), res.url());
+              try {
+                const text = await res.text();
+                console.log('RESPONSE_TEXT', text.slice(0, 20000).replace(/\n/g, ' '));
+              } catch (e) {
+                console.log('RESPONSE_ERROR', String(e));
+              }
+            }
+          });
+
+          await page.goto('https://www.neeq.com.cn/disclosure/announcement.html', {
+            waitUntil: 'networkidle', timeout: 120000,
+          });
+          console.log('PAGE_LOADED', await page.title());
+
+          const details = await page.evaluate(() => {
+            const ids = ['companyCode', 'companyName', 'startTime', 'endTime', 'keyword', 'noticeType', 'disclosureType', 'disclosureSubtype'];
+            const fields = {};
+            for (const id of ids) {
+              const e = document.getElementById(id);
+              fields[id] = e ? {
+                outerHTML: e.outerHTML,
+                parentHTML: e.parentElement?.outerHTML?.slice(0, 2000) || '',
+                value: e.value,
+                type: e.type,
+                display: getComputedStyle(e).display,
+                visibility: getComputedStyle(e).visibility,
+              } : null;
+            }
+            const inputs = [...document.querySelectorAll('input')]
+              .filter(e => e.id || e.name)
+              .map(e => ({id:e.id, name:e.name, type:e.type, value:e.value, class:e.className, placeholder:e.placeholder, display:getComputedStyle(e).display, visibility:getComputedStyle(e).visibility}))
+              .filter(x => !x.name.includes('nodes-data'));
+            const globals = Object.keys(window).filter(k => /marker|announce|disclosure|notice/i.test(k));
+            return {fields, inputs, globals};
+          });
+          console.log('DETAILS', JSON.stringify(details, null, 2));
+
+          await page.evaluate(() => {
+            const setValue = (id, value) => {
+              const e = document.getElementById(id);
+              if (!e) return false;
+              e.value = value;
+              e.setAttribute('value', value);
+              e.dispatchEvent(new Event('input', {bubbles:true}));
+              e.dispatchEvent(new Event('change', {bubbles:true}));
+              return true;
+            };
+            setValue('companyCode', '832982');
+            setValue('companyName', '山西锦波生物医药股份有限公司');
+            setValue('startTime', '2015-01-01');
+            setValue('endTime', '2017-12-31');
+            setValue('keyword', '年度报告');
+          });
+
+          console.log('VALUES_AFTER_SET', await page.evaluate(() => ({
+            companyCode: document.getElementById('companyCode')?.value,
+            companyName: document.getElementById('companyName')?.value,
+            startTime: document.getElementById('startTime')?.value,
+            endTime: document.getElementById('endTime')?.value,
+            keyword: document.getElementById('keyword')?.value,
+          })));
+
+          const button = page.locator('button.go.cx, button.go, .go').first();
+          console.log('BUTTON_COUNT', await page.locator('button.go.cx, button.go, .go').count());
+          console.log('BUTTON_HTML', await button.evaluate(e => e.outerHTML));
+          await button.click({force:true});
+          await page.waitForTimeout(15000);
+
+          console.log('BODY_RESULT_SNIPPET', (await page.locator('body').innerText()).slice(0, 10000));
+          console.log('SEEN_REQUESTS', JSON.stringify(seen, null, 2));
+          await browser.close();
+          JS
+          node capture-v2.mjs
