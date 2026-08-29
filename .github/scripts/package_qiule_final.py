@@ -61,14 +61,13 @@ def main() -> None:
     original_extract = "    raw_url, detail_url, context = extract_pdf_from_detail(record)"
     replacement_extract = """    legacy_paths = {
         2014: \"/disclosure/2015/2015-04-23/1429788302_905419.pdf\",
-        2015: \"/disclosure/2016/2016-04-19/1461035033_733658.pdf\",
-        2016: \"/disclosure/2017/2017-04-18/1492513077_864396.pdf\",
-        2017: \"/disclosure/2018/2018-03-30/1522391050_110718.pdf\",
-        2018: \"/disclosure/2020/2020-08-28/1598581152_197119.pdf\",
-        2019: \"/disclosure/2020/2020-04-28/1588064524_541340.pdf\",
-        2020: \"/disclosure/2021/2021-04-28/1619584409_432835.pdf\",
-        2021: \"/disclosure/2022/2022-03-31/1648726375_007257.pdf\",
-        2022: \"/disclosure/2023/2023-03-29/1680096104_495556.pdf\",
+        2015: \"/disclosure/2016/2016-03-30/1459334978_580677.pdf\",
+        2016: \"/disclosure/2017/2017-03-30/1490879004_351115.pdf\",
+        2017: \"/disclosure/2018/2018-03-21/1521629686_380159.pdf\",
+        2018: \"/disclosure/2020/2020-06-11/1591861132_091496.pdf\",
+        2019: \"/disclosure/2022/2022-06-17/1655473710_166693.pdf\",
+        2020: \"/disclosure/2022/2022-06-17/1655471902_768742.pdf\",
+        2021: \"/disclosure/2022/2022-06-17/1655469838_246111.pdf\",
     }
     if year in legacy_paths:
         legacy_path = legacy_paths[year]
@@ -106,8 +105,9 @@ def main() -> None:
         'SHORT_NAME = "秋乐种业"',
         "range(2014, 2026)",
         "list(range(2014, 2026))",
-        "1598581152_197119.pdf",
-        "1680096104_495556.pdf",
+        "1459334978_580677.pdf",
+        "1591861132_091496.pdf",
+        "1655469838_246111.pdf",
         "秋乐种业_全部年报_2026年最新半年报_完整PDF.zip",
     ]
     missing = [token for token in required if token not in code]
