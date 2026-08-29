@@ -1,0 +1,246 @@
+name: Temporary Boya Bio Sina reports package
+
+on:
+  push:
+    branches:
+      - tmp-boya-bio-sina-pack-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_boya_sina.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK = "300294"
+          OUT = Path("dist")
+          DOCS = OUT / "博雅生物_300294_2020-2025年报_2026年最新半年报"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          # Detail IDs and dates were resolved from Sina Finance's annual/interim
+          # report indexes. The 2020 report uses the latest updated version.
+          ITEMS = [
+              ("博雅生物_300294_2020年年度报告_更新后.pdf", 7382915, "2021-07-15", "2020年年度报告（更新后）", 60, 2020),
+              ("博雅生物_300294_2021年年度报告.pdf", 7907017, "2022-03-23", "2021年年度报告", 60, 2021),
+              ("博雅生物_300294_2022年年度报告.pdf", 8911807, "2023-03-25", "2022年年度报告", 60, 2022),
+              ("博雅生物_300294_2023年年度报告.pdf", 9893338, "2024-03-23", "2023年年度报告", 60, 2023),
+              ("博雅生物_300294_2024年年度报告.pdf", 10791677, "2025-03-19", "2024年年度报告", 60, 2024),
+              ("博雅生物_300294_2025年年度报告.pdf", 12008126, "2026-03-21", "2025年年度报告", 60, 2025),
+              ("博雅生物_300294_2026年半年度报告.pdf", 12515758, "2026-08-22", "2026年半年度报告", 30, 2026),
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
+          })
+
+          def detail_url(identifier: int) -> str:
+              return f"https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id={identifier}&stockid={STOCK}"
+
+          def decode_html(raw: bytes) -> str:
+              for encoding in ("utf-8", "gb18030", "gbk"):
+                  try:
+                      return raw.decode(encoding)
+                  except UnicodeDecodeError:
+                      pass
+              return raw.decode("utf-8", errors="replace")
+
+          def derived_pdf_url(identifier: int, date_text: str) -> str:
+              year, month, _ = date_text.split("-")
+              month = str(int(month))
+              return (
+                  "https://file.finance.sina.com.cn/211.154.219.97:9494/"
+                  f"MRGG/CNSESZ_STOCK/{year}/{year}-{month}/{date_text}/{identifier}.PDF"
+              )
+
+          def discover_pdf_urls(identifier: int, fallback_date: str) -> tuple[list[str], str, str]:
+              page = detail_url(identifier)
+              urls: list[str] = []
+              page_title = ""
+              disclosed_date = fallback_date
+              errors: list[str] = []
+              for attempt in range(4):
+                  try:
+                      response = session.get(page, timeout=(20, 120), allow_redirects=True)
+                      print("DETAIL", identifier, response.status_code, len(response.content), response.url)
+                      response.raise_for_status()
+                      text = decode_html(response.content)
+                      soup = BeautifulSoup(text, "html.parser")
+                      page_title = " ".join((soup.title.get_text(" ", strip=True) if soup.title else "").split())
+                      match = re.search(r"公告日期\s*[:：]\s*(20\d{2}-\d{2}-\d{2})", text)
+                      if match:
+                          disclosed_date = match.group(1)
+                      for anchor in soup.find_all("a", href=True):
+                          label = " ".join(anchor.get_text(" ", strip=True).split())
+                          href = html.unescape(unquote(str(anchor["href"]))).strip()
+                          if "下载公告" not in label and "file.finance.sina.com.cn" not in href:
+                              continue
+                          if href.startswith("//"):
+                              href = "https:" + href
+                          elif href.startswith("/"):
+                              href = urljoin(response.url, href)
+                          if href.startswith("http://file.finance.sina.com.cn"):
+                              href = "https://" + href[len("http://"):]
+                          if href.startswith("http") and href not in urls:
+                              urls.append(href)
+                      break
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      if attempt < 3:
+                          time.sleep(2 ** attempt)
+              fallback = derived_pdf_url(identifier, disclosed_date)
+              if fallback not in urls:
+                  urls.append(fallback)
+              # Also try the supplied date in case the HTML disclosure date is unavailable.
+              supplied = derived_pdf_url(identifier, fallback_date)
+              if supplied not in urls:
+                  urls.append(supplied)
+              print("DISCOVER", identifier, disclosed_date, page_title, urls, errors)
+              return urls, page_title, disclosed_date
+
+          def validate_pdf(path: Path, minimum_pages: int, expected_year: int) -> tuple[int, int, str, str]:
+              raw = path.read_bytes()
+              if len(raw) < 100_000 or not raw.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF bytes={len(raw)}, head={raw[:16]!r}")
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(f"Unexpectedly short PDF: {pages} pages")
+              parts: list[str] = []
+              for page in reader.pages[:12]:
+                  try:
+                      parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", "", "".join(parts))
+              if "博雅生物" not in sample and "华润博雅" not in sample and "華潤博雅" not in sample:
+                  print("WARNING company name not extracted", path.name)
+              if str(expected_year) not in sample:
+                  print("WARNING year not extracted", expected_year, path.name)
+              return len(raw), pages, hashlib.sha256(raw).hexdigest(), sample[:600]
+
+          def download_one(filename: str, identifier: int, fallback_date: str, minimum_pages: int, expected_year: int) -> tuple[str, int, int, str, str, str]:
+              destination = DOCS / filename
+              urls, page_title, disclosed_date = discover_pdf_urls(identifier, fallback_date)
+              errors: list[str] = []
+              referer = detail_url(identifier)
+              for url in urls:
+                  variants = [url]
+                  if url.startswith("https://"):
+                      variants.append("http://" + url[len("https://"):])
+                  for candidate in variants:
+                      for attempt in range(4):
+                          try:
+                              with session.get(
+                                  candidate,
+                                  headers={
+                                      "Referer": referer,
+                                      "Accept": "application/pdf,application/octet-stream,*/*",
+                                  },
+                                  timeout=(30, 600),
+                                  stream=True,
+                                  allow_redirects=True,
+                              ) as response:
+                                  print("DOWNLOAD", identifier, response.status_code, response.url, response.headers.get("content-type"), response.headers.get("content-length"))
+                                  response.raise_for_status()
+                                  with destination.open("wb") as output:
+                                      for chunk in response.iter_content(1024 * 1024):
+                                          if chunk:
+                                              output.write(chunk)
+                                  final_url = response.url
+                              size, pages, digest, _ = validate_pdf(destination, minimum_pages, expected_year)
+                              return final_url, size, pages, digest, page_title, disclosed_date
+                          except Exception as exc:
+                              destination.unlink(missing_ok=True)
+                              errors.append(f"{candidate} attempt {attempt + 1}: {exc!r}")
+                              if attempt < 3:
+                                  time.sleep(min(2 ** attempt, 8))
+              raise RuntimeError("; ".join(errors))
+
+          manifest = [
+              "华润博雅生物制药集团股份有限公司（300294.SZ）",
+              "资料范围：2020—2025年年度报告全文及2026年半年度报告全文。",
+              "版本规则：2020年采用新浪财经年报索引列示的2021-07-15最新更新后版本；其余年份均为完整报告，不含摘要。",
+              "来源：新浪财经上市公司公告镜像；PDF内容为上市公司正式披露文件。",
+              "",
+          ]
+
+          for filename, identifier, fallback_date, document_title, minimum_pages, expected_year in ITEMS:
+              used_url, size, pages, digest, page_title, disclosed_date = download_one(
+                  filename,
+                  identifier,
+                  fallback_date,
+                  minimum_pages,
+                  expected_year,
+              )
+              manifest.extend([
+                  filename,
+                  f"  文件类型：{document_title}",
+                  f"  公告详情ID：{identifier}",
+                  f"  披露日期：{disclosed_date}",
+                  f"  新浪页面标题：{page_title}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  PDF来源：{used_url}",
+                  f"  公告详情页：{detail_url(identifier)}",
+                  "",
+              ])
+              print("OK", filename, pages, size, used_url)
+
+          (DOCS / "资料清单与来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / "博雅生物_300294_2020-2025年报_2026年最新半年报.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdfs}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_boya_sina.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: boya-bio-sina-reports-final-zip
+          path: dist/博雅生物_300294_2020-2025年报_2026年最新半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
