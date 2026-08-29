@@ -1,0 +1,77 @@
+name: Temporary Jiuqi Hibor NewContent probe
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-hibor-newcontent-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Inspect dynamic report metadata and preview assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re,requests,urllib.parse
+          from bs4 import BeautifulSoup
+
+          targets={
+            '2016_aijian':'https://www.hibor.com.cn/docdetail_1763895.html',
+            '2011_huatai':'https://www.hibor.com.cn/docdetail_563758.html',
+            '2013_shenwan':'https://www.hibor.com.cn/docdetail_1127088.html',
+            '2009_shanghai':'https://www.hibor.com.cn/docdetail_206028.html',
+          }
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Accept':'text/html,application/json,text/plain,*/*','X-Requested-With':'XMLHttpRequest'})
+          for label,url in targets.items():
+            print('\n=== TARGET',label,url,'===')
+            r=s.get(url,timeout=60,allow_redirects=True)
+            print('PAGE',r.status_code,len(r.content),r.url,s.cookies.get_dict())
+            text=r.text
+            m=re.search(r"var\s+ncid\s*=\s*['\"]([^'\"]+)['\"]",text)
+            ncid=m.group(1) if m else None
+            print('NCID',ncid)
+            js_urls=[]
+            soup=BeautifulSoup(text,'html.parser')
+            for tag in soup.find_all('script',src=True):
+              u=urllib.parse.urljoin(r.url,tag['src'])
+              if 'DocDetail' in u or 'docdetail' in u:
+                js_urls.append(u)
+            for ju in js_urls:
+              try:
+                jr=s.get(ju,timeout=60)
+                print('JS',ju,jr.status_code,len(jr.content))
+                jt=jr.text
+                for needle in ['NewContent','newContentUrl','ncid','$.post','ajax','preview','image','download']:
+                  poss=[x.start() for x in re.finditer(re.escape(needle),jt,re.I)]
+                  for p in poss[:5]: print('JSCTX',needle,jt[max(0,p-500):p+1400].replace('\n',' ')[:1900])
+              except Exception as e: print('JSERR',ju,repr(e))
+            if not ncid: continue
+            endpoint=urllib.parse.urljoin(r.url,'/hiborweb/DocDetail/NewContent')
+            attempts=[
+              ('form_ncid',{'ncid':ncid},None),
+              ('form_id',{'id':ncid},None),
+              ('form_both',{'ncid':ncid,'id':ncid},None),
+              ('json_ncid',None,{'ncid':ncid}),
+              ('json_id',None,{'id':ncid}),
+            ]
+            for name,data,jdata in attempts:
+              try:
+                h={'Referer':r.url,'Origin':'https://www.hibor.com.cn','X-Requested-With':'XMLHttpRequest','Accept':'application/json,text/html,text/plain,*/*'}
+                rr=s.post(endpoint,data=data,json=jdata,headers=h,timeout=60,allow_redirects=False)
+                print('\nPOST',name,endpoint,'STATUS',rr.status_code,'TYPE',rr.headers.get('content-type'),'LEN',len(rr.content),'LOC',rr.headers.get('location'))
+                body=rr.text
+                print('BODY_HEAD',body[:8000].replace('\n',' '))
+                for pat in [r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',r'https?://[^\s"\'<>]+\.(?:png|jpg|jpeg|webp)(?:\?[^\s"\'<>]*)?',r'https?://[^\s"\'<>]+(?:download|file|attachment|preview|image)[^\s"\'<>]*']:
+                  for x in sorted(set(re.findall(pat,body,re.I))): print('POST_ASSET',x[:1800])
+              except Exception as e: print('POST_ERR',name,repr(e))
+          PY
