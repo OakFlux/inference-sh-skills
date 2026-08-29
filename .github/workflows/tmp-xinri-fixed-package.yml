@@ -1,0 +1,140 @@
+name: Temporary Xinri corrected report package
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-fixed-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF tools
+        run: python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Build corrected package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output pages2020 pages2022
+          cat > /tmp/build.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          OUT.mkdir(exist_ok=True)
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept':'image/png,image/*,application/pdf,*/*;q=0.8',
+          })
+
+          def fetch(url, min_bytes=20000, magic=None, referer=None):
+              h = {'Referer': referer} if referer else {}
+              r = s.get(url, headers=h, timeout=120, allow_redirects=True)
+              if r.status_code != 200 or len(r.content) < min_bytes:
+                  raise RuntimeError(f'下载失败: {url}, HTTP={r.status_code}, bytes={len(r.content)}')
+              if magic and not r.content.startswith(magic):
+                  raise RuntimeError(f'文件格式异常: {url}, head={r.content[:16]!r}')
+              return r
+
+          # 国盛证券2020首次覆盖报告：公开网页仅提供前8页预览。
+          urls2020 = [
+              'https://img.xdyanbao.com/data/file/2022/07/17/29024_sjil_5789.png',
+              'https://img.xdyanbao.com/data/file/2022/07/17/29024_1yeq_4904.png',
+              'https://img.xdyanbao.com/data/file/2022/07/17/29024_2qjt_5443.png',
+              'https://img.xdyanbao.com/data/file/2022/07/17/29024_s6fk_9423.png',
+              'https://img.xdyanbao.com/data/file/2022/07/17/29024_yaea_7227.png',
+              'https://img.xdyanbao.com/data/file/2022/07/17/29024_xbk3_1360.png',
+              'https://img.xdyanbao.com/data/file/2022/07/17/29024_tzxo_8641.png',
+              'https://img.xdyanbao.com/data/file/2022/07/17/29024_3llr_2358.png',
+          ]
+          p2020=[]
+          for i,u in enumerate(urls2020,1):
+              r=fetch(u, min_bytes=20000, magic=b'\x89PNG\r\n\x1a\n', referer='https://xdyanbao.com/doc/dezagtl9e3')
+              p=Path('pages2020')/f'{i:02d}.png'; p.write_bytes(r.content)
+              with Image.open(io.BytesIO(r.content)) as im:
+                  if im.width < 700 or im.height < 900: raise RuntimeError(f'2020预览页分辨率异常: {im.size}')
+              p2020.append(str(p))
+          pdf2020=OUT/'01_国盛证券_电动两轮高景气渠道产品助力公司加速扩张_20200915_公开预览8页.pdf'
+          pdf2020.write_bytes(img2pdf.convert(p2020))
+          if len(PdfReader(str(pdf2020)).pages)!=8: raise RuntimeError('2020 PDF页数异常')
+
+          # 招商证券2022公司深度：公开页面可读取前15页预览。
+          p2022=[]
+          for i in range(15):
+              u=f'https://oss.sdyanbao.com/page/2022/10/25/377228/{i}.png'
+              r=fetch(u, min_bytes=20000, magic=b'\x89PNG\r\n\x1a\n', referer='https://www.sdyanbao.com/detail/304932')
+              p=Path('pages2022')/f'{i+1:02d}.png'; p.write_bytes(r.content)
+              with Image.open(io.BytesIO(r.content)) as im:
+                  if im.width < 700 or im.height < 900: raise RuntimeError(f'2022预览页分辨率异常: {im.size}')
+              p2022.append(str(p))
+          pdf2022=OUT/'02_招商证券_修炼内功聚焦份额新日正东升_20221025_公开预览15页.pdf'
+          pdf2022.write_bytes(img2pdf.convert(p2022))
+          if len(PdfReader(str(pdf2022)).pages)!=15: raise RuntimeError('2022 PDF页数异常')
+
+          # 太平洋证券2023公司年报点评：完整原始PDF。
+          u2023='https://pdf.dfcfw.com/pdf/H3_AP202304181585537779_1.pdf'
+          r=fetch(u2023, min_bytes=100000, magic=b'%PDF-', referer='https://data.eastmoney.com/report/603787.html')
+          pdf2023=OUT/'03_太平洋证券_豪华车型量价齐增拉升盈利布局多渠道兼海外_20230418_5页_原始PDF.pdf'
+          pdf2023.write_bytes(r.content)
+          reader=PdfReader(str(pdf2023), strict=False)
+          if len(reader.pages)!=5: raise RuntimeError(f'2023 PDF页数异常: {len(reader.pages)}')
+          text=''.join((p.extract_text() or '') for p in reader.pages[:2]).replace(' ','').replace('\n','')
+          if '新日股份' not in text and '603787' not in text: raise RuntimeError('2023报告身份核验失败')
+
+          files=[pdf2020,pdf2022,pdf2023]
+          items=[]
+          for p in files:
+              data=p.read_bytes()
+              items.append({'filename':p.name,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'pages':len(PdfReader(str(p),strict=False).pages)})
+
+          readme=OUT/'报告清单与说明.txt'
+          readme.write_text(
+              '新日股份（603787.SH）券商研究资料包\n\n'
+              '1. 国盛证券：《电动两轮高景气，渠道+产品助力公司加速扩张》，2020-09-15，首次覆盖报告。\n'
+              '   本文件为公开网页可直接读取的前8页预览，原报告共24页；未绕过登录或积分权限。\n\n'
+              '2. 招商证券：《修炼内功，聚焦份额，“新日”正东升》，2022-10-25，公司深度研究。\n'
+              '   本文件为公开网页可直接读取的前15页预览，原报告共23页；未绕过登录或下载权限。\n\n'
+              '3. 太平洋证券：《豪华车型量价齐增拉升盈利，布局多渠道兼海外》，2023-04-18，5页。\n'
+              '   该文件为完整原始PDF，但属于年报点评，不是标准长篇深度。\n\n'
+              '三份文件均已检查PDF结构、实际页数和可读性。资料仅供研究参考。\n',
+              encoding='utf-8'
+          )
+          (OUT/'manifest.json').write_text(json.dumps(items,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          zpath=Path('xinri_reports_fixed.zip')
+          with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+              for p in files+[readme,OUT/'manifest.json']:
+                  z.write(p,arcname=p.name)
+          with zipfile.ZipFile(zpath) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError(f'ZIP完整性失败: {bad}')
+              print('ZIP_OK',zpath.stat().st_size,z.namelist())
+          PY
+          python /tmp/build.py
+          ls -lh output xinri_reports_fixed.zip
+
+      - name: Upload corrected package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinri-reports-fixed
+          path: xinri_reports_fixed.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 2
