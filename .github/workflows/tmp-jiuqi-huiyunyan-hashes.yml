@@ -1,0 +1,75 @@
+name: Temporary Jiuqi Huiyunyan hash inspection
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-huiyunyan-hashes.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Inspect metadata, page images and public download calls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re,requests,urllib.parse
+          from bs4 import BeautifulSoup
+
+          hashes={
+            '2009_shanghai':'25ad9bad49e81a1883c642c31f5e59bd',
+            '2011_huatai':'154087e698172b8f5225048a614a4782',
+            '2013_shenwan':'6d29d9e0bfb56bb1e6bb9ad7a13ff294',
+          }
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/json,application/pdf,image/*,*/*;q=0.8'})
+          for label,h in hashes.items():
+            u=f'https://www.huiyunyan.com/doc-{h}.html'
+            print('\n===',label,u,'===')
+            try:
+              r=s.get(u,timeout=60,allow_redirects=True)
+              print('PAGE',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+              text=r.text
+              soup=BeautifulSoup(text,'html.parser')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+              visible=' '.join(soup.get_text(' ',strip=True).split())
+              for needle in ['研报页数','研报大小','研报出处','打开报告原文','下载报告','1/','久其软件','002279']:
+                p=visible.find(needle)
+                if p>=0: print('VIS',needle,visible[max(0,p-200):p+700])
+              for tag in soup.find_all(['a','button','input','form','img','iframe','embed','object','source','script']):
+                blob=str(tag).lower()
+                if any(k in blob for k in ['download','下载','原文','pdf',h,'preview','page','image']):
+                  attrs={k:v for k,v in tag.attrs.items() if k in ['href','src','data','data-src','data-original','onclick','id','class','name','value','action','method']}
+                  if attrs or tag.name in ['button','form']:
+                    print('NODE',json.dumps({'tag':tag.name,'text':tag.get_text(' ',strip=True)[:300],'attrs':attrs},ensure_ascii=False))
+              patterns=[
+                r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+                r'https?://[^\s"\'<>]+\.(?:png|jpg|jpeg|webp)(?:\?[^\s"\'<>]*)?',
+                r'https?://[^\s"\'<>]+(?:download|down|file|attachment|preview|page)[^\s"\'<>]*',
+                r'[/A-Za-z0-9_.?=&%-]+(?:download|down|file|attachment|pdf|preview|page)[/A-Za-z0-9_.?=&%-]*',
+              ]
+              for pat in patterns:
+                for x in sorted(set(re.findall(pat,text,re.I))): print('ASSET',x[:1800])
+              # Script srcs: only inspect site-owned compactly.
+              for tag in soup.find_all('script',src=True):
+                su=urllib.parse.urljoin(r.url,tag['src'])
+                if 'huiyunyan.com' not in su: continue
+                try:
+                  sr=s.get(su,timeout=40)
+                  st=sr.text
+                  if any(k in st.lower() for k in ['download','pdf','attachment','doc-','report']):
+                    print('SCRIPT',su,sr.status_code,len(sr.content))
+                    for needle in ['download','pdf','attachment','doc-','report']:
+                      for m in list(re.finditer(needle,st,re.I))[:6]:
+                        p=m.start(); print('SCTX',needle,st[max(0,p-450):p+1100].replace('\n',' ')[:1500])
+                except Exception as e: print('SCRIPT_ERR',su,repr(e))
+            except Exception as e: print('PAGE_ERR',repr(e))
+          PY
