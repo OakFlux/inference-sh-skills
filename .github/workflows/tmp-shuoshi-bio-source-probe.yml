@@ -1,0 +1,83 @@
+name: Temporary Shuoshi Bio public source probe
+
+on:
+  push:
+    branches:
+      - tmp/download-shuoshi-bio-reports-20260829
+    paths:
+      - .github/workflows/tmp-shuoshi-bio-source-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect public report pages and assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept':'text/html,application/xhtml+xml,application/json,application/pdf,*/*;q=0.8'
+          })
+          pages=[
+              ('east_first','https://www.baogaobox.com/reports/241024000035699.html'),
+              ('zhe_report','https://www.hangyan.co/reports/3487955008555583369'),
+              ('pharnex','https://consult.pharnexcloud.com/report/detail/93917.html'),
+              ('old_report_search','https://stock.9fzt.com/list/sh_688399_3.html'),
+          ]
+          pats=[
+              r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+              r'https?://[^\s"\'<>]+(?:download|file|attachment|oss|cos|cdn)[^\s"\'<>]*',
+              r'[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+          ]
+          for name,url in pages:
+              print('\n=== PAGE',name,url,'===')
+              try:
+                  r=s.get(url,timeout=90,allow_redirects=True)
+                  print('HTTP',r.status_code,'BYTES',len(r.content),'TYPE',r.headers.get('content-type'),'FINAL',r.url)
+                  text=r.text
+                  print(text[:3000].replace('\n',' ')[:3000])
+                  for pat in pats:
+                      for m in sorted(set(re.findall(pat,text,re.I))):
+                          print('MATCH',m[:1500])
+                  soup=BeautifulSoup(text,'html.parser')
+                  for tag in soup.find_all(['a','button','iframe','embed','object','source'],href=True):
+                      blob=str(tag)
+                      if any(k in blob.lower() for k in ['pdf','download','报告','下载','file']):
+                          print('TAG',blob[:1500].replace('\n',' '))
+                  for tag in soup.find_all(['iframe','embed','object','source']):
+                      for attr in ('src','data'):
+                          if tag.get(attr): print('EMBED',urllib.parse.urljoin(r.url,tag.get(attr)))
+                  scripts=[]
+                  for tag in soup.find_all('script',src=True):
+                      u=urllib.parse.urljoin(r.url,tag['src'])
+                      scripts.append(u)
+                  print('SCRIPTS',len(scripts))
+                  for u in scripts[:30]:
+                      try:
+                          rr=s.get(u,timeout=60)
+                          t=rr.text
+                          if any(k in t.lower() for k in ['pdf','download','attachment','report']) or '241024000035699' in t or '3487955008555583369' in t or '93917' in t:
+                              print('SCRIPT',u,'HTTP',rr.status_code,'BYTES',len(rr.content))
+                              for pat in pats:
+                                  for m in sorted(set(re.findall(pat,t,re.I))): print('SCRIPT_MATCH',m[:1500])
+                              for needle in ['241024000035699','3487955008555583369','93917','download','pdf']:
+                                  p=t.find(needle)
+                                  if p>=0: print('SCRIPT_CTX',needle,t[max(0,p-500):p+1500].replace('\n',' ')[:2000])
+                      except Exception as e:
+                          print('SCRIPT_ERR',u,repr(e))
+              except Exception as e:
+                  print('PAGE_ERR',repr(e))
+          PY
