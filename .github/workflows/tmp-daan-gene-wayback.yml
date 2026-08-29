@@ -1,0 +1,113 @@
+name: Temporary Daan Gene Wayback inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-wayback.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query Internet Archive CDX and recover archived report files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/cdx diagnostic/snapshots diagnostic/downloads
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import json, time, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          queries=[
+              ('view_deep','www.nxny.com/report/view_3189898.html','exact'),
+              ('view_deep_dup','www.nxny.com/report/view_3189923.html','exact'),
+              ('view_2020h1','www.nxny.com/report/view_4461177.html','exact'),
+              ('view_2020q3','www.nxny.com/report/view_4507887.html','exact'),
+              ('vip_download','vip.nxny.com/DownLoad/DownLoad.aspx*','prefix'),
+              ('vip_all','vip.nxny.com/*','prefix'),
+              ('nxny_pdfs','*.nxny.com/*.pdf','domain'),
+              ('nxny_all_pdf','nxny.com/*.pdf','domain'),
+              ('nxny_deep_id','*.nxny.com/*3189898*','domain'),
+              ('nxny_2020h1_id','*.nxny.com/*4461177*','domain'),
+          ]
+          base='https://web.archive.org/cdx/search/cdx'
+          all_rows=[]
+          for name,url,match in queries:
+              params={
+                  'url':url,'output':'json','fl':'timestamp,original,statuscode,mimetype,length,digest,urlkey',
+                  'filter':'statuscode:200','collapse':'digest','limit':'20000'
+              }
+              if match!='exact': params['matchType']=match
+              full=base+'?'+urlencode(params)
+              try:
+                  req=urllib.request.Request(full,headers={'User-Agent':UA})
+                  raw=urllib.request.urlopen(req,timeout=180).read()
+                  Path(f'diagnostic/cdx/{name}.json').write_bytes(raw)
+                  obj=json.loads(raw.decode('utf-8','replace'))
+              except Exception as exc:
+                  Path(f'diagnostic/cdx/{name}.error').write_text(repr(exc)+'\n'+full,encoding='utf-8')
+                  continue
+              if not isinstance(obj,list) or len(obj)<2: continue
+              header=obj[0]
+              for row in obj[1:]:
+                  rec=dict(zip(header,row)); rec['query']=name; all_rows.append(rec)
+              time.sleep(1)
+          Path('diagnostic/cdx/all_rows.json').write_text(json.dumps(all_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CDX ROWS',len(all_rows))
+          for r in all_rows[:500]: print(json.dumps(r,ensure_ascii=False))
+
+          # Download promising snapshots. Original file snapshots use id_ to avoid archive rewriting.
+          selected=[]; seen=set()
+          for r in all_rows:
+              orig=r.get('original',''); mime=(r.get('mimetype') or '').lower(); q=r.get('query','')
+              low=orig.lower()
+              promising=(
+                  q.startswith('view_') or q.endswith('_id') or
+                  'download.aspx' in low or '.pdf' in low or mime=='application/pdf' or
+                  any(x in low for x in ['3189898','3189923','4461177','4507887'])
+              )
+              key=(r.get('timestamp'),orig)
+              if promising and key not in seen:
+                  seen.add(key); selected.append(r)
+          # newest first; cap generously
+          selected.sort(key=lambda r:r.get('timestamp',''),reverse=True)
+          selected=selected[:2000]
+          Path('diagnostic/cdx/selected.json').write_text(json.dumps(selected,ensure_ascii=False,indent=2),encoding='utf-8')
+          for i,r in enumerate(selected):
+              ts=r['timestamp']; orig=r['original']
+              snap=f'https://web.archive.org/web/{ts}id_/{orig}'
+              try:
+                  req=urllib.request.Request(snap,headers={'User-Agent':UA})
+                  resp=urllib.request.urlopen(req,timeout=180)
+                  raw=resp.read()
+                  headers=dict(resp.headers.items())
+              except Exception as exc:
+                  Path(f'diagnostic/snapshots/{i:04d}.error').write_text(repr(exc)+'\n'+snap,encoding='utf-8')
+                  continue
+              Path(f'diagnostic/snapshots/{i:04d}.body').write_bytes(raw)
+              Path(f'diagnostic/snapshots/{i:04d}.json').write_text(json.dumps({'record':r,'snapshot':snap,'headers':headers,'size':len(raw)},ensure_ascii=False,indent=2),encoding='utf-8')
+              print('SNAP',i,len(raw),headers.get('Content-Type'),orig)
+              time.sleep(.3)
+          PY
+
+          file diagnostic/snapshots/*.body > diagnostic/snapshots/file_types.txt 2>&1 || true
+          grep -l '^%PDF' diagnostic/snapshots/*.body > diagnostic/snapshots/pdf_files.txt 2>/dev/null || true
+          cat diagnostic/snapshots/file_types.txt | head -500 || true
+          echo 'PDF snapshots:'
+          cat diagnostic/snapshots/pdf_files.txt || true
+
+      - name: Upload Wayback diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-wayback-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
