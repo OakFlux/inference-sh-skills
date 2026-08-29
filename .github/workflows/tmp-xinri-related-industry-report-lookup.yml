@@ -1,0 +1,49 @@
+name: Temporary Xinri related industry report lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-related-industry-report-lookup.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Query exact dates and test direct PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, requests
+          api='https://reportapi.eastmoney.com/report/list'
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/'}
+          keys=['别开生面','进阶中的两轮','两轮电动车高景气','共享电单车放量进行时','新日股份','603787']
+          for begin,end in [('2020-07-16','2020-07-24')]:
+            for q in ('0','1','2'):
+              p={'pageNo':'1','pageSize':'100','code':'','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':begin,'endTime':end,'fields':'','qType':q,'orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
+              r=requests.get(api,params=p,headers=h,timeout=60); r.raise_for_status(); o=r.json()
+              pages=max(1,int(o.get('TotalPage') or math.ceil(int(o.get('hits') or 0)/100) or 1))
+              print('SCAN',q,'HITS',o.get('hits'),'PAGES',pages)
+              for page in range(1,min(pages,20)+1):
+                if page==1: rows=o.get('data') or []
+                else:
+                  pp=dict(p); pp.update({'pageNo':str(page),'p':str(page),'pageNum':str(page),'pageNumber':str(page)})
+                  rr=requests.get(api,params=pp,headers=h,timeout=60); rr.raise_for_status(); rows=rr.json().get('data') or []
+                for row in rows:
+                  blob=' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode','orgSName','researcher'])
+                  if any(k in blob for k in keys):
+                    print('MATCH',json.dumps(row,ensure_ascii=False))
+                    info=row.get('infoCode')
+                    if info:
+                      url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+                      try:
+                        x=requests.get(url,headers={**h,'Range':'bytes=0-4095'},timeout=45)
+                        print('PDF',x.status_code,x.headers.get('content-type'),x.headers.get('content-range'),len(x.content),x.content[:8],url)
+                      except Exception as e: print('PDFERR',repr(e))
+          PY
