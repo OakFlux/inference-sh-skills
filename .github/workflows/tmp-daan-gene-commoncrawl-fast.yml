@@ -1,0 +1,149 @@
+name: Temporary Daan Gene fast archive PDF recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-commoncrawl-fast.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Search archive indexes and recover matching PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out records
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import gzip, hashlib, json, re, urllib.request, zlib
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          info=json.loads(urllib.request.urlopen(urllib.request.Request('https://index.commoncrawl.org/collinfo.json',headers={'User-Agent':UA}),timeout=90).read())
+          # Use crawls nearest the report years plus the newest crawl.
+          wanted=[]
+          for year in (2015,2016,2017,2020,2021):
+              arr=[x for x in info if f'CC-MAIN-{year}-' in x.get('id','')]
+              if arr:
+                  arr=sorted(arr,key=lambda x:x['id'])
+                  for x in (arr[0],arr[len(arr)//2],arr[-1]):
+                      if x not in wanted:wanted.append(x)
+          if info and info[0] not in wanted:wanted.append(info[0])
+
+          patterns=[
+            'vip.nxny.com/DownLoad/DownLoad.aspx*',
+            'www.nxny.com/DownLoad/DownLoad.aspx*',
+            '*.nxny.com/*3189898*',
+            '*.nxny.com/*3189923*',
+            '*.nxny.com/*3423061*',
+            '*.nxny.com/*4461177*',
+            '*.nxny.com/*4507887*',
+            '*.nxny.com/*4414374*',
+            '*.nxny.com/*.pdf',
+          ]
+          rows=[]
+          for idx in wanted:
+              for pat in patterns:
+                  url=idx['cdx-api']+'?'+urlencode([('url',pat),('output','json'),('filter','status:200'),('collapse','digest'),('pageSize','200')])
+                  try:
+                      raw=urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':UA}),timeout=90).read().decode('utf-8','replace')
+                  except Exception as exc:
+                      continue
+                  for line in raw.splitlines():
+                      try:r=json.loads(line)
+                      except Exception:continue
+                      r['_index']=idx['id'];r['_pattern']=pat;rows.append(r)
+          # dedupe and rank PDF/download records first
+          uniq=[];seen=set()
+          for r in rows:
+              key=(r.get('digest'),r.get('url'),r.get('timestamp'))
+              if key in seen:continue
+              seen.add(key);uniq.append(r)
+          def rank(r):
+              u=(r.get('url') or '').lower();m=(r.get('mime') or '').lower();n=int(r.get('length') or 0)
+              return (m=='application/pdf' or '.pdf' in u,'download.aspx' in u,100000<=n<=10000000,r.get('timestamp',''))
+          uniq.sort(key=rank,reverse=True)
+          Path('out/index_rows.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('INDEX_ROWS',len(uniq))
+          for r in uniq[:300]: print(json.dumps(r,ensure_ascii=False))
+
+          def payload(block):
+              try:data=gzip.decompress(block)
+              except Exception:
+                  try:data=zlib.decompress(block,16+zlib.MAX_WBITS)
+                  except Exception:return b''
+              # strip WARC headers
+              p=data.find(b'\r\n\r\n'); sep=4
+              if p<0:p=data.find(b'\n\n');sep=2
+              if p<0:return data
+              rest=data[p+sep:]
+              q=rest.find(b'\r\n\r\n'); sep2=4
+              if q<0:q=rest.find(b'\n\n');sep2=2
+              if q<0:return rest
+              head=rest[:q].decode('latin1','replace').lower(); body=rest[q+sep2:]
+              if 'content-encoding: gzip' in head:
+                  try:body=gzip.decompress(body)
+                  except Exception:pass
+              elif 'content-encoding: deflate' in head:
+                  try:body=zlib.decompress(body)
+                  except Exception:pass
+              return body
+
+          recovered=[]
+          # Limit to records plausibly carrying files, plus target-id records.
+          candidates=[]
+          for r in uniq:
+              u=(r.get('url') or '').lower();m=(r.get('mime') or '').lower();n=int(r.get('length') or 0)
+              target=any(x in u for x in ['3189898','3189923','3423061','4461177','4507887','4414374'])
+              if target or m=='application/pdf' or '.pdf' in u or ('download.aspx' in u and n>30000): candidates.append(r)
+          for i,r in enumerate(candidates[:350]):
+              try:
+                  off=int(r['offset']); length=int(r['length']); fn=r['filename']
+                  req=urllib.request.Request('https://data.commoncrawl.org/'+fn,headers={'User-Agent':UA,'Range':f'bytes={off}-{off+length-1}'})
+                  block=urllib.request.urlopen(req,timeout=150).read()
+                  body=payload(block)
+              except Exception as exc:
+                  continue
+              meta={'url':r.get('url'),'timestamp':r.get('timestamp'),'mime':r.get('mime'),'size':len(body),'sha256':hashlib.sha256(body).hexdigest(),'is_pdf':body.startswith(b'%PDF')}
+              recovered.append(meta)
+              if body.startswith(b'%PDF'):
+                  Path(f'records/{i:04d}.pdf').write_bytes(body)
+              elif b'<html' in body[:5000].lower():
+                  Path(f'records/{i:04d}.html').write_bytes(body)
+          Path('out/recovered.json').write_text(json.dumps(recovered,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('RECOVERED',len(recovered),'PDF',sum(x['is_pdf'] for x in recovered))
+          PY
+
+          shopt -s nullglob
+          n=0
+          for pdf in records/*.pdf; do
+            pages=$(pdfinfo "$pdf" 2>/dev/null | awk '/^Pages:/ {print $2}' || true)
+            pdftotext -f 1 -l 5 "$pdf" "${pdf%.pdf}.txt" 2>/dev/null || true
+            if grep -Eqi '达安基因|002030|分子诊断行业待爆发|独立实验室新业态崛起|新冠筛查从严|三季度业绩超预期' "${pdf%.pdf}.txt"; then
+              n=$((n+1))
+              cp "$pdf" "out/target_${n}_${pages}p.pdf"
+              cp "${pdf%.pdf}.txt" "out/target_${n}_${pages}p.txt"
+              echo "TARGET $n pages=$pages source=$pdf"
+            fi
+          done
+          echo "$n" > out/target_count.txt
+          ls -lh out
+
+      - name: Upload recovery output
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-fast-archive-recovery
+          path: out/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
