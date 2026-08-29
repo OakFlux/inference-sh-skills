@@ -1,0 +1,123 @@
+name: Temporary Meikang Biotech broker report metadata discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/meikang-bio-meta-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and rank broker report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for page in $(seq 1 12); do
+            curl --http1.1 --location --fail --silent --show-error \
+              --retry 6 --retry-all-errors --retry-delay 1 \
+              --connect-timeout 15 --max-time 150 \
+              --user-agent "$UA" \
+              --referer 'https://data.eastmoney.com/report/300439.html' \
+              --header 'Accept-Encoding: identity' \
+              --get 'https://reportapi.eastmoney.com/report/list' \
+              --data-urlencode 'industryCode=*' \
+              --data-urlencode 'pageSize=100' \
+              --data-urlencode 'industry=*' \
+              --data-urlencode 'rating=*' \
+              --data-urlencode 'ratingChange=*' \
+              --data-urlencode 'beginTime=2010-01-01' \
+              --data-urlencode 'endTime=2026-08-29' \
+              --data-urlencode "pageNo=$page" \
+              --data-urlencode 'fields=' \
+              --data-urlencode 'qType=0' \
+              --data-urlencode 'orgCode=' \
+              --data-urlencode 'code=300439' \
+              --data-urlencode 'rcode=' \
+              --data-urlencode "p=$page" \
+              --data-urlencode "pageNum=$page" \
+              --data-urlencode "pageNumber=$page" \
+              --output "diagnostics/page_${page}.txt"
+          done
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+
+          def parse(s):
+              s=s.strip()
+              if s and s[0] not in '[{' and '(' in s and s.rstrip().endswith(')'):
+                  s=s[s.find('(')+1:s.rfind(')')]
+              return json.loads(s)
+
+          rows=[]; seen=set()
+          for p in sorted(Path('diagnostics').glob('page_*.txt')):
+              try:
+                  obj=parse(p.read_text(encoding='utf-8',errors='ignore'))
+              except Exception as e:
+                  print('BAD',p,e); continue
+              data=obj.get('data') or obj.get('result',{}).get('data') or []
+              if not isinstance(data,list):
+                  continue
+              added=0
+              for r in data:
+                  c=str(r.get('infoCode') or r.get('infocode') or r.get('info_code') or '')
+                  if c and c not in seen:
+                      seen.add(c); rows.append(r); added+=1
+              if data and added==0:
+                  break
+
+          def title(r): return str(r.get('title') or r.get('reportTitle') or '')
+          def broker(r): return str(r.get('orgSName') or r.get('orgName') or r.get('orgNameCn') or '')
+          def date(r):
+              x=str(r.get('publishDate') or r.get('publishTime') or r.get('publishDateTime') or '')
+              m=re.search(r'20\d{2}-\d{2}-\d{2}',x)
+              return m.group(0) if m else x[:10]
+          def code(r): return str(r.get('infoCode') or r.get('infocode') or r.get('info_code') or '')
+
+          pos=[
+              '深度','首次覆盖','公司深度','研究报告','体外诊断','IVD','生化诊断',
+              '化学发光','自产产品','医学检验','精准诊断','质谱','检验服务',
+              '第三方医学检验','行业龙头','国产替代','平台化','产品矩阵','一体化',
+              '诊断服务','临床质谱','全产业链','拐点','价值重估','持续增长'
+          ]
+          neg=[
+              '一季报点评','中报点评','半年报点评','年报点评','三季报点评','业绩点评',
+              '事件点评','点评报告','公司信息更新','信息更新报告','公告点评','季报点评',
+              '业绩快报','定期报告点评','跟踪点评','简评','点评：'
+          ]
+
+          def sc(r):
+              t=re.sub(r'\s+','',title(r)); s=0
+              if '深度' in t: s+=360
+              if '首次覆盖' in t: s+=340
+              if '公司深度' in t: s+=120
+              s+=sum(55 for x in pos if re.sub(r'\s+','',x) in t)
+              s-=sum(260 for x in neg if re.sub(r'\s+','',x) in t)
+              try:y=int(date(r)[:4])
+              except:y=0
+              s+={2026:85,2025:75,2024:65,2023:55,2022:45,2021:35,2020:25,2019:20,2018:15,2017:10}.get(y,0)
+              return s
+
+          out=sorted([
+              {'score':sc(r),'date':date(r),'broker':broker(r),'title':title(r),'infoCode':code(r)}
+              for r in rows
+          ], key=lambda x:(x['score'],x['date']), reverse=True)
+          Path('diagnostics/candidates.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL',len(rows))
+          print('TOP_CANDIDATES')
+          for x in out[:80]:
+              print(json.dumps(x,ensure_ascii=False))
+          PY
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: meikang-biotech-report-metadata
+          path: diagnostics/candidates.json
+          if-no-files-found: error
+          retention-days: 2
