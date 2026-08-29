@@ -1,0 +1,84 @@
+name: Temporary Hualan Vaccine fast report lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-eastmoney-fast.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Query report catalog in parallel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import json, requests
+
+          api='https://reportapi.eastmoney.com/report/list'
+          dates=['2022-07-08','2023-07-18','2023-07-19','2023-08-15','2023-10-13','2023-10-17','2023-10-25']
+          tasks=[]
+          for d in dates:
+            for q in ('0','1','2'):
+              for code in ('','301207'):
+                tasks.append((d,q,code))
+
+          def one(task):
+            d,q,code=task
+            params={
+              'pageNo':'1','pageSize':'1000','code':code,
+              'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+              'beginTime':d,'endTime':d,'fields':'','qType':q,
+              'orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'
+            }
+            r=requests.get(api,params=params,timeout=35,headers={
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/'
+            })
+            return task,r.status_code,r.url,r.json() if r.ok else {'error':r.text[:300]}
+
+          found={}
+          with ThreadPoolExecutor(max_workers=18) as ex:
+            futures=[ex.submit(one,t) for t in tasks]
+            for fut in as_completed(futures):
+              try:
+                (d,q,code),status,url,obj=fut.result()
+              except Exception as e:
+                print('ERROR',repr(e)); continue
+              rows=obj.get('data') or []
+              print('RESULT_META',d,q,repr(code),status,'rows',len(rows),'hits',obj.get('hits'))
+              for row in rows:
+                title=str(row.get('title') or '')
+                stock=str(row.get('stockName') or '')
+                stockcode=str(row.get('stockCode') or '')
+                if stockcode=='301207' or stock=='华兰疫苗' or '华兰疫苗' in title or any(k in title for k in ['天高任鸟飞','疫苗行业龙头','深耕流感疫苗市场','国内领先流感疫苗制造商','拨云见日','流感疫苗龙头']):
+                  info={
+                    'query':(d,q,code),'date':str(row.get('publishDate') or '')[:10],
+                    'broker':row.get('orgSName'),'title':title,'pages':row.get('attachPages'),
+                    'infoCode':row.get('infoCode'),'column':row.get('column'),
+                    'rating':row.get('sRatingName') or row.get('emRatingName'),
+                    'stockName':stock,'stockCode':stockcode
+                  }
+                  found[str(info.get('infoCode') or json.dumps(info,ensure_ascii=False,sort_keys=True))]=info
+                  print('MATCH',json.dumps(info,ensure_ascii=False))
+
+          print('UNIQUE')
+          for info in found.values():
+            print(json.dumps(info,ensure_ascii=False))
+            ic=info.get('infoCode')
+            if ic:
+              u=f'https://pdf.dfcfw.com/pdf/H3_{ic}_1.pdf'
+              try:
+                r=requests.get(u,timeout=60,headers={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/'})
+                print('PDF',u,r.status_code,len(r.content),r.headers.get('content-type'),r.content[:5])
+              except Exception as e:
+                print('PDF_ERROR',u,repr(e))
+          PY
