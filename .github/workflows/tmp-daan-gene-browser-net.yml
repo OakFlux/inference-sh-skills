@@ -1,0 +1,92 @@
+name: Temporary Daan Gene browser network capture
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-browser-net-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install Playwright Python package
+        run: python -m pip install --disable-pip-version-check playwright
+
+      - name: Capture 9F network requests and response bodies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          which google-chrome || which chromium || which chromium-browser || true
+          cat > /tmp/capture.py <<'PY'
+          from __future__ import annotations
+          import asyncio,json,os,shutil,re
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          OUT=Path('diagnostics')
+          URLS=[
+              'https://stock.9fzt.com/list/sz_002030_3.html',
+              'https://www.9fzt.com/detail/sz_002030_10_508957738559.html',
+              'https://stock.9fzt.com/report/company.html',
+          ]
+
+          async def main():
+              executable=shutil.which('google-chrome') or shutil.which('chromium') or shutil.which('chromium-browser')
+              async with async_playwright() as p:
+                  browser=await p.chromium.launch(headless=True,executable_path=executable,args=['--no-sandbox','--disable-dev-shm-usage'])
+                  context=await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36')
+                  all_rows=[]
+                  for pi,url in enumerate(URLS):
+                      page=await context.new_page()
+                      rows=[]
+                      async def on_response(resp):
+                          u=resp.url
+                          if any(k in u.lower() for k in ['api','report','research','news','detail','download','file','pdf']):
+                              row={'page':url,'url':u,'status':resp.status,'headers':await resp.all_headers()}
+                              try:
+                                  ct=(row['headers'].get('content-type') or '').lower()
+                                  if any(k in ct for k in ['json','text','javascript']) or any(k in u.lower() for k in ['report/list','report/detail','report/info','report/content']):
+                                      body=await resp.body()
+                                      row['body_size']=len(body)
+                                      row['body']=body[:2_000_000].decode('utf-8','ignore')
+                              except Exception as exc:
+                                  row['body_error']=repr(exc)
+                              rows.append(row)
+                      page.on('response',on_response)
+                      try:
+                          await page.goto(url,wait_until='networkidle',timeout=120000)
+                      except Exception as exc:
+                          rows.append({'page':url,'navigation_error':repr(exc)})
+                      await page.wait_for_timeout(10000)
+                      try:
+                          await page.screenshot(path=str(OUT/f'page_{pi}.png'),full_page=True)
+                          html=await page.content();(OUT/f'page_{pi}.html').write_text(html,encoding='utf-8')
+                          rows.append({'page':url,'title':await page.title(),'final_url':page.url,'localStorage':await page.evaluate('Object.fromEntries(Object.entries(localStorage))'),'sessionStorage':await page.evaluate('Object.fromEntries(Object.entries(sessionStorage))'),'cookies':await context.cookies()})
+                      except Exception as exc:
+                          rows.append({'page':url,'capture_error':repr(exc)})
+                      await page.close()
+                      (OUT/f'network_{pi}.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+                      all_rows.extend(rows)
+                  (OUT/'network_all.json').write_text(json.dumps(all_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+                  for r in all_rows:
+                      if 'url' in r and any(k in r['url'].lower() for k in ['report','research','download','pdf']):
+                          print('NET',r.get('status'),r['url'],(r.get('body') or '')[:1000].replace('\n',' '))
+                  await browser.close()
+          asyncio.run(main())
+          PY
+          python /tmp/capture.py
+
+      - name: Upload capture
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-browser-network-capture
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
