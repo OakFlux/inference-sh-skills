@@ -1,0 +1,328 @@
+name: Temporary Shanghai RAAS reports package
+
+on:
+  push:
+    branches:
+      - tmp-shanghai-raas-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/package_shanghai_raas.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK = "002252"
+          COMPANY_CN = "上海莱士"
+          COMPANY_EN = "SHANGHAI RAAS"
+          ANNUAL_INDEX = "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/002252/page_type/ndbg.phtml"
+          HALF_INDEX = "https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/002252/page_type/zqbg.phtml"
+
+          OUT = Path("dist")
+          DOCS = OUT / "上海莱士_002252_2020-2025年报_2026年最新半年报"
+          DOCS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
+          })
+
+          def decode_html(raw: bytes) -> str:
+              for encoding in ("utf-8", "gb18030", "gbk"):
+                  try:
+                      return raw.decode(encoding)
+                  except UnicodeDecodeError:
+                      pass
+              return raw.decode("utf-8", errors="replace")
+
+          def request_bytes(url: str, *, referer: str | None = None, attempts: int = 5) -> tuple[bytes, str]:
+              errors: list[str] = []
+              for attempt in range(attempts):
+                  try:
+                      headers = {"Referer": referer} if referer else {}
+                      response = session.get(url, headers=headers, timeout=(30, 300), allow_redirects=True)
+                      print("GET", response.status_code, len(response.content), response.url)
+                      response.raise_for_status()
+                      return response.content, response.url
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      if attempt < attempts - 1:
+                          time.sleep(min(2 ** attempt, 12))
+              raise RuntimeError(f"Unable to fetch {url}: {errors}")
+
+          def parse_index(index_url: str, *, kind: str) -> list[tuple[int, int, str]]:
+              raw, final_url = request_bytes(index_url)
+              soup = BeautifulSoup(decode_html(raw), "html.parser")
+              rows: list[tuple[int, int, str]] = []
+
+              for anchor in soup.find_all("a", href=True):
+                  title = " ".join(anchor.get_text(" ", strip=True).split())
+                  href = html.unescape(unquote(str(anchor["href"]))).strip()
+                  normalized = re.sub(r"\s+", "", title)
+
+                  if kind == "annual":
+                      if "年度报告" not in normalized and "年度報告" not in normalized:
+                          continue
+                  else:
+                      if not any(token in normalized for token in ("半年度报告", "半年度報告", "中期报告", "中期報告")):
+                          continue
+
+                  if any(token in normalized for token in (
+                      "摘要", "英文版", "审计报告", "審計報告", "环境", "環境", "ESG",
+                      "社会责任", "社會責任", "股东大会", "股東大會", "董事会", "董事會",
+                  )):
+                      continue
+
+                  year_match = re.search(r"(20\d{2})", normalized)
+                  id_match = re.search(r"[?&]id=(\d+)", href)
+                  if not year_match or not id_match:
+                      continue
+
+                  rows.append((int(year_match.group(1)), int(id_match.group(1)), title))
+
+              if not rows:
+                  raise RuntimeError(f"No {kind} report links found at {final_url}")
+              return rows
+
+          def select_reports() -> list[tuple[str, int, str, int, int]]:
+              annual_rows = parse_index(ANNUAL_INDEX, kind="annual")
+              annual_candidates: dict[int, list[tuple[tuple[int, int], int, str]]] = {}
+              for year, identifier, title in annual_rows:
+                  if year not in range(2020, 2026):
+                      continue
+                  normalized = re.sub(r"\s+", "", title)
+                  revision_score = int(any(token in normalized for token in ("修订", "修訂", "修正", "更正", "更新")))
+                  annual_candidates.setdefault(year, []).append(((revision_score, identifier), identifier, title))
+
+              selected: list[tuple[str, int, str, int, int]] = []
+              for year in range(2020, 2026):
+                  candidates = annual_candidates.get(year, [])
+                  if not candidates:
+                      raise RuntimeError(f"No complete annual report found for {year}")
+                  candidates.sort(key=lambda item: item[0], reverse=True)
+                  _, identifier, title = candidates[0]
+                  filename = f"上海莱士_002252_{year}年年度报告.pdf"
+                  if any(token in title for token in ("修订", "修訂", "修正", "更正", "更新")):
+                      filename = f"上海莱士_002252_{year}年年度报告_后续版本.pdf"
+                  print("SELECT ANNUAL", year, identifier, title)
+                  selected.append((filename, identifier, title, 100, year))
+
+              half_rows = parse_index(HALF_INDEX, kind="half")
+              half_candidates: list[tuple[tuple[int, int, int], int, str, int]] = []
+              for year, identifier, title in half_rows:
+                  normalized = re.sub(r"\s+", "", title)
+                  revision_score = int(any(token in normalized for token in ("修订", "修訂", "修正", "更正", "更新")))
+                  half_candidates.append(((year, revision_score, identifier), identifier, title, year))
+
+              half_candidates.sort(key=lambda item: item[0], reverse=True)
+              _, half_id, half_title, half_year = half_candidates[0]
+              if half_year != 2026:
+                  raise RuntimeError(f"Latest half-year report selected was {half_year}, expected 2026: {half_title}")
+              print("SELECT HALF", half_year, half_id, half_title)
+              selected.append(("上海莱士_002252_2026年半年度报告.pdf", half_id, half_title, 60, 2026))
+              return selected
+
+          ITEMS = select_reports()
+
+          def detail_url(identifier: int) -> str:
+              return f"https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id={identifier}&stockid={STOCK}"
+
+          def derived_pdf_url(identifier: int, date_text: str) -> str:
+              year, month, _ = date_text.split("-")
+              month = str(int(month))
+              return (
+                  "https://file.finance.sina.com.cn/211.154.219.97:9494/"
+                  f"MRGG/CNSESZ_STOCK/{year}/{year}-{month}/{date_text}/{identifier}.PDF"
+              )
+
+          def discover_pdf_urls(identifier: int) -> tuple[list[str], str, str]:
+              page = detail_url(identifier)
+              raw, final_page_url = request_bytes(page)
+              text = decode_html(raw)
+              soup = BeautifulSoup(text, "html.parser")
+              page_title = " ".join((soup.title.get_text(" ", strip=True) if soup.title else "").split())
+
+              date_match = re.search(r"公告日期\s*[:：]\s*(20\d{2}-\d{2}-\d{2})", text)
+              if not date_match:
+                  raise RuntimeError(f"Disclosure date not found for detail ID {identifier}")
+              disclosed_date = date_match.group(1)
+
+              urls: list[str] = []
+              for anchor in soup.find_all("a", href=True):
+                  label = " ".join(anchor.get_text(" ", strip=True).split())
+                  href = html.unescape(unquote(str(anchor["href"]))).strip()
+                  if "下载公告" not in label and "file.finance.sina.com.cn" not in href:
+                      continue
+                  if href.startswith("//"):
+                      href = "https:" + href
+                  elif href.startswith("/"):
+                      href = urljoin(final_page_url, href)
+                  if href.startswith("http://file.finance.sina.com.cn"):
+                      href = "https://" + href[len("http://"):]
+                  if href.startswith("http") and href not in urls:
+                      urls.append(href)
+
+              fallback = derived_pdf_url(identifier, disclosed_date)
+              if fallback not in urls:
+                  urls.append(fallback)
+
+              print("DISCOVER", identifier, disclosed_date, page_title, urls)
+              return urls, page_title, disclosed_date
+
+          def validate_pdf(path: Path, minimum_pages: int, expected_year: int) -> tuple[int, int, str]:
+              raw_head = path.read_bytes()[:16]
+              size = path.stat().st_size
+              if size < 100_000 or not raw_head.startswith(b"%PDF-"):
+                  raise RuntimeError(f"Invalid PDF {path.name}: size={size}, head={raw_head!r}")
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(f"Unexpectedly short PDF {path.name}: {pages} pages")
+
+              parts: list[str] = []
+              for page in reader.pages[:16]:
+                  try:
+                      parts.append(page.extract_text() or "")
+                  except Exception:
+                      pass
+              sample = re.sub(r"\s+", "", "".join(parts)).upper()
+              if COMPANY_CN not in sample and COMPANY_EN not in sample:
+                  print("WARNING company name not extracted", path.name)
+              if str(expected_year) not in sample:
+                  print("WARNING expected year not extracted", expected_year, path.name)
+
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return size, pages, digest.hexdigest()
+
+          def download_one(filename: str, identifier: int, minimum_pages: int, expected_year: int) -> tuple[str, int, int, str, str, str]:
+              destination = DOCS / filename
+              urls, page_title, disclosed_date = discover_pdf_urls(identifier)
+              errors: list[str] = []
+              referer = detail_url(identifier)
+
+              for url in urls:
+                  variants = [url]
+                  if url.startswith("https://"):
+                      variants.append("http://" + url[len("https://"):])
+                  for candidate in variants:
+                      for attempt in range(4):
+                          try:
+                              with session.get(
+                                  candidate,
+                                  headers={"Referer": referer, "Accept": "application/pdf,application/octet-stream,*/*"},
+                                  timeout=(30, 600),
+                                  stream=True,
+                                  allow_redirects=True,
+                              ) as response:
+                                  print("DOWNLOAD", identifier, response.status_code, response.url, response.headers.get("content-type"), response.headers.get("content-length"))
+                                  response.raise_for_status()
+                                  with destination.open("wb") as output:
+                                      for chunk in response.iter_content(1024 * 1024):
+                                          if chunk:
+                                              output.write(chunk)
+                                  final_url = response.url
+
+                              size, pages, digest = validate_pdf(destination, minimum_pages, expected_year)
+                              return final_url, size, pages, digest, page_title, disclosed_date
+                          except Exception as exc:
+                              destination.unlink(missing_ok=True)
+                              errors.append(f"{candidate} attempt {attempt + 1}: {exc!r}")
+                              if attempt < 3:
+                                  time.sleep(min(2 ** attempt, 8))
+
+              raise RuntimeError("; ".join(errors))
+
+          manifest = [
+              "上海莱士血液制品股份有限公司（002252.SZ）",
+              "资料范围：2020—2025年年度报告全文及2026年半年度报告全文。",
+              "版本规则：排除年度报告摘要、英文版、审计报告、ESG/环境报告等非目标文件；如有修订、更正或更新版本，优先采用后续版本。",
+              "来源：新浪财经上市公司公告镜像；PDF内容为上市公司正式披露文件。",
+              "",
+          ]
+
+          for filename, identifier, document_title, minimum_pages, expected_year in ITEMS:
+              used_url, size, pages, digest, page_title, disclosed_date = download_one(
+                  filename,
+                  identifier,
+                  minimum_pages,
+                  expected_year,
+              )
+              manifest.extend([
+                  filename,
+                  f"  文件类型：{document_title}",
+                  f"  公告详情ID：{identifier}",
+                  f"  披露日期：{disclosed_date}",
+                  f"  公告页面标题：{page_title}",
+                  f"  页数：{pages}",
+                  f"  文件大小：{size} bytes",
+                  f"  SHA-256：{digest}",
+                  f"  PDF来源：{used_url}",
+                  f"  公告详情页：{detail_url(identifier)}",
+                  "",
+              ])
+              print("OK", filename, pages, size, used_url)
+
+          (DOCS / "资料清单与来源.txt").write_text("\n".join(manifest), encoding="utf-8")
+
+          final_zip = OUT / "上海莱士_002252_2020-2025年报_2026年最新半年报.zip"
+          with zipfile.ZipFile(final_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(DOCS.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(final_zip, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP integrity failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, got {pdfs}")
+
+          print(f"FINAL_ZIP={final_zip}")
+          print(f"ZIP_SIZE={final_zip.stat().st_size}")
+          print("CONTENTS")
+          for path in sorted(DOCS.iterdir()):
+              if path.suffix.lower() == ".pdf":
+                  reader = PdfReader(str(path), strict=False)
+                  print(path.name, path.stat().st_size, len(reader.pages))
+              else:
+                  print(path.name, path.stat().st_size)
+          PY
+          python /tmp/package_shanghai_raas.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: shanghai-raas-reports-final-zip
+          path: dist/上海莱士_002252_2020-2025年报_2026年最新半年报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
