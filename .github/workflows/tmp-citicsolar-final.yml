@@ -1,0 +1,208 @@
+name: Temporary Citic Bo final broker deep reports package
+
+on:
+  push:
+    branches:
+      - 'tmp/citicsolar-final-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Download, validate and package exact deep reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/citicsolar_final.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          candidates = [
+              {
+                  'infoCode': 'AP202402231623143205',
+                  'date': '2024-02-23',
+                  'broker': '太平洋证券',
+                  'title': '中信博深度报告：光伏支架乘海风，业绩触底绽新荣',
+                  'min_pages': 20,
+              },
+              {
+                  'infoCode': 'AP202105191492623752',
+                  'date': '2021-05-19',
+                  'broker': '中银证券',
+                  'title': '光伏跟踪支架龙头，成长空间广阔',
+                  'min_pages': 20,
+              },
+              {
+                  'infoCode': 'AP202012311445611199',
+                  'date': '2020-12-31',
+                  'broker': '东吴证券',
+                  'title': '光伏支架执牛耳者，跟踪系统向阳而生',
+                  'min_pages': 20,
+              },
+          ]
+
+          def safe(value: str, limit: int = 76) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', '', value).strip(' ._')
+              return (value or '报告')[:limit]
+
+          def fetch_pdf(url: str, destination: Path, referer: str) -> tuple[bool, str]:
+              destination.unlink(missing_ok=True)
+              proc = subprocess.run([
+                  'curl', '--http1.1', '--location', '--fail', '--silent', '--show-error',
+                  '--retry', '6', '--retry-all-errors', '--retry-delay', '1',
+                  '--connect-timeout', '20', '--max-time', '300',
+                  '--user-agent', UA, '--referer', referer,
+                  '--header', 'Accept-Encoding: identity',
+                  '--header', 'Accept: application/pdf,application/octet-stream,*/*',
+                  '--output', str(destination), url,
+              ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return proc.returncode == 0, proc.stderr[-1600:]
+
+          results = []
+          failures = []
+          digests = set()
+          temp = DIST / '_candidate.pdf'
+
+          for item in candidates:
+              code = item['infoCode']
+              stamp = int(time.time() * 1000)
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{stamp}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{code}.pdf',
+              ]
+              accepted = False
+              errors = []
+              for url in urls:
+                  ok, err = fetch_pdf(url, temp, f'https://data.eastmoney.com/report/info/{code}.html')
+                  if not ok:
+                      errors.append(f'{url}: {err}')
+                      continue
+                  try:
+                      raw = temp.read_bytes()
+                      if len(raw) < 180_000 or not raw.startswith(b'%PDF-'):
+                          raise RuntimeError(f'invalid or too small PDF: {len(raw)} bytes')
+                      digest = hashlib.sha256(raw).hexdigest()
+                      if digest in digests:
+                          raise RuntimeError('duplicate PDF')
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < item['min_pages']:
+                          raise RuntimeError(f'only {pages} pages')
+                      sample = ''
+                      for page in reader.pages[:min(8, pages)]:
+                          try:
+                              sample += ' ' + (page.extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = re.sub(r'\s+', '', sample)
+                      if '中信博' not in compact and '688408' not in compact:
+                          raise RuntimeError('company identity not found in first eight pages')
+                      filename = f'{item["date"]}_{safe(item["broker"],18)}_{safe(item["title"])}_{pages}页.pdf'
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+                      record = {
+                          **item,
+                          'filename': filename,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': digest,
+                          'url': url,
+                      }
+                      results.append(record)
+                      digests.add(digest)
+                      print('OK', json.dumps(record, ensure_ascii=False))
+                      accepted = True
+                      break
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+                  finally:
+                      temp.unlink(missing_ok=True)
+              if not accepted:
+                  failures.append({**item, 'errors': errors})
+
+          DIAG.joinpath('results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          DIAG.joinpath('failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(results) < 2:
+              raise RuntimeError(f'Only {len(results)} validated reports downloaded')
+
+          manifest = [
+              '中信博（688408）券商深度报告资料包',
+              '筛选规则：公司深度与首次覆盖优先；不以短篇季报、年报点评凑数。',
+              '所有PDF均已核验文件头、实际页数、公司名称和SHA-256。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(results, 1):
+              manifest += [
+                  f'{index}. {item["title"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   日期：{item["date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   公开来源：{item["url"]}',
+                  '',
+              ]
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = DIST / f'中信博_券商深度报告_{len(results)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(results):
+                  raise RuntimeError(f'PDF count mismatch: {pdfs}')
+
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/citicsolar_final.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: citic-bo-final-original-deep-reports
+          path: dist/中信博_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: citic-bo-final-results
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
