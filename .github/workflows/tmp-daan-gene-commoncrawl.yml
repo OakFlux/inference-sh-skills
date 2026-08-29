@@ -1,0 +1,194 @@
+name: Temporary Daan Gene Common Crawl PDF recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-commoncrawl.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Query Common Crawl indexes and recover archived payloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/index diagnostic/records diagnostic/matches previews
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urlencode
+          import gzip, hashlib, json, re, time, urllib.request, zlib
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          # Pull index catalogue and keep crawls around the report publication years plus recent crawls.
+          req=urllib.request.Request('https://index.commoncrawl.org/collinfo.json',headers={'User-Agent':UA})
+          infos=json.loads(urllib.request.urlopen(req,timeout=120).read().decode())
+          selected=[]
+          for x in infos:
+              cid=x.get('id','')
+              m=re.search(r'CC-MAIN-(\d{4})-',cid)
+              if m and 2013 <= int(m.group(1)) <= 2021:
+                  selected.append(x)
+          # One to four crawls per year are sufficient; retain all but bound total.
+          byyear={}
+          for x in selected:
+              y=re.search(r'CC-MAIN-(\d{4})-',x['id']).group(1)
+              byyear.setdefault(y,[]).append(x)
+          selected=[]
+          for y,arr in sorted(byyear.items()):
+              arr=sorted(arr,key=lambda x:x['id'])
+              # first, middle, last crawl in each year
+              picks=[arr[0],arr[len(arr)//2],arr[-1]]
+              for p in picks:
+                  if p not in selected:selected.append(p)
+          Path('diagnostic/index/selected_indexes.json').write_text(json.dumps(selected,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('INDEXES',len(selected),[x['id'] for x in selected])
+
+          patterns=[
+              'vip.nxny.com/DownLoad/DownLoad.aspx*',
+              'www.nxny.com/DownLoad/DownLoad.aspx*',
+              '*.nxny.com/*.pdf',
+              '*.nxny.com/*3189898*',
+              '*.nxny.com/*3189923*',
+              '*.nxny.com/*4461177*',
+              '*.nxny.com/*4507887*',
+              '*.nxny.com/*4414374*',
+              '*.9fzt.com/*508957738559*',
+              '*.9fzt.com/*684425869377*',
+              '*.9fzt.com/*657799781946*',
+              '*.9fzt.com/*648229670402*',
+          ]
+          rows=[]
+          for info in selected:
+              api=info['cdx-api']
+              for pi,pat in enumerate(patterns):
+                  params=[('url',pat),('output','json'),('filter','status:200'),('collapse','digest'),('pageSize','500')]
+                  url=api+'?'+urlencode(params)
+                  try:
+                      req=urllib.request.Request(url,headers={'User-Agent':UA})
+                      raw=urllib.request.urlopen(req,timeout=120).read().decode('utf-8','replace')
+                  except Exception as exc:
+                      Path(f'diagnostic/index/{info["id"]}_{pi}.error').write_text(repr(exc)+'\n'+url,encoding='utf-8')
+                      continue
+                  Path(f'diagnostic/index/{info["id"]}_{pi}.ndjson').write_text(raw,encoding='utf-8')
+                  for line in raw.splitlines():
+                      try:r=json.loads(line)
+                      except Exception:continue
+                      r['_index']=info['id'];r['_pattern']=pat;rows.append(r)
+                  time.sleep(.1)
+          # Deduplicate by digest/URL/timestamp.
+          uniq=[];seen=set()
+          for r in rows:
+              key=(r.get('digest'),r.get('url'),r.get('timestamp'))
+              if key in seen:continue
+              seen.add(key);uniq.append(r)
+          def score(r):
+              u=(r.get('url') or '').lower();mime=(r.get('mime') or '').lower();length=int(r.get('length') or 0)
+              target=any(x in u for x in ['3189898','3189923','4461177','4507887','4414374','508957738559','684425869377','657799781946','648229670402'])
+              return (target,mime=='application/pdf' or '.pdf' in u,'download.aspx' in u,100_000<=length<=20_000_000,r.get('timestamp',''))
+          uniq.sort(key=score,reverse=True)
+          Path('diagnostic/index/all_rows.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('ROWS',len(rows),'UNIQUE',len(uniq))
+          for r in uniq[:500]:print(json.dumps(r,ensure_ascii=False))
+
+          def extract_payload(block):
+              # Each CC range is normally one gzip member containing a WARC record.
+              try:data=gzip.decompress(block)
+              except Exception:
+                  try:data=zlib.decompress(block,16+zlib.MAX_WBITS)
+                  except Exception:return None,{},b''
+              first=data.find(b'\r\n\r\n')
+              if first<0:first=data.find(b'\n\n')
+              if first<0:return None,{},data
+              warc_head=data[:first].decode('latin1','replace')
+              rest=data[first+4:] if data[first:first+4]==b'\r\n\r\n' else data[first+2:]
+              second=rest.find(b'\r\n\r\n')
+              sep=4
+              if second<0:
+                  second=rest.find(b'\n\n');sep=2
+              if second<0:return warc_head,{},rest
+              http_head=rest[:second].decode('latin1','replace')
+              body=rest[second+sep:]
+              headers={}
+              for line in http_head.splitlines()[1:]:
+                  if ':' in line:
+                      k,v=line.split(':',1);headers[k.strip().lower()]=v.strip()
+              enc=headers.get('content-encoding','').lower()
+              try:
+                  if enc=='gzip':body=gzip.decompress(body)
+                  elif enc=='deflate':body=zlib.decompress(body)
+              except Exception:pass
+              return warc_head,headers,body
+
+          # Bound retrieval to promising records. Include HTML target pages and likely PDF/download payloads.
+          cand=[]
+          for r in uniq:
+              u=(r.get('url') or '').lower();mime=(r.get('mime') or '').lower();length=int(r.get('length') or 0)
+              target=any(x in u for x in ['3189898','3189923','4461177','4507887','4414374','508957738559','684425869377','657799781946','648229670402'])
+              promising=target or mime=='application/pdf' or '.pdf' in u or ('download.aspx' in u and length>1000)
+              if promising:cand.append(r)
+          cand=cand[:1200]
+          Path('diagnostic/index/candidates.json').write_text(json.dumps(cand,ensure_ascii=False,indent=2),encoding='utf-8')
+          recovered=[]
+          for i,r in enumerate(cand):
+              try:
+                  off=int(r['offset']);length=int(r['length']);fn=r['filename']
+              except Exception:continue
+              url='https://data.commoncrawl.org/'+fn
+              req=urllib.request.Request(url,headers={'User-Agent':UA,'Range':f'bytes={off}-{off+length-1}'})
+              try:block=urllib.request.urlopen(req,timeout=180).read()
+              except Exception as exc:
+                  Path(f'diagnostic/records/{i:04d}.error').write_text(repr(exc)+'\n'+url,encoding='utf-8');continue
+              wh,hdr,body=extract_payload(block)
+              meta={'index':i,'record':r,'range_url':url,'warc_header':wh,'http_headers':hdr,'size':len(body),'sha256':hashlib.sha256(body).hexdigest(),'is_pdf':body.startswith(b'%PDF')}
+              Path(f'diagnostic/records/{i:04d}.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+              ext='.pdf' if body.startswith(b'%PDF') else '.html' if b'<html' in body[:5000].lower() else '.bin'
+              Path(f'diagnostic/records/{i:04d}{ext}').write_bytes(body)
+              recovered.append(meta)
+              if body.startswith(b'%PDF'):
+                  Path(f'diagnostic/matches/{i:04d}.pdf').write_bytes(body)
+              elif any(x.encode() in body for x in ['3189898','3189923','4461177','4507887']):
+                  Path(f'diagnostic/matches/{i:04d}_target.html').write_bytes(body)
+              if i%50==0:print('REC',i,len(body),meta['is_pdf'],r.get('url'))
+              time.sleep(.05)
+          Path('diagnostic/recovered.json').write_text(json.dumps(recovered,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('RECOVERED',len(recovered),'PDFS',sum(x['is_pdf'] for x in recovered))
+          PY
+
+          shopt -s nullglob
+          for pdf in diagnostic/matches/*.pdf; do
+            stem=$(basename "$pdf" .pdf)
+            pages=$(pdfinfo "$pdf" 2>/dev/null | awk '/^Pages:/ {print $2}' || true)
+            pdftotext -f 1 -l 5 "$pdf" "diagnostic/matches/${stem}.txt" 2>/dev/null || true
+            if grep -Eqi '达安基因|002030|分子诊断行业待爆发|新冠筛查从严|三季度业绩超预期' "diagnostic/matches/${stem}.txt"; then
+              mv "$pdf" "diagnostic/matches/${stem}_TARGET_${pages}p.pdf"
+              pdftoppm -f 1 -singlefile -png -r 90 "diagnostic/matches/${stem}_TARGET_${pages}p.pdf" "previews/${stem}_first" >/dev/null 2>&1 || true
+              pdftoppm -f "$pages" -singlefile -png -r 90 "diagnostic/matches/${stem}_TARGET_${pages}p.pdf" "previews/${stem}_last" >/dev/null 2>&1 || true
+              echo "TARGET PDF $stem pages=$pages"
+              head -100 "diagnostic/matches/${stem}.txt" || true
+            fi
+          done
+          ls -lh diagnostic/matches previews || true
+
+      - name: Upload Common Crawl recovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-commoncrawl-results
+          path: |
+            diagnostic/index/all_rows.json
+            diagnostic/index/candidates.json
+            diagnostic/recovered.json
+            diagnostic/matches/
+            previews/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
