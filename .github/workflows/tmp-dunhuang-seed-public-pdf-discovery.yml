@@ -1,0 +1,449 @@
+name: Temporary Dunhuang Seed public PDF discovery and package
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-public-pdf-discovery-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  discover-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install parsers and PDF renderer
+        shell: bash
+        run: |
+          python -m pip install --disable-pip-version-check requests beautifulsoup4 pypdf
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils >/dev/null
+
+      - name: Discover public sources, validate PDFs and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics/html diagnostics/raw diagnostics/renders
+          cat > /tmp/discover.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          from xml.etree import ElementTree
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          HTMLDIR = DIAG / 'html'
+          RAWDIR = DIAG / 'raw'
+          RENDERS = DIAG / 'renders'
+          for p in (REPORTS, HTMLDIR, RAWDIR, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept-Encoding': 'gzip, deflate',
+          })
+
+          queries = [
+              '敦煌种业 深度报告 PDF',
+              '敦煌种业 券商 深度研究 PDF',
+              '敦煌种业 先玉高增 加工减亏 盈利可期 PDF',
+              '敦煌先锋产销激增 驱动盈利稳定增长 PDF',
+              '敦煌先锋持续快速扩张 公司本部业务亏损减少 PDF',
+              '敦煌种业 聚焦种业发展机遇 并购打开成长空间 PDF',
+              '敦煌种业 2015年投资策略报告 借力政策 PDF',
+              '敦煌种业 进一步聚焦种业 公司业绩有望回升 PDF',
+              '600354 券商研报 PDF',
+              '600354 深度研究 PDF',
+          ]
+
+          site_searches = [
+              'https://www.nxny.com/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.nxny.com/report/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.fxbaogao.com/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.fxbaogao.com/search?keyword=600354',
+              'https://www.iyanbao.com/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.sgpjbg.com/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.vzkoo.com/search/?q=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.hangyan.co/search?q=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://www.9fzt.com/search?keyword=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+              'https://m.dcbbs.com/search.php?mod=forum&searchid=1&orderby=lastpost&ascdesc=desc&searchsubmit=yes&kw=%E6%95%A6%E7%85%8C%E7%A7%8D%E4%B8%9A',
+          ]
+
+          known_pages = [
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/365771252125/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/365499152875/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/336478009061/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/616733300399/index.phtml',
+              'https://cs.com.cn/gppd/zzgsm/201605/zzgsm20160525/05/201701/t20170109_5148697.html',
+          ]
+
+          expected = [
+              ('先玉高增', '国泰君安证券', '2011-08-04', '深度研究：先玉高增，加工减亏，盈利可期'),
+              ('产销激增', '齐鲁证券（现中泰证券）', '2011-08-01', '深度研究：敦煌先锋产销激增，驱动盈利稳定增长'),
+              ('业绩快速回升', '申银万国（现申万宏源）', '2010-08-30', '深度报告：业绩快速回升，敦煌先锋持续快速扩张，公司本部业务亏损减少'),
+              ('并购打开成长空间', '天风证券', '2017-01-05', '聚焦种业发展机遇，并购打开成长空间'),
+              ('借力政策', '华龙证券', '2014-12-15', '2015年投资策略报告：借力政策，公司坚定专业化道路'),
+              ('进一步聚焦种业', '华龙证券', '2015-03-20', '2014年年报点评：进一步聚焦种业，公司业绩有望回升'),
+              ('政策春风', '华宝证券', '2011-09-26', '政策春风，孕育历史之机遇'),
+              ('打消悲观预期', '国泰君安证券', '2011-11-08', '调研报告：打消悲观预期，期待改善来临'),
+          ]
+
+          def safe_name(text: str, max_len: int = 90) -> str:
+              text = re.sub(r'[\\/:*?"<>|\r\n]+', '_', text)
+              text = re.sub(r'\s+', '', text).strip(' ._')
+              return (text or '敦煌种业研究报告')[:max_len]
+
+          def fetch(url: str, *, timeout: int = 50, max_bytes: int = 50_000_000):
+              last = None
+              for attempt in range(3):
+                  try:
+                      r = session.get(url, timeout=timeout, allow_redirects=True, stream=True,
+                                      headers={'Referer': url if 'sina.com.cn' not in url else 'https://stock.finance.sina.com.cn/'})
+                      if r.status_code >= 400:
+                          raise RuntimeError(f'HTTP {r.status_code}')
+                      data = bytearray()
+                      for chunk in r.iter_content(131072):
+                          if chunk:
+                              data.extend(chunk)
+                              if len(data) > max_bytes:
+                                  raise RuntimeError('response too large')
+                      return r, bytes(data)
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(0.5 * (attempt + 1))
+              raise RuntimeError(f'{url}: {last!r}')
+
+          search_rows = []
+          seed_urls = set(site_searches + known_pages)
+
+          for qi, query in enumerate(queries):
+              q = urllib.parse.quote_plus(query)
+              endpoints = [
+                  f'https://www.bing.com/search?format=rss&count=50&q={q}',
+                  f'https://www.bing.com/search?count=50&q={q}',
+                  f'https://search.yahoo.com/search?p={q}&n=50',
+              ]
+              for ei, endpoint in enumerate(endpoints):
+                  try:
+                      r, raw = fetch(endpoint, timeout=80, max_bytes=5_000_000)
+                      (HTMLDIR / f'search_{qi}_{ei}.html').write_bytes(raw)
+                      text = raw.decode(r.encoding or 'utf-8', errors='ignore')
+                      links = []
+                      if 'format=rss' in endpoint:
+                          try:
+                              root = ElementTree.fromstring(raw)
+                              for item in root.findall('.//item'):
+                                  link = item.findtext('link')
+                                  title = item.findtext('title') or ''
+                                  if link:
+                                      links.append((link, title))
+                          except Exception:
+                              pass
+                      soup = BeautifulSoup(text, 'html.parser')
+                      for a in soup.find_all('a', href=True):
+                          href = html.unescape(a['href'])
+                          if href.startswith('//'):
+                              href = 'https:' + href
+                          elif href.startswith('/'):
+                              href = urllib.parse.urljoin(r.url, href)
+                          if href.startswith('http'):
+                              links.append((href, a.get_text(' ', strip=True)))
+                      for link, title in links:
+                          host = urllib.parse.urlparse(link).netloc.lower()
+                          if any(x in host for x in ['bing.com','yahoo.com','microsoft.com']):
+                              continue
+                          if link not in seed_urls:
+                              seed_urls.add(link)
+                          search_rows.append({'query': query, 'engine': endpoint, 'url': link, 'title': title})
+                  except Exception as exc:
+                      search_rows.append({'query': query, 'engine': endpoint, 'error': repr(exc)})
+
+          (DIAG / 'search_results.json').write_text(json.dumps(search_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('SEARCH_SEEDS', len(seed_urls))
+
+          def decode_text(raw: bytes, encoding_hint: str | None = None) -> str:
+              encs = [encoding_hint, 'utf-8', 'gb18030', 'gbk']
+              vals = []
+              for enc in encs:
+                  if not enc:
+                      continue
+                  try:
+                      vals.append(raw.decode(enc, errors='ignore'))
+                  except Exception:
+                      pass
+              return max(vals or [''], key=lambda x: x.count('敦煌种业') + x.count('600354') + x.lower().count('.pdf'))
+
+          page_rows = []
+          discovered_links = set()
+          pdf_blobs = []
+
+          def scan_page(index: int, url: str):
+              try:
+                  r, raw = fetch(url, timeout=65)
+                  ctype = (r.headers.get('content-type') or '').lower()
+                  if raw.startswith(b'%PDF-') or 'application/pdf' in ctype:
+                      return {'url': url, 'effective_url': r.url, 'kind': 'pdf', 'raw': raw,
+                              'source_title': '', 'source_text': ''}
+                  text = decode_text(raw, r.encoding)
+                  path = HTMLDIR / f'page_{index:04d}.html'
+                  path.write_bytes(raw)
+                  norm = html.unescape(text.replace('\\/', '/'))
+                  soup = BeautifulSoup(norm, 'html.parser')
+                  title = soup.title.get_text(' ', strip=True) if soup.title else ''
+                  visible = re.sub(r'\s+', ' ', soup.get_text(' ', strip=True))[:12000]
+                  relevant = ('敦煌种业' in visible or '600354' in visible or
+                              '敦煌种业' in title or '600354' in title or
+                              any(h in visible for h, *_ in expected))
+                  links = []
+                  for tag in soup.find_all(True):
+                      for attr in ('href','src','data-url','data-src','data-href','action','content'):
+                          val = tag.get(attr)
+                          if not isinstance(val, str):
+                              continue
+                          val = html.unescape(val.strip())
+                          if val.startswith('javascript:') or val.startswith('#'):
+                              continue
+                          full = urllib.parse.urljoin(r.url, val)
+                          if full.startswith('http'):
+                              links.append(full)
+                  for hit in re.findall(r'https?://[^"\'<>\s]+', norm, flags=re.I):
+                      links.append(urllib.parse.unquote(hit).rstrip('),;]'))
+                  if relevant or url in site_searches:
+                      keep = []
+                      for link in dict.fromkeys(links):
+                          low = link.lower()
+                          if any(k in low for k in ('.pdf','download','attach','file','report','view','detail','doc')):
+                              keep.append(link)
+                      return {'url': url, 'effective_url': r.url, 'kind': 'html', 'title': title,
+                              'text': visible, 'links': keep[:500], 'relevant': relevant, 'size': len(raw)}
+                  return {'url': url, 'effective_url': r.url, 'kind': 'irrelevant', 'title': title, 'size': len(raw)}
+              except Exception as exc:
+                  return {'url': url, 'kind': 'error', 'error': repr(exc)}
+
+          initial = list(seed_urls)[:220]
+          with ThreadPoolExecutor(max_workers=10) as pool:
+              futures = {pool.submit(scan_page, i, url): (i, url) for i, url in enumerate(initial)}
+              for fut in as_completed(futures):
+                  row = fut.result()
+                  if row.get('kind') == 'pdf':
+                      pdf_blobs.append(row)
+                      row = {k:v for k,v in row.items() if k != 'raw'}
+                  for link in row.get('links', []):
+                      discovered_links.add(link)
+                  page_rows.append(row)
+
+          print('ROUND1_PAGES', len(page_rows), 'DISCOVERED_LINKS', len(discovered_links), 'PDFS', len(pdf_blobs))
+
+          round2 = []
+          for link in discovered_links:
+              low = link.lower()
+              if any(x in low for x in ['logout','register','javascript','mailto:']):
+                  continue
+              round2.append(link)
+              if len(round2) >= 300:
+                  break
+
+          start_index = len(initial)
+          with ThreadPoolExecutor(max_workers=12) as pool:
+              futures = {pool.submit(scan_page, start_index+i, url): url for i, url in enumerate(round2)}
+              for fut in as_completed(futures):
+                  row = fut.result()
+                  if row.get('kind') == 'pdf':
+                      pdf_blobs.append(row)
+                      row = {k:v for k,v in row.items() if k != 'raw'}
+                  page_rows.append(row)
+
+          (DIAG / 'pages.json').write_text(json.dumps(page_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('ALL_PAGES', len(page_rows), 'RAW_PDFS', len(pdf_blobs))
+
+          # Also try all direct-looking PDF/download links using a larger response cap.
+          direct_urls = []
+          for row in page_rows:
+              for link in row.get('links', []):
+                  low = link.lower()
+                  if '.pdf' in low or any(k in low for k in ('download','attach','file')):
+                      direct_urls.append((link, row.get('title',''), row.get('text','')[:2000]))
+          seen_direct = set()
+          direct_urls = [x for x in direct_urls if not (x[0] in seen_direct or seen_direct.add(x[0]))][:350]
+
+          def get_direct(entry):
+              url, source_title, source_text = entry
+              try:
+                  r, raw = fetch(url, timeout=90)
+                  if raw.startswith(b'%PDF-'):
+                      return {'url': url, 'effective_url': r.url, 'kind':'pdf', 'raw':raw,
+                              'source_title': source_title, 'source_text': source_text}
+                  return {'url':url,'kind':'not_pdf','size':len(raw),
+                          'content_type':r.headers.get('content-type'),'effective_url':r.url}
+              except Exception as exc:
+                  return {'url':url,'kind':'error','error':repr(exc)}
+
+          with ThreadPoolExecutor(max_workers=10) as pool:
+              futures = {pool.submit(get_direct, entry): entry for entry in direct_urls}
+              for fut in as_completed(futures):
+                  row = fut.result()
+                  if row.get('kind') == 'pdf':
+                      pdf_blobs.append(row)
+
+          print('PDF_BLOBS_AFTER_DIRECT', len(pdf_blobs))
+
+          validated = []
+          hashes = set()
+          for idx, blob in enumerate(pdf_blobs):
+              raw = blob['raw']
+              digest = hashlib.sha256(raw).hexdigest()
+              if digest in hashes or len(raw) < 100_000:
+                  continue
+              hashes.add(digest)
+              temp = RAWDIR / f'candidate_{idx:03d}.pdf'
+              temp.write_bytes(raw)
+              try:
+                  reader = PdfReader(str(temp), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 6:
+                      continue
+                  text_parts = []
+                  for page in reader.pages[:min(15, pages)]:
+                      try:
+                          text_parts.append(page.extract_text() or '')
+                      except Exception:
+                          pass
+                  pdf_text = re.sub(r'\s+', '', ' '.join(text_parts))
+                  if '敦煌种业' not in pdf_text and '600354' not in pdf_text:
+                      continue
+                  meta_title = str((reader.metadata or {}).get('/Title') or '')
+                  combined = pdf_text[:30000] + re.sub(r'\s+','', blob.get('source_title','') + blob.get('source_text',''))
+                  broker = '券商'
+                  date = ''
+                  title = meta_title.strip() or '敦煌种业公司研究报告'
+                  score = pages
+                  for fragment, exp_broker, exp_date, exp_title in expected:
+                      if fragment.replace(' ','') in combined:
+                          broker, date, title = exp_broker, exp_date, exp_title
+                          score += 500
+                          if '深度' in exp_title or '策略' in exp_title:
+                              score += 200
+                          break
+                  if '深度' in combined:
+                      score += 150
+                  filename = f'{date or "日期未识别"}_{safe_name(broker,24)}_{safe_name(title)}_{pages}页.pdf'
+                  destination = REPORTS / filename
+                  destination.write_bytes(raw)
+                  validated.append({
+                      'filename': filename, 'broker': broker, 'date': date, 'title': title,
+                      'pages': pages, 'size': len(raw), 'sha256': digest,
+                      'source_url': blob.get('url'), 'effective_url': blob.get('effective_url'),
+                      'score': score,
+                  })
+                  print('VALID', json.dumps(validated[-1], ensure_ascii=False))
+              except Exception as exc:
+                  print('PDF_ERROR', temp, repr(exc))
+
+          validated.sort(key=lambda x:(x['score'],x['pages']), reverse=True)
+          selected = []
+          used_brokers = set()
+          for item in validated:
+              if item['broker'] != '券商' and item['broker'] in used_brokers:
+                  continue
+              selected.append(item)
+              used_brokers.add(item['broker'])
+              if len(selected) == 3:
+                  break
+          for item in validated:
+              if len(selected) == 3:
+                  break
+              if item not in selected:
+                  selected.append(item)
+
+          keep = {item['filename'] for item in selected}
+          for path in REPORTS.glob('*.pdf'):
+              if path.name not in keep:
+                  path.unlink()
+
+          (DIAG / 'validated.json').write_text(json.dumps(validated, ensure_ascii=False, indent=2), encoding='utf-8')
+          (DIAG / 'selected.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} validated public original PDFs found')
+
+          # Render first and last pages for structural verification.
+          for i, item in enumerate(selected, 1):
+              path = REPORTS / item['filename']
+              for page_no, label in ((1,'first'), (item['pages'],'last')):
+                  prefix = RENDERS / f'{i:02d}_{label}'
+                  subprocess.run([
+                      'pdftoppm','-f',str(page_no),'-l',str(page_no),'-png','-r','120',
+                      str(path),str(prefix)
+                  ],check=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+              rendered = list(RENDERS.glob(f'{i:02d}_*.png'))
+              if len(rendered) < 2 or any(p.stat().st_size < 10000 for p in rendered):
+                  raise RuntimeError(f'render verification failed: {item["filename"]}')
+
+          manifest = [
+              '敦煌种业（600354）券商研究报告资料包',
+              '文件均来自无需登录即可取得的公开原始PDF。',
+              '已核验PDF文件头、公司名称、实际页数、SHA-256，并渲染检查首页和末页。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          for i, item in enumerate(selected, 1):
+              manifest += [
+                  f'{i}. {item["title"]}', f'   券商：{item["broker"]}',
+                  f'   日期：{item["date"] or "未识别"}', f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}', f'   SHA-256：{item["sha256"]}',
+                  f'   公开来源：{item["effective_url"] or item["source_url"]}', '',
+              ]
+          (REPORTS / '资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = DIST / f'敦煌种业_券商深度报告_{len(selected)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(REPORTS.iterdir()):
+                  zf.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(selected):
+                  raise RuntimeError(f'PDF count mismatch: {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/discover.py
+
+      - name: Upload final ZIP
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-public-original-pdfs
+          path: dist/敦煌种业_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-public-discovery-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
