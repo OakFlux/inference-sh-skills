@@ -1,0 +1,58 @@
+name: Temporary Daan Gene NXNY metadata list
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-nxny-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch linked Daan Gene report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics_meta/pages
+          cat > /tmp/meta.py <<'PY'
+          import html,json,re,subprocess
+          from pathlib import Path
+          ids=['4461177','4414374','3491455','3423061','3344271','3237309','3227011','3189923','3189898','3140491','3132516']
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          rows=[]
+          for rid in ids:
+              url=f'https://www.nxny.com/report/view_{rid}.html'
+              p=Path(f'diagnostics_meta/pages/{rid}.html')
+              r=subprocess.run(['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','20','--max-time','150','--user-agent',ua,'--header','Accept-Encoding: identity',url,'-o',str(p)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if r.returncode or not p.exists():
+                  rows.append({'id':rid,'url':url,'error':r.stderr[-500:]});continue
+              raw=p.read_bytes(); texts=[raw.decode(e,'ignore') for e in ('utf-8','gb18030','gbk')]
+              t=max(texts,key=lambda x:x.count('达安基因')+x.count('共')+x.count('上传日期'))
+              t=html.unescape(t)
+              tm=re.search(r'<title>(.*?)</title>',t,re.I|re.S); title=re.sub(r'<[^>]+>','',tm.group(1)).strip() if tm else ''
+              visible=re.sub(r'<script.*?</script>|<style.*?</style>',' ',t,flags=re.I|re.S)
+              visible=re.sub(r'<[^>]+>',' ',visible); visible=re.sub(r'\s+',' ',visible)
+              date=''; broker=''; author=''; pages=None; size=''; rating=''
+              m=re.search(r'上传日期[：:]?\s*(20\d{2}/\d{1,2}/\d{1,2})',visible); date=m.group(1) if m else ''
+              m=re.search(r'来源[：:]?\s*([^\s]{2,30})',visible); broker=m.group(1) if m else ''
+              m=re.search(r'作者[：:]?\s*(.*?)\s*(?:下载权限|行业名称|报告摘要|$)',visible); author=m.group(1).strip() if m else ''
+              m=re.search(r'共\s*(\d+)\s*页',visible); pages=int(m.group(1)) if m else None
+              m=re.search(r'大小[：:]?\s*([\d.]+\s*(?:KB|MB))',visible,re.I); size=m.group(1) if m else ''
+              m=re.search(r'评级[：:]?\s*([^\s]{1,20})',visible); rating=m.group(1) if m else ''
+              rows.append({'id':rid,'url':url,'title':title,'date':date,'broker':broker,'author':author,'pages':pages,'size':size,'rating':rating,'text_prefix':visible[:1800]})
+          Path('diagnostics_meta/metadata.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          for x in rows: print(json.dumps({k:x.get(k) for k in ('id','title','date','broker','author','pages','size','rating')},ensure_ascii=False))
+          PY
+          python /tmp/meta.py
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-nxny-metadata
+          path: diagnostics_meta/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
