@@ -1,0 +1,323 @@
+name: Package Anxu Biotech reports v2
+on:
+  push:
+    branches:
+      - tmp/anxu-biotech-reports-20260829
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PDF tools
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+      - name: Build verified package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+          from urllib.parse import urljoin, urlsplit
+
+          import pymupdf as fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          ROOT = Path.cwd()
+          PACKAGE = ROOT / "anxu_biotech_package"
+          ANNUAL_DIR = PACKAGE / "01_Annual_Reports_2021-2025"
+          PROSPECTUS_DIR = PACKAGE / "02_Prospectus"
+          HALF_DIR = PACKAGE / "03_Latest_Half_Year_Report"
+          for directory in (ANNUAL_DIR, PROSPECTUS_DIR, HALF_DIR):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36"
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": UA,
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          def normalize(text: str) -> str:
+              return re.sub(r"\s+", "", text or "").lower()
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for block in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def sina_candidates(url: str) -> list[str]:
+              candidates = [url]
+              parsed = urlsplit(url)
+              if parsed.hostname == "file.finance.sina.com.cn":
+                  path = parsed.path
+                  marker = "/211.154.219.97:9494/"
+                  if path.startswith(marker):
+                      encoded = "/211.154.219.97%3A9494/" + path[len(marker):]
+                      candidates.insert(0, "https://file.finance.sina.com.cn" + encoded)
+              return list(dict.fromkeys(candidates))
+
+          def extract_annual_pdf(detail_id: int) -> tuple[str, str]:
+              detail_url = (
+                  "https://vip.stock.finance.sina.com.cn/corp/view/"
+                  f"vCB_AllBulletinDetail.php?stockid=688075&id={detail_id}"
+              )
+              response = session.get(detail_url, timeout=(20, 90))
+              response.raise_for_status()
+              response.encoding = response.apparent_encoding or "gb18030"
+              soup = BeautifulSoup(response.text, "html.parser")
+              links: list[str] = []
+              for anchor in soup.find_all("a", href=True):
+                  href = urljoin(response.url, anchor["href"])
+                  if ".pdf" in href.lower() and "file.finance.sina.com.cn" in href.lower():
+                      links.append(href)
+              if not links:
+                  links.extend(re.findall(
+                      r"https?://file\.finance\.sina\.com\.cn/[^\"'<>\s]+?\.PDF",
+                      response.text,
+                      flags=re.I,
+                  ))
+              if not links:
+                  raise RuntimeError(f"No PDF link in annual detail {detail_id}")
+              return links[0], detail_url
+
+          def download_pdf(urls: list[str], target: Path, referer: str) -> str:
+              errors: list[str] = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      part = target.with_suffix(target.suffix + ".part")
+                      part.unlink(missing_ok=True)
+                      try:
+                          with session.get(
+                              url,
+                              headers={"Referer": referer, "Accept": "application/pdf,*/*;q=0.8"},
+                              stream=True,
+                              timeout=(25, 300),
+                              allow_redirects=True,
+                          ) as response:
+                              response.raise_for_status()
+                              with part.open("wb") as handle:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          handle.write(chunk)
+                          if part.stat().st_size < 100_000:
+                              raise RuntimeError(f"file too small: {part.stat().st_size}")
+                          with part.open("rb") as handle:
+                              if handle.read(5) != b"%PDF-":
+                                  raise RuntimeError("response is not PDF")
+                          part.replace(target)
+                          print(f"Downloaded {url} -> {target} ({target.stat().st_size} bytes)")
+                          return url
+                      except Exception as exc:
+                          part.unlink(missing_ok=True)
+                          errors.append(f"{url} attempt {attempt}: {exc}")
+                          time.sleep(attempt * 2)
+              raise RuntimeError("Unable to download: " + " | ".join(errors))
+
+          def inspect_pdf(path: Path, *, expected_year: int, kind: str) -> dict[str, Any]:
+              reader = PdfReader(str(path))
+              encrypted = reader.is_encrypted
+              if encrypted and reader.decrypt("") == 0:
+                  raise RuntimeError(f"Cannot decrypt {path}")
+              pages = len(reader.pages)
+              minimum = {"annual": 100, "prospectus": 250, "half": 80}[kind]
+              if pages < minimum:
+                  raise RuntimeError(f"Unexpectedly short {kind} PDF {path}: {pages}")
+
+              document = fitz.open(path)
+              if document.page_count != pages:
+                  raise RuntimeError(f"Page count mismatch: {path}")
+              indices = sorted(set(list(range(min(65, pages))) + [pages // 2, pages - 1]))
+              sample = "\n".join(document.load_page(i).get_text("text") for i in indices)
+              compact = normalize(sample)
+              markers = ("安旭生物", "杭州安旭生物科技", "688075")
+              if not any(marker in compact for marker in markers):
+                  front = "\n".join(document.load_page(i).get_text("text") for i in range(min(160, pages)))
+                  compact = normalize(front)
+              if not any(marker in compact for marker in markers):
+                  raise RuntimeError(f"Company marker missing: {path}")
+              if str(expected_year) not in compact:
+                  front = "\n".join(document.load_page(i).get_text("text") for i in range(min(200, pages)))
+                  if str(expected_year) not in normalize(front):
+                      raise RuntimeError(f"Year {expected_year} missing: {path}")
+
+              if kind == "annual" and "年度报告" not in compact:
+                  raise RuntimeError(f"Annual marker missing: {path}")
+              if kind == "prospectus":
+                  front = "\n".join(document.load_page(i).get_text("text") for i in range(min(200, pages)))
+                  if "招股说明书" not in normalize(front):
+                      raise RuntimeError(f"Prospectus marker missing: {path}")
+              if kind == "half":
+                  text = "\n".join(document.load_page(i).get_text("text") for i in range(pages))
+                  compact_all = normalize(text)
+                  if "半年度报告" not in compact_all or "2026" not in compact_all:
+                      raise RuntimeError(f"Half-year marker missing: {path}")
+
+              for i in (0, pages // 2, pages - 1):
+                  pixmap = document.load_page(i).get_pixmap(matrix=fitz.Matrix(0.5, 0.5), alpha=False)
+                  if pixmap.width < 150 or pixmap.height < 150:
+                      raise RuntimeError(f"Render check failed: {path}, page {i + 1}")
+              document.close()
+              return {
+                  "pages": pages,
+                  "bytes": path.stat().st_size,
+                  "sha256": sha256(path),
+                  "encrypted": encrypted,
+              }
+
+          annual_ids = {
+              2021: 8109234,
+              2022: 9319287,
+              2023: 10158270,
+              2024: 11073757,
+              2025: 12282338,
+          }
+          documents: list[dict[str, Any]] = []
+
+          for year, detail_id in annual_ids.items():
+              raw_url, detail_url = extract_annual_pdf(detail_id)
+              target = ANNUAL_DIR / f"安旭生物_{year}年年度报告.pdf"
+              used = download_pdf(sina_candidates(raw_url), target, detail_url)
+              metadata = inspect_pdf(target, expected_year=year, kind="annual")
+              note = "完整年度报告，不含摘要。"
+              if year == 2022:
+                  note += "采用后续披露的修订版。"
+              documents.append({
+                  "category": "Annual Report",
+                  "year": year,
+                  "label": f"安旭生物{year}年年度报告",
+                  "period": f"截至{year}年12月31日止年度",
+                  "file": str(target.relative_to(PACKAGE)),
+                  "source": used,
+                  "source_detail": detail_url,
+                  "note": note,
+                  **metadata,
+              })
+
+          prospectus_target = PROSPECTUS_DIR / "安旭生物_首次公开发行股票并在科创板上市招股说明书.pdf"
+          prospectus_url = "https://static.cninfo.com.cn/finalpage/2021-11-12/1211562312.PDF"
+          prospectus_used = download_pdf(
+              [prospectus_url, prospectus_url.replace("https://", "http://")],
+              prospectus_target,
+              "https://cfi.cn/p20211111003093.html",
+          )
+          prospectus_meta = inspect_pdf(prospectus_target, expected_year=2021, kind="prospectus")
+          documents.append({
+              "category": "Prospectus",
+              "year": 2021,
+              "label": "安旭生物首次公开发行股票并在科创板上市招股说明书",
+              "period": "正式发行版，2021年11月披露",
+              "file": str(prospectus_target.relative_to(PACKAGE)),
+              "source": prospectus_used,
+              "source_detail": "https://cfi.cn/p20211111003093.html",
+              "note": "正式招股说明书全文，不是申报稿、招股意向书或摘要。",
+              **prospectus_meta,
+          })
+
+          half_target = HALF_DIR / "安旭生物_2026年半年度报告.pdf"
+          half_url = "https://static.cninfo.com.cn/finalpage/2026-08-28/1225522227.PDF"
+          half_used = download_pdf(
+              [half_url, half_url.replace("https://", "http://")],
+              half_target,
+              "https://cfi.cn/p20260828000278.html",
+          )
+          half_meta = inspect_pdf(half_target, expected_year=2026, kind="half")
+          documents.append({
+              "category": "Latest Half-Year Report",
+              "year": 2026,
+              "label": "安旭生物2026年半年度报告",
+              "period": "截至2026年6月30日止六个月",
+              "published_date": "2026-08-28",
+              "file": str(half_target.relative_to(PACKAGE)),
+              "source": half_used,
+              "source_detail": "https://cfi.cn/p20260828000278.html",
+              "note": "截至整理日最新的完整半年度报告，不含摘要。",
+              **half_meta,
+          })
+
+          total_pages = sum(item["pages"] for item in documents)
+          total_bytes = sum(item["bytes"] for item in documents)
+          readme = [
+              "杭州安旭生物科技股份有限公司（688075.SH）",
+              "全部年度报告、正式招股说明书及最新半年度报告",
+              "整理日期：2026-08-29",
+              "",
+              "文件口径",
+              "1. 公司于2021年上市，上市以来完整年度报告为2021—2025年，共5份。",
+              "2. 2022年年度报告采用后续披露的修订版。",
+              "3. 招股说明书采用2021年正式发行版本，不是申报稿、招股意向书或摘要。",
+              "4. 最新半年报为2026年8月28日披露的《2026年半年度报告》。",
+              "",
+              "文件清单",
+          ]
+          checksums: list[str] = []
+          for index, item in enumerate(documents, 1):
+              readme.extend([
+                  f"{index}. {item['label']}",
+                  f"   报告期：{item['period']}",
+                  f"   文件：{item['file']}",
+                  f"   页数：{item['pages']}",
+                  f"   大小：{item['bytes']} bytes",
+                  f"   SHA-256：{item['sha256']}",
+                  f"   来源：{item['source']}",
+                  f"   说明：{item['note']}",
+                  "",
+              ])
+              checksums.append(f"{item['sha256']}  {item['file']}")
+
+          readme.extend([
+              "完整性检查",
+              f"- 共{len(documents)}份PDF，合计{total_pages}页，未压缩总大小{total_bytes / 1024 / 1024:.2f} MiB。",
+              "- 每份PDF均检查文件头、结构可解析性、公司名称、报告年度/期间及文档类型。",
+              "- 已抽查每份PDF的首页、中间页和末页渲染结果。",
+              "- ZIP已通过CRC完整性测试；逐文件SHA-256见SHA256SUMS.txt。",
+          ])
+          (PACKAGE / "README_来源与校验.txt").write_text("\n".join(readme), encoding="utf-8")
+          (PACKAGE / "SHA256SUMS.txt").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+          (PACKAGE / "manifest.json").write_text(
+              json.dumps({
+                  "company": "杭州安旭生物科技股份有限公司",
+                  "ticker": "688075.SH",
+                  "prepared_date": "2026-08-29",
+                  "documents": documents,
+                  "total_pages": total_pages,
+                  "total_bytes": total_bytes,
+              }, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+
+          output = ROOT / "安旭生物_全部年报_招股说明书_2026年最新半年报_完整PDF.zip"
+          with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in sorted(PACKAGE.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(path.relative_to(PACKAGE)))
+          with zipfile.ZipFile(output, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP CRC failure: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, found {len(pdfs)}: {pdfs}")
+
+          print("\n".join(readme))
+          print(f"ZIP_FILE={output}")
+          print(f"ZIP_BYTES={output.stat().st_size}")
+          print(f"ZIP_SHA256={sha256(output)}")
+          PY
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: anxu-biotech-complete-reports-v2
+          path: 安旭生物_全部年报_招股说明书_2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
