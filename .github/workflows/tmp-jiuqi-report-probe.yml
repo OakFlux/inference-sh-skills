@@ -1,0 +1,97 @@
+name: Temporary Jiuqi Software brokerage report probe
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-report-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Query Eastmoney public research catalog and test PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, requests
+
+          API='https://reportapi.eastmoney.com/report/list'
+          CODE='002279'
+          H={
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/report/{CODE}.html',
+          }
+          rows=[]
+          for qtype in ('0','1','2'):
+              for page in range(1,11):
+                  p={
+                      'pageNo':str(page),'pageSize':'100','code':CODE,
+                      'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':'2008-01-01','endTime':'2026-08-29','fields':'',
+                      'qType':qtype,'orgCode':'','rcode':'','p':str(page),
+                      'pageNum':str(page),'pageNumber':str(page),
+                  }
+                  r=requests.get(API,params=p,headers=H,timeout=90)
+                  print('API',qtype,page,r.status_code,len(r.content),r.url)
+                  r.raise_for_status(); o=r.json(); data=o.get('data') or []
+                  rows.extend(data)
+                  total=int(o.get('TotalPage') or math.ceil(int(o.get('hits') or 0)/100) or 1)
+                  if page>=total: break
+
+          dedup={}
+          for row in rows:
+              key=row.get('infoCode') or (row.get('title'),row.get('publishDate'),row.get('orgSName'))
+              dedup[key]=row
+          rows=list(dedup.values())
+          rows.sort(key=lambda x:str(x.get('publishDate') or ''),reverse=True)
+          print('TOTAL_ROWS',len(rows))
+
+          def compact(row):
+              return {
+                  'date':str(row.get('publishDate') or '')[:10],
+                  'broker':row.get('orgSName') or row.get('orgName'),
+                  'title':row.get('title'),
+                  'pages':row.get('attachPages'),
+                  'size_kb':row.get('attachSize'),
+                  'infoCode':row.get('infoCode'),
+                  'reportType':row.get('reportType'),
+                  'column':row.get('column'),
+                  'rating':row.get('emRatingName') or row.get('sRatingName'),
+                  'researcher':row.get('researcher'),
+                  'stockName':row.get('stockName'),
+                  'stockCode':row.get('stockCode'),
+                  'indvIsNew':row.get('indvIsNew'),
+              }
+
+          print('\n=== CANDIDATES ===')
+          candidates=[]
+          for row in rows:
+              title=str(row.get('title') or '')
+              pages=int(row.get('attachPages') or 0)
+              if int(row.get('reportType') or 0)==2 and (pages>=8 or any(k in title for k in ['深度','首次覆盖','首次','价值分析','专题','覆盖报告'])):
+                  candidates.append(row)
+                  print('CANDIDATE',json.dumps(compact(row),ensure_ascii=False))
+
+          print('\n=== ALL REPORTS ===')
+          for row in rows:
+              print('REPORT',json.dumps(compact(row),ensure_ascii=False))
+
+          print('\n=== PDF TESTS FOR CANDIDATES ===')
+          for row in candidates:
+              info=row.get('infoCode')
+              if not info: continue
+              url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              try:
+                  rr=requests.get(url,headers={**H,'Range':'bytes=0-4095','Accept':'application/pdf,*/*'},timeout=60,allow_redirects=True)
+                  print('PDFTEST',json.dumps(compact(row),ensure_ascii=False),rr.status_code,rr.headers.get('content-type'),rr.headers.get('content-range'),len(rr.content),repr(rr.content[:8]),rr.url)
+              except Exception as e:
+                  print('PDFERR',json.dumps(compact(row),ensure_ascii=False),repr(e))
+          PY
