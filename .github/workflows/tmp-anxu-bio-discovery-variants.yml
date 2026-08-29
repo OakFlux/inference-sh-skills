@@ -1,0 +1,51 @@
+name: Temporary Anxu Bio report variant discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-anxu-bio-reports-20260829
+    paths:
+      - .github/workflows/tmp-anxu-bio-discovery-variants.yml
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query alternate report catalog variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/'})
+          base='https://reportapi.eastmoney.com/report/list'
+          variants=[]
+          for q in range(0,5):
+            variants.append((f'code_q{q}', {'code':'688075','qType':str(q)}))
+            variants.append((f'stock_q{q}', {'stockCode':'688075','secuCode':'688075.SH','qType':str(q)}))
+          for name, extra in variants:
+            p={'pageNo':'1','pageSize':'500','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':'2010-01-01','endTime':'2030-12-31','fields':'','orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
+            p.update(extra)
+            r=s.get(base,params=p,timeout=90)
+            print('\nVARIANT',name,'HTTP',r.status_code,'BYTES',len(r.content),r.url)
+            try: obj=r.json()
+            except Exception as e:
+              print('JSON ERROR',e,r.text[:500]); continue
+            rows=obj.get('data') or []
+            print('ROWS',len(rows),'HITS',obj.get('hits'),'PAGES',obj.get('TotalPage'))
+            for row in rows:
+              blob=json.dumps(row,ensure_ascii=False)
+              if '安旭生物' in blob or str(row.get('stockCode') or '')=='688075':
+                print('MATCH',json.dumps({
+                  'date':str(row.get('publishDate') or '')[:10],
+                  'broker':row.get('orgSName'),
+                  'title':row.get('title'),
+                  'pages':row.get('attachPages'),
+                  'infoCode':row.get('infoCode'),
+                  'column':row.get('column'),
+                  'stockName':row.get('stockName'),
+                  'stockCode':row.get('stockCode')
+                },ensure_ascii=False))
+          PY
