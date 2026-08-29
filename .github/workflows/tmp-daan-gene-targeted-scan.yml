@@ -1,0 +1,64 @@
+name: Temporary Daan Gene targeted annual scan
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-targeted-scan-20260829'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Query annual report lists and filter Daan Gene
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          python - <<'PY'
+          import json,os,subprocess,tempfile,urllib.parse
+          from pathlib import Path
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          API='https://reportapi.eastmoney.com/report/list'
+          matches=[]
+          stats=[]
+          for year in range(2004,2024):
+              params={
+                'pageNo':'1','pageSize':'5000','code':'*','industryCode':'*','industry':'*',
+                'rating':'*','ratingChange':'*','beginTime':f'{year}-01-01','endTime':f'{year}-12-31',
+                'fields':'','qType':'0','orgCode':'','rcode':''
+              }
+              url=API+'?'+urllib.parse.urlencode(params)
+              out=Path(f'diagnostics/{year}.json')
+              p=subprocess.run(['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','180','--user-agent',UA,'--referer','https://data.eastmoney.com/report/','--header','Accept-Encoding: identity',url,'-o',str(out)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode:
+                  print('ERROR',year,p.stderr[-500:]);continue
+              text=out.read_text(encoding='utf-8',errors='ignore').strip()
+              if text and text[0] not in '[{' and '(' in text and text.endswith(')'):
+                  text=text[text.find('(')+1:text.rfind(')')]
+              obj=json.loads(text)
+              rows=obj.get('data') or obj.get('result',{}).get('data') or []
+              hits=int(obj.get('hits') or obj.get('total') or len(rows))
+              pages=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+              stats.append({'year':year,'hits':hits,'rows':len(rows),'pages':pages})
+              print('YEAR',year,'HITS',hits,'ROWS',len(rows),'PAGES',pages)
+              for r in rows:
+                  if str(r.get('stockCode') or '')=='002030' or str(r.get('stockName') or '')=='达安基因' or '达安基因' in str(r.get('title') or ''):
+                      r=dict(r);r['_year']=year;r['_page']=1;matches.append(r)
+          Path('diagnostics/stats.json').write_text(json.dumps(stats,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCHES',len(matches))
+          for r in matches:
+              print(json.dumps({'date':r.get('publishDate'),'broker':r.get('orgSName'),'title':r.get('title'),'stockCode':r.get('stockCode'),'stockName':r.get('stockName'),'infoCode':r.get('infoCode')},ensure_ascii=False))
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-targeted-annual-scan
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
