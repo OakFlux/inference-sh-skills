@@ -1,0 +1,117 @@
+name: Diagnose Jinbo Bio historical disclosure sources
+
+on:
+  push:
+    branches:
+      - tmp/jinbo-bio-complete-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Probe mirrors and disclosure APIs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import html
+          import json
+          import re
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          s = requests.Session()
+          s.headers.update({
+              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+          })
+
+          print("=== HEXUN PAGES ===")
+          hexun_urls = [
+              "https://stockdata.hexun.com/2009_ggqw_832982.shtml",
+              "https://stockdata.hexun.com/2009_ggqw_832982_2.shtml",
+              "https://stockdata.hexun.com/2009_ggqw_832982_3.shtml",
+              "https://stockdata.hexun.com/2009_ggqw_832982.shtml?page=2",
+              "https://stockdata.hexun.com/2009_ggqw_832982.shtml?page=3",
+          ]
+          for url in hexun_urls:
+              try:
+                  r = s.get(url, timeout=30)
+                  print("HEXUN", url, r.status_code, len(r.content), r.url)
+                  r.encoding = r.apparent_encoding or "gb18030"
+                  soup = BeautifulSoup(r.text, "html.parser")
+                  for a in soup.find_all("a", href=True):
+                      text = " ".join(a.get_text(" ", strip=True).split())
+                      href = urljoin(r.url, a["href"])
+                      if any(k in text for k in ("2015年年度报告", "年度报告", "PDF公告")) or ".pdf" in href.lower():
+                          print("  A", repr(text), href)
+              except Exception as e:
+                  print("HEXUN ERROR", url, repr(e))
+
+          print("=== OLD NEEQ PATH TRANSFORMS ===")
+          old_path = "/upload/disclosure/2016/2016-02-05/1454665815_906048.pdf"
+          candidates = [
+              "http://www.neeq.com.cn" + old_path,
+              "https://www.neeq.com.cn" + old_path,
+              "https://static.neeq.com.cn" + old_path,
+              "https://www.neeq.com.cn" + old_path.replace("/upload", ""),
+              "https://static.neeq.com.cn" + old_path.replace("/upload", ""),
+              "https://www.bse.cn" + old_path,
+              "https://static.bse.cn" + old_path,
+              "https://static.bse.cn" + old_path.replace("/upload", ""),
+              "https://www.neeq.com.cn/uploads/disclosure/2016/2016-02-05/1454665815_906048.pdf",
+              "https://static.neeq.com.cn/uploads/disclosure/2016/2016-02-05/1454665815_906048.pdf",
+          ]
+          for url in candidates:
+              try:
+                  r = s.get(url, timeout=25, allow_redirects=True, stream=True)
+                  head = next(r.iter_content(16), b"")
+                  print("PATH", r.status_code, r.url, r.headers.get("content-type"), r.headers.get("content-length"), head)
+                  r.close()
+              except Exception as e:
+                  print("PATH ERROR", url, repr(e))
+
+          print("=== DISCLOSURE PAGES / SCRIPTS ===")
+          pages = [
+              "https://www.neeq.com.cn/disclosure/announcement.html",
+              "https://www.neeq.com.cn/disclosure.html",
+              "https://www.bse.cn/disclosure/announcement.html",
+              "https://www.bse.cn/disclosureInfoController/companyAnnouncement.do",
+          ]
+          for url in pages:
+              try:
+                  r = s.get(url, timeout=30)
+                  print("PAGE", url, r.status_code, len(r.content), r.url, r.headers.get("content-type"))
+                  r.encoding = r.apparent_encoding or "utf-8"
+                  text = html.unescape(r.text).replace("\\/", "/")
+                  for pat in ("companyAnnouncement", "disclosureInfoController", "destFilePath", "announcement"):
+                      if pat.lower() in text.lower():
+                          print("  FOUND", pat)
+                  soup = BeautifulSoup(text, "html.parser")
+                  for script in soup.find_all("script", src=True):
+                      src = urljoin(r.url, script["src"])
+                      if any(k in src.lower() for k in ("disclosure", "announce", "company")):
+                          print("  SCRIPT", src)
+              except Exception as e:
+                  print("PAGE ERROR", url, repr(e))
+
+          print("=== COMMON API PROBES ===")
+          api_urls = [
+              "https://www.neeq.com.cn/disclosureInfoController/companyAnnouncement.do?callback=cb&page=0&companyCd=832982&keyword=2015%E5%B9%B4%E5%B9%B4%E5%BA%A6%E6%8A%A5%E5%91%8A",
+              "https://www.neeq.com.cn/disclosureInfoController/companyAnnouncement.do?page=0&companyCd=832982&keyword=2015%E5%B9%B4%E5%B9%B4%E5%BA%A6%E6%8A%A5%E5%91%8A",
+              "https://www.bse.cn/disclosureInfoController/companyAnnouncement.do?callback=cb&page=0&companyCd=832982&keyword=2015%E5%B9%B4%E5%B9%B4%E5%BA%A6%E6%8A%A5%E5%91%8A",
+              "https://www.bse.cn/disclosureInfoController/companyAnnouncement.do?page=0&companyCd=832982&keyword=2015%E5%B9%B4%E5%B9%B4%E5%BA%A6%E6%8A%A5%E5%91%8A",
+          ]
+          for url in api_urls:
+              try:
+                  r = s.get(url, timeout=30, headers={"Referer": "https://www.neeq.com.cn/"})
+                  r.encoding = r.apparent_encoding or "utf-8"
+                  print("API", url, r.status_code, len(r.content), r.url, r.headers.get("content-type"))
+                  print(r.text[:2000].replace("\n", " "))
+              except Exception as e:
+                  print("API ERROR", url, repr(e))
+          PY
