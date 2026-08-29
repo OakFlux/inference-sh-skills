@@ -1,0 +1,60 @@
+name: Temporary Xinri Vzkoo report probe
+
+on:
+  push:
+    branches:
+      - tmp/download-xinri-reports-20260829
+    paths:
+      - .github/workflows/tmp-xinri-vzkoo-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect report page for public PDF links
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          url='https://www.vzkoo.com/read/2022102515f1189d784c8c2d45595bc5.html'
+          s=requests.Session(); s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept':'text/html,application/xhtml+xml,application/pdf,*/*;q=0.8',
+              'Referer':'https://www.vzkoo.com/'
+          })
+          r=s.get(url,timeout=90,allow_redirects=True)
+          print('PAGE',r.status_code,len(r.content),r.headers.get('content-type'),r.url)
+          text=r.text
+          print(text[:5000])
+          pats=[
+              r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+              r'https?://[^\s"\'<>]*(?:download|file|attachment|oss|cos|cdn)[^\s"\'<>]*',
+              r'[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+          ]
+          for pat in pats:
+              for x in sorted(set(re.findall(pat,text,re.I))): print('MATCH',x[:2000])
+          soup=BeautifulSoup(text,'html.parser')
+          for tag in soup.find_all(['a','iframe','embed','object','source']):
+              vals=[]
+              for a in ('href','src','data'):
+                  if tag.get(a): vals.append(urllib.parse.urljoin(r.url,tag.get(a)))
+              if vals and any(k in (str(tag).lower()) for k in ['pdf','download','报告','下载','file']):
+                  print('TAG',str(tag)[:2000].replace('\n',' '),'URLS',vals)
+          for script in soup.find_all('script',src=True):
+              u=urllib.parse.urljoin(r.url,script['src'])
+              try:
+                  rr=s.get(u,timeout=60)
+                  if any(k in rr.text.lower() for k in ['pdf','download','attachment','2022102515f1189d784c8c2d45595bc5']):
+                      print('SCRIPT',u,rr.status_code,len(rr.content))
+                      for pat in pats:
+                          for x in sorted(set(re.findall(pat,rr.text,re.I))): print('SCRIPT_MATCH',x[:2000])
+              except Exception as e: print('SCRIPT_ERR',u,repr(e))
+          PY
