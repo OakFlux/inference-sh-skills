@@ -1,0 +1,192 @@
+name: Temporary Changchun High-Tech deep report download
+
+on:
+  push:
+    branches:
+      - tmp/download-changchun-gaoxin-reports-20260829
+    paths:
+      - .github/workflows/tmp-changchun-gaoxin-download.yml
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF verification tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --quiet pypdf
+
+      - name: Download, validate, render, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output verify
+
+          cat > /tmp/download_verify.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          VERIFY = Path('verify')
+          OUT.mkdir(exist_ok=True)
+          VERIFY.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '信达证券',
+                  'date': '2023-12-25',
+                  'title': '公司深度报告：研发管线丰厚、长效生长激素及带疱疫苗发力',
+                  'info_code': 'AP202312251614887401',
+                  'expected_pages': 19,
+                  'filename': '01_信达证券_研发管线丰厚、长效生长激素及带疱疫苗发力_20231225_19页.pdf',
+              },
+              {
+                  'broker': '华鑫证券',
+                  'date': '2022-11-04',
+                  'title': '公司深度报告：生长激素成长动力足，带状疱疹注入新增量',
+                  'info_code': 'AP202211041579970024',
+                  'expected_pages': 38,
+                  'filename': '02_华鑫证券_生长激素成长动力足、带状疱疹注入新增量_20221104_38页.pdf',
+              },
+              {
+                  'broker': '国元证券',
+                  'date': '2021-07-22',
+                  'title': '长春高新首次覆盖报告：生长激素龙头地位稳定，疫苗板块未来可期',
+                  'info_code': 'AP202107221505405021',
+                  'expected_pages': 36,
+                  'filename': '03_国元证券_生长激素龙头地位稳定、疫苗板块未来可期_20210722_36页.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept': 'application/pdf,*/*;q=0.8',
+          })
+
+          manifest = []
+          for index, report in enumerate(reports, 1):
+              url = f"https://pdf.dfcfw.com/pdf/H3_{report['info_code']}_1.pdf"
+              print(f"DOWNLOAD {index}: {url}")
+              response = None
+              last_error = None
+              for attempt in range(1, 6):
+                  try:
+                      response = session.get(url, timeout=(25, 180), allow_redirects=True)
+                      print(' attempt', attempt, 'status', response.status_code, 'bytes', len(response.content), 'type', response.headers.get('content-type'), 'final', response.url)
+                      if response.status_code == 200 and response.content[:5] == b'%PDF-' and len(response.content) > 100_000:
+                          break
+                      last_error = RuntimeError(f'invalid response: status={response.status_code}, bytes={len(response.content)}, head={response.content[:20]!r}')
+                  except Exception as exc:
+                      last_error = exc
+                  time.sleep(attempt * 2)
+              else:
+                  raise RuntimeError(f"Unable to download {report['filename']}: {last_error}")
+
+              content = response.content
+              path = OUT / report['filename']
+              path.write_bytes(content)
+
+              reader = PdfReader(io.BytesIO(content), strict=False)
+              pages = len(reader.pages)
+              print(' pages', pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(f"Page mismatch for {report['filename']}: expected {report['expected_pages']}, got {pages}")
+
+              extracted_parts = []
+              for pageno in range(min(7, pages)):
+                  try:
+                      extracted_parts.append(reader.pages[pageno].extract_text() or '')
+                  except Exception as exc:
+                      extracted_parts.append(f'[extract error: {exc}]')
+              extracted = '\n'.join(extracted_parts)
+              compact = re.sub(r'\s+', '', extracted)
+              if not ('长春高新' in compact or '000661' in compact):
+                  raise RuntimeError(f"Identity verification failed for {report['filename']}")
+
+              sha256 = hashlib.sha256(content).hexdigest()
+              (VERIFY / f'{index:02d}_first_pages_text.txt').write_text(extracted, encoding='utf-8')
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120',
+                  str(path), str(VERIFY / f'{index:02d}_page1')
+              ], check=True)
+              subprocess.run([
+                  'pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90',
+                  str(path), str(VERIFY / f'{index:02d}_last_page')
+              ], check=True)
+
+              manifest.append({
+                  'filename': report['filename'],
+                  'broker': report['broker'],
+                  'date': report['date'],
+                  'title': report['title'],
+                  'pages': pages,
+                  'source_url': response.url,
+                  'info_code': report['info_code'],
+                  'bytes': len(content),
+                  'sha256': sha256,
+                  'identity_check': '通过：前7页可识别“长春高新”或“000661”',
+              })
+
+          lines = [
+              '长春高新（000661）券商深度报告清单与核验说明',
+              '',
+              '说明：三份文件均从公开报告文件地址下载；已核验PDF文件头、页数、前7页主体身份，并渲染首页及末页检查可读性。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              lines.extend([
+                  f"{i}. {item['broker']}｜{item['date']}｜{item['title']}",
+                  f"   文件：{item['filename']}",
+                  f"   页数：{item['pages']}页",
+                  f"   来源：{item['source_url']}",
+                  f"   SHA256：{item['sha256']}",
+                  f"   身份核验：{item['identity_check']}",
+                  '',
+              ])
+          lines.append('资料仅供研究参考，不构成投资建议。')
+          (OUT / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (VERIFY / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          with (OUT / 'SHA256SUMS.txt').open('w', encoding='utf-8') as fh:
+              for item in manifest:
+                  fh.write(f"{item['sha256']}  {item['filename']}\n")
+
+          print('MANIFEST')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+          python /tmp/download_verify.py | tee verify/run.log
+          ls -lh output verify
+
+      - name: Upload final report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: changchun-gaoxin-broker-deep-reports-3
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
+
+      - name: Upload verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: changchun-gaoxin-broker-deep-reports-verification
+          path: verify/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
