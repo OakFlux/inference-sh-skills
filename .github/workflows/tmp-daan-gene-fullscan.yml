@@ -1,0 +1,87 @@
+name: Temporary Daan Gene full Eastmoney scan 2017-2022
+
+on:
+  push:
+    branches:
+      - 'tmp/daan-gene-fullscan-2017-2022'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Scan every report page for 2017-2022
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/fullscan.py <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess, tempfile, urllib.parse, time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          API='https://reportapi.eastmoney.com/report/list'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          OUT=Path('diagnostics')
+
+          def get_page(year:int,page:int):
+              params={'pageNo':str(page),'pageSize':'100','code':'*','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':f'{year}-01-01','endTime':f'{year}-12-31','fields':'','qType':'0','orgCode':'','rcode':''}
+              url=API+'?'+urllib.parse.urlencode(params)
+              fd,name=tempfile.mkstemp(prefix=f'daan_{year}_{page}_',suffix='.json');os.close(fd)
+              pth=Path(name)
+              try:
+                  proc=subprocess.run(['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','120','--user-agent',UA,'--referer','https://data.eastmoney.com/report/','--header','Accept-Encoding: identity',url,'-o',str(pth)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if proc.returncode: raise RuntimeError(proc.stderr[-1000:])
+                  s=pth.read_text(encoding='utf-8',errors='ignore').strip()
+                  if s and s[0] not in '[{' and '(' in s and s.endswith(')'): s=s[s.find('(')+1:s.rfind(')')]
+                  return json.loads(s)
+              finally: pth.unlink(missing_ok=True)
+
+          first={}
+          tasks=[]
+          for y in range(2017,2023):
+              obj=get_page(y,1);first[(y,1)]=obj
+              rows=obj.get('data') or []
+              total=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+              print('FIRST',y,'ROWS',len(rows),'PAGES',total)
+              tasks += [(y,p) for p in range(2,total+1)]
+          allobjs=dict(first)
+          print('TASKS',len(tasks))
+          with ThreadPoolExecutor(max_workers=24) as ex:
+              futures={ex.submit(get_page,y,p):(y,p) for y,p in tasks}
+              for n,f in enumerate(as_completed(futures),1):
+                  y,p=futures[f]
+                  try: allobjs[(y,p)]=f.result()
+                  except Exception as e:
+                      print('RETRY',y,p,repr(e));time.sleep(.2);allobjs[(y,p)]=get_page(y,p)
+                  if n%100==0: print('DONE',n)
+          matches=[];seen=set()
+          title_terms=['达安基因','上半年业绩超预期，公司发展迎里程碑拐点','后疫情时代新冠筛查从严','三季度业绩超预期，产能扩建有望延续新冠优势']
+          for (y,p),obj in sorted(allobjs.items()):
+              for r in obj.get('data') or []:
+                  sc=str(r.get('stockCode') or '')
+                  sn=str(r.get('stockName') or '')
+                  ti=str(r.get('title') or '')
+                  if sc=='002030' or sn=='达安基因' or any(t in ti for t in title_terms):
+                      info=str(r.get('infoCode') or '')
+                      if info in seen: continue
+                      seen.add(info); rr=dict(r);rr['_year']=y;rr['_page']=p;matches.append(rr)
+          matches.sort(key=lambda r:str(r.get('publishDate') or ''),reverse=True)
+          OUT.joinpath('matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCH_COUNT',len(matches))
+          for r in matches:
+              print('MATCH',json.dumps({'date':r.get('publishDate'),'broker':r.get('orgSName'),'title':r.get('title'),'stockCode':r.get('stockCode'),'stockName':r.get('stockName'),'infoCode':r.get('infoCode'),'page':r.get('_page')},ensure_ascii=False))
+          PY
+          python /tmp/fullscan.py
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-fullscan-results
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
