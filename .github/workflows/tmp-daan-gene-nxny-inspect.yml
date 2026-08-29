@@ -1,0 +1,156 @@
+name: Temporary Daan Gene NXNY inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-daan-gene-reports-20260829
+    paths:
+      - .github/workflows/tmp-daan-gene-nxny-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect NXNY list, report pages, scripts, and download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic/list diagnostic/reports diagnostic/assets diagnostic/probes
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          curl -L --compressed --retry 5 --retry-all-errors --connect-timeout 30 --max-time 180 \
+            -A "$UA" -e 'https://www.baidu.com/' -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
+            -D diagnostic/list/headers 'https://www.nxny.com/stock/stock_002030/' -o diagnostic/list/page.html || true
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html, json, re, urllib.request
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          base='https://www.nxny.com/stock/stock_002030/'
+          text=Path('diagnostic/list/page.html').read_text(errors='replace') if Path('diagnostic/list/page.html').exists() else ''
+          links=[]
+          for m in re.finditer(r'href=["\']([^"\']+)["\']',text,re.I):
+              u=urljoin(base,html.unescape(m.group(1)))
+              if '/report/view_' in u:
+                  links.append(u)
+          links=list(dict.fromkeys(links))
+          # Retain all report links, but prioritize Daan-related text contexts.
+          Path('diagnostic/list/report_links.json').write_text(json.dumps(links,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('LIST SIZE',len(text),'REPORT LINKS',len(links))
+          print('\n'.join(links[:200]))
+
+          summaries=[]; assets=[]; candidates=[]
+          for i,u in enumerate(links):
+              try:
+                  req=urllib.request.Request(u,headers={'User-Agent':UA,'Referer':base,'Accept-Language':'zh-CN,zh;q=0.9'})
+                  raw=urllib.request.urlopen(req,timeout=90).read()
+                  t=raw.decode('utf-8','replace')
+              except Exception as exc:
+                  Path(f'diagnostic/reports/{i:03d}.error').write_text(repr(exc),encoding='utf-8')
+                  continue
+              Path(f'diagnostic/reports/{i:03d}.html').write_text(t,encoding='utf-8')
+              Path(f'diagnostic/reports/{i:03d}.url').write_text(u,encoding='utf-8')
+              title_m=re.search(r'<title[^>]*>(.*?)</title>',t,re.I|re.S)
+              title=html.unescape(re.sub('<[^>]+>',' ',title_m.group(1))).strip() if title_m else ''
+              visible=html.unescape(re.sub(r'<script.*?</script>|<style.*?</style>',' ',t,flags=re.I|re.S))
+              visible=re.sub('<[^>]+>',' ',visible)
+              visible=' '.join(visible.split())
+              report_id=re.search(r'view_(\d+)\.html',u)
+              rid=report_id.group(1) if report_id else ''
+              summaries.append({'index':i,'id':rid,'url':u,'size':len(raw),'title':title,'visible':visible[:10000]})
+              blob=title+' '+visible
+              if '达安基因' in blob:
+                  candidates.append({'index':i,'id':rid,'url':u,'title':title,'visible':visible[:30000]})
+              for m in re.finditer(r'(?:src|href)=["\']([^"\']+)["\']',t,re.I):
+                  a=urljoin(u,html.unescape(m.group(1)))
+                  if '.js' in a and a.startswith('http'): assets.append(a)
+
+          Path('diagnostic/reports/summaries.json').write_text(json.dumps(summaries,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/reports/candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CANDIDATES',len(candidates))
+          for x in candidates: print(json.dumps(x,ensure_ascii=False)[:3000])
+
+          assets=list(dict.fromkeys(assets))[:250]
+          for i,u in enumerate(assets):
+              try:
+                  req=urllib.request.Request(u,headers={'User-Agent':UA,'Referer':'https://www.nxny.com/'})
+                  raw=urllib.request.urlopen(req,timeout=60).read()
+                  if len(raw)>10_000_000: raw=raw[:10_000_000]
+                  Path(f'diagnostic/assets/{i:03d}.txt').write_bytes(raw)
+                  Path(f'diagnostic/assets/{i:03d}.url').write_text(u,encoding='utf-8')
+              except Exception as exc:
+                  Path(f'diagnostic/assets/{i:03d}.error').write_text(repr(exc),encoding='utf-8')
+          Path('diagnostic/assets/assets.json').write_text(json.dumps(assets,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Extract download/API/static file clues from report pages and scripts.
+          hits=[]
+          roots=[Path('diagnostic/reports'),Path('diagnostic/assets')]
+          patterns=[
+              r'https?://[^"\'<>\s]+',
+              r'/[^"\'<>\s]*(?:download|down|pdf|attachment|file|report)[^"\'<>\s]*',
+              r'[^"\'<>\s]*(?:downloadUrl|fileUrl|pdfUrl|attachUrl|reportUrl|resourceUrl)[^"\'<>\s]*',
+          ]
+          for root in roots:
+              for p in root.glob('*'):
+                  if p.suffix in {'.url','.error','.json'}: continue
+                  try: t=p.read_text(errors='replace')
+                  except Exception: continue
+                  for pat in patterns:
+                      for m in re.finditer(pat,t,re.I):
+                          h=html.unescape(m.group(0)).replace('&amp;','&')
+                          if any(k in h.lower() for k in ['download','pdf','attachment','file','report','down']):
+                              hits.append({'file':str(p),'hit':h[:2500]})
+                  for needle in ['4461177','download','下载','pdf','PDF','fileUrl','downloadUrl','reportId','attach','login','无限制']:
+                      start=0
+                      while True:
+                          pos=t.find(needle,start)
+                          if pos<0: break
+                          hits.append({'file':str(p),'needle':needle,'context':t[max(0,pos-1800):pos+5000]})
+                          start=pos+len(needle)
+                          if len(hits)>25000: break
+                      if len(hits)>25000: break
+          Path('diagnostic/hits.json').write_text(json.dumps(hits[:25000],ensure_ascii=False,indent=2),encoding='utf-8')
+          print('ASSETS',len(assets),'HITS',len(hits))
+          print(json.dumps(hits[:600],ensure_ascii=False,indent=2)[:150000])
+          PY
+
+      - name: Probe likely NXNY download routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          # Known report IDs and common endpoint/path conventions. Responses are diagnostics only.
+          ids=(4461177 4461176 4461175)
+          n=0
+          for id in "${ids[@]}"; do
+            urls=(
+              "https://www.nxny.com/report/download_${id}.html"
+              "https://www.nxny.com/report/download/${id}"
+              "https://www.nxny.com/report/down_${id}.html"
+              "https://www.nxny.com/report/down/${id}"
+              "https://www.nxny.com/download/report/${id}"
+              "https://www.nxny.com/report/download?id=${id}"
+              "https://www.nxny.com/ajax/report/download?id=${id}"
+              "https://www.nxny.com/api/report/download?id=${id}"
+            )
+            for url in "${urls[@]}"; do
+              n=$((n+1))
+              curl -L --compressed --retry 2 --retry-all-errors --connect-timeout 20 --max-time 90 \
+                -A "$UA" -e "https://www.nxny.com/report/view_${id}.html" \
+                -D "diagnostic/probes/${n}.headers" "$url" -o "diagnostic/probes/${n}.body" || true
+              echo "$url" > "diagnostic/probes/${n}.url"
+              file "diagnostic/probes/${n}.body" > "diagnostic/probes/${n}.file" 2>&1 || true
+            done
+          done
+
+      - name: Upload NXNY diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: daan-gene-nxny-diagnostic
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
