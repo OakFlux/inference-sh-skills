@@ -1,0 +1,141 @@
+name: Temporary Hualan Vaccine Fxbaogao probe
+
+on:
+  push:
+    branches:
+      - tmp/download-hualan-vaccine-reports-20260829
+    paths:
+      - .github/workflows/tmp-hualan-vaccine-fxbaogao-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect public search pages, scripts, APIs and downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import html, json, re, urllib.parse
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+            'Accept':'text/html,application/json,application/pdf,*/*;q=0.8',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.6',
+            'Referer':'https://www.fxbaogao.com/'
+          })
+          titles=[
+            '华兰疫苗',
+            '天高任鸟飞 海阔凭鱼跃',
+            '疫苗行业龙头 业绩有望强势复苏',
+            '国内领先流感疫苗制造商 四价流感疫苗打造华兰力量',
+            '拨云见日 流感疫苗行业龙头蓄势待发',
+            '流感疫苗龙头 业绩有望重回正增长',
+            '疫苗龙头 迎风起舞',
+          ]
+          seed_urls=[]
+          for q in titles:
+            qq=urllib.parse.quote(q)
+            seed_urls += [
+              f'https://www.fxbaogao.com/search?keyword={qq}',
+              f'https://www.fxbaogao.com/search?q={qq}',
+              f'https://www.fxbaogao.com/search/{qq}',
+              f'https://www.fxbaogao.com/?keyword={qq}',
+            ]
+          seed_urls += ['https://www.fxbaogao.com/detail/1620961']
+
+          pats=[
+            r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+            r'https?://[^\s"\'<>]+(?:download|file|attach|oss|cos|cdn|report|pdf)[^\s"\'<>]*',
+            r'(?i)(?:downloadUrl|fileUrl|pdfUrl|sourceUrl|ossUrl|url)["\']?\s*[:=]\s*["\']([^"\']+)',
+          ]
+          script_urls=[]
+          report_links={}
+          for url in seed_urls:
+            print('\n===== PAGE',url,'=====')
+            try:
+              r=s.get(url,timeout=90,allow_redirects=True)
+              print('HTTP',r.status_code,'BYTES',len(r.content),'TYPE',r.headers.get('content-type'),'FINAL',r.url)
+              r.encoding=r.apparent_encoding or r.encoding or 'utf-8'
+              text=r.text
+              soup=BeautifulSoup(text,'lxml')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+              visible=' '.join(soup.get_text(' ',strip=True).split())
+              print('VISIBLE',visible[:20000])
+              for pat in pats:
+                for hit in list(dict.fromkeys(re.findall(pat,text,re.I)))[:300]:
+                  print('MATCH',hit if isinstance(hit,str) else repr(hit))
+              for a in soup.find_all('a',href=True):
+                label=' '.join(a.get_text(' ',strip=True).split())
+                full=urllib.parse.urljoin(r.url,a['href'])
+                if '/detail/' in full:
+                  report_links[full]=label
+                  if any(k in (label+' '+visible) for k in ['华兰疫苗','天高任鸟飞','疫苗行业龙头','国内领先流感疫苗','拨云见日','流感疫苗龙头','疫苗龙头']):
+                    print('REPORT_LINK',label[:1000],full)
+              for tag in soup.find_all(['a','button','iframe','embed','object','source','script']):
+                for attr in ('href','src','data','data-url','data-id','onclick'):
+                  val=tag.get(attr)
+                  if not val: continue
+                  full=urllib.parse.urljoin(r.url,val) if attr not in ('onclick','data-id') else val
+                  blob=(str(tag)+' '+str(full)).lower()
+                  if any(k in blob for k in ['pdf','download','report','文件','下载','华兰疫苗','301207']):
+                    print('TAG',attr,str(full)[:3000],str(tag)[:3000].replace('\n',' '))
+              for sc in soup.find_all('script',src=True):
+                u=urllib.parse.urljoin(r.url,sc['src'])
+                if u not in script_urls: script_urls.append(u)
+            except Exception as e:
+              print('PAGE_ERROR',repr(e))
+
+          print('\n===== REPORT LINKS',len(report_links),'=====')
+          for u,label in report_links.items(): print('REPORT',label,u)
+
+          print('\n===== SCRIPTS',len(script_urls),'=====')
+          for u in script_urls:
+            try:
+              r=s.get(u,timeout=60)
+              text=r.text
+              if any(k in text.lower() for k in ['download','pdf','fileurl','reporturl','/api/','search']):
+                print('\nSCRIPT',u,'HTTP',r.status_code,'BYTES',len(r.content))
+                for pat in pats:
+                  for hit in list(dict.fromkeys(re.findall(pat,text,re.I)))[:300]:
+                    print('SCRIPT_MATCH',hit if isinstance(hit,str) else repr(hit))
+                for needle in ['download','pdf','fileUrl','reportUrl','search','detail','/api/']:
+                  for m in list(re.finditer(needle,text,re.I))[:20]:
+                    print('SCRIPT_CTX',needle,text[max(0,m.start()-1500):m.start()+4500].replace('\n',' ')[:6000])
+            except Exception as e:
+              print('SCRIPT_ERROR',u,repr(e))
+
+          # Probe only ordinary public endpoints visible/commonly named; no auth bypass.
+          ids=[]
+          for u in report_links:
+            m=re.search(r'/detail/(\d+)',u)
+            if m: ids.append(m.group(1))
+          ids=list(dict.fromkeys(ids))[:100]
+          print('IDS',ids)
+          for rid in ids:
+            for method,u,data in [
+              ('GET',f'https://www.fxbaogao.com/detail/{rid}',None),
+              ('GET',f'https://www.fxbaogao.com/download/{rid}',None),
+              ('GET',f'https://www.fxbaogao.com/api/download/{rid}',None),
+              ('GET',f'https://www.fxbaogao.com/api/report/{rid}',None),
+              ('GET',f'https://www.fxbaogao.com/api/detail/{rid}',None),
+              ('POST','https://www.fxbaogao.com/api/download',{'id':rid}),
+            ]:
+              try:
+                if method=='POST':
+                  r=s.post(u,json=data,timeout=60,allow_redirects=False)
+                else:
+                  r=s.get(u,timeout=60,allow_redirects=False)
+                print('\nENDPOINT',method,u,data,'HTTP',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'LOC',r.headers.get('location'),'HEAD',r.content[:30])
+                if len(r.content)<10000 and ('text' in str(r.headers.get('content-type')).lower() or 'json' in str(r.headers.get('content-type')).lower()): print(r.text[:10000])
+              except Exception as e:
+                print('ENDPOINT_ERROR',method,u,repr(e))
+          PY
