@@ -1,0 +1,311 @@
+name: Temporary Dunhuang Seed public PDF resolver
+
+on:
+  push:
+    branches:
+      - 'tmp/dunhuang-seed-jina-resolver-20260829'
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Search, resolve, validate and package public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics/search diagnostics/pages diagnostics/readers diagnostics/files dist/reports
+          cat > /tmp/resolve_dunhuang.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          import time
+          import urllib.parse
+          import zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          from pypdf import PdfReader
+
+          ROOT=Path('.')
+          DIAG=Path('diagnostics')
+          DIST=Path('dist')
+          REPORTS=DIST/'reports'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          queries=[
+            '"敦煌种业" "先玉高增 加工减亏 盈利可期" pdf',
+            '"敦煌先锋产销激增 驱动盈利稳定增长" pdf',
+            '"业绩快速回升" "敦煌先锋持续快速扩张" "600354"',
+            '"敦煌种业" "聚焦种业发展机遇 并购打开成长空间"',
+            '"敦煌种业" "深度研究" filetype:pdf',
+            '"敦煌种业" "深度报告" filetype:pdf',
+            '"600354" 券商 深度 研报 PDF',
+            '敦煌种业 研报 PDF 国泰君安 中泰 申万宏源 天风',
+            'site:fxbaogao.com 敦煌种业',
+            'site:sdyanbao.com 敦煌种业',
+            'site:nxny.com 敦煌种业 深度',
+            'site:iyanbao.com 敦煌种业',
+            'site:pdf.dfcfw.com 600354',
+          ]
+
+          def curl(url: str, path: Path, timeout: int=90, referer: str|None=None) -> tuple[bool,str,str]:
+              path.parent.mkdir(parents=True,exist_ok=True)
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error',
+                   '--retry','4','--retry-all-errors','--retry-delay','1',
+                   '--connect-timeout','20','--max-time',str(timeout),
+                   '--user-agent',UA,'--header','Accept-Encoding: identity']
+              if referer: cmd += ['--referer',referer]
+              cmd += ['--write-out','%{url_effective}',url,'-o',str(path)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              return p.returncode==0 and path.exists() and path.stat().st_size>0,p.stderr[-1200:],p.stdout.strip()
+
+          search_jobs=[]
+          for qi,q in enumerate(queries):
+              e=urllib.parse.quote(q,safe='')
+              search_jobs += [
+                  (qi,'jina_search_q',f'https://s.jina.ai/?q={e}'),
+                  (qi,'jina_search_path',f'https://s.jina.ai/{e}'),
+                  (qi,'jina_google',f'https://r.jina.ai/http://www.google.com/search?q={e}'),
+                  (qi,'jina_bing',f'https://r.jina.ai/http://www.bing.com/search?q={e}'),
+                  (qi,'jina_ddg',f'https://r.jina.ai/http://html.duckduckgo.com/html/?q={e}'),
+                  (qi,'jina_baidu',f'https://r.jina.ai/http://www.baidu.com/s?wd={e}'),
+              ]
+
+          def fetch_search(job):
+              qi,name,url=job
+              p=DIAG/'search'/f'{qi:02d}_{name}.txt'
+              ok,err,eff=curl(url,p,120)
+              return {'query':queries[qi],'engine':name,'url':url,'ok':ok,'error':err,'effective':eff,'path':str(p),'bytes':p.stat().st_size if p.exists() else 0}
+
+          search_results=[]
+          with ThreadPoolExecutor(max_workers=12) as pool:
+              futs=[pool.submit(fetch_search,j) for j in search_jobs]
+              for fut in as_completed(futs): search_results.append(fut.result())
+
+          candidates=[]
+          def add_url(u: str, source: str, title: str=''):
+              u=html.unescape(urllib.parse.unquote(u.strip())).rstrip('),.;]}>"\'')
+              if u.startswith('//'): u='https:'+u
+              if not u.startswith('http'): return
+              host=urllib.parse.urlsplit(u).netloc.lower()
+              if any(x in host for x in ['google.com','bing.com','duckduckgo.com','baidu.com','jina.ai','microsoft.com','gstatic.com']): return
+              candidates.append({'url':u,'source':source,'title':title})
+
+          for sr in search_results:
+              p=Path(sr['path'])
+              if not sr['ok'] or not p.exists(): continue
+              text=p.read_text(encoding='utf-8',errors='ignore')
+              # Markdown links and plain URLs
+              for title,u in re.findall(r'\[([^\]]{0,300})\]\((https?://[^)\s]+)\)',text,re.I): add_url(u,f"{sr['engine']}:{sr['query']}",title)
+              for u in re.findall(r'https?://[^\s<>"\']+',text,re.I): add_url(u,f"{sr['engine']}:{sr['query']}")
+
+          # Known archive pages are useful seeds for finding mirrors through Jina reader.
+          known_pages=[
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/365771252125/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/365499152875/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/336478009061/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/616733300399/index.phtml',
+          ]
+          for u in known_pages: add_url(u,'known_sina')
+
+          # Deduplicate and prioritize likely report/PDF URLs.
+          dedup=[];seen=set()
+          for c in candidates:
+              u=c['url']
+              if u in seen: continue
+              seen.add(u);dedup.append(c)
+          def priority(c):
+              u=c['url'].lower();t=(c.get('title') or '')
+              s=0
+              if '.pdf' in u:s+=1500
+              if any(k in u for k in ['yanbao','baogao','report','research','download','file','pdf']):s+=400
+              if any(k in u for k in ['fxbaogao','sdyanbao','nxny','iyanbao','dfcfw','hibor','mbalib','docin','book118','hexun','sina']):s+=300
+              if '敦煌种业' in t or '600354' in t:s+=250
+              return s
+          dedup.sort(key=priority,reverse=True)
+          DIAG.joinpath('search_results.json').write_text(json.dumps(search_results,ensure_ascii=False,indent=2),encoding='utf-8')
+          DIAG.joinpath('candidate_urls_initial.json').write_text(json.dumps(dedup,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Inspect direct URLs and Jina-rendered versions of candidate pages.
+          inspect_targets=dedup[:350]
+          resolved_urls=[]
+          page_records=[]
+
+          def inspect_one(i,c):
+              u=c['url']; p=DIAG/'pages'/f'{i:03d}.bin'
+              ok,err,eff=curl(u,p,100)
+              rec={**c,'ok':ok,'error':err,'effective':eff,'bytes':p.stat().st_size if p.exists() else 0}
+              if not ok or not p.exists(): return rec,[]
+              raw=p.read_bytes();rec['head']=raw[:32].hex();rec['is_pdf']=raw.startswith(b'%PDF-')
+              found=[]
+              if rec['is_pdf']:
+                  found.append({'url':eff or u,'source':f'direct:{u}'})
+                  return rec,found
+              texts=[raw.decode(enc,'ignore') for enc in ('utf-8','gb18030','gbk')]
+              text=max(texts,key=lambda x:x.count('敦煌种业')+x.count('600354')+x.lower().count('.pdf')+x.lower().count('download'))
+              norm=html.unescape(text.replace('\\/','/'))
+              rec['contains_company']='敦煌种业' in norm or '600354' in norm
+              m=re.search(r'<title>(.*?)</title>',norm,re.I|re.S)
+              rec['page_title']=re.sub(r'<[^>]+>','',m.group(1)).strip() if m else ''
+              for v in re.findall(r'https?://[^"\'<>\s]+',norm,re.I):
+                  v=urllib.parse.unquote(v).rstrip('),;]')
+                  if re.search(r'\.pdf(?:\?|$)|download|attach|file',v,re.I): found.append({'url':v,'source':f'html:{u}'})
+              for v in re.findall(r'(?:href|src|data-url|fileurl|downloadurl|action)=["\']([^"\']+)["\']',norm,re.I):
+                  full=urllib.parse.urljoin(eff or u,html.unescape(v))
+                  if re.search(r'\.pdf(?:\?|$)|download|attach|file',full,re.I): found.append({'url':full,'source':f'html:{u}'})
+              return rec,found
+
+          with ThreadPoolExecutor(max_workers=14) as pool:
+              futs={pool.submit(inspect_one,i,c):i for i,c in enumerate(inspect_targets)}
+              for fut in as_completed(futs):
+                  try:
+                      rec,found=fut.result();page_records.append(rec);resolved_urls.extend(found)
+                  except Exception as exc: page_records.append({'index':futs[fut],'exception':repr(exc)})
+
+          # Jina reader often exposes links that are hidden by script-rendered pages.
+          reader_targets=[r for r in page_records if r.get('ok') and not r.get('is_pdf') and (r.get('contains_company') or priority(r)>=400)][:160]
+          def read_one(i,r):
+              original=r['effective'] or r['url']
+              reader='https://r.jina.ai/http://'+original.removeprefix('http://').removeprefix('https://')
+              p=DIAG/'readers'/f'{i:03d}.txt'
+              ok,err,eff=curl(reader,p,100)
+              rec={'original':original,'reader':reader,'ok':ok,'error':err,'bytes':p.stat().st_size if p.exists() else 0}
+              found=[]
+              if ok and p.exists():
+                  text=p.read_text(encoding='utf-8',errors='ignore')
+                  rec['contains_company']='敦煌种业' in text or '600354' in text
+                  for title,u in re.findall(r'\[([^\]]{0,300})\]\((https?://[^)\s]+)\)',text,re.I):
+                      if re.search(r'\.pdf(?:\?|$)|download|attach|file|report',u,re.I): found.append({'url':u,'source':f'jina:{original}','title':title})
+                  for u in re.findall(r'https?://[^\s<>"\']+',text,re.I):
+                      if re.search(r'\.pdf(?:\?|$)|download|attach|file',u,re.I): found.append({'url':u.rstrip('),.;]'),'source':f'jina:{original}'})
+              return rec,found
+
+          reader_records=[]
+          with ThreadPoolExecutor(max_workers=10) as pool:
+              futs={pool.submit(read_one,i,r):i for i,r in enumerate(reader_targets)}
+              for fut in as_completed(futs):
+                  try:
+                      rec,found=fut.result();reader_records.append(rec);resolved_urls.extend(found)
+                  except Exception as exc: reader_records.append({'index':futs[fut],'exception':repr(exc)})
+
+          # Add direct candidate URLs and deduplicate all potential files.
+          for c in dedup:
+              if '.pdf' in c['url'].lower(): resolved_urls.append(c)
+          files=[];seen=set()
+          for c in resolved_urls:
+              u=c['url']
+              if u.startswith('//'):u='https:'+u
+              if not u.startswith('http') or u in seen:continue
+              seen.add(u);files.append({**c,'url':u})
+          files.sort(key=priority,reverse=True)
+          DIAG.joinpath('page_records.json').write_text(json.dumps(page_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          DIAG.joinpath('reader_records.json').write_text(json.dumps(reader_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          DIAG.joinpath('resolved_file_urls.json').write_text(json.dumps(files,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Download and validate all likely public PDFs. Do not invoke login-only/member download endpoints.
+          accepted=[];failures=[];digests=set()
+          title_expectations=[
+              ('先玉高增加工减亏盈利可期','国泰君安证券','2011-08-04'),
+              ('敦煌先锋产销激增驱动盈利稳定增长','齐鲁证券（现中泰证券）','2011-08-01'),
+              ('业绩快速回升敦煌先锋持续快速扩张公司本部业务亏损减少','申银万国（现申万宏源）','2010-08-30'),
+              ('聚焦种业发展机遇并购打开成长空间','天风证券','2017-01-05'),
+          ]
+
+          for i,c in enumerate(files[:500]):
+              if len(accepted)>=3:break
+              u=c['url'];p=DIAG/'files'/f'{i:03d}.pdf'
+              ok,err,eff=curl(u,p,180,c.get('source'))
+              if not ok:
+                  failures.append({**c,'error':err});continue
+              raw=p.read_bytes()
+              if len(raw)<100000 or not raw.startswith(b'%PDF-'):
+                  failures.append({**c,'error':f'not PDF {len(raw)} bytes head={raw[:20]!r}'});p.unlink(missing_ok=True);continue
+              try:
+                  reader=PdfReader(str(p),strict=False);pages=len(reader.pages)
+                  if pages<8:raise RuntimeError(f'only {pages} pages')
+                  text=''
+                  for pg in reader.pages[:min(15,pages)]:
+                      try:text+=' '+(pg.extract_text() or '')
+                      except Exception:pass
+                  compact=re.sub(r'\s+','',text)
+                  if '敦煌种业' not in compact and '600354' not in compact:
+                      raise RuntimeError('company identity not found')
+                  digest=hashlib.sha256(raw).hexdigest()
+                  if digest in digests:raise RuntimeError('duplicate PDF')
+                  # Identify title/broker/date from the report text when possible.
+                  matched=None
+                  for title,broker,date in title_expectations:
+                      if title[:8] in compact or sum(fragment in compact for fragment in [title[:6],title[-6:]])>=1:
+                          matched=(title,broker,date);break
+                  if matched:
+                      title,broker,date=matched
+                  else:
+                      title='敦煌种业券商公司研究报告';broker='券商';date='历史'
+                  safe=lambda s,n:re.sub(r'[\\/:*?"<>|\r\n]+','_',s).strip()[:n]
+                  dest=REPORTS/f'{date}_{safe(broker,24)}_{safe(title,70)}_{pages}页.pdf'
+                  dest.write_bytes(raw)
+                  accepted.append({'url':u,'effective':eff,'source':c.get('source'),'title':title,'broker':broker,'date':date,'pages':pages,'size':len(raw),'sha256':digest,'filename':dest.name})
+                  digests.add(digest)
+              except Exception as exc:
+                  failures.append({**c,'error':repr(exc)});p.unlink(missing_ok=True)
+
+          DIAG.joinpath('accepted.json').write_text(json.dumps(accepted,ensure_ascii=False,indent=2),encoding='utf-8')
+          DIAG.joinpath('failures.json').write_text(json.dumps(failures,ensure_ascii=False,indent=2),encoding='utf-8')
+          status={'search_queries':len(search_jobs),'initial_candidates':len(dedup),'page_records':len(page_records),'reader_records':len(reader_records),'resolved_urls':len(files),'accepted_pdfs':len(accepted)}
+          DIAG.joinpath('status.json').write_text(json.dumps(status,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          if len(accepted)>=2:
+              manifest=['敦煌种业（600354）券商深度报告资料包','公开渠道可验证的完整原始PDF；已核验PDF结构、公司名称、页数与SHA-256。','资料仅供研究参考，请遵守原报告版权声明和使用限制。','']
+              for i,x in enumerate(accepted,1):
+                  manifest += [f'{i}. {x["title"]}',f'   券商：{x["broker"]}',f'   日期：{x["date"]}',f'   页数：{x["pages"]}',f'   文件：{x["filename"]}',f'   SHA-256：{x["sha256"]}',f'   来源：{x["url"]}','']
+              REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(manifest),encoding='utf-8')
+              final=DIST/f'敦煌种业_券商深度报告_{len(accepted)}份_完整原始PDF.zip'
+              with zipfile.ZipFile(final,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+                  for p in sorted(REPORTS.iterdir()):z.write(p,p.name)
+              with zipfile.ZipFile(final) as z:
+                  if z.testzip():raise RuntimeError('ZIP integrity failure')
+              status['final_zip']=str(final);status['final_size']=final.stat().st_size
+              DIAG.joinpath('status.json').write_text(json.dumps(status,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('FINAL',final,final.stat().st_size)
+          else:
+              print('NO_FINAL',json.dumps(status,ensure_ascii=False))
+          PY
+          python /tmp/resolve_dunhuang.py
+
+      - name: Commit machine-readable results and final ZIP when available
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p public_results
+          cp diagnostics/status.json public_results/status.json
+          cp diagnostics/accepted.json public_results/accepted.json
+          cp diagnostics/resolved_file_urls.json public_results/resolved_file_urls.json
+          cp dist/敦煌种业_券商深度报告_*份_完整原始PDF.zip public_results/ 2>/dev/null || true
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add public_results/
+          git commit -m 'Publish Dunhuang Seed report resolution results' || true
+          git push origin HEAD:tmp/dunhuang-seed-jina-resolver-20260829
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dunhuang-seed-jina-resolver-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
