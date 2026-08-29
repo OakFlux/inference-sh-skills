@@ -1,0 +1,157 @@
+name: Temporary StarPower Semiconductor brokerage report discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-starpower-reports-20260829
+    paths:
+      - .github/workflows/tmp-starpower-report-discovery.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Query public report catalogs and test PDF sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, requests
+
+          CODE='603290'
+          NAME='斯达半导'
+          session=requests.Session()
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/report/{CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+          })
+
+          api='https://reportapi.eastmoney.com/report/list'
+          rows=[]
+          for qtype in ('0','1','2'):
+              for page in range(1,20):
+                  params={
+                      'pageNo':str(page),'pageSize':'100','code':CODE,
+                      'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':'2020-01-01','endTime':'2026-08-29','fields':'',
+                      'qType':qtype,'orgCode':'','rcode':'','p':str(page),
+                      'pageNum':str(page),'pageNumber':str(page),
+                  }
+                  response=session.get(api,params=params,timeout=90)
+                  print('API',qtype,page,response.status_code,len(response.content),response.url)
+                  response.raise_for_status()
+                  payload=response.json()
+                  data=payload.get('data') or []
+                  rows.extend(data)
+                  total_pages=int(payload.get('TotalPage') or math.ceil(int(payload.get('hits') or 0)/100) or 1)
+                  if page>=total_pages:
+                      break
+
+          dedup={}
+          for row in rows:
+              key=row.get('infoCode') or (row.get('title'),row.get('publishDate'),row.get('orgSName'))
+              dedup[key]=row
+          rows=list(dedup.values())
+          rows.sort(key=lambda r:str(r.get('publishDate') or ''),reverse=True)
+          print('\nTOTAL_ROWS',len(rows))
+
+          candidates=[]
+          for row in rows:
+              title=str(row.get('title') or '')
+              pages=int(row.get('attachPages') or 0)
+              report_type=int(row.get('reportType') or 0)
+              if report_type == 2 and (pages >= 12 or any(k in title for k in ['深度','首次覆盖','首次','公司覆盖','专题'])):
+                  candidates.append(row)
+
+          print('CANDIDATES',len(candidates))
+          for row in candidates:
+              info=row.get('infoCode') or ''
+              meta={
+                  'date':str(row.get('publishDate') or '')[:10],
+                  'broker':row.get('orgSName') or row.get('orgName'),
+                  'title':row.get('title'),
+                  'pages':row.get('attachPages'),
+                  'size_kb':row.get('attachSize'),
+                  'infoCode':info,
+                  'reportType':row.get('reportType'),
+                  'column':row.get('column'),
+                  'rating':row.get('emRatingName') or row.get('sRatingName'),
+                  'researcher':row.get('researcher'),
+                  'stockCode':row.get('stockCode'),
+                  'stockName':row.get('stockName'),
+              }
+              print('\nCANDIDATE',json.dumps(meta,ensure_ascii=False))
+              if info:
+                  for prefix in ('H3','H2'):
+                      url=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                      try:
+                          rr=session.get(url,headers={'Range':'bytes=0-4095','Accept':'application/pdf,*/*'},timeout=60,allow_redirects=True)
+                          print('PDF_TEST',prefix,rr.status_code,rr.headers.get('content-type'),rr.headers.get('content-range'),len(rr.content),rr.content[:8],rr.url)
+                      except Exception as exc:
+                          print('PDF_ERR',prefix,repr(exc))
+
+          print('\nALL_REPORTS')
+          for row in rows:
+              print('REPORT',json.dumps({
+                  'date':str(row.get('publishDate') or '')[:10],
+                  'broker':row.get('orgSName') or row.get('orgName'),
+                  'title':row.get('title'),
+                  'pages':row.get('attachPages'),
+                  'size_kb':row.get('attachSize'),
+                  'infoCode':row.get('infoCode'),
+                  'reportType':row.get('reportType'),
+                  'column':row.get('column'),
+                  'rating':row.get('emRatingName') or row.get('sRatingName'),
+              },ensure_ascii=False))
+
+          # Supplement with Sdyanbao's public metadata index.
+          search=requests.Session()
+          search.headers.update({
+              'User-Agent':session.headers['User-Agent'],
+              'Origin':'https://www.sdyanbao.com',
+              'Referer':'https://www.sdyanbao.com/',
+              'Content-Type':'application/json;charset=UTF-8',
+              'Accept':'application/json,text/plain,*/*',
+          })
+          seen=set()
+          for query in (NAME,CODE,'斯达半导体'):
+              for page in range(1,15):
+                  body={
+                      'device':1,'hideTrader':0,'onlyTitle':0,'order':0,
+                      'page':page,'pageSize':100,'keyword':query,'pageCount':0,
+                      'dateRange':0,'startTime':'','endTime':'','typeIds':[], 'industryIds':[]
+                  }
+                  response=search.post('https://api.sdyanbao.com/api/file/search',json=body,timeout=90)
+                  print('\nSDY_API',query,page,response.status_code,len(response.content))
+                  response.raise_for_status()
+                  payload=response.json().get('data') or {}
+                  files=payload.get('files') or []
+                  print('SDY_COUNT',len(files),'TOTAL',payload.get('total'))
+                  for item in files:
+                      fid=item.get('id')
+                      if fid in seen:
+                          continue
+                      seen.add(fid)
+                      stock=item.get('stock') or {}
+                      name=str(item.get('name') or '')
+                      content=str(item.get('content') or '')[:1500]
+                      blob=' '.join([name,str(stock.get('name') or ''),str(stock.get('code') or ''),content])
+                      if NAME in blob or CODE in blob:
+                          print('SDY_REPORT',json.dumps({
+                              'id':fid,'name':name,'date':item.get('time_text'),
+                              'pages':item.get('page_count'),'size':item.get('file_size'),
+                              'type':(item.get('type') or {}).get('name'),
+                              'organization':(item.get('organization') or {}).get('name'),
+                              'uuid':item.get('data_source_uuid'),'data_source':item.get('data_source'),
+                              'original_id':item.get('original_id'),'page_url':item.get('page_url'),
+                              'share_url':item.get('share_url'),'stock':stock,
+                          },ensure_ascii=False))
+                  if not files or page*100>=int(payload.get('total') or 0):
+                      break
+          PY
