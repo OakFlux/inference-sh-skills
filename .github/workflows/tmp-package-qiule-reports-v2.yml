@@ -1,0 +1,236 @@
+name: Package verified Qiule Seeds reports v2
+
+on:
+  push:
+    branches:
+      - tmp/qiule-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+
+      - name: Build complete verified package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import requests
+          import textwrap
+
+          source_url = "https://raw.githubusercontent.com/OakFlux/inference-sh-skills/e78cdf29c3a2721979d2ee1a81123fbf0a37dee3/.github/workflows/tmp-package-foxit-reports.yml"
+          response = requests.get(source_url, timeout=120)
+          response.raise_for_status()
+          workflow = response.text
+
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n"
+          if start_marker not in workflow or end_marker not in workflow:
+              raise RuntimeError("Unable to extract embedded Python packaging script")
+
+          block = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
+          code = textwrap.dedent(block)
+
+          replacements = [
+              ("foxit_verified_package", "qiule_verified_package"),
+              ('STOCK_ID = "688095"', 'STOCK_ID = "920087"'),
+              ('COMPANY = "福建福昕软件开发股份有限公司"', 'COMPANY = "河南秋乐种业科技股份有限公司"'),
+              ('SHORT_NAME = "福昕软件"', 'SHORT_NAME = "秋乐种业"'),
+              ("福建福昕软件开发股份有限公司", "河南秋乐种业科技股份有限公司"),
+              ("福昕软件", "秋乐种业"),
+              ('"foxit"', '"qiule"'),
+              ("688095.SH", "920087.BJ"),
+              ('f"{STOCK_ID}.SH"', 'f"{STOCK_ID}.BJ"'),
+              ("static.sse.com.cn", "static.bse.cn"),
+              ("01_年度报告_2020-2025", "01_年度报告_2014-2025"),
+              ("2020—2025", "2014—2025"),
+              ("range(2020, 2026)", "range(2014, 2026)"),
+              ("共6份完整年度报告", "共12份完整年度报告"),
+              ("len(documents) != 7", "len(documents) != 13"),
+              ("Expected 7 documents", "Expected 13 documents"),
+              ("list(range(2020, 2026))", "list(range(2014, 2026))"),
+              ("len(pdfs) != 7", "len(pdfs) != 13"),
+              ("Expected 7 PDFs", "Expected 13 PDFs"),
+              ('minimum_pages = {"annual": 100, "half": 60}[kind]', 'minimum_pages = {"annual": 55, "half": 60}[kind]'),
+              ("秋乐种业_2020-2025年报_2026年最新半年报_完整PDF.zip", "秋乐种业_全部年报_2026年最新半年报_完整PDF.zip"),
+          ]
+          for old, new in replacements:
+              code = code.replace(old, new)
+
+          helper_block = r'''
+def parse_neeq_jsonp(text: str) -> dict[str, Any]:
+    start = text.find("(")
+    end = text.rfind(")")
+    if start < 0 or end <= start:
+        raise RuntimeError("Invalid NEEQ JSONP response")
+    payload = json.loads(text[start + 1:end])
+    if isinstance(payload, list):
+        if not payload:
+            raise RuntimeError("Empty NEEQ JSONP response")
+        payload = payload[0]
+    if not isinstance(payload, dict):
+        raise RuntimeError("Unexpected NEEQ payload type")
+    return payload
+
+
+def get_neeq_2014_report() -> tuple[str, str, str]:
+    endpoint = "https://www.neeq.com.cn/disclosureInfoController/companyAnnouncement.do"
+    need_fields = [
+        "companyCd", "companyName", "disclosureTitle", "disclosurePostTitle",
+        "destFilePath", "publishDate", "xxfcbj", "fileExt", "xxzrlx",
+    ]
+    errors: list[str] = []
+    all_records: list[dict[str, Any]] = []
+    for company_code in ("831087", "920087"):
+        try:
+            page_number = 0
+            total_pages = 1
+            while page_number < total_pages:
+                data: list[tuple[str, str]] = [
+                    ("noticeType[]", "5"),
+                    ("disclosureType[]", "5"),
+                    ("disclosureSubtype[]", ""),
+                    ("page", "" if page_number == 0 else str(page_number)),
+                    ("companyCd", company_code),
+                    ("isNewThree", "1"),
+                    ("keyword", "2014年年度报告"),
+                    ("xxfcbj[]", "3"),
+                    ("hyType[]", ""),
+                ]
+                data.extend(("needFields[]", field) for field in need_fields)
+                data.extend([
+                    ("siteId", "1"),
+                    ("sortfield", "xxssdq"),
+                    ("sorttype", "asc"),
+                ])
+                response = session.post(
+                    endpoint,
+                    params={"callback": "qiuleCallback"},
+                    data=data,
+                    headers={
+                        "Referer": "https://www.neeq.com.cn/disclosure/announcement.html",
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Accept": "text/javascript, application/javascript, */*; q=0.01",
+                    },
+                    timeout=(25, 120),
+                )
+                response.raise_for_status()
+                payload = parse_neeq_jsonp(response.text)
+                list_info = payload.get("listInfo") or {}
+                content = list_info.get("content") or []
+                if not isinstance(content, list):
+                    raise RuntimeError("Invalid NEEQ content list")
+                all_records.extend(content)
+                total_pages = int(list_info.get("totalPages") or 1)
+                page_number += 1
+        except Exception as exc:
+            errors.append(f"companyCd={company_code}: {exc}")
+
+    candidates: list[tuple[float, dict[str, Any]]] = []
+    for record in all_records:
+        title = normalize(
+            str(record.get("disclosureTitle") or "")
+            + str(record.get("disclosurePostTitle") or "")
+        )
+        if "秋乐种业" not in title and "河南秋乐种业科技" not in title:
+            continue
+        if "2014年年度报告" not in title and "2014年度报告" not in title:
+            continue
+        if "摘要" in title or "取消" in title:
+            continue
+        dest = str(record.get("destFilePath") or "").strip()
+        if not dest:
+            continue
+        score = 100.0
+        if any(marker in title for marker in ("修订", "更正后", "更新后")):
+            score += 100.0
+        publish_date = str(record.get("publishDate") or "").replace("-", "")
+        if publish_date.isdigit():
+            score += int(publish_date) / 100_000_000
+        candidates.append((score, record))
+
+    if not candidates:
+        raise RuntimeError(
+            "No NEEQ 2014 annual report found; errors=" + " | ".join(errors)
+            + "; records=" + json.dumps(all_records, ensure_ascii=False)[:10000]
+        )
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    record = candidates[0][1]
+    path_or_url = html_lib.unescape(str(record.get("destFilePath") or "")).replace("\\/", "/")
+    detail_url = "https://www.neeq.com.cn/disclosure/announcement.html?companyCode=831087"
+    context = json.dumps(record, ensure_ascii=False)
+    print("Selected official NEEQ 2014 report:", context)
+    return path_or_url, detail_url, context
+
+
+def neeq_download_urls(path_or_url: str) -> list[str]:
+    path_or_url = html_lib.unescape(path_or_url).replace("\\/", "/")
+    if path_or_url.startswith("http://") or path_or_url.startswith("https://"):
+        urls = [path_or_url]
+    else:
+        if not path_or_url.startswith("/"):
+            path_or_url = "/" + path_or_url
+        urls = [
+            "https://www.neeq.com.cn" + path_or_url,
+            "https://static.neeq.com.cn" + path_or_url,
+            "https://www.bse.cn" + path_or_url,
+            "https://static.bse.cn" + path_or_url,
+            "http://www.neeq.com.cn" + path_or_url,
+        ]
+    return list(dict.fromkeys(urls))
+'''
+
+          marker = "documents: list[dict[str, Any]] = []"
+          if marker not in code:
+              raise RuntimeError("Unable to locate document-list marker")
+          code = code.replace(marker, helper_block + "\n\n" + marker, 1)
+
+          original_extract = 'raw_url, detail_url, context = extract_pdf_from_detail(record)'
+          replacement_extract = '''
+    if year == 2014:
+        raw_url, detail_url, context = get_neeq_2014_report()
+    else:
+        raw_url, detail_url, context = extract_pdf_from_detail(record)
+'''.strip("\n")
+          if original_extract not in code:
+              raise RuntimeError("Unable to locate annual PDF extraction line")
+          code = code.replace(original_extract, replacement_extract, 1)
+
+          original_download = 'used_url = download_pdf(download_candidates(raw_url), target, detail_url)'
+          replacement_download = '''
+    annual_urls = neeq_download_urls(raw_url) if year == 2014 else download_candidates(raw_url)
+    used_url = download_pdf(annual_urls, target, detail_url)
+'''.strip("\n")
+          if original_download not in code:
+              raise RuntimeError("Unable to locate annual download line")
+          code = code.replace(original_download, replacement_download, 1)
+
+          required_tokens = [
+              'STOCK_ID = "920087"',
+              'COMPANY = "河南秋乐种业科技股份有限公司"',
+              'SHORT_NAME = "秋乐种业"',
+              'range(2014, 2026)',
+              'get_neeq_2014_report()',
+              '秋乐种业_全部年报_2026年最新半年报_完整PDF.zip',
+          ]
+          missing = [token for token in required_tokens if token not in code]
+          if missing:
+              raise RuntimeError(f"Required transformations missing: {missing}")
+
+          exec(compile(code, "qiule_packaging_v2.py", "exec"), {"__name__": "__main__"})
+          PY
+
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: qiule-reports-final-v2
+          path: 秋乐种业_全部年报_2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
