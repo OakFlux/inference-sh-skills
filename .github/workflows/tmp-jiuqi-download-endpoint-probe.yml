@@ -1,0 +1,95 @@
+name: Temporary Jiuqi report download endpoint probe
+
+on:
+  push:
+    branches:
+      - tmp/download-jiuqi-software-reports-20260829
+    paths:
+      - .github/workflows/tmp-jiuqi-download-endpoint-probe.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Inspect public report pages and unauthenticated download handlers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept':'text/html,application/xhtml+xml,application/json,application/pdf,*/*;q=0.8'
+          })
+          pages=[
+              ('hibor2016','https://www.hibor.com.cn/docdetail_1763895.html'),
+              ('huiyun2009','https://www.huiyunyan.com/doc-25ad9bad49e81a1883c642c31f5e59bd.html'),
+          ]
+          for name,url in pages:
+              print('\n=== PAGE',name,url,'===')
+              r=s.get(url,timeout=90,allow_redirects=True)
+              print('HTTP',r.status_code,'LEN',len(r.content),'TYPE',r.headers.get('content-type'),'FINAL',r.url)
+              text=r.text
+              print('COOKIES',s.cookies.get_dict())
+              soup=BeautifulSoup(text,'html.parser')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+              for form in soup.find_all('form'):
+                  print('FORM',json.dumps({
+                      'action':urllib.parse.urljoin(r.url,form.get('action') or ''),
+                      'method':form.get('method'),'id':form.get('id'),'class':form.get('class'),
+                      'inputs':[{'name':x.get('name'),'value':x.get('value'),'type':x.get('type')} for x in form.find_all('input')[:30]],
+                  },ensure_ascii=False))
+              for tag in soup.find_all(['a','button','input','iframe','embed','object','source']):
+                  blob=str(tag).lower()
+                  if any(k in blob for k in ['download','下载','原文','pdf','fulltext','reportfile','docdown']):
+                      attrs={k:v for k,v in tag.attrs.items() if k in ['href','src','data','onclick','id','class','name','value','action']}
+                      print('TAG',json.dumps({'tag':tag.name,'text':tag.get_text(' ',strip=True)[:300],'attrs':attrs},ensure_ascii=False))
+              for pat in [
+                  r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+                  r'https?://[^\s"\'<>]+(?:download|down|file|attachment|pdf)[^\s"\'<>]*',
+                  r'[/A-Za-z0-9_.?=&%-]*(?:download|down|file|attachment|pdf)[/A-Za-z0-9_.?=&%-]*',
+                  r'[/A-Za-z0-9_.?=&%-]*(?:1763895|25ad9bad49e81a1883c642c31f5e59bd)[/A-Za-z0-9_.?=&%-]*',
+              ]:
+                  for m in sorted(set(re.findall(pat,text,re.I))):
+                      if len(m)>3: print('MATCH',m[:2000])
+              scripts=[]
+              for tag in soup.find_all('script',src=True):
+                  u=urllib.parse.urljoin(r.url,tag['src'])
+                  scripts.append(u)
+              print('SCRIPT_COUNT',len(scripts))
+              for u in scripts[:80]:
+                  try:
+                      rr=s.get(u,timeout=60)
+                      t=rr.text
+                      if any(k in t.lower() for k in ['download','pdf','attachment','1763895','25ad9bad49e81a1883c642c31f5e59bd','docdetail']):
+                          print('SCRIPT',u,'HTTP',rr.status_code,'LEN',len(rr.content))
+                          for needle in ['download','pdf','attachment','1763895','docdetail','reportfile','downfile']:
+                              for mm in list(re.finditer(needle,t,re.I))[:10]:
+                                  p=mm.start(); print('SCRIPT_CTX',needle,t[max(0,p-700):p+1800].replace('\n',' ')[:2500])
+                  except Exception as e: print('SCRIPT_ERR',u,repr(e))
+
+          # Probe common unauthenticated endpoints. Treat redirects to login or JSON auth errors as gated.
+          tests=[
+              ('GET','https://www.hibor.com.cn/download.aspx?id=1763895',None),
+              ('GET','https://www.hibor.com.cn/Download.aspx?id=1763895',None),
+              ('GET','https://www.hibor.com.cn/down.aspx?id=1763895',None),
+              ('GET','https://www.hibor.com.cn/docdownload_1763895.html',None),
+              ('GET','https://www.hibor.com.cn/report/1763895.pdf',None),
+              ('GET','https://www.hibor.com.cn/pdf/1763895.pdf',None),
+              ('GET','https://www.huiyunyan.com/download/25ad9bad49e81a1883c642c31f5e59bd',None),
+              ('GET','https://www.huiyunyan.com/api/doc/25ad9bad49e81a1883c642c31f5e59bd/download',None),
+          ]
+          for method,url,data in tests:
+              try:
+                  r=s.request(method,url,data=data,timeout=60,allow_redirects=False,headers={'Referer':'https://www.hibor.com.cn/docdetail_1763895.html'})
+                  print('\nTEST',method,url,'STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'LOC',r.headers.get('location'),'HEAD',r.content[:80])
+              except Exception as e: print('TEST_ERR',method,url,repr(e))
+          PY
