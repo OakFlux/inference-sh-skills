@@ -1,0 +1,68 @@
+name: Diagnose Qiule 2014 report sources
+
+on:
+  push:
+    branches:
+      - tmp/qiule-reports-20260829
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Inspect candidate pages
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "zh-CN,zh;q=0.9"})
+          urls = [
+              "https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=920087&id=1742022",
+              "https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?stockid=920087&id=1742022",
+              "https://stockdata.hexun.com/2009_ggqw_831087.shtml",
+              "https://www.bse.cn/disclosure/announcement.html?companyCode=831087",
+              "https://www.neeq.com.cn/disclosure/announcement.html?companyCode=831087",
+          ]
+          for url in urls:
+              print("\n=====", url, "=====")
+              try:
+                  r = s.get(url, timeout=120, allow_redirects=True)
+                  print("STATUS", r.status_code, "FINAL", r.url, "LEN", len(r.content), "CT", r.headers.get("content-type"))
+                  text = r.content.decode(r.apparent_encoding or "utf-8", errors="replace")
+                  print("ENC", r.apparent_encoding)
+                  soup = BeautifulSoup(text, "html.parser")
+                  for tag in soup.find_all(["a", "iframe", "script", "form"]):
+                      attrs = []
+                      for key in ("href", "src", "action", "data-url", "data-href"):
+                          value = tag.get(key)
+                          if value:
+                              attrs.append(f"{key}={urljoin(r.url, value)}")
+                      label = " ".join(tag.get_text(" ", strip=True).split())[:160]
+                      joined = " | ".join(attrs)
+                      if attrs and ("pdf" in joined.lower() or "1742022" in joined or "2014" in label or "秋乐种业" in label or "下载" in label):
+                          print(tag.name, joined, "TEXT=", label)
+                  patterns = [
+                      r'https?://[^\"\'<>\s]+',
+                      r'[^\"\'<>\s]+\.PDF',
+                      r'[^\"\'<>\s]+\.pdf',
+                  ]
+                  found = []
+                  for pat in patterns:
+                      found.extend(re.findall(pat, text, flags=re.I))
+                  for item in dict.fromkeys(found):
+                      if any(k in item.lower() for k in ("pdf", "1742022", "download", "attach", "announcement")):
+                          print("REGEX", item[:500])
+                  for keyword in ("1742022", "2014年年度报告", "公告原文", "附件", "download", "pdf", "fileurl", "file_url", "attach"):
+                      idx = text.lower().find(keyword.lower())
+                      if idx >= 0:
+                          print("SNIP", keyword, text[max(0, idx-800):idx+1800].replace("\n", " "))
+              except Exception as e:
+                  print("ERROR", repr(e))
+          PY
