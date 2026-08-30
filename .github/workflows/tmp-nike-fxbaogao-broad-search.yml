@@ -1,0 +1,52 @@
+name: Temporary broad Nike Fxbaogao search
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-fxbaogao-broad-search.yml
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search broad keywords and filter target titles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          import json, pathlib, urllib.request
+          api='https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          queries=['Nike','NIKE','耐克','全球体育用品品牌','专业功能品牌','单季营收正增长','望远镜系列']
+          all_rows=[]
+          for q in queries:
+              for page in range(1,11):
+                  body=json.dumps({'keywords':q,'pageIndex':page,'pageSize':100,'order':2,'nop':-1},ensure_ascii=False).encode('utf-8')
+                  req=urllib.request.Request(api,data=body,headers={'User-Agent':ua,'Content-Type':'application/json'},method='POST')
+                  raw=urllib.request.urlopen(req,timeout=120).read().decode('utf-8','replace')
+                  obj=json.loads(raw); rows=(obj.get('data') or {}).get('dataList') or []
+                  print('QUERY',q,'PAGE',page,'COUNT',len(rows))
+                  for r in rows:
+                      title=str(r.get('title') or '')
+                      if any(k.lower() in title.lower() for k in ['nike','耐克','全球体育用品品牌','望远镜系列']):
+                          print('MATCH',json.dumps({k:r.get(k) for k in ['docId','title','orgName','pageNum','pubTime','fileSize','categoryName']},ensure_ascii=False))
+                          rr=dict(r);rr['_query']=q;rr['_page']=page;all_rows.append(rr)
+                  if len(rows)<100:break
+          uniq={str(r.get('docId') or r.get('title')):r for r in all_rows}
+          pathlib.Path('diagnostic/matches.json').write_text(json.dumps(list(uniq.values()),ensure_ascii=False,indent=2),encoding='utf-8')
+          print('UNIQUE',len(uniq))
+          PY
+
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-fxbaogao-broad-search
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
