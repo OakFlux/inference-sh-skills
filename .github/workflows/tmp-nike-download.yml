@@ -1,0 +1,120 @@
+name: Temporary NIKE report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260826
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf zip
+
+      - name: Download, verify and package NIKE reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir='NIKE_2020-2025年报及最新季报'
+          mkdir -p "$package_dir" previews
+
+          download_pdf() {
+            local dest="$1"
+            local min_pages="$2"
+            local label="$3"
+            local expected_regex="$4"
+            local url="$5"
+            local tmp="${dest}.part"
+            local pages
+
+            echo "Downloading ${label}: ${url}"
+            rm -f "$tmp"
+            curl -L --fail --retry 5 --retry-delay 2 --retry-all-errors \
+              --connect-timeout 30 --max-time 1200 --http1.1 \
+              -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' \
+              -H 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8' \
+              -e 'https://investors.nike.com/' "$url" -o "$tmp"
+
+            [[ -s "$tmp" ]]
+            [[ "$(head -c 4 "$tmp")" == '%PDF' ]]
+            pages="$(pdfinfo "$tmp" | awk '/^Pages:/ {print $2}')"
+            [[ -n "$pages" ]]
+            (( pages >= min_pages ))
+
+            pdftotext -f 1 -l 16 "$tmp" - 2>/dev/null | tr -d '\000' > /tmp/nike_report_text.txt || true
+            grep -Eqi 'NIKE,? INC\.|NIKE,? Inc\.' /tmp/nike_report_text.txt
+            grep -Eqi "$expected_regex" /tmp/nike_report_text.txt
+
+            mv "$tmp" "$dest"
+            qpdf --check "$dest"
+
+            local stem
+            stem="$(basename "$dest" .pdf)"
+            pdftoppm -f 1 -singlefile -png -r 90 "$dest" "previews/${stem}_first" >/dev/null 2>&1
+            pdftoppm -f "$pages" -singlefile -png -r 90 "$dest" "previews/${stem}_last" >/dev/null 2>&1
+            echo "Verified ${label}: ${pages} pages"
+          }
+
+          download_pdf "$package_dir/NIKE_FY2020_年度报告_10-K.pdf" 100 'FY2020 annual report' \
+            'FISCAL YEAR ENDED MAY 31, 2020|2020 FORM 10-K' \
+            'https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320187/72b61935-3ee0-4f79-a564-0d5134713574.pdf'
+
+          download_pdf "$package_dir/NIKE_FY2021_年度报告_10-K.pdf" 100 'FY2021 annual report' \
+            'FISCAL YEAR ENDED MAY 31, 2021|2021 FORM 10-K' \
+            'https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320187/702c5a98-3399-4049-aa9b-a159dd44826c.pdf'
+
+          download_pdf "$package_dir/NIKE_FY2022_年度报告_10-K.pdf" 100 'FY2022 annual report' \
+            'FISCAL YEAR ENDED MAY 31, 2022|2022 FORM 10-K' \
+            'https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320187/de1a2596-13c0-452e-9122-fee481da40ad.pdf'
+
+          download_pdf "$package_dir/NIKE_FY2023_年度报告_10-K.pdf" 100 'FY2023 annual report' \
+            'FISCAL YEAR ENDED MAY 31, 2023|2023 FORM 10-K' \
+            'https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320187/af34257a-4449-46e1-a2f0-df90d23d6180.pdf'
+
+          download_pdf "$package_dir/NIKE_FY2024_年度报告_10-K.pdf" 120 'FY2024 annual report' \
+            'FISCAL YEAR ENDED MAY 31, 2024|2024 FORM 10-K' \
+            'https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320187/3b853bdf-ecf8-433c-960b-43cf691c5aa2.pdf'
+
+          download_pdf "$package_dir/NIKE_FY2025_年度报告_10-K.pdf" 100 'FY2025 annual report' \
+            'FISCAL YEAR ENDED MAY 31, 2025|2025 FORM 10-K' \
+            'https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320187/5ab73042-8dfb-493d-a9b1-e680d1882164.pdf'
+
+          download_pdf "$package_dir/NIKE_FY2026_Q3_季度报告_10-Q_截至2026-02-28.pdf" 50 'FY2026 third-quarter report' \
+            'QUARTERLY PERIOD ENDED FEBRUARY 28, 2026|FORM 10-Q' \
+            'https://d18rn0p25nwr6d.cloudfront.net/CIK-0000320187/228dd47e-5fbd-4842-9441-169a2d618168.pdf'
+
+          {
+            echo 'NIKE, Inc.（NYSE: NKE）财务报告包，共7份完整PDF。'
+            echo
+            echo '口径说明：NIKE财年截至每年5月31日，因此“2020-2025年报”按FY2020-FY2025整理。'
+            echo '截至2026年8月30日，最新已披露的Form 10-Q为FY2026第三季度报告，报告期截至2026年2月28日。FY2026第四季度及全年结果已纳入FY2026 Form 10-K，不属于季度报告Form 10-Q；本包按用户要求仅收录FY2020-FY2025年报。'
+            echo
+            for f in "$package_dir"/*.pdf; do
+              p="$(pdfinfo "$f" | awk '/^Pages:/ {print $2}')"
+              s="$(stat -c%s "$f")"
+              printf '%s | %s页 | %s字节\n' "$(basename "$f")" "$p" "$s"
+            done
+            echo
+            echo '来源：NIKE投资者关系网站披露的SEC文件PDF。'
+            echo '核验：PDF文件头、NIKE公司名称、报告期、最低页数、qpdf结构检查，以及首页和末页渲染。'
+          } > "$package_dir/报告清单与口径说明.txt"
+
+          (cd "$package_dir" && sha256sum ./*.pdf > SHA256SUMS.txt)
+          zip -9 -r 'NIKE_2020-2025年报及最新季报.zip' "$package_dir" >/dev/null
+          unzip -t 'NIKE_2020-2025年报及最新季报.zip'
+          ls -lh "$package_dir" 'NIKE_2020-2025年报及最新季报.zip'
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-final-package
+          path: NIKE_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
