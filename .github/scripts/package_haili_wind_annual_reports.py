@@ -113,10 +113,6 @@ def main() -> None:
         ("CNSESH_STOCK", "CNSESZ_STOCK"),
         ("2021年11月29日", "2021年11月24日"),
         (
-            "公司于2021年11月24日在深圳证券交易所创业板上市；收录上市后全部独立年度报告2021—2025年，共5份。",
-            "公司于2021年11月24日在深圳证券交易所创业板上市；收录上市后全部独立年度报告2021—2025年，共5份。",
-        ),
-        (
             "招股说明书采用2021年11月24日披露的正式发行版，排除招股意向书、申报稿、注册稿和问询回复。",
             "招股说明书采用2021年11月19日披露的正式发行版，排除招股意向书、申报稿、注册稿和问询回复。",
         ),
@@ -126,12 +122,20 @@ def main() -> None:
         ),
         ('"prepared_date": "2026-08-29"', '"prepared_date": "2026-08-30"'),
         ('"整理日期：2026-08-29"', '"整理日期：2026-08-30"'),
+        (
+            "    code = response.text\n\n    replacements = [",
+            "    code = (\n"
+            "        response.text\n"
+            "        .replace(\"科创板\", \"创业板\")\n"
+            "        .replace(\"上海证券交易所\", \"深圳证券交易所\")\n"
+            "        .replace(\"CNSESH_STOCK\", \"CNSESZ_STOCK\")\n"
+            "    )\n\n"
+            "    replacements = [",
+        ),
     ]
     for old, new in replacements:
         code = code.replace(old, new)
 
-    # The source wrapper validates the discovered ID against its constant. The constant
-    # above has already been replaced with the freshly discovered formal prospectus ID.
     required = [
         f'STOCK_ID = "{STOCK_ID}"',
         f'COMPANY = "{COMPANY}"',
@@ -144,6 +148,7 @@ def main() -> None:
         "首次公开发行股票并在创业板上市招股说明书",
         "CNSESZ_STOCK",
         "海力风电_全部年报_招股说明书_2026年最新半年报_完整PDF.zip",
+        '.replace("科创板", "创业板")',
     ]
     missing = [token for token in required if token not in code]
     if missing:
