@@ -1,0 +1,76 @@
+name: Temporary Nike Haitong initiation page recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-haitong-page-recovery.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Recover all public report page images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages diagnostics raw
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import hashlib,json,subprocess
+
+          UA='Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 Chrome/151 Mobile Safari/537.36'
+          root='https://file.sgpjbg.com/fileroot2/2024-1/2/9c478bf5-ca71-4029-aad3-d30d40a6ae77/'
+          stem='9c478bf5-ca71-4029-aad3-d30d40a6ae77'
+          urls=[('base',root+stem),('cover',root+'00eb2e55716d4d2683e843d2a9d00dbb.gif')]
+          for p in range(1,25):
+              urls.append((f'page_{p:02d}',root+stem+str(p)+'.gif'))
+          results=[]
+          for name,url in urls:
+              out=Path('raw')/f'{name}.bin'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','4','--retry-all-errors',
+                   '--connect-timeout','20','--max-time','180','-A',UA,
+                   '-e','https://m.sgpjbg.com/baogao/150331.html','-H','Accept-Encoding: identity',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode or not out.exists():
+                  out.unlink(missing_ok=True); results.append({'name':name,'url':url,'ok':False,'error':p.stderr[-300:]}); print('FAIL',name,p.returncode,p.stderr[-120:]); continue
+              b=out.read_bytes(); kind='other'; ext='.bin'
+              if b[:4]==b'%PDF':kind='pdf';ext='.pdf'
+              elif b[:6] in [b'GIF87a',b'GIF89a']:kind='gif';ext='.gif'
+              elif b[:8]==b'\x89PNG\r\n\x1a\n':kind='png';ext='.png'
+              elif b[:3]==b'\xff\xd8\xff':kind='jpg';ext='.jpg'
+              elif b[:4]==b'RIFF' and b[8:12]==b'WEBP':kind='webp';ext='.webp'
+              if kind=='other' or len(b)<3000:
+                  preview=b[:200].decode('utf-8','replace'); out.unlink(missing_ok=True)
+                  results.append({'name':name,'url':url,'ok':False,'size':len(b),'preview':preview})
+                  print('INVALID',name,len(b),b[:16],preview[:80]); continue
+              final=out.with_suffix(ext); out.rename(final)
+              # Copy report pages to ordered page directory.
+              if name.startswith('page_'):
+                  page_num=int(name.split('_')[1])
+                  page_dest=Path('pages')/f'{page_num:03d}{ext}'
+                  page_dest.write_bytes(b)
+              results.append({'name':name,'url':url,'ok':True,'kind':kind,'size':len(b),
+                              'file':str(final),'sha256':hashlib.sha256(b).hexdigest()})
+              print('OK',name,kind,len(b),url)
+          Path('diagnostics/manifest.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          file pages/* raw/* || true
+          identify pages/* 2>/dev/null || true
+          find pages raw diagnostics -type f -printf '%p\t%s\n' | sort
+
+      - name: Upload recovered pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-haitong-initiation-pages
+          path: |
+            pages/
+            raw/
+            diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
