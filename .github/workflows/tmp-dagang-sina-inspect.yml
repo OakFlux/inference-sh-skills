@@ -1,0 +1,63 @@
+name: Temporary Dagang Sina research report inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-sina-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Probe Sina research report pages and extract report IDs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          import pathlib, re, subprocess, urllib.parse
+
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          urls=[
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=002077&t1=all',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=002077',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=sz002077&t1=all',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?keyword='+urllib.parse.quote('大港股份'),
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml',
+            'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=002077&t1=all',
+          ]
+          all_text=[]
+          for i,u in enumerate(urls,1):
+              out=pathlib.Path(f'diagnostic/url_{i}.html')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','120','-A',ua,'-e','https://finance.sina.com.cn/','-H','Accept-Encoding: identity',u,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('URL',i,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'FINAL',u,'ERR',p.stderr[-400:])
+              if out.exists():
+                  txt=out.read_text(encoding='utf-8',errors='ignore')
+                  all_text.append(txt)
+                  for pat in ['大港股份','封测行业迎机遇','剥离亏损建材业务','艾科半导体并表扭亏','rptid','vReport_Show']:
+                      if pat in txt:
+                          print('FOUND',i,pat)
+                  for m in sorted(set(re.findall(r'rptid[/=](\d+)',txt))):
+                      print('RPTID',i,m)
+                  for line in txt.splitlines():
+                      if any(k in line for k in ['大港股份','封测行业迎机遇','剥离亏损建材业务','艾科半导体并表扭亏']):
+                          print('LINE',i,line[:1000])
+          combined='\n'.join(all_text)
+          pathlib.Path('diagnostic/combined.txt').write_text(combined,encoding='utf-8')
+          print('TOTAL_RPTIDS',sorted(set(re.findall(r'rptid[/=](\d+)',combined))))
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-sina-inspection
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
