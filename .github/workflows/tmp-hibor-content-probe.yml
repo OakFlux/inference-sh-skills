@@ -1,0 +1,107 @@
+name: Temporary Hibor dynamic content probe for Jinmei reports
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-hibor-content-probe.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Find report IDs and inspect dynamic content endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          ids={
+              '81532':'平安证券-拥有世界领先技术的煤化工龙头',
+              '81468':'中金公司-核心煤化工技术带来长期增长潜力',
+              '85516':'海通证券-醋酐和乙二醇两业并举',
+              '98855':'兴业证券-煤制乙二醇揭开公司高增长的序幕',
+              '159693':'海通证券-先进煤化工生产技术的探索者',
+              '194871':'国元证券-碳一技术行业翘楚',
+              '289662':'东莞证券-煤化工技术创新成就高速成长',
+              '412119':'中航证券-煤制乙二醇前景广阔静待技术瓶颈突破',
+              '595072':'中金公司-新型煤化工系列报告之二',
+          }
+
+          # Add Hibor IDs from the 2019 restructuring reports if indexed in monthly archives.
+          for ym in ['201906','201907']:
+              for base in ['https://www.hibor.com.cn/archiver_houtai/','https://p.hibor.com.cn/Archiver/']:
+                  url=base+ym+'.html'
+                  try:
+                      r=requests.get(url,headers={'User-Agent':UA},timeout=60)
+                      print('ARCHIVE',ym,url,r.status_code,len(r.content))
+                      if r.status_code!=200: continue
+                      texts=[]
+                      for enc in ['utf-8','gb18030','latin1']:
+                          try: texts.append(r.content.decode(enc,'ignore'))
+                          except: pass
+                      for text in texts:
+                          if not any(k in text for k in ['丹化科技','斯尔邦','600844']): continue
+                          soup=BeautifulSoup(text,'html.parser')
+                          for a in soup.find_all('a',href=True):
+                              label=' '.join(a.get_text(' ',strip=True).split())
+                              blob=label+' '+a['href']
+                              if any(k in blob for k in ['丹化科技','斯尔邦','600844']):
+                                  m=re.search(r'docdetail_(\d+)\.html',a['href'])
+                                  if m:
+                                      ids[m.group(1)]=label
+                                      print('ARCHIVE_MATCH',json.dumps({'ym':ym,'id':m.group(1),'label':label,'href':urllib.parse.urljoin(url,a['href'])},ensure_ascii=False))
+                  except Exception as e: print('ARCHIVE_ERR',ym,url,repr(e))
+
+          print('TOTAL_IDS',len(ids),json.dumps(ids,ensure_ascii=False,indent=2))
+
+          for docid,label in ids.items():
+              print('\n==============================')
+              print('DOC',docid,label)
+              s=requests.Session()
+              s.headers.update({'User-Agent':UA,'Accept':'text/html,application/json,text/javascript,*/*'})
+              start=f'https://www.hibor.com.cn/docdetail_{docid}.html'
+              try:
+                  r=s.get(start,timeout=90,allow_redirects=True)
+                  print('LANDING',r.status_code,len(r.content),r.url,r.headers.get('content-type'),'COOKIES',s.cookies.get_dict())
+                  text=r.text
+                  ncid_m=re.search(r"var\s+ncid\s*=\s*['\"]([^'\"]+)",text)
+                  endpoint_m=re.search(r"var\s+newContentUrl\s*=\s*['\"]([^'\"]+)",text)
+                  print('NCID',ncid_m.group(1) if ncid_m else None,'ENDPOINT',endpoint_m.group(1) if endpoint_m else None)
+                  if not ncid_m: continue
+                  endpoint=urllib.parse.urljoin(r.url, endpoint_m.group(1) if endpoint_m else '/hiborweb/DocDetail/NewContent')
+                  headers={'Referer':r.url,'X-Requested-With':'XMLHttpRequest','Origin':'https://www.hibor.com.cn','Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'}
+                  for method in ['post','get']:
+                      try:
+                          if method=='post':
+                              x=s.post(endpoint,data={'ncid':ncid_m.group(1)},headers=headers,timeout=90,allow_redirects=True)
+                          else:
+                              x=s.get(endpoint,params={'ncid':ncid_m.group(1)},headers=headers,timeout=90,allow_redirects=True)
+                          print('CONTENT',method,x.status_code,len(x.content),x.url,x.headers.get('content-type'))
+                          body=x.text
+                          print('CONTENT_HEAD',body[:12000].replace('\n',' ')[:12000])
+                          for needle in ['viewUrl','downloadUrl','metaTitle','研报页数','股票名称','股票代码','报告原文','PDF','pdf','download','view','81532','600844','丹化科技']:
+                              hits=[m.start() for m in re.finditer(re.escape(needle),body,re.I)]
+                              if hits: print('NEEDLE',needle,'COUNT',len(hits))
+                              for p in hits[:15]: print('CTX',needle,body[max(0,p-600):p+2200].replace('\n',' ')[:2800])
+                          urls=set(re.findall(r'https?://[^\s"\'<>]+',body,re.I))
+                          urls.update(urllib.parse.urljoin(x.url,u) for u in re.findall(r"['\"](/[^'\"]*(?:view|download|pdf|file)[^'\"]*)['\"]",body,re.I))
+                          for u in sorted(urls):
+                              print('CANDIDATE_URL',u[:2000])
+                              try:
+                                  z=s.get(u,headers={'User-Agent':UA,'Referer':x.url,'Accept':'application/pdf,image/*,text/html,*/*'},timeout=60,allow_redirects=False)
+                                  print('URL_TEST',z.status_code,z.headers.get('content-type'),len(z.content),z.headers.get('location'),z.content[:12],u)
+                              except Exception as e: print('URL_ERR',u,repr(e))
+                      except Exception as e: print('CONTENT_ERR',method,repr(e))
+              except Exception as e: print('DOC_ERR',docid,repr(e))
+          PY
