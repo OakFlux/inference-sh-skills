@@ -20,7 +20,7 @@ jobs:
         run: python -m pip install --quiet requests pypdf pymupdf
 
       - name: Download, verify, and package reports
-        run: python .github/scripts/package_biyi_broker_reports.py
+        run: python .github/scripts/package_biyi_broker_reports_v2.py
 
       - name: Upload verified ZIP
         uses: actions/upload-artifact@v4
