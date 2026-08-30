@@ -1,0 +1,48 @@
+name: Temporary Wansheng CNINFO probe
+
+on:
+  push:
+    branches:
+      - tmp/download-wansheng-reports-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Query CNINFO APIs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, requests
+
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9'})
+          url='https://www.cninfo.com.cn/new/information/topSearch/query'
+          r=s.get(url,params={'keyWord':'603010','maxNum':20},headers={'Referer':'https://www.cninfo.com.cn/'},timeout=60)
+          print('top status',r.status_code,r.url)
+          print('top body',r.text[:10000])
+          r.raise_for_status()
+          data=r.json()
+          print('top json',json.dumps(data,ensure_ascii=False)[:20000])
+          org=None
+          for item in data:
+              if '603010' in str(item.get('code','')) or '万盛股份' in str(item):
+                  org=item.get('orgId')
+                  print('selected',item)
+                  break
+          if not org:
+              raise RuntimeError('orgId not found')
+
+          endpoint='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          variants=[]
+          for column in ['sse','szse']:
+            for category in ['category_bndbg_szsh;','']:
+              for searchkey in ['','2026年半年度报告']:
+                payload={'pageNum':1,'pageSize':100,'column':column,'tabName':'fulltext','plate':'sh','stock':f'603010,{org}','searchkey':searchkey,'secid':'','category':category,'trade':'','seDate':'2026-08-20~2026-08-30','sortName':'','sortType':'','isHLtitle':'true'}
+                rr=s.post(endpoint,data=payload,headers={'Referer':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=603010&orgId={org}','X-Requested-With':'XMLHttpRequest','Origin':'https://www.cninfo.com.cn'},timeout=90)
+                print('\nvariant',column,category,searchkey,'status',rr.status_code,'type',rr.headers.get('content-type'))
+                print(rr.text[:20000])
+          PY
