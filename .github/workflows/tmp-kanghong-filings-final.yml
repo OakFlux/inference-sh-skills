@@ -1,0 +1,420 @@
+name: Temporary Kanghong annual reports and latest quarterly report package
+
+on:
+  push:
+    branches:
+      - 'tmp/kanghong-filings-final-20260830'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Discover, download, validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/kanghong_filings.py <<'PY'
+          from __future__ import annotations
+
+          import concurrent.futures
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from dataclasses import dataclass
+          from datetime import datetime
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          SESSION = requests.Session()
+          SESSION.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept-Encoding': 'gzip, deflate',
+          })
+
+          @dataclass
+          class Filing:
+              title: str
+              date: str
+              source: str
+              url: str
+              art_code: str = ''
+              adjunct_url: str = ''
+
+          def clean_title(value: str) -> str:
+              value = html.unescape(re.sub(r'<[^>]+>', '', value or ''))
+              return re.sub(r'\s+', '', value)
+
+          def date_from_any(value: Any) -> str:
+              if value is None:
+                  return ''
+              if isinstance(value, (int, float)):
+                  # CNINFO uses milliseconds since epoch.
+                  number = float(value)
+                  if number > 10_000_000_000:
+                      number /= 1000.0
+                  try:
+                      return datetime.fromtimestamp(number).strftime('%Y-%m-%d')
+                  except Exception:
+                      return ''
+              text = str(value)
+              match = re.search(r'20\d{2}-\d{2}-\d{2}', text)
+              return match.group(0) if match else text[:10]
+
+          def query_cninfo(category: str) -> list[Filing]:
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              headers = {
+                  'User-Agent': UA,
+                  'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002773&orgId=9900024131',
+                  'X-Requested-With': 'XMLHttpRequest',
+                  'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                  'Accept': 'application/json, text/javascript, */*; q=0.01',
+              }
+              payload = {
+                  'pageNum': '1',
+                  'pageSize': '100',
+                  'column': 'szse',
+                  'tabName': 'fulltext',
+                  'plate': 'sz',
+                  'stock': '002773,康弘药业',
+                  'searchkey': '',
+                  'secid': '',
+                  'category': category,
+                  'trade': '',
+                  'seDate': '2020-01-01~2026-08-30',
+                  'sortName': '',
+                  'sortType': '',
+                  'isHLtitle': 'true',
+              }
+              # Establish cookies before the POST.
+              try:
+                  SESSION.get('https://www.cninfo.com.cn/new/index', headers=headers, timeout=45)
+              except Exception:
+                  pass
+              response = SESSION.post(endpoint, data=payload, headers=headers, timeout=90)
+              response.raise_for_status()
+              DIAG.joinpath(f'cninfo_{category.replace(";", "")}.json').write_bytes(response.content)
+              obj = response.json()
+              rows = obj.get('announcements') or []
+              result: list[Filing] = []
+              for row in rows:
+                  title = clean_title(str(row.get('announcementTitle') or ''))
+                  adjunct = str(row.get('adjunctUrl') or '')
+                  if not title or not adjunct:
+                      continue
+                  url = adjunct if adjunct.startswith('http') else 'https://static.cninfo.com.cn/' + adjunct.lstrip('/')
+                  result.append(Filing(
+                      title=title,
+                      date=date_from_any(row.get('announcementTime')),
+                      source='巨潮资讯',
+                      url=url,
+                      adjunct_url=adjunct,
+                  ))
+              return result
+
+          def fetch_eastmoney_page(page: int) -> list[dict[str, Any]]:
+              endpoint = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+              params = {
+                  'sr': '-1',
+                  'page_size': '100',
+                  'page_index': str(page),
+                  'ann_type': 'A',
+                  'client_source': 'web',
+                  'stock_list': '002773',
+              }
+              response = SESSION.get(
+                  endpoint,
+                  params=params,
+                  headers={'Referer': 'https://data.eastmoney.com/notices/stock/002773.html'},
+                  timeout=90,
+              )
+              response.raise_for_status()
+              DIAG.joinpath(f'eastmoney_page_{page}.json').write_bytes(response.content)
+              obj = response.json()
+              return (obj.get('data') or {}).get('list') or obj.get('list') or []
+
+          def query_eastmoney() -> list[Filing]:
+              rows: list[dict[str, Any]] = []
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                  futures = {pool.submit(fetch_eastmoney_page, page): page for page in range(1, 13)}
+                  for future in concurrent.futures.as_completed(futures):
+                      try:
+                          rows.extend(future.result())
+                      except Exception as exc:
+                          DIAG.joinpath(f'eastmoney_page_{futures[future]}_error.txt').write_text(repr(exc), encoding='utf-8')
+              seen: set[str] = set()
+              result: list[Filing] = []
+              for row in rows:
+                  art_code = str(row.get('art_code') or row.get('artCode') or '')
+                  if not art_code or art_code in seen:
+                      continue
+                  seen.add(art_code)
+                  title = clean_title(str(row.get('title') or row.get('notice_title') or ''))
+                  if not title:
+                      continue
+                  date = date_from_any(row.get('notice_date') or row.get('display_time'))
+                  stamp = int(time.time() * 1000)
+                  url = f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf?{stamp}.pdf'
+                  result.append(Filing(title=title, date=date, source='东方财富公告镜像', url=url, art_code=art_code))
+              return result
+
+          filings: list[Filing] = []
+          discovery_errors: list[str] = []
+          for category in ('category_ndbg_szsh;', 'category_yjdbg_szsh;'):
+              try:
+                  filings.extend(query_cninfo(category))
+              except Exception as exc:
+                  discovery_errors.append(f'CNINFO {category}: {exc!r}')
+          try:
+              filings.extend(query_eastmoney())
+          except Exception as exc:
+              discovery_errors.append(f'Eastmoney: {exc!r}')
+
+          DIAG.joinpath('discovery_errors.txt').write_text('\n'.join(discovery_errors), encoding='utf-8')
+          DIAG.joinpath('all_filings.json').write_text(
+              json.dumps([f.__dict__ for f in filings], ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          if not filings:
+              raise RuntimeError(f'No filing metadata discovered: {discovery_errors}')
+
+          def candidate_score(filing: Filing, year: int, kind: str) -> int:
+              title = clean_title(filing.title)
+              score = 0
+              if filing.source == '巨潮资讯':
+                  score += 120
+              if filing.date:
+                  score += 5
+              if kind == 'annual':
+                  if f'{year}年年度报告' not in title:
+                      return -10_000
+                  if any(term in title for term in ('摘要', '英文版', '取消', '审计报告', '社会责任报告', '董事会报告')):
+                      return -10_000
+                  if title.endswith('年度报告'):
+                      score += 350
+                  if '修订版' in title or '更新后' in title:
+                      score += 40
+                  # The full annual report is normally substantially longer than summaries.
+                  score += max(0, 80 - abs(len(title) - len(f'康弘药业：{year}年年度报告')))
+              else:
+                  if str(year) not in title or not any(term in title for term in ('第一季度报告', '一季度报告')):
+                      return -10_000
+                  if any(term in title for term in ('摘要', '英文版', '取消', '更正公告')):
+                      return -10_000
+                  if title.endswith('第一季度报告') or title.endswith('一季度报告'):
+                      score += 350
+              # Prefer later disclosure among duplicate/revised filings.
+              try:
+                  score += int(filing.date.replace('-', '')[-4:]) // 100
+              except Exception:
+                  pass
+              return score
+
+          expected = [(year, 'annual') for year in range(2020, 2026)] + [(2026, 'quarter')]
+          selected_meta: list[tuple[int, str, Filing]] = []
+          for year, kind in expected:
+              ranked = sorted(filings, key=lambda f: (candidate_score(f, year, kind), f.date), reverse=True)
+              if not ranked or candidate_score(ranked[0], year, kind) < 0:
+                  raise RuntimeError(f'Missing metadata for {year} {kind}. Available relevant titles: ' + '; '.join(
+                      f.title for f in filings if str(year) in f.title
+                  ))
+              selected_meta.append((year, kind, ranked[0]))
+
+          DIAG.joinpath('selected_metadata.json').write_text(
+              json.dumps([
+                  {'year': year, 'kind': kind, **filing.__dict__}
+                  for year, kind, filing in selected_meta
+              ], ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          def download_bytes(url: str, referer: str = '') -> tuple[bytes, str]:
+              headers = {
+                  'User-Agent': UA,
+                  'Accept': 'application/pdf,application/octet-stream,*/*',
+                  'Accept-Encoding': 'identity',
+              }
+              if referer:
+                  headers['Referer'] = referer
+              response = SESSION.get(url, headers=headers, timeout=240, allow_redirects=True)
+              response.raise_for_status()
+              raw = response.content
+              if len(raw) < 200_000 or not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(
+                      f'Invalid PDF from {url}: {len(raw)} bytes, '
+                      f'content-type={response.headers.get("content-type")}, head={raw[:20]!r}'
+                  )
+              return raw, response.url
+
+          def alternative_urls(filing: Filing) -> list[tuple[str, str]]:
+              choices = [(filing.url, filing.source)]
+              if filing.art_code:
+                  choices.extend([
+                      (f'https://pdf.dfcfw.com/pdf/H2_{filing.art_code}_1.pdf', '东方财富公告镜像'),
+                      (f'https://pdf.dfcfw.com/pdf/H2_{filing.art_code}_1.pdf?{filing.art_code}.pdf', '东方财富公告镜像'),
+                  ])
+              # Find equivalent metadata from the other source by normalized title.
+              normalized = clean_title(filing.title)
+              for other in filings:
+                  if clean_title(other.title) == normalized and other.url != filing.url:
+                      choices.append((other.url, other.source))
+                      if other.art_code:
+                          choices.append((f'https://pdf.dfcfw.com/pdf/H2_{other.art_code}_1.pdf', '东方财富公告镜像'))
+              dedup: list[tuple[str, str]] = []
+              seen_urls: set[str] = set()
+              for item in choices:
+                  if item[0] not in seen_urls:
+                      seen_urls.add(item[0]); dedup.append(item)
+              return dedup
+
+          downloaded: list[dict[str, Any]] = []
+          download_errors: list[dict[str, Any]] = []
+
+          for year, kind, filing in selected_meta:
+              accepted = False
+              errors: list[str] = []
+              for url, source_name in alternative_urls(filing):
+                  try:
+                      raw, final_url = download_bytes(
+                          url,
+                          'https://www.cninfo.com.cn/' if 'cninfo' in url else 'https://data.eastmoney.com/notices/stock/002773.html',
+                      )
+                      reader = PdfReader(BytesIO(raw), strict=False)
+                      pages = len(reader.pages)
+                      minimum_pages = 60 if kind == 'annual' else 8
+                      if pages < minimum_pages:
+                          raise RuntimeError(f'Only {pages} pages; expected at least {minimum_pages}')
+                      indexes = sorted(set(list(range(min(8, pages))) + [pages - 1]))
+                      sample = ''
+                      for idx in indexes:
+                          try:
+                              sample += ' ' + (reader.pages[idx].extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = re.sub(r'\s+', '', sample)
+                      if not any(term in compact for term in ('康弘药业', '002773', '成都康弘')):
+                          raise RuntimeError('Company identity not found in sampled pages')
+                      if str(year) not in compact:
+                          raise RuntimeError(f'Report year {year} not found in sampled pages')
+                      if kind == 'annual' and '年度报告' not in compact:
+                          raise RuntimeError('Annual report identity not found')
+                      if kind == 'quarter' and not any(term in compact for term in ('第一季度报告', '一季度报告')):
+                          raise RuntimeError('First-quarter report identity not found')
+
+                      digest = hashlib.sha256(raw).hexdigest()
+                      label = '年度报告' if kind == 'annual' else '第一季度报告'
+                      filename = f'{year}_康弘药业_{label}_{pages}页.pdf'
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+                      downloaded.append({
+                          'year': year,
+                          'kind': kind,
+                          'title': filing.title,
+                          'disclosure_date': filing.date,
+                          'filename': filename,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': digest,
+                          'source': source_name,
+                          'url': final_url,
+                      })
+                      print('OK', json.dumps(downloaded[-1], ensure_ascii=False))
+                      accepted = True
+                      break
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              if not accepted:
+                  download_errors.append({
+                      'year': year,
+                      'kind': kind,
+                      'title': filing.title,
+                      'errors': errors,
+                  })
+
+          DIAG.joinpath('downloaded.json').write_text(
+              json.dumps(downloaded, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          DIAG.joinpath('download_errors.json').write_text(
+              json.dumps(download_errors, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          if len(downloaded) != 7:
+              raise RuntimeError(f'Expected 7 reports, validated {len(downloaded)}; errors={download_errors}')
+
+          downloaded.sort(key=lambda x: (x['year'], x['kind']))
+          manifest = [
+              '康弘药业（002773）2020—2025年度报告及最新季度报告资料包',
+              '内容：2020、2021、2022、2023、2024、2025年度报告，以及截至2026年8月30日最新季度报告——2026年第一季度报告。',
+              '筛选规则：仅保留完整年度报告/季度报告，排除年度报告摘要、英文版、审计附件和更正公告。',
+              '所有PDF均已核验文件头、公司名称、报告年份、实际页数和SHA-256；ZIP已执行完整性测试。',
+              '资料仅供研究参考，请遵守原公告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(downloaded, 1):
+              manifest.extend([
+                  f'{index}. {item["title"]}',
+                  f'   报告期：{item["year"]}年' + ('年度' if item['kind'] == 'annual' else '第一季度'),
+                  f'   披露日期：{item["disclosure_date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   来源：{item["source"]}',
+                  f'   原始公告PDF：{item["url"]}',
+                  '',
+              ])
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = DIST / '康弘药业_2020-2025年报及2026年一季报_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_names}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/kanghong_filings.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghong-2020-2025-annual-reports-and-latest-quarterly
+          path: dist/康弘药业_2020-2025年报及2026年一季报_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghong-filings-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
