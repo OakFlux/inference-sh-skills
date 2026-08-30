@@ -1,0 +1,373 @@
+name: Temporary verified Nike broker research package
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-final-discovery.yml
+
+permissions:
+  contents: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install PDF and HTML utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip python3-bs4 python3-lxml
+
+      - name: Discover, download, validate and rank public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/pages work/pdfs work/text work/previews work/meta
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urlencode, quote, urljoin, urlparse, parse_qs
+          from html import unescape
+          import concurrent.futures, hashlib, json, os, re, subprocess, tempfile, time, urllib.request, xml.etree.ElementTree as ET
+          from bs4 import BeautifulSoup
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          W=Path('work'); PAGE=W/'pages'; PDF=W/'pdfs'; TEXT=W/'text'; PRE=W/'previews'; META=W/'meta'; OUT=Path('output')
+          for p in [PAGE,PDF,TEXT,PRE,META,OUT]: p.mkdir(parents=True,exist_ok=True)
+
+          keywords=['耐克','Nike','NIKE','NKE']
+          broker_words=['证券','中金','华泰','国金','国信','海通','招商','招银','中银','高盛','摩根','瑞银','瑞信','花旗','汇丰','美银','Jefferies','UBS','Goldman','Morgan Stanley','J.P. Morgan','JPMorgan','Citi','HSBC','BofA','Credit Suisse','Deutsche','Barclays','Bernstein','Evercore','Cowen','Wedbush','Morningstar','Mizuho','William Blair','Stifel','Oppenheimer','Piper Sandler','Needham']
+          deep_words=['深度','首次覆盖','首次评级','公司研究','公司深度','initiation','initiating coverage','company report','equity research','investment research','research report','coverage']
+
+          def curl(url:str,dest:Path,referer:str='https://www.bing.com/',timeout=180)->bool:
+              dest.parent.mkdir(parents=True,exist_ok=True)
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time',str(timeout),'-A',UA,'-e',referer,'-H','Accept-Encoding: identity',url,'-o',str(dest)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode:
+                  return False
+              return dest.exists() and dest.stat().st_size>0
+
+          seeds=[]
+          def add_seed(url, title='', source='', description='', metadata=None):
+              if not url or not str(url).startswith(('http://','https://')): return
+              seeds.append({'url':str(url).strip(),'title':title or '','source':source or '','description':description or '','metadata':metadata or {}})
+
+          # 1) Bing RSS and DuckDuckGo HTML, Chinese and English queries.
+          queries=[
+            '耐克 券商 深度报告 PDF',
+            '耐克 公司深度 研报 PDF',
+            '耐克 首次覆盖 券商 报告 pdf',
+            '耐克 海外公司研究 报告 pdf',
+            'Nike NKE equity research report PDF',
+            'Nike initiation coverage equity research PDF',
+            'Nike company report broker research PDF',
+            'Nike investment research report PDF NKE',
+            '耐克 华泰证券 研究报告 pdf',
+            '耐克 中金公司 研究报告 pdf',
+            '耐克 招银国际 研究报告 pdf',
+            '耐克 国金证券 研究报告 pdf',
+            '耐克 浦银国际 研究报告 pdf',
+            '耐克 海通国际 研究报告 pdf',
+            'site:pdf.dfcfw.com 耐克 Nike NKE',
+            'site:research-doc.credit-suisse.com Nike NKE pdf',
+            'site:research-doc.credit-suisse.com NKE equity research',
+            'site:doc.research-and-analytics.csfb.com Nike',
+            'site:hk-official.com Nike research pdf',
+            'site:irpages2.eqs.com Nike research pdf',
+            'site:sgpjbg.com 耐克 Nike',
+            'site:hangyan.co 耐克 Nike',
+            'site:fxbaogao.com 耐克 Nike',
+            'site:nxny.com/report 耐克 Nike',
+          ]
+          for qi,q in enumerate(queries,1):
+              # Bing RSS
+              rss='https://www.bing.com/search?'+urlencode({'q':q,'format':'rss','count':'50'})
+              p=PAGE/f'bing_{qi}.xml'
+              if curl(rss,p):
+                  try:
+                      root=ET.fromstring(p.read_bytes())
+                      for item in root.findall('.//item'):
+                          add_seed(item.findtext('link') or '',item.findtext('title') or '','bing',item.findtext('description') or '',{'query':q})
+                  except Exception: pass
+              # DuckDuckGo HTML
+              ddg='https://html.duckduckgo.com/html/?'+urlencode({'q':q})
+              p=PAGE/f'ddg_{qi}.html'
+              if curl(ddg,p,'https://duckduckgo.com/'):
+                  try:
+                      soup=BeautifulSoup(p.read_bytes(),'lxml')
+                      for a in soup.select('a.result__a'):
+                          href=a.get('href') or ''
+                          qs=parse_qs(urlparse(href).query)
+                          if 'uddg' in qs: href=qs['uddg'][0]
+                          add_seed(href,a.get_text(' ',strip=True),'duckduckgo','',{'query':q})
+                  except Exception: pass
+
+          # 2) Fxbaogao public search metadata.
+          fx_api='https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth'
+          fx_rows=[]
+          for kw in ['耐克','Nike','NKE','耐克公司','NIKE公司','运动鞋服耐克']:
+              for page in range(1,8):
+                  body=json.dumps({'keywords':kw,'pageIndex':page,'pageSize':100,'order':2,'nop':-1},ensure_ascii=False).encode('utf-8')
+                  req=urllib.request.Request(fx_api,data=body,headers={'User-Agent':UA,'Content-Type':'application/json'},method='POST')
+                  try: obj=json.loads(urllib.request.urlopen(req,timeout=120).read().decode('utf-8','replace'))
+                  except Exception: break
+                  rows=(obj.get('data') or {}).get('dataList') or []
+                  for r in rows:
+                      rr=dict(r); rr['_keyword']=kw; fx_rows.append(rr)
+                  if len(rows)<100: break
+          META.joinpath('fx_rows.json').write_text(json.dumps(fx_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          for r in fx_rows:
+              did=r.get('docId') or r.get('id')
+              title=str(r.get('title') or '')
+              for k in ['fileUrl','downloadUrl','url','pdfUrl']:
+                  if r.get(k): add_seed(r[k],title,'fxbaogao-api','',r)
+              if did:
+                  add_seed(f'https://www.fxbaogao.com/detail/{did}',title,'fxbaogao-detail','',r)
+                  add_seed(f'https://www.fxbaogao.com/detail/{did}?from=search',title,'fxbaogao-detail','',r)
+
+          # 3) Public report portals' result pages and Nike-tagged pages.
+          portal_urls=[
+              'https://www.fxbaogao.com/search?keyword='+quote('耐克'),
+              'https://www.fxbaogao.com/search?keyword='+quote('Nike'),
+              'https://www.sgpjbg.com.cn/search?keyword='+quote('耐克'),
+              'https://www.sgpjbg.com/search?keyword='+quote('Nike'),
+              'https://www.hangyan.co/search?keyword='+quote('耐克'),
+              'https://www.baogaobox.com/search?keyword='+quote('耐克'),
+              'https://www.reportify.cn/search?q='+quote('耐克'),
+              'https://www.nxny.com/?s='+quote('耐克'),
+              'https://www.nxny.com/?s='+quote('Nike'),
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?keyword='+quote('耐克'),
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?keyword='+quote('Nike'),
+          ]
+          for u in portal_urls: add_seed(u,'','portal-search')
+
+          # De-duplicate initial seeds.
+          seed_map={}
+          for s in seeds:
+              u=s['url'].split('#')[0]
+              if u not in seed_map or len(s.get('title',''))>len(seed_map[u].get('title','')): seed_map[u]=s
+          seeds=list(seed_map.values())
+          META.joinpath('initial_seeds.json').write_text(json.dumps(seeds,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Crawl pages and collect direct PDF URLs/AP codes, depth up to 2.
+          queue=[(s,0) for s in seeds]
+          visited=set(); pdf_candidates=[]; page_records=[]
+          max_pages=700
+          while queue and len(visited)<max_pages:
+              s,depth=queue.pop(0); url=s['url'].split('#')[0]
+              if url in visited: continue
+              visited.add(url)
+              idx=len(visited); dest=PAGE/f'page_{idx:04d}.bin'
+              if not curl(url,dest,s.get('url') or 'https://www.bing.com/',240): continue
+              body=dest.read_bytes(); magic=body[:8]
+              rec=dict(s); rec.update({'depth':depth,'size':len(body),'magic':magic.hex()}); page_records.append(rec)
+              if body[:4]==b'%PDF':
+                  pdf_candidates.append(dict(s, direct_url=url, discovered_from=url, discovery='seed-pdf'))
+                  continue
+              # Decode HTML/text.
+              text=None
+              for enc in ['utf-8','gb18030','gbk','latin1']:
+                  try: text=body.decode(enc); break
+                  except Exception: pass
+              if not text: continue
+              low=text.lower()
+              # AP/AS info codes can reconstruct public Eastmoney PDF URLs.
+              for code in sorted(set(re.findall(r'\b(?:AP|AS)\d{12,24}\b',text,re.I))):
+                  add=dict(s); add.update({'direct_url':f'https://pdf.dfcfw.com/pdf/H3_{code.upper()}_1.pdf','discovered_from':url,'discovery':'info-code'}); pdf_candidates.append(add)
+              # All literal PDF URLs/links.
+              found=[]
+              try:
+                  soup=BeautifulSoup(text,'lxml')
+                  for tag in soup.find_all(['a','iframe','embed','object','script','source']):
+                      for attr in ['href','src','data']:
+                          v=tag.get(attr)
+                          if v: found.append(urljoin(url,unescape(v)))
+                  # Capture metadata title/description.
+                  title=soup.title.get_text(' ',strip=True) if soup.title else ''
+              except Exception:
+                  title=''
+              for val in re.findall(r'''https?://[^\s"'<>]+|//[^\s"'<>]+|[^\s"'<>]+\.pdf(?:\?[^\s"'<>]*)?''',text,re.I):
+                  found.append(urljoin(url,unescape(val)))
+              # JS/JSON file URL fields.
+              for pat in [r'''(?:fileUrl|file_url|pdfUrl|pdf_url|downloadUrl|download_url|attachUrl|attachmentUrl)["']?\s*[:=]\s*["']([^"']+)["']''',r'''["']([^"']+\.pdf(?:\?[^"']*)?)["']''']:
+                  for val in re.findall(pat,text,re.I): found.append(urljoin(url,unescape(val)))
+              for link in found:
+                  link=link.replace('&amp;','&').strip('"\' );,')
+                  if not link.startswith(('http://','https://')): continue
+                  l=link.lower()
+                  title_blob=' '.join([s.get('title',''),s.get('description',''),title,text[:3000]])
+                  if '.pdf' in l or 'pdf.dfcfw.com' in l or '/download' in l and any(k.lower() in title_blob.lower() for k in keywords):
+                      pdf_candidates.append(dict(s,direct_url=link,discovered_from=url,discovery='html-link',page_title=title))
+                  elif depth<2 and any(dom in l for dom in ['fxbaogao.com','sgpjbg.com','hangyan.co','baogaobox.com','reportify.cn','nxny.com/report','finance.sina.com.cn/stock/go.php/vreport_show']) and link not in visited:
+                      blob=(s.get('title','')+' '+title+' '+link+' '+text[:5000]).lower()
+                      if any(k.lower() in blob for k in keywords):
+                          queue.append((dict(s,url=link,title=s.get('title') or title,source=s.get('source') or 'crawl'),depth+1))
+
+          META.joinpath('page_records.json').write_text(json.dumps(page_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          # De-duplicate candidate URLs.
+          cands={}
+          for c in pdf_candidates:
+              u=c.get('direct_url','').split('#')[0]
+              if u.startswith('//'): u='https:'+u
+              if not u.startswith(('http://','https://')): continue
+              c['direct_url']=u
+              if u not in cands or len(c.get('title',''))>len(cands[u].get('title','')): cands[u]=c
+          candidates=list(cands.values())
+          META.joinpath('pdf_candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Download and validate PDFs concurrently.
+          def inspect_candidate(item):
+              url=item['direct_url']
+              key=hashlib.sha1(url.encode()).hexdigest()[:16]
+              tmp=PDF/f'{key}.pdf'
+              if not curl(url,tmp,item.get('discovered_from') or 'https://www.bing.com/',600): return None
+              if tmp.stat().st_size<25000 or tmp.read_bytes()[:4]!=b'%PDF':
+                  tmp.unlink(missing_ok=True); return None
+              try:
+                  info=subprocess.check_output(['pdfinfo',str(tmp)],text=True,errors='replace',stderr=subprocess.STDOUT,timeout=90)
+                  m=re.search(r'^Pages:\s*(\d+)',info,re.M); pages=int(m.group(1)) if m else 0
+                  if pages<3 or pages>500: return None
+                  txt=TEXT/f'{key}.txt'
+                  subprocess.run(['pdftotext','-f','1','-l',str(min(pages,20)),str(tmp),str(txt)],check=False,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=180)
+                  text=txt.read_text(encoding='utf-8',errors='replace') if txt.exists() else ''
+                  compact=''.join(text.split())
+                  low=text.lower()
+                  nike_hit=('耐克' in compact or 'nike' in low or re.search(r'\bNKE\b',text,re.I))
+                  if not nike_hit: return None
+                  # A report must have a brokerage/research signature or source metadata strongly indicating one.
+                  meta_blob=' '.join([item.get('title',''),item.get('description',''),str(item.get('metadata','')),text[:8000]])
+                  broker_hits=[b for b in broker_words if b.lower() in meta_blob.lower()]
+                  research_hits=[d for d in deep_words if d.lower() in meta_blob.lower()]
+                  # reject obvious company filings, press articles, student work and annual reports
+                  reject=['annual report','form 10-k','10-k','10-q','年报','可持续发展报告','招股说明书','毕业论文','学位论文','课程论文']
+                  if any(x.lower() in meta_blob.lower() for x in reject) and not broker_hits: return None
+                  if not broker_hits and not research_hits and pages<10: return None
+                  # Extract probable date, broker, and title.
+                  date=''
+                  for pat in [r'20\d{2}[-/.年]\s*\d{1,2}[-/.月]\s*\d{1,2}',r'20\d{2}[-/.]\d{1,2}',r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},\s+20\d{2}\b']:
+                      mm=re.search(pat,text[:10000],re.I)
+                      if mm: date=mm.group(0); break
+                  broker=broker_hits[0] if broker_hits else (item.get('metadata') or {}).get('orgName','')
+                  title=item.get('title','').strip()
+                  # Prefer PDF first-page title lines if metadata is generic.
+                  lines=[' '.join(x.split()) for x in text[:12000].splitlines() if x.strip()]
+                  probable=[]
+                  for line in lines[:100]:
+                      if 6<=len(line)<=180 and any(k.lower() in line.lower() for k in keywords) and not re.fullmatch(r'[\d\W_]+',line):
+                          probable.append(line)
+                  if (not title or len(title)<6 or title.lower().startswith(('http','download'))) and probable: title=probable[0]
+                  score=0
+                  score += min(pages,80)
+                  score += 35 if any(d.lower() in meta_blob.lower() for d in ['深度','首次覆盖','首次评级','initiation','initiating coverage']) else 0
+                  score += 20 if broker_hits else 0
+                  score += 15 if pages>=15 else 0
+                  score += 10 if pages>=25 else 0
+                  score += 8 if any(str(y) in date for y in range(2020,2027)) else 0
+                  # Penalize broad industry pieces unless Nike appears frequently.
+                  nike_count=low.count('nike')+compact.count('耐克')+len(re.findall(r'\bNKE\b',text,re.I))
+                  if nike_count<3: score-=20
+                  if any(x in meta_blob.lower() for x in ['行业周报','行业点评','strategy report','macro report']): score-=20
+                  return dict(item,pages=pages,size_bytes=tmp.stat().st_size,sha256=hashlib.sha256(tmp.read_bytes()).hexdigest(),local=str(tmp),text_file=str(txt),broker=broker,title_extracted=title,date_extracted=date,broker_hits=broker_hits,research_hits=research_hits,nike_count=nike_count,score=score)
+              except Exception:
+                  return None
+
+          valid=[]
+          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+              futs=[ex.submit(inspect_candidate,c) for c in candidates]
+              for i,f in enumerate(concurrent.futures.as_completed(futs),1):
+                  try:
+                      r=f.result()
+                      if r: valid.append(r)
+                  except Exception: pass
+          # SHA de-duplicate and sort.
+          by_sha={}
+          for r in valid:
+              sh=r['sha256']
+              if sh not in by_sha or r['score']>by_sha[sh]['score']: by_sha[sh]=r
+          valid=list(by_sha.values())
+          valid.sort(key=lambda r:(r['score'],r['pages'],r.get('date_extracted','')),reverse=True)
+          META.joinpath('valid_candidates.json').write_text(json.dumps(valid,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Select up to 3: prefer distinct brokers and company-focused reports.
+          selected=[]; used_brokers=set()
+          for r in valid:
+              b=(r.get('broker') or '').strip().lower()
+              focus=('深度' in (r.get('title_extracted') or '') or '首次' in (r.get('title_extracted') or '') or any(x in ' '.join(r.get('research_hits') or []).lower() for x in ['initiation','company report','equity research']))
+              if len(selected)<2 and not focus and r['pages']<10: continue
+              if b and b in used_brokers and len(valid)>len(selected)+1: continue
+              selected.append(r)
+              if b: used_brokers.add(b)
+              if len(selected)==3: break
+          if len(selected)<3:
+              for r in valid:
+                  if r in selected: continue
+                  selected.append(r)
+                  if len(selected)==3: break
+
+          if len(selected)<2:
+              # Always publish diagnostics so the caller can inspect an honest failure.
+              META.joinpath('selection_failure.txt').write_text(f'Only {len(selected)} valid public PDF(s) found.\n',encoding='utf-8')
+              raise SystemExit(22)
+
+          final=[]
+          for i,r in enumerate(selected,1):
+              broker=re.sub(r'[^A-Za-z0-9]+','_',r.get('broker') or 'Broker').strip('_') or 'Broker'
+              date=re.sub(r'[^0-9]+','',r.get('date_extracted') or '')[:8] or 'Undated'
+              name=f'{i:02d}_Nike_{broker}_{date}_{r["pages"]}p.pdf'
+              dest=OUT/name
+              Path(r['local']).replace(dest)
+              # Render first and last pages.
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','100',str(dest),str(PRE/f'{i:02d}_first')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              subprocess.run(['pdftoppm','-f',str(r['pages']),'-singlefile','-png','-r','100',str(dest),str(PRE/f'{i:02d}_last')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              rr=dict(r); rr['filename']=name; rr.pop('local',None); rr.pop('text_file',None); final.append(rr)
+
+          manifest={'company':'Nike, Inc.','ticker':'NKE','count':len(final),'reports':final}
+          OUT.joinpath('manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          with OUT.joinpath('报告清单与核验说明.txt').open('w',encoding='utf-8') as f:
+              f.write(f'Nike, Inc.（NKE）券商研究报告，共{len(final)}份\n\n')
+              for i,r in enumerate(final,1):
+                  f.write(f'{i}. {r.get("broker") or "券商/研究机构"}，{r.get("date_extracted") or "日期见原报告"}，{r["pages"]}页\n')
+                  f.write(f'   《{r.get("title_extracted") or r.get("title") or "Nike研究报告"}》\n')
+                  f.write(f'   公开来源：{r.get("direct_url")}\n\n')
+              f.write('以上均为原始PDF，已核验PDF文件头、实际页数、Nike/耐克/NKE正文命中，并完成首页和末页渲染。\n')
+              f.write('仅供研究资料整理，不构成投资建议。\n')
+          with OUT.joinpath('SHA256SUMS.txt').open('w',encoding='utf-8') as f:
+              for r in final: f.write(f'{r["sha256"]}  {r["filename"]}\n')
+          print(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Package successful result or diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ls output/*.pdf >/dev/null 2>&1; then
+            (cd output && zip -q -9 Nike_Broker_Research_Reports_Verified.zip ./*.pdf ./manifest.json ./报告清单与核验说明.txt ./SHA256SUMS.txt)
+            unzip -t output/Nike_Broker_Research_Reports_Verified.zip
+          else
+            (cd work && zip -q -9 ../output/Nike_Report_Discovery_Diagnostics.zip meta/* pages/* 2>/dev/null || true)
+          fi
+          ls -lh output work/meta work/previews | head -200
+
+      - name: Publish deterministic temporary release
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='tmp-nike-broker-reports-20260830'
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          git init -q temp-repo
+          cd temp-repo
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git commit --allow-empty -m 'temporary Nike broker reports' >/dev/null
+          git tag "$TAG"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin "$TAG" --force >/dev/null
+          cd ..
+          gh release create "$TAG" output/* --repo "$GITHUB_REPOSITORY" \
+            --title 'Temporary verified Nike broker reports' \
+            --notes 'Temporary downloadable assets; safe to delete.'
