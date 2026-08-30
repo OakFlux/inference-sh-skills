@@ -1,0 +1,243 @@
+name: Temporary Jiejie Micro final broker deep reports package
+
+on:
+  push:
+    branches:
+      - 'tmp/jiejie-micro-final-20260830'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/jiejie_final.py <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          candidates = [
+              {
+                  'priority': 1,
+                  'infoCode': 'AP202303151584283375',
+                  'date': '2023-03-15',
+                  'broker': '国金证券',
+                  'title': '晶闸管龙头，8寸线及车规级产品驱动新成长',
+                  'min_pages': 18,
+              },
+              {
+                  'priority': 2,
+                  'infoCode': 'AP202307171592336378',
+                  'date': '2023-07-17',
+                  'broker': '中邮证券',
+                  'title': '多线布局车规、新能源领域，成长可期',
+                  'min_pages': 16,
+              },
+              {
+                  'priority': 3,
+                  'infoCode': 'AP202009201415171073',
+                  'date': '2020-09-21',
+                  'broker': '开源证券',
+                  'title': '公司首次覆盖报告：新品产能扩张，受益国产替代',
+                  'min_pages': 18,
+              },
+              {
+                  'priority': 4,
+                  'infoCode': 'AP201912151371853752',
+                  'date': '2019-12-15',
+                  'broker': '新时代证券',
+                  'title': '首次覆盖报告：国内晶闸管龙头，布局MOSFET和IGBT新赛道',
+                  'min_pages': 18,
+              },
+              {
+                  'priority': 5,
+                  'infoCode': 'AP201905241331940232',
+                  'date': '2019-05-24',
+                  'broker': '国元证券',
+                  'title': '首次覆盖报告：国内晶闸管领航者，半导体业务稳步成长',
+                  'min_pages': 18,
+              },
+          ]
+
+          def safe(value: str, limit: int = 90) -> str:
+              value = re.sub(r'[\\/:*?"<>|\r\n]+', '_', value)
+              value = re.sub(r'\s+', '', value).strip(' ._')
+              return (value or '报告')[:limit]
+
+          def fetch_one(item: dict) -> tuple[dict | None, dict | None]:
+              info_code = item['infoCode']
+              temp = DIST / f'_candidate_{info_code}.pdf'
+              stamp = int(time.time() * 1000)
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf?{stamp}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf?{info_code}.pdf',
+              ]
+              errors = []
+              for url in urls:
+                  temp.unlink(missing_ok=True)
+                  process = subprocess.run([
+                      'curl', '--http1.1', '--location', '--fail', '--silent', '--show-error',
+                      '--retry', '5', '--retry-all-errors', '--retry-delay', '1',
+                      '--connect-timeout', '20', '--max-time', '240',
+                      '--user-agent', UA,
+                      '--referer', f'https://data.eastmoney.com/report/info/{info_code}.html',
+                      '--header', 'Accept-Encoding: identity',
+                      '--header', 'Accept: application/pdf,application/octet-stream,*/*',
+                      '--output', str(temp), url,
+                  ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  if process.returncode != 0:
+                      errors.append(f'{url}: {process.stderr[-1200:]}')
+                      continue
+                  try:
+                      raw = temp.read_bytes()
+                      if len(raw) < 170_000 or not raw.startswith(b'%PDF-'):
+                          raise RuntimeError(f'invalid or too small PDF: {len(raw)} bytes')
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < item['min_pages']:
+                          raise RuntimeError(f'only {pages} pages')
+                      sample = ''
+                      sample_indexes = list(range(min(10, pages)))
+                      if pages > 10:
+                          sample_indexes.append(pages - 1)
+                      for idx in sample_indexes:
+                          try:
+                              sample += ' ' + (reader.pages[idx].extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = re.sub(r'\s+', '', sample)
+                      if '捷捷微电' not in compact and '300623' not in compact:
+                          raise RuntimeError('company identity not found in sampled pages')
+                      digest = hashlib.sha256(raw).hexdigest()
+                      filename = (
+                          f'{item["date"]}_{safe(item["broker"],20)}_'
+                          f'{safe(item["title"])}_{pages}页.pdf'
+                      )
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+                      return ({
+                          **item,
+                          'filename': filename,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': digest,
+                          'url': url,
+                      }, None)
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+                  finally:
+                      temp.unlink(missing_ok=True)
+              return (None, {**item, 'errors': errors})
+
+          results = []
+          failures = []
+          with ThreadPoolExecutor(max_workers=5) as pool:
+              future_map = {pool.submit(fetch_one, item): item for item in candidates}
+              for future in as_completed(future_map):
+                  result, failure = future.result()
+                  if result:
+                      results.append(result)
+                      print('OK', json.dumps(result, ensure_ascii=False))
+                  if failure:
+                      failures.append(failure)
+
+          results.sort(key=lambda x: x['priority'])
+          selected = results[:3]
+          keep = {item['filename'] for item in selected}
+          for path in REPORTS.glob('*.pdf'):
+              if path.name not in keep:
+                  path.unlink()
+
+          DIAG.joinpath('results.json').write_text(
+              json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          DIAG.joinpath('failures.json').write_text(
+              json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} validated complete reports downloaded')
+
+          manifest = [
+              '捷捷微电（300623）券商深度报告资料包',
+              '筛选规则：优先公司深度、首次覆盖及长篇专题研究；排除短篇季报、年报和事件点评。',
+              '所有PDF均已核验文件头、实际页数、公司名称和SHA-256。',
+              '资料仅供研究参考，请遵守原报告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(selected, 1):
+              manifest += [
+                  f'{index}. {item["title"]}',
+                  f'   券商：{item["broker"]}',
+                  f'   日期：{item["date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   公开来源：{item["url"]}',
+                  '',
+              ]
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text(
+              '\n'.join(manifest), encoding='utf-8'
+          )
+
+          final_zip = DIST / f'捷捷微电_券商深度报告_{len(selected)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(selected):
+                  raise RuntimeError(f'PDF count mismatch: {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          print('SELECTED', json.dumps(selected, ensure_ascii=False))
+          PY
+          python /tmp/jiejie_final.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiejie-micro-final-original-deep-reports
+          path: dist/捷捷微电_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiejie-micro-final-results
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
