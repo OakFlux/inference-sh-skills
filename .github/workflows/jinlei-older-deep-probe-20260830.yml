@@ -1,0 +1,128 @@
+name: Probe older full Jinlei deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jinlei-older-deep-probe-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet pypdf pillow img2pdf
+      - name: Search and reconstruct only complete public reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, re, time, zipfile
+          from pathlib import Path
+          import img2pdf, requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          out=Path('jinlei_older_deep'); out.mkdir(exist_ok=True)
+          work=Path('_older_pages'); work.mkdir(exist_ok=True)
+          s=requests.Session(); ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          h={'User-Agent':ua,'Accept':'application/json, text/plain, */*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','Device':'1','X-Token':''}
+          queries=[
+            '全球风机锻造主轴领军者 进军铸件迎战新局',
+            '金雷股份 全球风机锻造主轴领军者',
+            '全球风电锻造主轴龙头 铸造布局打开远期空间',
+            '金雷股份 铸造布局打开远期空间',
+            '全球风电主轴龙头 大型化铸造产能放量在即',
+            '金雷股份 大型化铸造产能放量在即',
+          ]
+          rows=[]; seen=set()
+          for q in queries:
+            for page in (1,2,3):
+              body={'keyword':q,'page':page,'pageSize':100,'opFrom':1}
+              try:
+                r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=body,timeout=(20,90))
+                print('SEARCH',q,page,r.status_code,len(r.content),flush=True)
+                if r.status_code!=200: continue
+                obj=r.json()
+              except Exception as e:
+                print('ERROR',q,page,repr(e),flush=True); continue
+              data=obj.get('data') if isinstance(obj,dict) else None
+              files=data.get('files') if isinstance(data,dict) else []
+              if not isinstance(files,list): continue
+              for x in files:
+                blob=json.dumps(x,ensure_ascii=False,default=str)
+                stock=x.get('stock') if isinstance(x.get('stock'),dict) else {}
+                if '金雷股份' not in blob and '金雷科技' not in blob and str(stock.get('code') or '')!='300443': continue
+                key=str(x.get('id') or x.get('data_source_uuid') or blob)
+                if key in seen: continue
+                seen.add(key); rows.append(x)
+                print('MATCH',json.dumps({k:x.get(k) for k in ('id','name','time_text','page_count','data_source_uuid','page_url','file_size','organization','type','stock')},ensure_ascii=False),flush=True)
+          (out/'metadata.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          records=[]
+          def safe(v): return re.sub(r'[\\/:*?"<>|\s]+','_',str(v)).strip('_')[:100]
+          def sha(b): return hashlib.sha256(b).hexdigest()
+          for x in rows:
+            title=str(x.get('name') or '')
+            if '深度' not in title and not any(t in title for t in ('领军者','龙头','远期空间','产能放量在即')): continue
+            try: expected=int(x.get('page_count') or 0)
+            except: expected=0
+            org=(x.get('organization') or {}).get('name') if isinstance(x.get('organization'),dict) else ''
+            date=str(x.get('time_text') or '')[:10]
+            uuid=str(x.get('data_source_uuid') or '')
+            # Try direct Eastmoney original when an AP code is available.
+            if uuid.startswith('AP'):
+              for pref in ('H3','H2'):
+                u=f'https://pdf.dfcfw.com/pdf/{pref}_{uuid}_1.pdf'
+                try:
+                  r=s.get(u,headers={'User-Agent':ua,'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*;q=0.8'},timeout=(20,180))
+                  print('PDF',u,r.status_code,len(r.content),flush=True)
+                  if r.status_code==200 and r.content.startswith(b'%PDF-'):
+                    p=work/'probe.pdf'; p.write_bytes(r.content); reader=PdfReader(str(p)); n=len(reader.pages); text='\n'.join((pg.extract_text() or '') for pg in reader.pages[:6]); p.unlink(missing_ok=True)
+                    if n>=15 and ('金雷股份' in text or '金雷科技' in text or '300443' in text):
+                      fn=f"{safe(org)}_{safe(title)}_{safe(date)}_{n}页.pdf"; (out/fn).write_bytes(r.content)
+                      records.append({'organization':org,'title':title,'date':date,'pages':n,'filename':fn,'source_url':u,'source_format':'公开原始PDF','sha256':sha(r.content)})
+                      break
+                except Exception as e: print('PDFERR',u,repr(e),flush=True)
+              if any(z['title']==title for z in records): continue
+            page_url=str(x.get('page_url') or '')
+            if not page_url or expected<15 or expected>100: continue
+            d=work/hashlib.sha256(page_url.encode()).hexdigest()[:16]; d.mkdir(exist_ok=True)
+            imgs=[]; complete=True
+            for i in range(expected):
+              u=f'{page_url}/{i}.png'
+              try:
+                r=s.get(u,headers={'User-Agent':ua,'Referer':'https://www.sdyanbao.com/','Accept':'image/png,image/*;q=0.9,*/*;q=0.7'},timeout=(12,45))
+              except Exception: complete=False; break
+              print('IMG',title[:20],i,r.status_code,len(r.content),flush=True)
+              if r.status_code!=200 or not r.content.startswith(b'\x89PNG'): complete=False; break
+              p=d/f'{i:03d}.png'; p.write_bytes(r.content)
+              try:
+                with Image.open(io.BytesIO(r.content)) as im: im.verify()
+                with Image.open(p) as im: w,hgt=im.size
+              except Exception: complete=False; break
+              if w<700 or hgt<900: complete=False; break
+              imgs.append(p)
+            if not complete or len(imgs)!=expected:
+              print('INCOMPLETE',title,'expected',expected,'got',len(imgs),flush=True); continue
+            pdf=img2pdf.convert([str(p) for p in imgs]); fn=f"{safe(org)}_{safe(title)}_{safe(date)}_{expected}页_逐页原图.pdf"; (out/fn).write_bytes(pdf)
+            if len(PdfReader(str(out/fn)).pages)!=expected: (out/fn).unlink(); continue
+            records.append({'organization':org,'title':title,'date':date,'pages':expected,'filename':fn,'source_url':page_url,'source_format':'公开完整逐页原图合成为PDF；页面内容和顺序未改动','sha256':sha(pdf)})
+          (out/'records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          with zipfile.ZipFile('金雷股份_更早深度报告_完整公开候选.zip','w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+            for p in sorted(out.iterdir()): z.write(p,arcname=p.name)
+          print('FINAL_RECORDS',json.dumps(records,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload probe output
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinlei-older-deep-probe
+          path: |
+            jinlei_older_deep/
+            金雷股份_更早深度报告_完整公开候选.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
