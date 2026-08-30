@@ -1,0 +1,148 @@
+name: Temporary Nike Sdyanbao asset inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-sdyanbao-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect report pages, scripts, and download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages scripts assets diagnostics
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import hashlib,json,re,subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          reports=[
+              {'id':'919996','label':'SWHY_Nike_2025Q2','url':'https://www.sdyanbao.com/detail/919996'},
+              {'id':'939092','label':'SWHY_Nike_2025Q3','url':'https://www.sdyanbao.com/detail/939092'},
+              {'id':'898496','label':'Changjiang_Nike_FY2025Q4','url':'https://www.sdyanbao.com/detail/898496'},
+          ]
+          manifest=[]; script_urls=[]; asset_urls=[]
+          for report in reports:
+              out=Path('pages')/(report['label']+'.bin')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors',
+                   '--connect-timeout','20','--max-time','240','--compressed','-A',UA,'-e','https://www.sdyanbao.com/',
+                   '-H','Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                   '-H','Accept-Language: zh-CN,zh;q=0.9,en;q=0.8',report['url'],'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',report['id'],'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'ERR',p.stderr[-500:])
+              if p.returncode or not out.exists():
+                  manifest.append({**report,'error':p.stderr[-1000:]}); continue
+              b=out.read_bytes(); text=None; enc=None
+              for e in ['utf-8','gb18030','gbk','latin1']:
+                  try:text=b.decode(e);enc=e;break
+                  except Exception:pass
+              if text is None: continue
+              html=out.with_suffix('.html'); out.unlink(); html.write_text(text,encoding='utf-8')
+              title=''; m=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              if m:title=' '.join(re.sub(r'<[^>]+>',' ',m.group(1)).split())
+              print('TITLE',report['id'],title)
+              scripts=[]
+              for s in re.findall(r'''<script[^>]+src=["']([^"']+)["']''',text,re.I):
+                  full=urljoin(report['url'],s.replace('&amp;','&'))
+                  if full not in scripts:scripts.append(full)
+                  if full not in script_urls:script_urls.append(full)
+              found=[]
+              pats=[
+                  r'''(?:href|src|data-src|data-original|data-url|url|file|pdf|pdfurl|downloadurl|previewurl|imgurl|imageurl)\s*[:=]\s*["']([^"']+)["']''',
+                  r'''https?://[^\s"'<>]+''',
+                  r'''//[^\s"'<>]+''',
+                  r'''[^\s"'<>]+\.(?:pdf|png|jpg|jpeg|webp)(?:\?[^\s"'<>]*)?''',
+              ]
+              for pat in pats:
+                  for v in re.findall(pat,text,re.I):
+                      if isinstance(v,tuple):v=v[0]
+                      v=v.replace('\\/','/').replace('&amp;','&').strip()
+                      if not v or v.startswith(('javascript:','#','data:')):continue
+                      try:full=urljoin(report['url'],v)
+                      except Exception:continue
+                      if full not in found:found.append(full)
+              interesting=[u for u in found if any(k in u.lower() for k in ['919996','939092','898496','pdf','download','preview','viewer','image','file','report','page','attach','oss','cos'])]
+              for u in interesting:
+                  print('PAGE_URL',report['id'],u[:2200])
+                  if u not in asset_urls:asset_urls.append(u)
+              for n,line in enumerate(text.splitlines(),1):
+                  low=line.lower()
+                  if any(k in low for k in ['919996','939092','898496','download','pdf','preview','pagecount','pagenum','fileurl','pdfurl','docid','reportid','imgurl','imageurl','oss','cos']):
+                      snip=' '.join(re.sub(r'<[^>]+>',' ',line).split())
+                      if snip:print('PAGE_LINE',report['id'],n,snip[:3500])
+              manifest.append({**report,'encoding':enc,'title':title,'size':len(b),'scripts':scripts,'interesting':interesting})
+
+          # Fetch scripts.
+          for i,u in enumerate(script_urls,1):
+              out=Path('scripts')/f'{i:03d}.js'
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors',
+                   '--connect-timeout','20','--max-time','180','-A',UA,'-e','https://www.sdyanbao.com/',
+                   '-H','Accept-Encoding: identity',u,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('SCRIPT',i,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'URL',u,'ERR',p.stderr[-200:])
+              if p.returncode:out.unlink(missing_ok=True)
+          # Search scripts for APIs and file paths.
+          for p in Path('scripts').glob('*.js'):
+              text=p.read_text(encoding='utf-8',errors='ignore')
+              for n,line in enumerate(text.splitlines(),1):
+                  low=line.lower()
+                  if any(k in low for k in ['download','pdf','fileurl','preview','detail/','reportid','docid','pagecount','pagenum','oss','cos','api/']):
+                      print('SCRIPT_LINE',p.name,n,line[:4000])
+              for v in re.findall(r'''https?://[^\s"'<>]+|//[^\s"'<>]+|/[A-Za-z0-9_./?=&-]*(?:download|pdf|file|preview|report|detail|api)[A-Za-z0-9_./?=&-]*''',text,re.I):
+                  full=urljoin('https://www.sdyanbao.com/',v.replace('\\/','/'))
+                  if full not in asset_urls:asset_urls.append(full)
+          Path('diagnostics/manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/script_urls.txt').write_text('\n'.join(script_urls)+'\n',encoding='utf-8')
+          Path('diagnostics/asset_urls.txt').write_text('\n'.join(asset_urls)+'\n',encoding='utf-8')
+
+          # Probe likely asset/API URLs. Only retain PDFs/images/JSON responses relevant to the three IDs.
+          probe_results=[]
+          for i,u in enumerate(asset_urls[:2000],1):
+              if not any(k in u.lower() for k in ['919996','939092','898496','download','pdf','preview','file','image','report','page','api']):continue
+              out=Path('assets')/f'{i:04d}.bin'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','3','--retry-all-errors',
+                   '--connect-timeout','15','--max-time','120','-A',UA,'-e','https://www.sdyanbao.com/',
+                   '-H','Accept: application/pdf,application/json,image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8',
+                   '-H','Accept-Encoding: identity',u,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode or not out.exists():
+                  out.unlink(missing_ok=True);probe_results.append({'url':u,'ok':False,'error':p.stderr[-300:]});continue
+              b=out.read_bytes();kind='other';ext='.bin'
+              if b[:4]==b'%PDF':kind='pdf';ext='.pdf'
+              elif b[:8]==b'\x89PNG\r\n\x1a\n':kind='png';ext='.png'
+              elif b[:3]==b'\xff\xd8\xff':kind='jpg';ext='.jpg'
+              elif b[:4]==b'RIFF' and b[8:12]==b'WEBP':kind='webp';ext='.webp'
+              elif b[:1] in [b'{',b'[']:kind='json';ext='.json'
+              elif b[:15].lstrip().startswith(b'<!DOCTYPE') or b[:6].lower().startswith(b'<html'):kind='html';ext='.html'
+              if kind in ['pdf','png','jpg','webp','json'] and len(b)>200:
+                  final=out.with_suffix(ext);out.rename(final)
+                  rec={'url':u,'ok':True,'kind':kind,'size':len(b),'file':str(final),'sha256':hashlib.sha256(b).hexdigest()}
+                  print('ASSET',i,kind,len(b),u);probe_results.append(rec)
+              else:
+                  preview=b[:400].decode('utf-8','replace');out.unlink(missing_ok=True)
+                  probe_results.append({'url':u,'ok':False,'kind':kind,'size':len(b),'preview':preview})
+          Path('diagnostics/probe_results.json').write_text(json.dumps(probe_results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          find pages scripts assets diagnostics -type f -printf '%p\t%s\n' | sort | tail -150
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-sdyanbao-inspection
+          path: |
+            pages/
+            scripts/
+            assets/
+            diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
