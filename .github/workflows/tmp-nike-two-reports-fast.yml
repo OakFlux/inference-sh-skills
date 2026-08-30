@@ -1,0 +1,102 @@
+name: Temporary fast recovery of two Nike broker reports
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-two-reports-fast.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Recover two complete sequential page sets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages diagnostics
+          python3 - <<'PY'
+          from __future__ import annotations
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          import hashlib, json, subprocess, time
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          docs=[
+            {'id':'4742006','date':'2025/03/23','label':'Nike_FY2025Q3_Guosheng'},
+            {'id':'4924081','date':'2025/06/29','label':'Nike_FY2025Q4_Guosheng'},
+            {'id':'5083891','date':'2025/10/08','label':'Nike_FY2026Q1_Guosheng'},
+          ]
+          root=Path('pages')
+
+          def fetch_one(doc,page):
+              base=f"https://public.fxbaogao.com/report-image/{doc['date']}/{doc['id']}-{page}.png"
+              url=base+'?x-oss-process=image/quality,q_100'
+              out=root/doc['label']/f'{page:03d}.png'; out.parent.mkdir(parents=True,exist_ok=True)
+              errors=[]
+              for attempt in range(1,4):
+                  cmd=['curl','--http1.1','-L','--silent','--show-error','--connect-timeout','12','--max-time','45',
+                       '-A',UA,'-e',f"https://www.fxbaogao.com/detail/{doc['id']}",
+                       '-H','Accept: image/avif,image/webp,image/png,image/*,*/*;q=0.8',
+                       '-H','Accept-Encoding: identity',url,'-o',str(out)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if p.returncode==0 and out.exists():
+                      b=out.read_bytes()
+                      if b[:8]==b'\x89PNG\r\n\x1a\n' and len(b)>5000:
+                          return {'page':page,'ok':True,'file':str(out),'url':url,'size':len(b),
+                                  'sha256':hashlib.sha256(b).hexdigest(),'attempt':attempt}
+                      errors.append(f'invalid {len(b)} {b[:16]!r}')
+                  else:
+                      errors.append(p.stderr[-180:])
+                  out.unlink(missing_ok=True)
+                  time.sleep(0.4*attempt)
+              return {'page':page,'ok':False,'url':url,'errors':errors}
+
+          def recover_doc(doc):
+              results=[]
+              consecutive_fail=0
+              for page in range(1,41):
+                  result=fetch_one(doc,page)
+                  results.append(result)
+                  print('PAGE',doc['id'],page,'OK' if result['ok'] else 'FAIL',result.get('size'),result.get('errors',[''])[-1][:120])
+                  if result['ok']:
+                      consecutive_fail=0
+                  else:
+                      consecutive_fail += 1
+                      if page>1 and consecutive_fail>=2:
+                          break
+              good=[r for r in results if r['ok']]
+              contiguous=0
+              for p in range(1,max([r['page'] for r in good],default=0)+1):
+                  if any(r['page']==p for r in good): contiguous=p
+                  else: break
+              for r in good:
+                  if r['page']>contiguous:
+                      Path(r['file']).unlink(missing_ok=True)
+              selected=[r for r in good if r['page']<=contiguous]
+              return {'doc':doc,'contiguous_pages':contiguous,'selected':selected,'results':results}
+
+          manifests=[]
+          with ThreadPoolExecutor(max_workers=3) as ex:
+              futures={ex.submit(recover_doc,d):d for d in docs}
+              for f in as_completed(futures):
+                  m=f.result(); manifests.append(m)
+                  print('COMPLETE',m['doc']['id'],'PAGES',m['contiguous_pages'])
+          manifests.sort(key=lambda m:m['doc']['id'])
+          Path('diagnostics/manifest.json').write_text(json.dumps(manifests,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          find pages -type f -printf '%p\t%s\n' | sort
+
+      - name: Upload recovered page sets
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-three-focused-reports-pages
+          path: |
+            pages/
+            diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
