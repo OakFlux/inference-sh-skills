@@ -1,0 +1,379 @@
+name: Temporary Wansheng report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-wansheng-reports-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  download-and-verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf zip
+
+      - name: Download, verify and package original reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          import urllib.parse
+          import zipfile
+          from pathlib import Path
+
+          import requests
+
+          STOCK = "603010"
+          COMPANY_PATTERNS = ("万盛股份", "浙江万盛股份有限公司")
+          PACKAGE_DIR = Path("万盛股份_2020-2025年报及最新季报")
+          PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEWS = Path("previews")
+          PREVIEWS.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+              "Accept": "text/html,application/xhtml+xml,application/json,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+          })
+
+          def decode_response(resp: requests.Response) -> str:
+              raw = resp.content
+              for encoding in ("utf-8", "gb18030", "gbk"):
+                  try:
+                      text = raw.decode(encoding)
+                  except UnicodeDecodeError:
+                      continue
+                  if "万盛" in text or "年度报告" in text or "半年度报告" in text:
+                      return text
+              return raw.decode("utf-8", errors="replace")
+
+          def strip_tags(value: str) -> str:
+              value = re.sub(r"<[^>]+>", "", value, flags=re.S)
+              return html.unescape(value).replace("\xa0", " ").strip()
+
+          def get_text(url: str, referer: str | None = None) -> str:
+              headers = {"Referer": referer} if referer else None
+              resp = session.get(url, headers=headers, timeout=90)
+              resp.raise_for_status()
+              return decode_response(resp)
+
+          def parse_sina_list(url: str) -> list[tuple[str, str]]:
+              text = get_text(url, "https://money.finance.sina.com.cn/")
+              items: list[tuple[str, str]] = []
+              pattern = re.compile(
+                  r'<a[^>]+href=["\']([^"\']*vCB_AllBulletinDetail\.php[^"\']+)["\'][^>]*>(.*?)</a>',
+                  flags=re.I | re.S,
+              )
+              for href, title_html in pattern.findall(text):
+                  title = strip_tags(title_html)
+                  if not title:
+                      continue
+                  href = html.unescape(href)
+                  href = urllib.parse.urljoin("https://money.finance.sina.com.cn/corp/view/", href)
+                  items.append((title, href))
+              print(f"Sina list {url}: {len(items)} detail links")
+              return items
+
+          def parse_sina_pdf(detail_url: str) -> str | None:
+              text = get_text(detail_url, "https://money.finance.sina.com.cn/")
+              text = html.unescape(text).replace("\\/", "/")
+              patterns = [
+                  r'(?:(?:https?:)?//)file\.finance\.sina\.com\.cn/[^"\'<>\s]+?\.PDF',
+                  r'(?:(?:https?:)?//)static\.cninfo\.com\.cn/[^"\'<>\s]+?\.PDF',
+                  r'(?:(?:https?:)?//)static\.sse\.com\.cn/[^"\'<>\s]+?\.pdf',
+              ]
+              for pattern in patterns:
+                  match = re.search(pattern, text, flags=re.I)
+                  if match:
+                      url = match.group(0)
+                      if url.startswith("//"):
+                          url = "https:" + url
+                      return url
+              return None
+
+          def cninfo_items(category: str) -> list[tuple[str, str]]:
+              try:
+                  search_resp = session.get(
+                      "https://www.cninfo.com.cn/new/information/topSearch/query",
+                      params={"keyWord": STOCK, "maxNum": 10},
+                      headers={"Referer": "https://www.cninfo.com.cn/"},
+                      timeout=60,
+                  )
+                  search_resp.raise_for_status()
+                  candidates = search_resp.json()
+                  org_id = None
+                  for item in candidates:
+                      if str(item.get("code", "")) == STOCK:
+                          org_id = item.get("orgId")
+                          break
+                  if not org_id:
+                      print("CNINFO orgId not found")
+                      return []
+
+                  payload = {
+                      "pageNum": 1,
+                      "pageSize": 100,
+                      "column": "sse",
+                      "tabName": "fulltext",
+                      "plate": "sh",
+                      "stock": f"{STOCK},{org_id}",
+                      "searchkey": "",
+                      "secid": "",
+                      "category": category,
+                      "trade": "",
+                      "seDate": "2020-01-01~2026-12-31",
+                      "sortName": "",
+                      "sortType": "",
+                      "isHLtitle": "true",
+                  }
+                  resp = session.post(
+                      "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+                      data=payload,
+                      headers={
+                          "Referer": f"https://www.cninfo.com.cn/new/disclosure/stock?stockCode={STOCK}&orgId={org_id}",
+                          "X-Requested-With": "XMLHttpRequest",
+                      },
+                      timeout=90,
+                  )
+                  resp.raise_for_status()
+                  data = resp.json()
+                  announcements = data.get("announcements") or []
+                  results: list[tuple[str, str]] = []
+                  for item in announcements:
+                      title = strip_tags(str(item.get("announcementTitle", "")))
+                      adjunct = str(item.get("adjunctUrl", ""))
+                      if title and adjunct:
+                          results.append((title, urllib.parse.urljoin("https://static.cninfo.com.cn/", adjunct)))
+                  print(f"CNINFO category {category}: {len(results)} announcements")
+                  return results
+              except Exception as exc:
+                  print(f"CNINFO query failed for {category}: {exc}")
+                  return []
+
+          annual_sources: dict[int, tuple[str, str]] = {}
+          latest_source: tuple[str, str] | None = None
+
+          # Primary discovery: Sina's annual and periodic-report lists.
+          annual_list_urls = [
+              f"https://money.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{STOCK}.phtml?ftype=ndbg",
+              f"https://money.finance.sina.com.cn/corp/view/vCB_Bulletin.php?page_type=ndbg&stockid={STOCK}&type=list",
+          ]
+          annual_items: list[tuple[str, str]] = []
+          for list_url in annual_list_urls:
+              try:
+                  annual_items.extend(parse_sina_list(list_url))
+              except Exception as exc:
+                  print(f"Sina annual list failed: {list_url}: {exc}")
+
+          for year in range(2020, 2026):
+              for title, detail_url in annual_items:
+                  compact = re.sub(r"\s+", "", title)
+                  if f"{year}年年度报告" in compact and "摘要" not in compact and "英文" not in compact:
+                      pdf_url = parse_sina_pdf(detail_url)
+                      if pdf_url:
+                          annual_sources[year] = (title, pdf_url)
+                          break
+
+          periodic_list_urls = [
+              f"https://money.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{STOCK}.phtml?ftype=zqbg",
+              f"https://money.finance.sina.com.cn/corp/view/vCB_Bulletin.php?page_type=zqbg&stockid={STOCK}&type=list",
+              f"https://money.finance.sina.com.cn/corp/go.php/vCB_AllBulletin/stockid/{STOCK}.phtml",
+          ]
+          periodic_items: list[tuple[str, str]] = []
+          for list_url in periodic_list_urls:
+              try:
+                  periodic_items.extend(parse_sina_list(list_url))
+              except Exception as exc:
+                  print(f"Sina periodic list failed: {list_url}: {exc}")
+
+          for title, detail_url in periodic_items:
+              compact = re.sub(r"\s+", "", title)
+              if "2026年半年度报告" in compact and "摘要" not in compact:
+                  pdf_url = parse_sina_pdf(detail_url)
+                  if pdf_url:
+                      latest_source = (title, pdf_url)
+                      break
+
+          # CNINFO fallback for any report that Sina does not expose directly.
+          if len(annual_sources) < 6:
+              for title, pdf_url in cninfo_items("category_ndbg_szsh;"):
+                  compact = re.sub(r"\s+", "", title)
+                  if "摘要" in compact or "英文" in compact:
+                      continue
+                  for year in range(2020, 2026):
+                      if year not in annual_sources and f"{year}年年度报告" in compact:
+                          annual_sources[year] = (title, pdf_url)
+
+          if latest_source is None:
+              for title, pdf_url in cninfo_items("category_bndbg_szsh;"):
+                  compact = re.sub(r"\s+", "", title)
+                  if "2026年半年度报告" in compact and "摘要" not in compact:
+                      latest_source = (title, pdf_url)
+                      break
+
+          missing_years = [year for year in range(2020, 2026) if year not in annual_sources]
+          if missing_years:
+              raise RuntimeError(f"Missing annual report sources for years: {missing_years}; sources={annual_sources}")
+          if latest_source is None:
+              raise RuntimeError("Missing 2026 half-year report source")
+
+          print("Selected sources:")
+          for year in sorted(annual_sources):
+              print(year, annual_sources[year])
+          print("latest", latest_source)
+
+          def run_checked(args: list[str]) -> str:
+              proc = subprocess.run(args, check=True, text=True, capture_output=True)
+              return proc.stdout
+
+          def download_and_validate(url: str, destination: Path, year: int, report_type: str, min_pages: int) -> tuple[int, int, str]:
+              headers = {
+                  "Referer": "https://money.finance.sina.com.cn/",
+                  "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+              }
+              last_error: Exception | None = None
+              for attempt in range(1, 6):
+                  try:
+                      with session.get(url, headers=headers, stream=True, timeout=(30, 600), allow_redirects=True) as resp:
+                          resp.raise_for_status()
+                          tmp = destination.with_suffix(destination.suffix + ".part")
+                          with tmp.open("wb") as fh:
+                              for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                  if chunk:
+                                      fh.write(chunk)
+                      if tmp.stat().st_size < 20_000:
+                          raise RuntimeError(f"Downloaded file too small: {tmp.stat().st_size}")
+                      if tmp.read_bytes()[:4] != b"%PDF":
+                          raise RuntimeError("Response is not a PDF")
+                      tmp.replace(destination)
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      print(f"Download attempt {attempt} failed for {url}: {exc}")
+                      time.sleep(attempt * 2)
+              else:
+                  raise RuntimeError(f"Download failed for {url}: {last_error}")
+
+              qpdf = subprocess.run(["qpdf", "--check", str(destination)], text=True, capture_output=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f"qpdf validation failed for {destination}: {qpdf.stdout}\n{qpdf.stderr}")
+
+              info = run_checked(["pdfinfo", str(destination)])
+              match = re.search(r"^Pages:\s+(\d+)", info, flags=re.M)
+              if not match:
+                  raise RuntimeError(f"Cannot determine page count for {destination}")
+              pages = int(match.group(1))
+              if pages < min_pages:
+                  raise RuntimeError(f"Unexpectedly short report {destination}: {pages} pages")
+
+              text_proc = subprocess.run(
+                  ["pdftotext", "-f", "1", "-l", str(min(25, pages)), str(destination), "-"],
+                  text=True,
+                  capture_output=True,
+                  errors="ignore",
+              )
+              text = re.sub(r"\s+", "", text_proc.stdout)
+              if not any(pattern in text for pattern in COMPANY_PATTERNS):
+                  raise RuntimeError(f"Company-name validation failed for {destination}")
+              if f"{year}年" not in text:
+                  raise RuntimeError(f"Year validation failed for {destination}")
+              if report_type == "annual" and "年度报告" not in text:
+                  raise RuntimeError(f"Annual-report title validation failed for {destination}")
+              if report_type == "half" and "半年度报告" not in text:
+                  raise RuntimeError(f"Half-year-report title validation failed for {destination}")
+
+              digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+              size = destination.stat().st_size
+
+              stem = destination.stem
+              subprocess.run(
+                  ["pdftoppm", "-f", "1", "-singlefile", "-png", "-r", "85", str(destination), str(PREVIEWS / f"{stem}_first")],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              )
+              subprocess.run(
+                  ["pdftoppm", "-f", str(pages), "-singlefile", "-png", "-r", "85", str(destination), str(PREVIEWS / f"{stem}_last")],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              )
+              return pages, size, digest
+
+          manifest_rows: list[tuple[str, int, int, str, str]] = []
+          for year in range(2020, 2026):
+              title, url = annual_sources[year]
+              destination = PACKAGE_DIR / f"万盛股份_{year}年年度报告.pdf"
+              pages, size, digest = download_and_validate(url, destination, year, "annual", 120)
+              manifest_rows.append((destination.name, pages, size, digest, url))
+              print(f"Verified {destination.name}: {pages} pages, {size} bytes")
+
+          latest_title, latest_url = latest_source
+          latest_destination = PACKAGE_DIR / "万盛股份_2026年半年度报告.pdf"
+          pages, size, digest = download_and_validate(latest_url, latest_destination, 2026, "half", 60)
+          manifest_rows.append((latest_destination.name, pages, size, digest, latest_url))
+          print(f"Verified {latest_destination.name}: {pages} pages, {size} bytes")
+
+          explanation = [
+              "万盛股份（603010.SH）定期报告包，共7份完整PDF。",
+              "",
+              "收录范围：2020—2025年年度报告，以及截至2026年8月30日最新的2026年半年度报告。",
+              "年报均为全文版，不含年度报告摘要替代文件。",
+              "",
+              "文件清单：",
+          ]
+          for name, pages, size, digest, url in manifest_rows:
+              explanation.append(f"{name} | {pages}页 | {size}字节 | SHA256 {digest}")
+              explanation.append(f"来源：{url}")
+          explanation.extend([
+              "",
+              "核验项目：PDF文件头、公司名称、报告年度和类型、最低页数、qpdf结构检查、首页与末页渲染，以及ZIP完整性测试。",
+          ])
+          (PACKAGE_DIR / "报告清单与核验说明.txt").write_text("\n".join(explanation), encoding="utf-8")
+          (PACKAGE_DIR / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{digest}  {name}" for name, _, _, digest, _ in manifest_rows) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("万盛股份_2020-2025年报及最新季报.zip")
+          with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(PACKAGE_DIR.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(path))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP CRC validation failed at {bad}")
+              pdf_count = sum(1 for name in archive.namelist() if name.lower().endswith(".pdf"))
+              if pdf_count != 7:
+                  raise RuntimeError(f"ZIP should contain 7 PDFs, found {pdf_count}")
+          print(f"Created {zip_path}: {zip_path.stat().st_size} bytes")
+          PY
+
+          unzip -t '万盛股份_2020-2025年报及最新季报.zip'
+          ls -lh '万盛股份_2020-2025年报及最新季报.zip' '万盛股份_2020-2025年报及最新季报'
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: wansheng-final-package
+          path: 万盛股份_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
