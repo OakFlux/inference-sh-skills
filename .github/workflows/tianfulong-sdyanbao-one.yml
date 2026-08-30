@@ -1,0 +1,46 @@
+name: Check exact Sdyanbao Tianfulong result
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-sdyanbao-one.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query exact public API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json, text/plain, */*','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','X-Secret-Key':'secret_key','X-Requested-With':'XMLHttpRequest'}
+          p={'category_code':'','keywords':'天富龙','order':'','pageNum':1,'pageSize':100,'brand_code':''}
+          r=s.get('https://api.sdyanbao.com/discover/report/original_search',params=p,headers=h,timeout=60)
+          print('SEARCH',r.status_code,r.url,r.headers.get('content-type'),len(r.content),flush=True)
+          print(r.text[:20000],flush=True)
+          obj=r.json()
+          def walk(x):
+              if isinstance(x,dict):
+                  yield x
+                  for v in x.values(): yield from walk(v)
+              elif isinstance(x,list):
+                  for v in x: yield from walk(v)
+          ids=[]
+          for d in walk(obj):
+              blob=json.dumps(d,ensure_ascii=False,default=str)
+              if '天富龙' in blob:
+                  print('MATCH',blob[:5000],flush=True)
+                  for k in ('rid','report_id','reportId','id','_id'):
+                      if d.get(k) not in (None,''):
+                          ids.append(str(d[k])); break
+          for rid in list(dict.fromkeys(ids))[:20]:
+              q=s.get('https://api.sdyanbao.com/research/report/detail',params={'rid':rid,'mark_code':''},headers=h,timeout=60)
+              print('DETAIL',rid,q.status_code,q.url,q.headers.get('content-type'),len(q.content),flush=True)
+              print(q.text[:20000],flush=True)
+          PY
