@@ -1,0 +1,87 @@
+name: Temporary Lanjian Electronics CNINFO document discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-lanjian-electronics-reports-20260830
+    paths:
+      - .github/workflows/tmp-lanjian-cninfo-docs.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query CNINFO and download matching broker-authored IPO documents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic downloads
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, urllib.parse, urllib.request
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          endpoint='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          payload={
+              'pageNum':'1','pageSize':'100','column':'szse','tabName':'fulltext',
+              'plate':'sz','stock':'','searchkey':'蓝箭电子','secid':'',
+              'category':'','trade':'','seDate':'2021-01-01~2024-12-31',
+              'sortName':'time','sortType':'desc','isHLtitle':'true'
+          }
+          data=urllib.parse.urlencode(payload).encode()
+          req=urllib.request.Request(endpoint,data=data,headers={
+              'User-Agent':UA,
+              'Referer':'https://www.cninfo.com.cn/new/fulltextSearch?notautosubmit=&keyWord=%E8%93%9D%E7%AE%AD%E7%94%B5%E5%AD%90',
+              'X-Requested-With':'XMLHttpRequest',
+              'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8',
+              'Accept':'application/json, text/javascript, */*; q=0.01',
+          },method='POST')
+          raw=urllib.request.urlopen(req,timeout=120).read().decode('utf-8','replace')
+          Path('diagnostic/cninfo_raw.json').write_text(raw,encoding='utf-8')
+          obj=json.loads(raw)
+          anns=obj.get('announcements') or []
+          print('ANNOUNCEMENTS',len(anns),'TOTAL',obj.get('totalAnnouncement'))
+          selected=[]
+          for a in anns:
+              title=(a.get('announcementTitle') or '').replace('<em>','').replace('</em>','')
+              url='https://static.cninfo.com.cn/'+(a.get('adjunctUrl') or '').lstrip('/')
+              row={
+                  'title':title,
+                  'time':a.get('announcementTime'),
+                  'secName':a.get('secName'),
+                  'secCode':a.get('secCode'),
+                  'orgId':a.get('orgId'),
+                  'adjunctUrl':a.get('adjunctUrl'),
+                  'url':url,
+              }
+              print(json.dumps(row,ensure_ascii=False))
+              if any(k in title for k in ['发行保荐书','上市保荐书','保荐工作报告','招股说明书','发行人及保荐机构回复意见']):
+                  selected.append(row)
+          Path('diagnostic/cninfo_selected.json').write_text(json.dumps(selected,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Download broker-authored IPO documents only.
+          for i,row in enumerate(selected,1):
+              title=row['title']
+              if not any(k in title for k in ['发行保荐书','上市保荐书','保荐工作报告']):
+                  continue
+              safe=''.join(c if c not in '\\/:*?"<>|' else '_' for c in title)[:100]
+              dest=Path('downloads')/f'{i:02d}_{safe}.pdf'
+              req=urllib.request.Request(row['url'],headers={'User-Agent':UA,'Referer':'https://www.cninfo.com.cn/'})
+              body=urllib.request.urlopen(req,timeout=180).read()
+              dest.write_bytes(body)
+              print('DOWNLOADED',dest,len(body),body[:4])
+          PY
+          ls -lh diagnostic downloads || true
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanjian-electronics-cninfo-docs
+          path: |
+            diagnostic/
+            downloads/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
