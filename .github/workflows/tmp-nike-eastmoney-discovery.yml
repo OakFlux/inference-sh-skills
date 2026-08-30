@@ -1,0 +1,177 @@
+name: Temporary Nike broker report discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-eastmoney-discovery.yml
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Search report catalog and recover original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output diagnostics previews
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import hashlib, json, os, re, subprocess, tempfile, time, urllib.parse
+
+          API='https://reportapi.eastmoney.com/report/list'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          DATES=[
+              '2023-12-27','2023-12-28','2023-12-29',
+              '2025-03-23','2025-03-24','2025-03-25',
+              '2025-06-29','2025-06-30','2025-07-01',
+              '2025-09-28','2025-09-29','2025-09-30',
+              '2025-10-07','2025-10-08','2025-10-09',
+              '2026-04-05','2026-04-06','2026-04-07',
+              '2026-06-16','2026-06-17','2026-06-18',
+          ]
+          KEYWORDS=['nike','耐克','NKE.US','NKE US','NIKE FY']
+          OUT=Path('output'); DIAG=Path('diagnostics'); PRE=Path('previews')
+
+          def fetch(day:str,page:int):
+              params={
+                  'pageNo':str(page),'pageSize':'100','code':'*','industryCode':'*','industry':'*',
+                  'rating':'*','ratingChange':'*','beginTime':day,'endTime':day,'fields':'',
+                  'qType':'0','orgCode':'','rcode':'','p':str(page),'pageNum':str(page),
+                  'pageNumber':str(page),
+              }
+              url=API+'?'+urllib.parse.urlencode(params)
+              fd,name=tempfile.mkstemp(prefix=f'nike_{day}_{page}_',suffix='.json'); os.close(fd)
+              path=Path(name)
+              try:
+                  cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6',
+                       '--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','180',
+                       '--user-agent',UA,'--referer','https://data.eastmoney.com/report/',
+                       '--header','Accept-Encoding: identity',url,'-o',str(path)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if p.returncode:
+                      raise RuntimeError(p.stderr[-1000:])
+                  s=path.read_text(encoding='utf-8',errors='ignore').strip()
+                  if s.startswith('datatable(') and s.endswith(')'):
+                      s=s[len('datatable('):-1]
+                  elif s and s[0] not in '[{' and '(' in s and s.endswith(')'):
+                      s=s[s.find('(')+1:s.rfind(')')]
+                  return json.loads(s), url
+              finally:
+                  path.unlink(missing_ok=True)
+
+          objs={}; tasks=[]; api_urls={}
+          for day in DATES:
+              try:
+                  obj,url=fetch(day,1)
+              except Exception as e:
+                  print('FIRST_ERROR',day,repr(e)); continue
+              objs[(day,1)]=obj; api_urls[(day,1)]=url
+              rows=obj.get('data') or []
+              pages=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+              print('FIRST',day,'HITS',obj.get('hits'),'ROWS',len(rows),'PAGES',pages)
+              tasks += [(day,p) for p in range(2,pages+1)]
+
+          with ThreadPoolExecutor(max_workers=20) as ex:
+              fm={ex.submit(fetch,d,p):(d,p) for d,p in tasks}
+              for i,f in enumerate(as_completed(fm),1):
+                  d,p=fm[f]
+                  try:
+                      obj,url=f.result(); objs[(d,p)]=obj; api_urls[(d,p)]=url
+                  except Exception as e:
+                      print('RETRY',d,p,repr(e)); time.sleep(.3)
+                      try:
+                          obj,url=fetch(d,p); objs[(d,p)]=obj; api_urls[(d,p)]=url
+                      except Exception as e2:
+                          print('FAIL',d,p,repr(e2))
+
+          matches=[]; seen=set()
+          for (day,page),obj in sorted(objs.items()):
+              for r in obj.get('data') or []:
+                  hay=json.dumps(r,ensure_ascii=False).lower()
+                  if any(k.lower() in hay for k in KEYWORDS):
+                      info=str(r.get('infoCode') or '')
+                      key=info or json.dumps(r,ensure_ascii=False,sort_keys=True)
+                      if key in seen: continue
+                      seen.add(key)
+                      rr=dict(r); rr['_day']=day; rr['_page']=page; rr['_api_url']=api_urls.get((day,page),'')
+                      matches.append(rr)
+          matches.sort(key=lambda r:str(r.get('publishDate') or ''),reverse=True)
+          DIAG.joinpath('matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCH_COUNT',len(matches))
+          for r in matches:
+              print('MATCH',json.dumps({
+                  'date':r.get('publishDate'),'broker':r.get('orgSName'),'title':r.get('title'),
+                  'stockCode':r.get('stockCode'),'stockName':r.get('stockName'),
+                  'infoCode':r.get('infoCode'),'attachPages':r.get('attachPages'),
+                  'attachSize':r.get('attachSize'),'reportType':r.get('reportType'),
+                  'page':r.get('_page')},ensure_ascii=False))
+
+          recovered=[]
+          for i,r in enumerate(matches,1):
+              info=str(r.get('infoCode') or '')
+              if not info: continue
+              urls=[
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?{str(r.get("publishDate") or "")[:10].replace("-","")}.pdf=',
+                  f'https://pdf.dfcfw.com/pdf/{info}.pdf',
+              ]
+              ok=False
+              for url in urls:
+                  tmp=OUT/f'tmp_{i:02d}.pdf'
+                  cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6',
+                       '--retry-all-errors','--retry-delay','2','--connect-timeout','25','--max-time','600',
+                       '--compressed','-A',UA,'-e','https://data.eastmoney.com/report/',
+                       '-H','Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',url,'-o',str(tmp)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  print('TRY',info,url,'RC',p.returncode,'SIZE',tmp.stat().st_size if tmp.exists() else 0,
+                        'MAGIC',tmp.read_bytes()[:8] if tmp.exists() else b'','ERR',p.stderr[-300:])
+                  if p.returncode==0 and tmp.exists() and tmp.stat().st_size>25000 and tmp.read_bytes()[:4]==b'%PDF':
+                      info_text=subprocess.check_output(['pdfinfo',str(tmp)],text=True,errors='replace')
+                      m=re.search(r'^Pages:\s*(\d+)',info_text,re.M); pages=int(m.group(1)) if m else 0
+                      txt=DIAG/f'{info}.txt'
+                      subprocess.run(['pdftotext','-f','1','-l',str(min(10,pages)),str(tmp),str(txt)],check=False)
+                      text=txt.read_text(errors='replace') if txt.exists() else ''
+                      compact=''.join(text.split()).lower()
+                      if not any(k.lower().replace(' ','') in compact for k in ['nike','耐克','nkeus']):
+                          print('TEXT_MISMATCH',info,pages,text[:1000]); tmp.unlink(missing_ok=True); continue
+                      safe_broker=re.sub(r'[^A-Za-z0-9_-]+','_',str(r.get('orgSName') or 'Broker'))
+                      date=str(r.get('publishDate') or r.get('_day') or '')[:10].replace('-','')
+                      final=OUT/f'{i:02d}_Nike_{safe_broker}_{date}_{pages}p.pdf'
+                      tmp.replace(final)
+                      subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','90',str(final),str(PRE/f'{i:02d}_first')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      subprocess.run(['pdftoppm','-f',str(pages),'-singlefile','-png','-r','90',str(final),str(PRE/f'{i:02d}_last')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      rec=dict(r); rec.update({'pages_actual':pages,'filename':final.name,'source_url':url,
+                          'size_bytes':final.stat().st_size,'sha256':hashlib.sha256(final.read_bytes()).hexdigest()})
+                      recovered.append(rec); ok=True; break
+                  tmp.unlink(missing_ok=True)
+              if not ok: print('NOT_RECOVERED',info)
+
+          DIAG.joinpath('recovered.json').write_text(json.dumps(recovered,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('RECOVERED_COUNT',len(recovered))
+          for r in recovered:
+              print('RECOVERED',json.dumps({k:r.get(k) for k in ['publishDate','orgSName','title','infoCode','pages_actual','filename','source_url']},ensure_ascii=False))
+          PY
+          ls -lh output diagnostics previews
+
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-report-discovery
+          path: |
+            output/
+            diagnostics/
+            previews/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
