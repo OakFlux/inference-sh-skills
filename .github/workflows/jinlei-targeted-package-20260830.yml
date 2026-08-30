@@ -1,0 +1,316 @@
+name: Package targeted public Jinlei broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jinlei-targeted-package-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet pypdf pillow img2pdf
+
+      - name: Locate, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY = '金雷股份'
+          ALTERNATE = '金雷科技'
+          CODE = '300443'
+          PACKAGE = '金雷股份_券商深度报告_公开完整版'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+          work = Path('_jinlei_targeted_pages')
+          work.mkdir(exist_ok=True)
+          s = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          em_headers = {'User-Agent':ua,'Accept':'application/pdf,*/*;q=0.8','Referer':'https://data.eastmoney.com/'}
+          sd_headers = {'User-Agent':ua,'Accept':'application/json, text/plain, */*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','Device':'1','X-Token':''}
+
+          def company_match(text: str) -> bool:
+              return CODE in text or COMPANY in text or ALTERNATE in text
+
+          def safe(value: str) -> str:
+              return re.sub(r'[\\/:*?"<>|\s]+','_',str(value)).strip('_')[:95]
+
+          def digest(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def fetch(url: str, headers: dict, attempts: int = 6) -> bytes:
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      r = s.get(url, headers=headers, timeout=(25, 240))
+                      print('GET',url,r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+                      if r.status_code == 200 and r.content:
+                          return r.content
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(2*(attempt+1))
+              raise RuntimeError(f'{url}: {last}')
+
+          candidates = {
+              'AP202307061592055923': {
+                  'infoCode':'AP202307061592055923',
+                  'organization':'华金证券',
+                  'title':'深度报告：横纵拓展精益求精，打造风电轴系核心竞争力',
+                  'date':'2023-07-06',
+                  'metadata_source':'东方财富公开研报索引',
+              },
+              'AP202404251631335854': {
+                  'infoCode':'AP202404251631335854',
+                  'organization':'信达证券',
+                  'title':'大兆瓦铸造能力领先，布局锻件新产能基地',
+                  'date':'2024-04-25',
+                  'metadata_source':'东方财富公开研报索引',
+              },
+          }
+
+          # Resolve additional recent reports and their public file identifiers.
+          queries = [
+              '大铸件产能优势领先 铸件盈利能力有望改善',
+              '大铸件产能优势领先',
+              '横纵拓展精益求精 打造风电轴系核心竞争力',
+              '大兆瓦铸造能力领先 布局锻件新产能基地',
+              '锻造业务需求旺盛 铸造业务进入收获期',
+              '铸+锻 双驱动 盈利能力提升',
+              '金雷股份 深度报告',
+              '金雷股份 公司研究',
+          ]
+          search_rows = []
+          for keyword in queries:
+              body = {'keyword':keyword,'page':1,'pageSize':100,'opFrom':1}
+              try:
+                  r = s.post('https://api.sdyanbao.com/api/file/search',headers=sd_headers,json=body,timeout=(20,90))
+                  print('SEARCH',keyword,r.status_code,len(r.content),flush=True)
+                  if r.status_code != 200:
+                      continue
+                  obj = r.json()
+              except Exception as exc:
+                  print('SEARCH_ERROR',keyword,repr(exc),flush=True)
+                  continue
+              data = obj.get('data') if isinstance(obj,dict) else None
+              files = data.get('files') if isinstance(data,dict) else None
+              if not isinstance(files,list):
+                  continue
+              for item in files:
+                  blob = json.dumps(item,ensure_ascii=False,default=str)
+                  stock = item.get('stock') if isinstance(item.get('stock'),dict) else {}
+                  if not company_match(blob) and str(stock.get('code') or '') != CODE:
+                      continue
+                  search_rows.append(item)
+                  uuid = str(item.get('data_source_uuid') or '')
+                  org_obj = item.get('organization') if isinstance(item.get('organization'),dict) else {}
+                  type_obj = item.get('type') if isinstance(item.get('type'),dict) else {}
+                  entry = {
+                      'infoCode': uuid if uuid.startswith('AP') else '',
+                      'organization':str(org_obj.get('name') or ''),
+                      'title':str(item.get('name') or ''),
+                      'date':str(item.get('time_text') or '')[:10],
+                      'pages_hint':item.get('page_count'),
+                      'page_url':str(item.get('page_url') or ''),
+                      'report_type':str(type_obj.get('name') or ''),
+                      'metadata_source':'水滴研报公开索引',
+                  }
+                  key = entry['infoCode'] or f"{entry['title']}|{entry['date']}|{entry['page_url']}"
+                  candidates[key] = entry
+
+          (out/'检索元数据.json').write_text(json.dumps(search_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          records = []
+          seen_sha = set()
+
+          def validate_and_save(pdf_data: bytes, item: dict, source_url: str, source_format: str) -> bool:
+              if not pdf_data.startswith(b'%PDF-'):
+                  return False
+              probe = work/'_probe.pdf'
+              probe.write_bytes(pdf_data)
+              try:
+                  reader = PdfReader(str(probe))
+                  pages = len(reader.pages)
+                  text = '\n'.join((page.extract_text() or '') for page in reader.pages[:8])
+              except Exception:
+                  probe.unlink(missing_ok=True)
+                  return False
+              probe.unlink(missing_ok=True)
+              if pages < 5 or not company_match(text):
+                  return False
+              sha = digest(pdf_data)
+              if sha in seen_sha:
+                  return False
+              seen_sha.add(sha)
+              filename = f"{len(records)+1:02d}_{safe(item.get('organization') or '券商')}_{safe(item.get('title') or COMPANY)}_{safe(item.get('date') or '')}_{pages}页.pdf"
+              path = out/filename
+              path.write_bytes(pdf_data)
+              records.append({**item,'filename':filename,'pages':pages,'bytes':len(pdf_data),'sha256':sha,'source_url':source_url,'source_format':source_format,'first_pages_text':text[:5000]})
+              print('SAVED',json.dumps({k:records[-1].get(k) for k in ('organization','title','date','pages','filename')},ensure_ascii=False),flush=True)
+              return True
+
+          # Download all public original PDFs that resolve.
+          ordered = list(candidates.values())
+          for item in ordered:
+              info = str(item.get('infoCode') or '')
+              if not info:
+                  continue
+              for prefix in ('H3','H2'):
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  try:
+                      data = fetch(url,em_headers,attempts=3)
+                  except Exception as exc:
+                      print('PDF_ERROR',url,repr(exc),flush=True)
+                      continue
+                  if validate_and_save(data,item,url,'公开原始PDF'):
+                      break
+
+          # Reconstruct only complete publicly exposed page sequences for non-AP sources.
+          for item in ordered:
+              if len(records) >= 8:
+                  break
+              if item.get('infoCode'):
+                  continue
+              page_url = str(item.get('page_url') or '')
+              try:
+                  expected = int(item.get('pages_hint') or 0)
+              except Exception:
+                  expected = 0
+              if not page_url or expected < 5 or expected > 80:
+                  continue
+              page_dir = work/hashlib.sha256(page_url.encode()).hexdigest()[:16]
+              page_dir.mkdir(exist_ok=True)
+              images = []
+              complete = True
+              for number in range(expected):
+                  url = f'{page_url}/{number}.png'
+                  try:
+                      data = fetch(url,{'User-Agent':ua,'Referer':'https://www.sdyanbao.com/','Accept':'image/png,image/*;q=0.9,*/*;q=0.7'},attempts=2)
+                  except Exception:
+                      complete = False
+                      break
+                  if not data.startswith(b'\x89PNG'):
+                      complete = False
+                      break
+                  image_path = page_dir/f'{number:03d}.png'
+                  image_path.write_bytes(data)
+                  try:
+                      with Image.open(io.BytesIO(data)) as image:
+                          image.verify()
+                      with Image.open(image_path) as image:
+                          width,height=image.size
+                  except Exception:
+                      complete=False
+                      break
+                  if width < 700 or height < 900:
+                      complete=False
+                      break
+                  images.append(image_path)
+              if not complete or len(images)!=expected:
+                  continue
+              pdf_data = img2pdf.convert([str(p) for p in images])
+              sha = digest(pdf_data)
+              if sha in seen_sha:
+                  continue
+              seen_sha.add(sha)
+              filename=f"{len(records)+1:02d}_{safe(item.get('organization') or '券商')}_{safe(item.get('title') or COMPANY)}_{safe(item.get('date') or '')}_{expected}页_逐页原图.pdf"
+              path=out/filename
+              path.write_bytes(pdf_data)
+              reader=PdfReader(str(path))
+              if len(reader.pages)!=expected:
+                  path.unlink(missing_ok=True)
+                  continue
+              records.append({**item,'filename':filename,'pages':expected,'bytes':len(pdf_data),'sha256':sha,'source_url':page_url,'source_format':'公开完整逐页原图合成为PDF；页面内容和顺序未改动'})
+              print('RECONSTRUCTED',json.dumps({k:records[-1].get(k) for k in ('organization','title','date','pages','filename')},ensure_ascii=False),flush=True)
+
+          # Rank: explicit deep report first, then longer reports, then recency. Select 2-3.
+          def score(item):
+              title=str(item.get('title') or '')
+              explicit=1000 if '深度' in title else 0
+              substantial=250 if int(item.get('pages') or 0)>=15 else 0
+              company_research=100 if str(item.get('report_type') or '')=='公司研究' else 0
+              return explicit+substantial+company_research+int(item.get('pages') or 0)
+
+          ranked=sorted(records,key=lambda x:(score(x),x.get('date') or ''),reverse=True)
+          selected=[]
+          # Always retain the explicit 2023 deep report if successfully downloaded.
+          for item in ranked:
+              if '横纵拓展精益求精' in str(item.get('title') or ''):
+                  selected.append(item)
+                  break
+          for item in ranked:
+              if item in selected:
+                  continue
+              selected.append(item)
+              if len(selected)>=3:
+                  break
+          if len(selected)<2:
+              raise RuntimeError(f'Only {len(selected)} valid public reports found')
+
+          # Remove unselected PDFs while retaining metadata files.
+          selected_names={item['filename'] for item in selected}
+          for path in out.glob('*.pdf'):
+              if path.name not in selected_names:
+                  path.unlink()
+
+          (out/'manifest.json').write_text(json.dumps(selected,ensure_ascii=False,indent=2),encoding='utf-8')
+          lines=[f'{COMPANY}（{CODE}）券商研究报告包','',f'本包共{len(selected)}份完整PDF。优先保留明确标注深度报告及页数较长的公司研究。','']
+          for index,item in enumerate(selected,1):
+              lines += [
+                  f"{index}. {item.get('organization')}：《{item.get('title')}》",
+                  f"   日期：{item.get('date')}；页数：{item.get('pages')}页",
+                  f"   文件：{item.get('filename')}",
+                  f"   获取形式：{item.get('source_format')}",
+                  f"   SHA-256：{item.get('sha256')}",
+                  '',
+              ]
+          lines += ['核验项目：PDF文件头与结构、实际页数、公司名称/证券代码、文件哈希以及ZIP CRC。','资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。']
+          (out/'报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{item['sha256']}  {item['filename']}\n" for item in selected),encoding='utf-8')
+
+          zip_name=f'金雷股份_券商深度报告_{len(selected)}份_公开完整版.zip'
+          zip_path=Path(zip_name)
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path,arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad=zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs=[n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs)!=len(selected):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+          print('FINAL',zip_path,zip_path.stat().st_size,flush=True)
+          print(json.dumps(selected,ensure_ascii=False),flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinlei-targeted-final
+          path: |
+            金雷股份_券商深度报告_公开完整版/
+            金雷股份_券商深度报告_*份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
