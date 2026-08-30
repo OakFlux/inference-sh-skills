@@ -1,0 +1,45 @@
+name: Temporary Jinmei Technology 2019 report enumeration
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-jinmei-tech-sdy-2019.yml
+
+permissions:
+  contents: read
+
+jobs:
+  enumerate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Query 2019 report metadata with title and date filters
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','Content-Type':'application/json;charset=UTF-8','Accept':'application/json,text/plain,*/*'})
+          tests=[]
+          for q in ['丹化科技','600844','斯尔邦','借壳登录资本市场','中国版高端新材料企业','产业链一体化定位高端']:
+              for only_title in [0,1]:
+                  tests.append((q,only_title,'2019-01-01','2019-12-31'))
+          seen=set()
+          for q,only_title,start,end in tests:
+              payload={'device':1,'hideTrader':0,'onlyTitle':only_title,'order':0,'page':1,'pageSize':100,'keyword':q,'pageCount':0,'dateRange':0,'startTime':start,'endTime':end,'typeIds':[],'industryIds':[]}
+              r=s.post('https://api.sdyanbao.com/api/file/search',json=payload,timeout=90)
+              print('\nTEST',json.dumps({'q':q,'onlyTitle':only_title,'start':start,'end':end},ensure_ascii=False),'HTTP',r.status_code,'LEN',len(r.content))
+              r.raise_for_status(); data=(r.json().get('data') or {}); files=data.get('files') or []
+              print('TOTAL',data.get('total'),'COUNT',len(files))
+              for f in files:
+                  fid=f.get('id')
+                  row={'id':fid,'name':f.get('name'),'date':f.get('time_text'),'pages':f.get('page_count'),'size':f.get('file_size'),'type':f.get('type'),'organization':f.get('organization'),'stock':f.get('stock'),'uuid':f.get('data_source_uuid'),'data_source':f.get('data_source'),'original_id':f.get('original_id'),'page_url':f.get('page_url'),'share_url':f.get('share_url'),'summary':str(f.get('summary') or '')[:500]}
+                  blob=' '.join(str(row.get(k) or '') for k in ['name','organization','stock','summary'])
+                  if any(t in blob for t in ['丹化科技','600844','斯尔邦','中国版高端新材料','借壳登录资本市场']):
+                      print('MATCH',json.dumps(row,ensure_ascii=False))
+                      seen.add(fid)
+          print('UNIQUE_MATCHES',len(seen))
+          PY
