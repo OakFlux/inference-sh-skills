@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from typing import Any
 
@@ -11,8 +10,9 @@ import package_biyi_broker_reports as base
 def fetch_report_records() -> list[dict[str, Any]]:
     url = "https://reportapi.eastmoney.com/report/list"
     timestamp = int(time.time() * 1000)
+    # The endpoint now returns JSON directly when cb is omitted. Supplying an
+    # arbitrary long callback name can be rejected as "Wrong callback Function".
     params = {
-        "cb": f"datatable{timestamp}",
         "industryCode": "*",
         "pageSize": "100",
         "industry": "*",
@@ -47,14 +47,17 @@ def fetch_report_records() -> list[dict[str, Any]]:
         )
 
     text = response.text.strip()
-    if text.startswith("{"):
-        payload = json.loads(text)
-    else:
-        left = text.find("(")
-        right = text.rfind(")")
-        if left < 0 or right <= left:
-            raise RuntimeError(f"Unexpected API response: {text[:1000]}")
-        payload = json.loads(text[left + 1 : right])
+    try:
+        payload = response.json()
+    except ValueError:
+        if text.startswith("{") or text.startswith("["):
+            payload = json.loads(text)
+        else:
+            left = text.find("(")
+            right = text.rfind(")")
+            if left < 0 or right <= left:
+                raise RuntimeError(f"Unexpected API response: {text[:1000]}")
+            payload = json.loads(text[left + 1 : right])
 
     raw_records: list[Any] = []
     if isinstance(payload, dict):
