@@ -1,0 +1,88 @@
+name: Temporary Dagang CFI report archive inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-cfi-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch CFI research-report archive and inspect PDF links
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic payloads
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import json,re,subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          urls=[
+            'https://gg.cfi.cn/ybyl/6729/002077.html',
+            'http://gg.cfi.cn/ybyl/6729/002077.html',
+            'https://data.cfi.cn/ybyl/6729/002077.html',
+            'http://data.cfi.cn/ybyl/6729/002077.html',
+            'https://gg.cfi.cn/yb_stock/6729/002077.html',
+          ]
+          all_links=[]
+          for i,u in enumerate(urls,1):
+              p=Path(f'diagnostic/page_{i}.html')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',UA,'-e','https://gg.cfi.cn/','-H','Accept-Encoding: identity',u,'-o',str(p)]
+              r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',i,u,'RC',r.returncode,'SIZE',p.stat().st_size if p.exists() else 0,'ERR',r.stderr[-500:])
+              if not p.exists(): continue
+              body=p.read_bytes(); text=None; enc=None
+              for e in ['utf-8','gb18030','latin1']:
+                  try: text=body.decode(e); enc=e; break
+                  except Exception: pass
+              if text is None: continue
+              Path(f'diagnostic/page_{i}_utf8.html').write_text(text,encoding='utf-8')
+              print('ENC',i,enc,'TITLE',re.sub(r'<[^>]+>',' ',(re.search(r'<title.*?</title>',text,re.I|re.S).group(0) if re.search(r'<title.*?</title>',text,re.I|re.S) else ''))[:500])
+              for line in text.splitlines():
+                  if any(k in line for k in ['大港股份','PDF原文','深度报告','封测行业迎机遇','定增推进转型','瞄准IC产业新趋势']):
+                      print('LINE',i,' '.join(re.sub(r'<[^>]+>',' ',line).split())[:2500])
+              links=re.findall(r'''(?:href|src)\s*=\s*["']([^"']+)["']''',text,re.I)
+              for href in links:
+                  full=urljoin(u,href)
+                  if any(k in full.lower() for k in ['pdf','yb','report','research','download','detail','002077']):
+                      if full not in all_links:
+                          all_links.append(full); print('LINK',i,full)
+          Path('diagnostic/links.json').write_text(json.dumps(all_links,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Fetch likely report detail and direct PDF links.
+          for j,u in enumerate(all_links[:300],1):
+              if not any(k in u.lower() for k in ['ybyl','yb_','report','research','pdf','detail']): continue
+              p=Path(f'payloads/item_{j}.bin')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',UA,'-e','https://gg.cfi.cn/','-H','Accept-Encoding: identity',u,'-o',str(p)]
+              r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('ITEM',j,u,'RC',r.returncode,'SIZE',p.stat().st_size if p.exists() else 0,'MAGIC',p.read_bytes()[:12] if p.exists() else b'','ERR',r.stderr[-300:])
+              if p.exists() and p.read_bytes()[:4]==b'%PDF':
+                  print('PDF_FOUND',j,u,p.stat().st_size)
+              elif p.exists():
+                  body=p.read_bytes(); text=None
+                  for e in ['utf-8','gb18030','latin1']:
+                      try: text=body.decode(e); break
+                      except Exception: pass
+                  if text:
+                      for val in sorted(set(re.findall(r'''https?://[^\s"'<>]+|//[^\s"'<>]+|[^\s"'<>]+\.pdf(?:\?[^\s"'<>]*)?''',text,re.I))):
+                          full=urljoin(u,val)
+                          if any(k in full.lower() for k in ['pdf','download','report','research']): print('INNER_URL',j,full[:2000])
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-cfi-inspection
+          path: |
+            diagnostic/
+            payloads/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
