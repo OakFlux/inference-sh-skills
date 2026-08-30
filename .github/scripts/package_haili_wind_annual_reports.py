@@ -141,6 +141,10 @@ def main() -> None:
             f'    direct_encoded = direct_plain = direct_http = "{PROSPECTUS_ATTACHMENT_URL}"\n'
             "    replacement_download = f'''",
         ),
+        (
+            '        f"{prospectus_id}.PDF",\n',
+            f'        "{PROSPECTUS_ATTACHMENT_URL}",\n',
+        ),
     ]
     for old, new in replacements:
         code = code.replace(old, new)
