@@ -1,0 +1,146 @@
+name: Fast exact search for Tianfulong reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-fast.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Search and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, re, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+
+          out=Path('out'); out.mkdir(exist_ok=True)
+          s=requests.Session()
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          sd_h={'User-Agent':ua,'Accept':'application/json, text/plain, */*','Accept-Language':'zh-CN,zh;q=0.9','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','X-Secret-Key':'secret_key','X-Requested-With':'XMLHttpRequest'}
+          em_h={'User-Agent':ua,'Accept':'application/json,text/plain,*/*','Referer':'https://data.eastmoney.com/'}
+          meta=[]; pdfs=[]; seen=set()
+
+          def dump(x,n=2000):
+              t=json.dumps(x,ensure_ascii=False,default=str)
+              return t[:n]
+          def walk(x):
+              if isinstance(x,dict):
+                  yield x
+                  for v in x.values(): yield from walk(v)
+              elif isinstance(x,list):
+                  for v in x: yield from walk(v)
+          def val(d,*ks):
+              for k in ks:
+                  if isinstance(d,dict) and d.get(k) not in (None,'',[]): return d.get(k)
+          def save(content,title,org,date,url,pages=None):
+              if not content.startswith(b'%PDF-'): return False
+              sha=hashlib.sha256(content).hexdigest()
+              if sha in seen: return False
+              seen.add(sha)
+              safe=lambda x: re.sub(r'[\\/:*?"<>|\s]+','_',str(x)).strip('_')[:90]
+              fn=f'{len(pdfs)+1:02d}_{safe(org or "券商")}_{safe(title)}_{safe(str(date)[:10])}.pdf'
+              (out/fn).write_bytes(content)
+              rec={'file':fn,'title':title,'org':org,'date':str(date)[:10],'url':url,'bytes':len(content),'pages_hint':pages,'approx_pages':len(re.findall(rb'/Type\s*/Page\b',content)),'sha256':sha}
+              pdfs.append(rec); print('SAVED',dump(rec),flush=True); return True
+
+          # Sdyanbao exact public search.
+          rid_rows={}
+          for kw in ['天富龙','注册制新股纵览：天富龙','新股覆盖研究：天富龙']:
+              p={'category_code':'','keywords':kw,'order':'','pageNum':1,'pageSize':100,'brand_code':''}
+              try:
+                  r=s.get('https://api.sdyanbao.com/discover/report/original_search',params=p,headers=sd_h,timeout=(20,60))
+                  print('SDSEARCH',r.url,r.status_code,r.headers.get('content-type'),len(r.content),r.text[:1000],flush=True)
+                  obj=r.json()
+              except Exception as e:
+                  print('SDSEARCHERR',kw,repr(e),flush=True); continue
+              for d in walk(obj):
+                  blob=dump(d,8000)
+                  if '天富龙' not in blob: continue
+                  print('SDROW',dump(d,3500),flush=True)
+                  rid=val(d,'rid','report_id','reportId','id','_id')
+                  if rid is not None: rid_rows[str(rid)]=d
+          for rid,row in rid_rows.items():
+              try:
+                  r=s.get('https://api.sdyanbao.com/research/report/detail',params={'rid':rid,'mark_code':''},headers=sd_h,timeout=(20,60))
+                  print('SDDETAIL',r.url,r.status_code,len(r.content),r.text[:3500],flush=True)
+                  obj=r.json()
+              except Exception as e:
+                  print('SDDETAILERR',rid,repr(e),flush=True); continue
+              for d in walk(obj):
+                  blob=dump(d,12000)
+                  if '天富龙' not in blob: continue
+                  title=str(val(d,'title','report_title','reportTitle','name') or val(row,'title','report_title','name') or '天富龙研报')
+                  org=str(val(d,'institution_name','organization','org_name','brand_name','source') or val(row,'institution_name','organization','org_name','brand_name','source') or '')
+                  pages=val(d,'pages','page_count','pageCount')
+                  free=val(d,'free','is_free','isFree','free_status')
+                  path=val(d,'original_pdf_path','originalPdfPath','pdf_path','pdf_url','file_url','download_url')
+                  rec={'rid':rid,'title':title,'org':org,'pages':pages,'free':free,'path':path}
+                  meta.append(rec); print('SDMETA',dump(rec),flush=True)
+                  is_free=free in (True,1,'1','true','True','免费','free')
+                  if path and is_free:
+                      raw=str(path); urls=[raw] if raw.startswith('http') else [urljoin('https://file.5kcrm.com/',raw.lstrip('/')),urljoin('https://pdf.shuididp.cn/',raw.lstrip('/'))]
+                      for u in urls:
+                          try:
+                              q=s.get(u,headers={'User-Agent':ua,'Referer':'https://www.sdyanbao.com/'},timeout=(30,120))
+                              print('SDPDF',u,q.status_code,q.headers.get('content-type'),len(q.content),flush=True)
+                              if q.status_code==200 and save(q.content,title,org,'',u,pages): break
+                          except Exception as e: print('SDPDFERR',u,repr(e),flush=True)
+
+          # Eastmoney pagination around the exact publication date.
+          em={}
+          for qtype in range(0,6):
+              for page in range(1,21):
+                  p={'pageNo':page,'pageSize':100,'qType':qtype,'beginTime':'2025-07-19','endTime':'2025-07-23'}
+                  try:
+                      r=s.get('https://reportapi.eastmoney.com/report/list',params=p,headers=em_h,timeout=(20,60))
+                      if page==1: print('EMQUERY',r.url,r.status_code,len(r.content),flush=True)
+                      obj=r.json()
+                  except Exception as e:
+                      print('EMERR',qtype,page,repr(e),flush=True); break
+                  rows=obj.get('data') if isinstance(obj,dict) else []
+                  if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or rows.get('items') or []
+                  if not isinstance(rows,list) or not rows: break
+                  for d in rows:
+                      if '天富龙' in str(d.get('title','')) or '天富龙' in str(d.get('stockName','')):
+                          code=str(d.get('infoCode') or d.get('infocode') or '')
+                          em[code or dump(d,1000)]=d; print('EMROW',dump(d,3500),flush=True)
+                  if len(rows)<100: break
+          em.setdefault('AP202507201712567083',{'title':'新股覆盖研究：天富龙','stockName':'天富龙','orgSName':'华金证券','publishDate':'2025-07-21','infoCode':'AP202507201712567083','attachPages':11})
+          for d in em.values():
+              code=str(d.get('infoCode') or d.get('infocode') or '')
+              if not code: continue
+              u=f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf'
+              try:
+                  r=s.get(u,headers=em_h,timeout=(30,120))
+                  print('EMPDF',u,r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+                  if r.status_code==200: save(r.content,str(d.get('title') or '天富龙研报'),str(d.get('orgSName') or d.get('orgName') or '券商'),str(d.get('publishDate') or ''),u,d.get('attachPages'))
+              except Exception as e: print('EMPDFERR',u,repr(e),flush=True)
+
+          (out/'metadata.json').write_text(json.dumps({'sdyanbao':meta,'eastmoney':list(em.values()),'downloaded':pdfs},ensure_ascii=False,indent=2),encoding='utf-8')
+          lines=['天富龙（603406）券商研究报告','']
+          for i,d in enumerate(pdfs,1): lines += [f'{i}. {d["org"]}：《{d["title"]}》',f'   日期：{d["date"]}',f'   页数：{d["pages_hint"] or d["approx_pages"]}',f'   文件：{d["file"]}','']
+          lines.append('资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。')
+          (out/'报告清单.txt').write_text('\n'.join(lines),encoding='utf-8')
+          z=Path('天富龙_券商深度报告_公开完整版.zip')
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED) as f:
+              for p in sorted(out.iterdir()): f.write(p,p.name)
+          print('DONE',len(pdfs),z.stat().st_size,flush=True)
+          PY
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tianfulong-fast-results
+          path: |
+            out/
+            天富龙_券商深度报告_公开完整版.zip
+          if-no-files-found: warn
