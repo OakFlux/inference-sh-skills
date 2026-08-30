@@ -1,0 +1,38 @@
+name: Temporary Hibor content fast probe
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-hibor-content-fast.yml
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch dynamic content for one report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re, requests, urllib.parse
+          s=requests.Session()
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s.headers.update({'User-Agent':ua,'Accept':'text/html,application/json,text/javascript,*/*'})
+          r=s.get('https://www.hibor.com.cn/docdetail_81532.html',timeout=60,allow_redirects=True)
+          print('LANDING',r.status_code,len(r.content),r.url,s.cookies.get_dict())
+          m=re.search(r"var\s+ncid\s*=\s*['\"]([^'\"]+)",r.text)
+          print('NCID',m.group(1) if m else None)
+          if not m: raise SystemExit(2)
+          endpoint=urllib.parse.urljoin(r.url,'/hiborweb/DocDetail/NewContent')
+          x=s.post(endpoint,data={'ncid':m.group(1)},headers={'User-Agent':ua,'Referer':r.url,'Origin':'https://www.hibor.com.cn','X-Requested-With':'XMLHttpRequest','Content-Type':'application/x-www-form-urlencoded; charset=UTF-8'},timeout=60,allow_redirects=True)
+          print('POST',x.status_code,len(x.content),x.url,x.headers.get('content-type'))
+          print('BODY_START')
+          print(x.text)
+          print('BODY_END')
+          PY
