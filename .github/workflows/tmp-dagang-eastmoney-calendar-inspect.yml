@@ -1,0 +1,67 @@
+name: Temporary Dagang Eastmoney calendar API inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-eastmoney-calendar-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect stock calendar HTML and scripts for report APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic scripts
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          curl --http1.1 -L --fail --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
+            -A "$UA" -e 'https://data.eastmoney.com/' -H 'Accept-Encoding: identity' \
+            'https://data.eastmoney.com/stockcalendar/002077.html' -o diagnostic/calendar.html
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import json,re,subprocess
+          html=Path('diagnostic/calendar.html').read_text(encoding='utf-8',errors='ignore')
+          base='https://data.eastmoney.com/stockcalendar/002077.html'
+          scripts=[]
+          for s in re.findall(r'''<script[^>]+src=["']([^"']+)["']''',html,re.I):
+              u=urljoin(base,s)
+              if u not in scripts: scripts.append(u)
+          print('SCRIPT_COUNT',len(scripts))
+          for i,u in enumerate(scripts,1):
+              print('SCRIPT',i,u)
+              p=Path(f'scripts/{i}.js')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','180','-A','Mozilla/5.0','-e',base,'-H','Accept-Encoding: identity',u,'-o',str(p)]
+              r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('SCRIPT_FETCH',i,r.returncode,p.stat().st_size if p.exists() else 0,r.stderr[-200:])
+          for p in Path('scripts').glob('*.js'):
+              txt=p.read_text(encoding='utf-8',errors='ignore')
+              if any(k in txt for k in ['stockcalendar','reportName','研报','REPORT','RPT_','datacenter-web','calendar']):
+                  print('MATCH_SCRIPT',p.name)
+                  for pat in [r'reportName.{0,200}',r'RPT_[A-Z0-9_]+',r'https?://[^\s"\']+',r'api/data[^\s"\']+']:
+                      for m in re.findall(pat,txt,re.I):
+                          print('PAT',p.name,str(m)[:1500])
+                  for line in txt.splitlines():
+                      if any(k in line for k in ['reportName','RPT_','stockcalendar','datacenter-web','研报']):
+                          print('LINE',p.name,line[:3000])
+          # Search raw HTML as well.
+          for line in html.splitlines():
+              if any(k in line for k in ['reportName','RPT_','stockcalendar','datacenter-web']):
+                  print('HTML_LINE',line[:3000])
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-eastmoney-calendar-inspection
+          path: |
+            diagnostic/
+            scripts/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
