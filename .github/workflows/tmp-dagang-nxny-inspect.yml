@@ -1,0 +1,101 @@
+name: Temporary Dagang Nxny report inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-nxny-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect Nxny archive pages and report endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic payloads
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin, quote
+          import json, re, subprocess, urllib.request
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          urls=[
+              'https://www.nxny.com/stype_gg_p1700_9/',
+              'http://www.nxny.com/stype_gg_p1700_9/',
+              'https://www3.nxny.com/stype_gg_p1700_9/',
+              'https://www.nxny.com/search/?q='+quote('大港股份'),
+              'https://www.nxny.com/search/'+quote('大港股份')+'/',
+              'https://www3.nxny.com/search/?q='+quote('大港股份'),
+              'https://www.nxny.com/report/search?keyword='+quote('大港股份'),
+              'https://www.nxny.com/?s='+quote('大港股份'),
+          ]
+          all_links=[]
+          for i,u in enumerate(urls,1):
+              out=Path(f'diagnostic/page_{i}.html')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',UA,'-e','https://www.nxny.com/','-H','Accept-Encoding: identity',u,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',i,u,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'ERR',p.stderr[-500:])
+              if not out.exists(): continue
+              body=out.read_bytes()
+              text=None; enc=None
+              for e in ['utf-8','gb18030','latin1']:
+                  try: text=body.decode(e); enc=e; break
+                  except Exception: pass
+              if text is None: continue
+              Path(f'diagnostic/page_{i}_utf8.html').write_text(text,encoding='utf-8')
+              for line in text.splitlines():
+                  if '大港股份' in line or '002077' in line:
+                      print('MATCH_LINE',i,' '.join(re.sub(r'<[^>]+>',' ',line).split())[:2000])
+              links=re.findall(r'''href\s*=\s*["']([^"']+)["']''',text,re.I)
+              for href in links:
+                  full=urljoin(u,href)
+                  if any(k in full for k in ['/report/view_','002077','download','down','pdf']):
+                      if full not in all_links:
+                          all_links.append(full); print('LINK',i,full)
+          Path('diagnostic/links.json').write_text(json.dumps(all_links,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Fetch report view links and inspect source for IDs/download endpoints.
+          for j,u in enumerate(all_links[:200],1):
+              if '/report/view_' not in u: continue
+              out=Path(f'diagnostic/report_{j}.html')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',UA,'-e','https://www.nxny.com/','-H','Accept-Encoding: identity',u,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode or not out.exists(): continue
+              body=out.read_bytes(); text=None
+              for e in ['utf-8','gb18030','latin1']:
+                  try: text=body.decode(e); break
+                  except Exception: pass
+              if text is None: continue
+              Path(f'diagnostic/report_{j}_utf8.html').write_text(text,encoding='utf-8')
+              title=''
+              m=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              if m: title=' '.join(re.sub(r'<[^>]+>',' ',m.group(1)).split())
+              print('REPORT',j,u,'TITLE',title)
+              found=sorted(set(re.findall(r'''https?://[^\s"'<>]+|//[^\s"'<>]+|[^\s"'<>]+\.pdf(?:\?[^\s"'<>]*)?|(?:download|down|file)[^\s"'<>]*''',text,re.I)))
+              for val in found:
+                  full=urljoin(u,val)
+                  if any(k in full.lower() for k in ['pdf','download','down','file','attach','report']):
+                      print('REPORT_URL',j,full[:2000])
+              for line in text.splitlines():
+                  low=line.lower()
+                  if any(k in low for k in ['download','downurl','pdf','fileurl','file_url','reportid','docid','加密报告','登录即可下载','无限制']):
+                      snippet=' '.join(re.sub(r'<[^>]+>',' ',line).split())
+                      if snippet: print('REPORT_LINE',j,snippet[:2000])
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-nxny-inspection
+          path: |
+            diagnostic/
+            payloads/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
