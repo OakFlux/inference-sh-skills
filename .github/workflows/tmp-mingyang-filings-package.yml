@@ -1,0 +1,299 @@
+name: Temporary verified Mingyang filings package
+
+on:
+  push:
+    branches:
+      - tmp/download-mingyang-filings-20260830
+    paths:
+      - .github/workflows/tmp-mingyang-filings-package.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Discover, download, verify and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output package previews diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import subprocess
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          OUTPUT = Path('output')
+          PACKAGE = Path('package')
+          PREVIEWS = Path('previews')
+          DIAG = Path('diagnostic')
+
+          # Query the complete public announcement catalog for 601615.SH.
+          rows = []
+          for page in range(1, 20):
+              url = (
+                  'https://np-anotice-stock.eastmoney.com/api/security/ann'
+                  f'?sr=-1&page_size=100&page_index={page}&ann_type=A&client_source=web&stock_list=601615'
+              )
+              out = DIAG / f'page_{page}.json'
+              cmd = [
+                  'curl', '--http1.1', '-L', '--fail', '--silent', '--show-error',
+                  '--retry', '8', '--retry-all-errors', '--retry-delay', '1',
+                  '--connect-timeout', '30', '--max-time', '240',
+                  '-A', UA, '-e', 'https://data.eastmoney.com/notices/stock/601615.html',
+                  '-H', 'Accept-Encoding: identity', url, '-o', str(out),
+              ]
+              proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              print('FETCH', page, 'RC', proc.returncode, 'SIZE', out.stat().st_size if out.exists() else 0, 'ERR', proc.stderr[-300:])
+              if proc.returncode or not out.exists():
+                  raise RuntimeError(f'Announcement catalog fetch failed on page {page}')
+              obj = json.loads(out.read_text(encoding='utf-8', errors='replace'))
+              data = obj.get('data') or {}
+              current = data.get('list') or []
+              print('PAGE', page, 'ROWS', len(current), 'TOTAL', data.get('total_hits'))
+              rows.extend(current)
+              if len(current) < 100:
+                  break
+
+          DIAG.joinpath('all_announcements.json').write_text(
+              json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          def title_of(row: dict) -> str:
+              return str(row.get('title') or '').strip()
+
+          def notice_date(row: dict) -> str:
+              return str(row.get('notice_date') or '')[:10]
+
+          def column_names(row: dict) -> list[str]:
+              return [str(c.get('column_name') or '') for c in (row.get('columns') or [])]
+
+          selected = []
+          annual_map = {}
+
+          for year in range(2020, 2026):
+              candidates = []
+              target = f'{year}年年度报告'
+              for row in rows:
+                  title = title_of(row)
+                  if target not in title:
+                      continue
+                  if any(word in title for word in ['摘要', '英文版', '英文', '审计报告', '社会责任报告', 'ESG报告']):
+                      continue
+                  cols = column_names(row)
+                  score = (
+                      1 if any('年度报告全文' in c for c in cols) else 0,
+                      1 if any(k in title for k in ['修订版', '更新版', '更正版']) else 0,
+                      notice_date(row),
+                  )
+                  candidates.append((score, row))
+              if not candidates:
+                  raise RuntimeError(f'No full annual report found for {year}')
+              candidates.sort(key=lambda item: item[0], reverse=True)
+              chosen = candidates[0][1]
+              annual_map[year] = chosen
+              print('ANNUAL_SELECTED', year, chosen.get('art_code'), notice_date(chosen), title_of(chosen), column_names(chosen))
+
+          # Latest genuine quarterly report: first-quarter or third-quarter full report.
+          quarter_candidates = []
+          for row in rows:
+              title = title_of(row)
+              if not any(k in title for k in ['第一季度报告', '第三季度报告']):
+                  continue
+              if any(k in title for k in ['摘要', '英文版', '英文']):
+                  continue
+              date = notice_date(row)
+              year_match = re.search(r'(20\d{2})年', title)
+              report_year = int(year_match.group(1)) if year_match else 0
+              quarter_rank = 3 if '第三季度报告' in title else 1
+              quarter_candidates.append(((report_year, quarter_rank, date), row))
+          if not quarter_candidates:
+              raise RuntimeError('No quarterly report found')
+          quarter_candidates.sort(key=lambda item: item[0], reverse=True)
+          latest_quarter = quarter_candidates[0][1]
+          print('LATEST_QUARTER_SELECTED', latest_quarter.get('art_code'), notice_date(latest_quarter), title_of(latest_quarter), column_names(latest_quarter))
+
+          filing_specs = []
+          for index, year in enumerate(range(2020, 2026), start=1):
+              row = annual_map[year]
+              filing_specs.append({
+                  'index': index,
+                  'kind': '年度报告全文',
+                  'report_year': year,
+                  'row': row,
+                  'filename': f'{index:02d}_Mingyang_Smart_Energy_{year}_Annual_Report.pdf',
+                  'min_pages': 80,
+                  'needles': ['明阳智能', f'{year}年年度报告'],
+              })
+
+          quarter_title = title_of(latest_quarter)
+          q_year_match = re.search(r'(20\d{2})年', quarter_title)
+          q_year = int(q_year_match.group(1)) if q_year_match else 0
+          q_label = 'Q3' if '第三季度报告' in quarter_title else 'Q1'
+          filing_specs.append({
+              'index': 7,
+              'kind': '最新季度报告',
+              'report_year': q_year,
+              'row': latest_quarter,
+              'filename': f'07_Mingyang_Smart_Energy_{q_year}_{q_label}_Report.pdf',
+              'min_pages': 8,
+              'needles': ['明阳智能', quarter_title.split(':')[-1].split('：')[-1]],
+          })
+
+          def download_pdf(art_code: str, publish_date: str, index: int) -> tuple[Path, str]:
+              attempts = [
+                  f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf?{publish_date.replace("-", "")}.pdf=',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art_code}_1.pdf?{publish_date.replace("-", "")}.pdf=',
+              ]
+              temp = OUTPUT / f'temp_{index:02d}.pdf'
+              for url in attempts:
+                  temp.unlink(missing_ok=True)
+                  cmd = [
+                      'curl', '--http1.1', '-L', '--fail', '--silent', '--show-error',
+                      '--retry', '10', '--retry-all-errors', '--retry-delay', '2',
+                      '--connect-timeout', '30', '--max-time', '1500', '--compressed',
+                      '-A', UA, '-e', 'https://data.eastmoney.com/notices/stock/601615.html',
+                      '-H', 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                      url, '-o', str(temp),
+                  ]
+                  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  size = temp.stat().st_size if temp.exists() else 0
+                  magic = temp.read_bytes()[:8] if temp.exists() else b''
+                  print('TRY', art_code, 'RC', proc.returncode, 'SIZE', size, 'MAGIC', magic, 'URL', url, 'ERR', proc.stderr[-300:])
+                  if proc.returncode == 0 and size > 25000 and magic[:4] == b'%PDF':
+                      return temp, url
+              raise RuntimeError(f'Unable to download valid PDF for {art_code}')
+
+          verified = []
+          for spec in filing_specs:
+              row = spec['row']
+              art_code = str(row.get('art_code') or '')
+              if not art_code:
+                  raise RuntimeError(f'Missing art_code for {title_of(row)}')
+              date = notice_date(row)
+              temp, source_url = download_pdf(art_code, date, spec['index'])
+
+              info = subprocess.check_output(['pdfinfo', str(temp)], text=True, errors='replace')
+              match = re.search(r'^Pages:\s*(\d+)', info, re.M)
+              pages = int(match.group(1)) if match else 0
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'{title_of(row)}: only {pages} pages, expected at least {spec["min_pages"]}')
+
+              text_file = DIAG / f'{art_code}.txt'
+              subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(25, pages)), str(temp), str(text_file)],
+                  check=True,
+              )
+              compact = ''.join(text_file.read_text(encoding='utf-8', errors='replace').split())
+              # Company name/code must be present; year/title check is tolerant of PDF line breaking.
+              if '明阳智能' not in compact and '601615' not in compact:
+                  raise RuntimeError(f'{title_of(row)}: company name/code not found')
+              year_text = str(spec['report_year'])
+              if year_text and year_text not in compact[:20000]:
+                  raise RuntimeError(f'{title_of(row)}: report year not found in opening pages')
+
+              final_pdf = OUTPUT / spec['filename']
+              temp.replace(final_pdf)
+
+              for page_no, tag in [(1, 'first'), (pages, 'last')]:
+                  target = PREVIEWS / f'{spec["index"]:02d}_{tag}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '90', str(final_pdf), str(target)],
+                      check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  )
+                  png = Path(str(target) + '.png')
+                  if not png.exists() or png.stat().st_size < 8000:
+                      raise RuntimeError(f'{final_pdf.name}: {tag}-page render failed')
+
+              item = {
+                  'category': spec['kind'],
+                  'reportYear': spec['report_year'],
+                  'title': title_of(row),
+                  'disclosureDate': date,
+                  'artCode': art_code,
+                  'pages': pages,
+                  'filename': final_pdf.name,
+                  'sizeBytes': final_pdf.stat().st_size,
+                  'sha256': hashlib.sha256(final_pdf.read_bytes()).hexdigest(),
+                  'sourceUrl': source_url,
+              }
+              verified.append(item)
+              print('VERIFIED', json.dumps(item, ensure_ascii=False))
+
+          manifest = {
+              'company': '明阳智慧能源集团股份公司',
+              'stockCode': '601615.SH',
+              'generatedAtUtc': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'annualReports': [r for r in verified if r['category'] == '年度报告全文'],
+              'latestQuarterlyReport': [r for r in verified if r['category'] == '最新季度报告'],
+              'files': verified,
+          }
+          (PACKAGE / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          lines = [
+              '明阳智能（601615.SH）2020—2025年年度报告及最新季报资料包',
+              '',
+              '收录2020、2021、2022、2023、2024、2025年度报告全文，以及截至打包日最新季度报告全文。',
+              '未收录年度报告摘要、英文版、ESG报告或其他附件。',
+              '',
+          ]
+          for i, item in enumerate(verified, start=1):
+              lines.extend([
+                  f'{i}. {item["title"]}',
+                  f'   类别：{item["category"]}',
+                  f'   披露日期：{item["disclosureDate"]}',
+                  f'   实际页数：{item["pages"]}',
+                  f'   文件名：{item["filename"]}',
+                  f'   公告代码：{item["artCode"]}',
+                  '',
+              ])
+          lines.extend([
+              '核验说明：所有文件均为原始PDF；已检查PDF文件头、实际页数和公司名称/证券代码，',
+              '并完成首页与末页渲染。压缩包附有SHA-256校验值。',
+              '仅供公开信息整理和研究使用。',
+          ])
+          (PACKAGE / '报告清单与核验说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (PACKAGE / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{r["sha256"]}  {r["filename"]}' for r in verified) + '\n',
+              encoding='utf-8',
+          )
+          for item in verified:
+              (PACKAGE / item['filename']).write_bytes((OUTPUT / item['filename']).read_bytes())
+
+          print('FINAL_COUNT', len(verified))
+          for item in verified:
+              print('FINAL', item['category'], item['reportYear'], item['pages'], item['title'], item['filename'])
+          PY
+
+          (cd package && zip -q -9 ../Mingyang_2020_2025_Annual_Reports_Latest_Quarterly_Report.zip ./*)
+          unzip -t Mingyang_2020_2025_Annual_Reports_Latest_Quarterly_Report.zip
+          ls -lh output package previews Mingyang_2020_2025_Annual_Reports_Latest_Quarterly_Report.zip
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mingyang-annual-reports-latest-quarterly-report
+          path: |
+            Mingyang_2020_2025_Annual_Reports_Latest_Quarterly_Report.zip
+            output/*.pdf
+            package/manifest.json
+            package/报告清单与核验说明.txt
+            package/SHA256SUMS.txt
+            previews/*.png
+            diagnostic/all_announcements.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
