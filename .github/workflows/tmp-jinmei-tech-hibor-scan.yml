@@ -1,0 +1,83 @@
+name: Temporary Jinmei Technology Hibor archive scan
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-jinmei-tech-hibor-scan.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Scan historical public report archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'})
+          report_links={}
+          terms=['丹化科技','600844','丹科B股','煤制乙二醇']
+          for year in range(2008,2017):
+              for month in range(1,13):
+                  ym=f'{year}{month:02d}'
+                  url=f'https://www.hibor.com.cn/archiver_houtai/{ym}.html'
+                  try:
+                      r=s.get(url,timeout=60,allow_redirects=True)
+                      print('ARCHIVE',ym,r.status_code,len(r.content))
+                      if r.status_code!=200 or len(r.content)<1000: continue
+                      r.encoding=r.apparent_encoding or 'utf-8'
+                      text=r.text
+                      if not any(t in text for t in terms):
+                          # Some archives are mis-decoded. Try GB18030 explicitly.
+                          try:
+                              text=r.content.decode('gb18030','ignore')
+                          except Exception:
+                              pass
+                      if not any(t in text for t in terms): continue
+                      soup=BeautifulSoup(text,'html.parser')
+                      for a in soup.find_all('a',href=True):
+                          label=' '.join(a.get_text(' ',strip=True).split())
+                          blob=label+' '+a['href']
+                          if any(t in blob for t in terms):
+                              href=urllib.parse.urljoin(r.url,a['href'])
+                              report_links[href]=label
+                              print('ARCHIVE_MATCH',json.dumps({'ym':ym,'label':label,'href':href},ensure_ascii=False))
+                  except Exception as exc:
+                      print('ARCHIVE_ERR',ym,repr(exc))
+
+          print('\nLINK_COUNT',len(report_links))
+          for href,label in report_links.items():
+              print('\nREPORT_LINK',json.dumps({'label':label,'href':href},ensure_ascii=False))
+              try:
+                  r=s.get(href,timeout=90,allow_redirects=True)
+                  print('HTTP',r.status_code,len(r.content),r.url)
+                  if r.status_code!=200 or len(r.content)<500: continue
+                  r.encoding=r.apparent_encoding or 'utf-8'
+                  text=r.text
+                  soup=BeautifulSoup(text,'html.parser')
+                  visible=' '.join(soup.get_text(' ',strip=True).split())
+                  title=soup.title.get_text(' ',strip=True) if soup.title else ''
+                  print('TITLE',title[:1000])
+                  p=visible.find('股票名称：')
+                  if p<0: p=visible.find('研报页数：')
+                  if p>=0: print('META_CTX',visible[max(0,p-250):p+1600])
+                  for needle in ['研报页数：','研报出处：','研报作者：','推荐评级：','研报大小：']:
+                      m=re.search(re.escape(needle)+r'\s*([^ ]+(?:\s*[^ ]+){0,4})',visible)
+                      if m: print('FIELD',needle,m.group(1)[:300])
+                  for pat in [r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',r'https?://[^\s"\'<>]+(?:download|down|file|attachment)[^\s"\'<>]*']:
+                      for x in sorted(set(re.findall(pat,text,re.I))): print('ASSET',x[:2000])
+              except Exception as exc:
+                  print('REPORT_ERR',repr(exc))
+          PY
