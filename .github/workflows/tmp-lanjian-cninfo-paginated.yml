@@ -1,0 +1,94 @@
+name: Temporary paginated CNINFO search for Lanjian Electronics IPO documents
+
+on:
+  push:
+    branches:
+      - tmp/download-lanjian-electronics-reports-20260830
+    paths:
+      - .github/workflows/tmp-lanjian-cninfo-paginated.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search all CNINFO result pages and download broker IPO documents
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic downloads
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, math, re, time, urllib.parse, urllib.request
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          endpoint='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          all_rows=[]
+          seen=set()
+
+          for page in range(1, 12):
+              payload={
+                  'pageNum':str(page),'pageSize':'30','column':'szse','tabName':'fulltext',
+                  'plate':'sz','stock':'','searchkey':'蓝箭电子','secid':'',
+                  'category':'','trade':'','seDate':'2022-01-01~2023-12-31',
+                  'sortName':'time','sortType':'desc','isHLtitle':'true'
+              }
+              req=urllib.request.Request(endpoint,data=urllib.parse.urlencode(payload).encode(),headers={
+                  'User-Agent':UA,
+                  'Referer':'https://www.cninfo.com.cn/new/fulltextSearch?notautosubmit=&keyWord=%E8%93%9D%E7%AE%AD%E7%94%B5%E5%AD%90',
+                  'X-Requested-With':'XMLHttpRequest',
+                  'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8',
+                  'Accept':'application/json, text/javascript, */*; q=0.01',
+              },method='POST')
+              raw=urllib.request.urlopen(req,timeout=120).read().decode('utf-8','replace')
+              Path(f'diagnostic/page_{page}.json').write_text(raw,encoding='utf-8')
+              obj=json.loads(raw)
+              anns=obj.get('announcements') or []
+              print('PAGE',page,'ROWS',len(anns),'TOTAL',obj.get('totalAnnouncement'))
+              if not anns: break
+              for a in anns:
+                  adjunct=a.get('adjunctUrl') or ''
+                  if adjunct in seen: continue
+                  seen.add(adjunct)
+                  title=(a.get('announcementTitle') or '').replace('<em>','').replace('</em>','')
+                  row={
+                      'title':title,
+                      'time':a.get('announcementTime'),
+                      'secName':(a.get('secName') or '').replace('<em>','').replace('</em>',''),
+                      'secCode':a.get('secCode'),
+                      'adjunctUrl':adjunct,
+                      'url':'https://static.cninfo.com.cn/'+adjunct.lstrip('/'),
+                  }
+                  all_rows.append(row)
+              if len(anns)<30: break
+              time.sleep(.2)
+
+          Path('diagnostic/all_rows.json').write_text(json.dumps(all_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          keys=['发行保荐书','上市保荐书','保荐工作报告','招股说明书','发行人及保荐机构回复意见','审核问询函的回复']
+          matches=[r for r in all_rows if any(k in r['title'] for k in keys)]
+          Path('diagnostic/matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('ALL',len(all_rows),'MATCHES',len(matches))
+          for r in matches: print('MATCH',json.dumps(r,ensure_ascii=False))
+
+          dl=[r for r in matches if any(k in r['title'] for k in ['发行保荐书','上市保荐书','保荐工作报告'])]
+          for i,r in enumerate(dl,1):
+              safe=re.sub(r'[\\/:*?"<>|]+','_',r['title'])[:120]
+              dest=Path('downloads')/f'{i:02d}_{safe}.pdf'
+              req=urllib.request.Request(r['url'],headers={'User-Agent':UA,'Referer':'https://www.cninfo.com.cn/'})
+              body=urllib.request.urlopen(req,timeout=180).read()
+              dest.write_bytes(body)
+              print('DOWNLOADED',dest,len(body),body[:4])
+          PY
+          ls -lh diagnostic downloads || true
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanjian-electronics-cninfo-paginated
+          path: |
+            diagnostic/
+            downloads/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
