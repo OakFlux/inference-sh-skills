@@ -1,0 +1,80 @@
+name: Temporary Sany Renewable Energy filings discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-sany-renewable-filings-20260830
+    paths:
+      - .github/workflows/tmp-sany-filings-discovery.yml
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query public announcement catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import json, subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          rows=[]
+          for page in range(1,10):
+              url=(
+                  'https://np-anotice-stock.eastmoney.com/api/security/ann'
+                  f'?sr=-1&page_size=100&page_index={page}&ann_type=A&client_source=web&stock_list=688349'
+              )
+              out=Path(f'diagnostic/page_{page}.json')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6',
+                   '--retry-all-errors','--retry-delay','1','--connect-timeout','25','--max-time','180',
+                   '-A',UA,'-e','https://data.eastmoney.com/notices/stock/688349.html',
+                   '-H','Accept-Encoding: identity',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',page,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'ERR',p.stderr[-300:])
+              if p.returncode or not out.exists():
+                  break
+              obj=json.loads(out.read_text(encoding='utf-8',errors='replace'))
+              data=obj.get('data') or {}
+              current=data.get('list') or []
+              print('PAGE',page,'ROWS',len(current),'TOTAL',data.get('total_hits'))
+              rows.extend(current)
+              if len(current)<100:
+                  break
+
+          Path('diagnostic/all_announcements.json').write_text(
+              json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8'
+          )
+          print('TOTAL_ROWS',len(rows))
+          keywords=['年度报告','招股说明书','第一季度报告','半年度报告','第三季度报告']
+          candidates=[]
+          for row in rows:
+              title=str(row.get('title') or '')
+              if any(k in title for k in keywords):
+                  candidates.append(row)
+                  print('CANDIDATE',json.dumps({
+                      'art_code':row.get('art_code'),
+                      'title':title,
+                      'notice_date':row.get('notice_date'),
+                      'display_time':row.get('display_time'),
+                      'columns':row.get('columns'),
+                      'codes':row.get('codes'),
+                  },ensure_ascii=False))
+          Path('diagnostic/candidates.json').write_text(
+              json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8'
+          )
+          PY
+
+      - name: Upload discovery results
+        uses: actions/upload-artifact@v4
+        with:
+          name: sany-renewable-filings-discovery
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
