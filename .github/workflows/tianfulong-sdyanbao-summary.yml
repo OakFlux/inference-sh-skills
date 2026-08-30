@@ -1,0 +1,125 @@
+name: Summarize Sdyanbao Tianfulong API responses
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-sdyanbao-summary.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query and summarize
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, requests
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          s=requests.Session()
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          base={'User-Agent':UA,'Accept':'application/json, text/plain, */*','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','Device':'1','X-Token':''}
+
+          def walk(x,path='$'):
+              if isinstance(x,dict):
+                  yield path,x
+                  for k,v in x.items(): yield from walk(v,f'{path}.{k}')
+              elif isinstance(x,list):
+                  for i,v in enumerate(x): yield from walk(v,f'{path}[{i}]')
+
+          def slim(d):
+              keys=['id','rid','file_id','report_id','title','name','file_name','report_name','company','author','brand_name','institution_name','organization','source','publish_time','release_time','page','pages','page_count','file_type','free','is_free','isFree','vip','is_vip','price','download_price','original_pdf_path','pdf_path','file_path','pdf_url','download_url','url','oss_url','watermark_pdf_path']
+              return {k:d.get(k) for k in keys if isinstance(d,dict) and d.get(k) not in (None,'',[],{})}
+
+          trials=[]
+          bodies=[
+            {'keyword':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'keywords':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'keyword':'天富龙','pageNum':1,'pageSize':100,'opFrom':1},
+            {'keywords':'天富龙','pageNum':1,'pageSize':100,'opFrom':1},
+            {'search':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'title':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'key':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'wd':'天富龙','page':1,'pageSize':100,'opFrom':1},
+          ]
+          modes=['json','form','params']
+          ids={}
+          for body in bodies:
+            for mode in modes:
+              try:
+                if mode=='json': r=s.post('https://api.sdyanbao.com/api/file/search',headers={**base,'Content-Type':'application/json;charset=UTF-8'},json=body,timeout=45)
+                elif mode=='form': r=s.post('https://api.sdyanbao.com/api/file/search',headers=base,data=body,timeout=45)
+                else: r=s.get('https://api.sdyanbao.com/api/file/search',headers=base,params=body,timeout=45)
+                rec={'body':body,'mode':mode,'status':r.status_code,'content_type':r.headers.get('content-type'),'bytes':len(r.content),'head':r.text[:400]}
+                try:
+                  obj=r.json()
+                  rec['top_keys']=list(obj.keys()) if isinstance(obj,dict) else type(obj).__name__
+                  rec['code']=obj.get('code') if isinstance(obj,dict) else None
+                  rec['msg']=obj.get('msg') if isinstance(obj,dict) else None
+                  matches=[]
+                  for path,d in walk(obj):
+                    blob=json.dumps(d,ensure_ascii=False,default=str)
+                    if '天富龙' in blob:
+                      entry={'path':path,'fields':slim(d)}
+                      if entry not in matches: matches.append(entry)
+                      for k in ('id','rid','file_id','report_id'):
+                        if isinstance(d,dict) and d.get(k) not in (None,''):
+                          ids[str(d[k])]=slim(d); break
+                  rec['matches']=matches[:30]
+                except Exception as e:
+                  rec['json_error']=repr(e)
+                trials.append(rec)
+                print('TRIAL',json.dumps(rec,ensure_ascii=False),flush=True)
+              except Exception as e:
+                rec={'body':body,'mode':mode,'error':repr(e)}; trials.append(rec); print('TRIAL',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          details=[]
+          detail_bodies=[]
+          for i in ids:
+            detail_bodies += [({'id':i,'opFrom':1},i),({'file_id':i,'opFrom':1},i),({'rid':i,'opFrom':1},i)]
+          for body,i in detail_bodies:
+            for mode in ('json','form','params'):
+              try:
+                if mode=='json': r=s.post('https://api.sdyanbao.com/api/file/detail',headers={**base,'Content-Type':'application/json;charset=UTF-8'},json=body,timeout=45)
+                elif mode=='form': r=s.post('https://api.sdyanbao.com/api/file/detail',headers=base,data=body,timeout=45)
+                else: r=s.get('https://api.sdyanbao.com/api/file/detail',headers=base,params=body,timeout=45)
+                rec={'id':i,'body':body,'mode':mode,'status':r.status_code,'content_type':r.headers.get('content-type'),'bytes':len(r.content),'head':r.text[:400]}
+                try:
+                  obj=r.json(); rec['code']=obj.get('code') if isinstance(obj,dict) else None; rec['msg']=obj.get('msg') if isinstance(obj,dict) else None
+                  entries=[]
+                  for path,d in walk(obj):
+                    f=slim(d)
+                    if f: entries.append({'path':path,'fields':f})
+                  rec['entries']=entries[:50]
+                except Exception as e: rec['json_error']=repr(e)
+                details.append(rec); print('DETAIL',json.dumps(rec,ensure_ascii=False),flush=True)
+              except Exception as e:
+                rec={'id':i,'body':body,'mode':mode,'error':repr(e)}; details.append(rec); print('DETAIL',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          # Extract exact request construction from public frontend bundles.
+          contexts=[]
+          try:
+            page=s.get('https://www.sdyanbao.com/detail/791620',headers={'User-Agent':UA},timeout=60)
+            scripts=re.findall(r'<script[^>]+src=["\']([^"\']+)["\']',page.text,re.I)
+            for src in scripts:
+              u=urljoin(page.url,src)
+              js=s.get(u,headers={'User-Agent':UA},timeout=60).text.replace('\\/','/')
+              for needle in ['/api/file/search','/api/file/detail','/api/file/download']:
+                for m in re.finditer(re.escape(needle),js):
+                  contexts.append({'script':u,'needle':needle,'context':js[max(0,m.start()-3000):m.start()+5000]})
+          except Exception as e: contexts.append({'error':repr(e)})
+
+          Path('summary.json').write_text(json.dumps({'trials':trials,'ids':ids,'details':details,'contexts':contexts},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY_IDS',json.dumps(ids,ensure_ascii=False),flush=True)
+          print('CONTEXT_COUNT',len(contexts),flush=True)
+          PY
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: tianfulong-sdyanbao-summary
+          path: summary.json
