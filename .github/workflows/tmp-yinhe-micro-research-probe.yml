@@ -34,20 +34,12 @@ jobs:
 
           endpoint = "https://reportapi.eastmoney.com/report/list"
           params = {
-              "industryCode": "*",
               "pageSize": "100",
-              "industry": "*",
-              "rating": "*",
-              "ratingChange": "*",
-              "beginTime": "2020-01-01",
-              "endTime": "2026-08-30",
-              "fields": "",
-              "qType": "0",
-              "orgCode": "",
-              "code": "688689",
               "pageNo": "1",
-              "p": "1",
-              "pageNum": "1",
+              "beginTime": "20200101",
+              "endTime": "20260830",
+              "qType": "0",
+              "code": "688689",
           }
           headers = {
               "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36",
@@ -60,7 +52,7 @@ jobs:
           response.raise_for_status()
           payload = response.json()
           print("TOP KEYS", list(payload.keys()), flush=True)
-          print("COUNT", payload.get("count"), "HITS", payload.get("hits"), flush=True)
+          print("HITS", payload.get("hits"), "SIZE", payload.get("size"), "TOTALPAGE", payload.get("TotalPage"), flush=True)
           data = payload.get("data") or []
           print("DATA LEN", len(data), flush=True)
           Path("reports").mkdir(exist_ok=True)
@@ -71,12 +63,13 @@ jobs:
               return int(match.group(1)) if match else 0
 
           for index, item in enumerate(data, start=1):
-              info_code = str(item.get("infoCode") or item.get("INFO_CODE") or "")
-              title = str(item.get("title") or item.get("TITLE") or "")
-              org = str(item.get("orgSName") or item.get("ORG_SNAME") or item.get("orgName") or "")
-              date = str(item.get("publishDate") or item.get("PUBLISH_DATE") or "")
-              researcher = str(item.get("researcher") or item.get("RESEARCHER") or "")
-              rating = str(item.get("emRatingName") or item.get("EM_RATING_NAME") or item.get("rating") or "")
+              info_code = str(item.get("infoCode") or "")
+              title = str(item.get("title") or "")
+              org = str(item.get("orgSName") or item.get("orgName") or "")
+              date = str(item.get("publishDate") or "")
+              researcher = str(item.get("researcher") or "")
+              rating = str(item.get("emRatingName") or item.get("sRatingName") or "")
+              attach_pages = item.get("attachPages")
               print("\nITEM", index, json.dumps({
                   "infoCode": info_code,
                   "title": title,
@@ -84,7 +77,7 @@ jobs:
                   "date": date,
                   "researcher": researcher,
                   "rating": rating,
-                  "keys": list(item.keys()),
+                  "attachPages": attach_pages,
               }, ensure_ascii=False), flush=True)
               if not info_code:
                   continue
@@ -103,6 +96,7 @@ jobs:
                               "User-Agent": headers["User-Agent"],
                               "Referer": "https://data.eastmoney.com/",
                               "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                              "Connection": "close",
                           },
                           timeout=(30, 300),
                       )
@@ -118,7 +112,7 @@ jobs:
                           capture_output=True,
                           errors="ignore",
                       ).stdout
-                      compact = re.sub(r"\s+", " ", text).strip()[:1200]
+                      compact = re.sub(r"\s+", " ", text).strip()[:1000]
                       print("PDF", destination.name, "PAGES", count, "FIRST_TEXT", compact, flush=True)
                       ok = True
                       break
