@@ -1,0 +1,124 @@
+name: Temporary Nike Fxbaogao asset recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-fxbaogao-assets.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils imagemagick
+
+      - name: Inspect frontend scripts and recover sequential report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p scripts diagnostics pages
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          # Fetch known frontend assets to identify any public download APIs.
+          for url in \
+            'https://static.fxbaogao.com/detail_source/js/app-v1.js' \
+            'https://static.fxbaogao.com/detail_source/_next/static/chunks/polyfills-0d1b80a048d4787e.js' \
+            'https://static.fxbaogao.com/detail_source/js/jquery-4.0.0.min.js'; do
+            name=$(echo "$url" | sed 's#https://##; s#[/?=&]#_#g')
+            curl --http1.1 -L --fail --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
+              -A "$UA" -e 'https://www.fxbaogao.com/' -H 'Accept-Encoding: identity' \
+              "$url" -o "scripts/${name}" || true
+          done
+          grep -RniE 'download|pdf|docId|fileUrl|report-image|searchReportData|api/' scripts > diagnostics/script_hits.txt || true
+          head -500 diagnostics/script_hits.txt || true
+
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import hashlib, json, subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          docs=[
+              {'id':'4742006','date':'2025/03/23','label':'Nike_FY2025Q3_Guosheng'},
+              {'id':'4924081','date':'2025/06/29','label':'Nike_FY2025Q4_Guosheng'},
+              {'id':'5083891','date':'2025/10/08','label':'Nike_FY2026Q1_Guosheng'},
+              {'id':'5337859','date':'2026/04/06','label':'Nike_FY2026Q3_Huachuang'},
+          ]
+          root=Path('pages'); diag=Path('diagnostics')
+
+          def fetch(doc,page,variant):
+              base=f"https://public.fxbaogao.com/report-image/{doc['date']}/{doc['id']}-{page}.png"
+              url=base if variant=='raw' else base+'?x-oss-process=image/format,webp'
+              out=root/doc['label']/f'{page:03d}_{variant}.bin'
+              out.parent.mkdir(parents=True,exist_ok=True)
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','3',
+                   '--retry-all-errors','--connect-timeout','15','--max-time','120','-A',UA,
+                   '-e',f"https://www.fxbaogao.com/detail/{doc['id']}",'-H','Accept-Encoding: identity',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode or not out.exists():
+                  out.unlink(missing_ok=True)
+                  return {'page':page,'variant':variant,'ok':False,'url':url,'err':p.stderr[-200:]}
+              b=out.read_bytes(); kind='other'; ext='.bin'
+              if b[:8]==b'\x89PNG\r\n\x1a\n': kind='png'; ext='.png'
+              elif b[:3]==b'\xff\xd8\xff': kind='jpg'; ext='.jpg'
+              elif b[:4]==b'RIFF' and b[8:12]==b'WEBP': kind='webp'; ext='.webp'
+              elif b[:4]==b'%PDF': kind='pdf'; ext='.pdf'
+              if kind=='other' or out.stat().st_size<5000:
+                  preview=b[:200].decode('utf-8','replace')
+                  out.unlink(missing_ok=True)
+                  return {'page':page,'variant':variant,'ok':False,'url':url,'size':len(b),'preview':preview}
+              final=out.with_suffix(ext); out.rename(final)
+              return {'page':page,'variant':variant,'ok':True,'url':url,'kind':kind,'size':final.stat().st_size,
+                      'file':str(final),'sha256':hashlib.sha256(final.read_bytes()).hexdigest()}
+
+          manifests=[]
+          for doc in docs:
+              results=[]
+              tasks=[(doc,p,v) for p in range(1,81) for v in ['raw','webp']]
+              with ThreadPoolExecutor(max_workers=20) as ex:
+                  fm={ex.submit(fetch,*t):t for t in tasks}
+                  for f in as_completed(fm): results.append(f.result())
+              results.sort(key=lambda x:(x['page'],x['variant']))
+              # Keep raw PNG when available; otherwise keep webp. Remove duplicate variants.
+              selected=[]
+              for p in range(1,81):
+                  opts=[r for r in results if r['page']==p and r.get('ok')]
+                  chosen=next((r for r in opts if r['variant']=='raw'), opts[0] if opts else None)
+                  if chosen: selected.append(chosen)
+                  for r in opts:
+                      if r is not chosen:
+                          Path(r['file']).unlink(missing_ok=True)
+              # Determine contiguous page count from page 1.
+              contiguous=0
+              for p in range(1,81):
+                  if any(r['page']==p for r in selected): contiguous=p
+                  else: break
+              gaps=[p for p in range(1,max([r['page'] for r in selected],default=0)+1) if not any(r['page']==p for r in selected)]
+              summary={'doc':doc,'contiguous_pages':contiguous,'downloaded_pages':len(selected),'gaps':gaps,
+                       'selected':selected,'all_results':results}
+              manifests.append(summary)
+              print('DOC',doc['id'],'CONTIGUOUS',contiguous,'DOWNLOADED',len(selected),'GAPS',gaps[:20])
+              for r in selected[:5]: print('PAGE',doc['id'],r['page'],r['kind'],r['size'],r['url'])
+              if selected: print('LAST',doc['id'],selected[-1]['page'],selected[-1]['kind'],selected[-1]['size'])
+          diag.joinpath('page_manifest.json').write_text(json.dumps(manifests,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          find pages -type f -printf '%p\t%s\n' | sort | tail -40
+
+      - name: Upload recovered assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-fxbaogao-assets
+          path: |
+            scripts/
+            diagnostics/
+            pages/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
