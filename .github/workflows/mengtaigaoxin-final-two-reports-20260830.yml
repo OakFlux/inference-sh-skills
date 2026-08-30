@@ -1,0 +1,198 @@
+name: Package two complete Mengtaigaoxin broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mengtaigaoxin-final-two-reports-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF and image dependencies
+        run: |
+          python -m pip install --quiet pypdf pillow img2pdf
+
+      - name: Download, reconstruct, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '蒙泰高新_券商研究报告_2份_公开完整版'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          pages_dir = Path('_pages_2024_haitong')
+          pages_dir.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer': 'https://www.sdyanbao.com/',
+          }
+
+          def get(url: str, accept: str) -> bytes:
+              last = None
+              for attempt in range(6):
+                  try:
+                      r = session.get(url, headers={**headers, 'Accept': accept}, timeout=(30, 240))
+                      print('GET', url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                      if r.status_code == 200 and r.content:
+                          return r.content
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(2 * (attempt + 1))
+              raise RuntimeError(f'Unable to download {url}: {last}')
+
+          def sha(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for block in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(block)
+              return h.hexdigest()
+
+          records = []
+
+          # 1. Public original PDF, 12 pages.
+          item1 = {
+              'organization': '海通国际',
+              'title': '公司公告点评：上半年业绩承压，授予限制性股票彰显发展信心',
+              'report_date': '2023-08-21',
+              'public_index_date': '2023-08-25',
+              'filename': '01_海通国际_蒙泰高新_上半年业绩承压_授予限制性股票彰显发展信心_2023-08-21_12页.pdf',
+              'source_url': 'https://pdf.dfcfw.com/pdf/H3_AP202308251595831687_1.pdf',
+              'source_format': '公开原始PDF',
+          }
+          data = get(item1['source_url'], 'application/pdf,*/*;q=0.8')
+          if not data.startswith(b'%PDF-'):
+              raise RuntimeError('First report response is not PDF')
+          path1 = out / item1['filename']
+          path1.write_bytes(data)
+          reader1 = PdfReader(str(path1))
+          pages1 = len(reader1.pages)
+          text1 = '\n'.join((p.extract_text() or '') for p in reader1.pages[:3])
+          if pages1 != 12 or '蒙泰高新' not in text1 or '300876' not in text1:
+              raise RuntimeError(f'First report verification failed: pages={pages1}')
+          records.append({**item1, 'pages': pages1, 'bytes': path1.stat().st_size, 'sha256': sha(path1)})
+
+          # 2. The report site's public full-page originals, all ten pages, retained in order.
+          image_paths = []
+          image_dims = []
+          base = 'https://oss.sdyanbao.com/page/2024/4/15/971902'
+          for number in range(10):
+              url = f'{base}/{number}.png'
+              content = get(url, 'image/png,image/*;q=0.9,*/*;q=0.7')
+              image_path = pages_dir / f'{number:03d}.png'
+              image_path.write_bytes(content)
+              try:
+                  with Image.open(io.BytesIO(content)) as image:
+                      image.verify()
+                  with Image.open(image_path) as image:
+                      width, height = image.size
+                      fmt = image.format
+              except Exception as exc:
+                  raise RuntimeError(f'Invalid image page {number}: {exc}') from exc
+              if width < 700 or height < 900 or fmt not in {'PNG', 'JPEG', 'WEBP'}:
+                  raise RuntimeError(f'Unexpected page image {number}: {width}x{height}, {fmt}')
+              image_dims.append([width, height])
+              image_paths.append(image_path)
+
+          # Confirm that page 10 is absent so the public sequence is exactly 0..9, matching the indexed 10 pages.
+          tail = session.get(f'{base}/10.png', headers={**headers, 'Accept': 'image/png,image/*'}, timeout=(15, 45))
+          if tail.status_code == 200 and tail.content.startswith(b'\x89PNG'):
+              raise RuntimeError('Unexpected extra public page after the indexed ten pages')
+
+          item2 = {
+              'organization': '海通国际',
+              'title': '公司年报点评：短期业绩承压，积极推进碳纤维项目落地',
+              'report_date': '2024-04-02',
+              'public_index_date': '2024-04-15',
+              'filename': '02_海通国际_蒙泰高新_短期业绩承压_积极推进碳纤维项目落地_2024-04-02_10页.pdf',
+              'source_url': base,
+              'source_format': '公开逐页原图合成为PDF；页面内容及顺序未改动',
+          }
+          path2 = out / item2['filename']
+          path2.write_bytes(img2pdf.convert([str(p) for p in image_paths]))
+          reader2 = PdfReader(str(path2))
+          pages2 = len(reader2.pages)
+          if pages2 != 10:
+              raise RuntimeError(f'Second report page count mismatch: {pages2}')
+          records.append({
+              **item2,
+              'pages': pages2,
+              'bytes': path2.stat().st_size,
+              'sha256': sha(path2),
+              'image_dimensions': image_dims,
+          })
+
+          if len({r['sha256'] for r in records}) != 2:
+              raise RuntimeError('Duplicate PDFs detected')
+
+          lines = [
+              '蒙泰高新（300876）券商研究报告包',
+              '',
+              '本包包含2份公开完整公司研究报告。',
+              '说明：东北证券《丙纶长丝行业领跑者，双基地强势进军碳纤维》共33页，但目前公开阅览端仅开放前15页；为避免将残缺预览冒充完整版，该报告未装入本包。',
+              '已排除4页短评、可转债报告、招股说明书、摘要和付费/登录后内容。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {record['organization']}：《{record['title']}》",
+                  f"   报告日期：{record['report_date']}；公开索引日期：{record['public_index_date']}；页数：{record['pages']}页",
+                  f"   文件：{record['filename']}",
+                  f"   获取形式：{record['source_format']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF结构、实际页数、公司名称与证券代码（原始PDF）、公开页面连续性、文件哈希及ZIP CRC。',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (out / 'SHA256SUMS.txt').open('w', encoding='utf-8') as f:
+              for record in records:
+                  f.write(f"{record['sha256']}  {record['filename']}\n")
+
+          zip_path = Path(f'{PACKAGE}.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for file in sorted(out.iterdir()):
+                  zf.write(file, arcname=f'{PACKAGE}/{file.name}')
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              if len([n for n in zf.namelist() if n.lower().endswith('.pdf')]) != 2:
+                  raise RuntimeError('ZIP PDF count mismatch')
+          print('FINAL', zip_path, zip_path.stat().st_size, flush=True)
+          print(json.dumps(records, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mengtaigaoxin-two-full-reports
+          path: |
+            蒙泰高新_券商研究报告_2份_公开完整版/
+            蒙泰高新_券商研究报告_2份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
