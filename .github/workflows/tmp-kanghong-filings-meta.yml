@@ -1,0 +1,81 @@
+name: Temporary Kanghong annual and quarterly filing metadata
+
+on:
+  push:
+    branches:
+      - 'tmp/kanghong-filings-meta-20260830'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and inspect announcement metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          for page in $(seq 1 8); do
+            curl --http1.1 --location --fail --silent --show-error \
+              --retry 6 --retry-all-errors --retry-delay 1 \
+              --connect-timeout 20 --max-time 120 \
+              --user-agent "$UA" \
+              --referer 'https://data.eastmoney.com/notices/stock/002773.html' \
+              --header 'Accept-Encoding: identity' \
+              --get 'https://np-anotice-stock.eastmoney.com/api/security/ann' \
+              --data-urlencode 'sr=-1' \
+              --data-urlencode 'page_size=100' \
+              --data-urlencode "page_index=$page" \
+              --data-urlencode 'ann_type=A' \
+              --data-urlencode 'client_source=web' \
+              --data-urlencode 'stock_list=002773' \
+              --output "diagnostics/page_${page}.json"
+          done
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+
+          rows=[]; seen=set()
+          for path in sorted(Path('diagnostics').glob('page_*.json')):
+              obj=json.loads(path.read_text(encoding='utf-8',errors='ignore'))
+              data=(obj.get('data') or {}).get('list') or obj.get('list') or []
+              for row in data:
+                  code=str(row.get('art_code') or row.get('artCode') or row.get('infoCode') or '')
+                  if code and code not in seen:
+                      seen.add(code); rows.append(row)
+              if len(data)<100:
+                  break
+
+          def title(row):
+              return str(row.get('title') or row.get('notice_title') or row.get('art_title') or '')
+          def date(row):
+              raw=str(row.get('notice_date') or row.get('display_time') or row.get('publish_date') or '')
+              m=re.search(r'20\d{2}-\d{2}-\d{2}',raw)
+              return m.group(0) if m else raw[:10]
+          def code(row):
+              return str(row.get('art_code') or row.get('artCode') or row.get('infoCode') or '')
+
+          relevant=[]
+          for row in rows:
+              t=re.sub(r'\s+','',title(row))
+              if any(key in t for key in ('年度报告','第一季度报告','一季度报告')):
+                  relevant.append({'date':date(row),'title':title(row),'art_code':code(row),'raw':row})
+          relevant.sort(key=lambda x:(x['date'],x['title']),reverse=True)
+          Path('diagnostics/relevant.json').write_text(json.dumps(relevant,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL_ANNOUNCEMENTS',len(rows))
+          print('RELEVANT')
+          for item in relevant:
+              print(json.dumps({k:item[k] for k in ('date','title','art_code')},ensure_ascii=False))
+          PY
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghong-filings-metadata
+          path: diagnostics/relevant.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
