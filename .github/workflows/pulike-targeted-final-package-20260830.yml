@@ -1,0 +1,166 @@
+name: Package three full public Pulike deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/pulike-targeted-final-package-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF dependency
+        run: python -m pip install --quiet pypdf
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY = '普莱柯'
+          CODE = '603566'
+          PACKAGE = '普莱柯_券商深度报告_3份_公开完整版'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+
+          reports = [
+              {
+                  'organization': '华安证券',
+                  'title': '养殖业步入上行周期，主力产品销量有望重回快车道',
+                  'date': '2022-08-01',
+                  'infoCode': 'AP202208011576749449',
+                  'expected_pages': 42,
+                  'filename': '01_华安证券_普莱柯_养殖业步入上行周期_主力产品销量有望重回快车道_2022-08-01_42页.pdf',
+              },
+              {
+                  'organization': '开源证券',
+                  'title': '公司深度报告：猪用疫苗单价、毛利率双升，进入研发投入兑现期',
+                  'date': '2022-05-05',
+                  'infoCode': 'AP202205051563678150',
+                  'expected_pages': 24,
+                  'filename': '02_开源证券_普莱柯_猪用疫苗单价毛利率双升_进入研发投入兑现期_2022-05-05_24页.pdf',
+              },
+              {
+                  'organization': '中航证券',
+                  'title': '创新为基，扬帆蓝海',
+                  'date': '2022-04-14',
+                  'infoCode': 'AP202204141559252305',
+                  'expected_pages': 27,
+                  'filename': '03_中航证券_普莱柯_创新为基扬帆蓝海_2022-04-14_27页.pdf',
+              },
+          ]
+
+          def download(item: dict) -> tuple[bytes, str]:
+              last = None
+              for prefix in ('H3', 'H2'):
+                  url = f"https://pdf.dfcfw.com/pdf/{prefix}_{item['infoCode']}_1.pdf"
+                  for attempt in range(6):
+                      try:
+                          response = session.get(url, headers=headers, timeout=(30, 240), allow_redirects=True)
+                          print('GET', url, response.status_code, response.headers.get('content-type'), len(response.content), flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-'):
+                              return response.content, url
+                          last = RuntimeError(f'HTTP {response.status_code}; {len(response.content)} bytes')
+                      except Exception as exc:
+                          last = exc
+                      time.sleep(2 * (attempt + 1))
+              raise RuntimeError(f"Failed to download {item['title']}: {last}")
+
+          records = []
+          seen_hashes = set()
+          for item in reports:
+              data, source_url = download(item)
+              path = out / item['filename']
+              path.write_bytes(data)
+              reader = PdfReader(str(path))
+              pages = len(reader.pages)
+              if pages != item['expected_pages']:
+                  raise RuntimeError(f"Page count mismatch for {item['title']}: {pages} != {item['expected_pages']}")
+              text = '\n'.join((page.extract_text() or '') for page in reader.pages[:8])
+              compact = re.sub(r'\s+', '', text)
+              if COMPANY not in compact and CODE not in compact:
+                  raise RuntimeError(f"Company identity check failed for {item['title']}")
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in seen_hashes:
+                  raise RuntimeError('Duplicate report files detected')
+              seen_hashes.add(digest)
+              record = {
+                  **item,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': source_url,
+                  'source_format': '公开原始PDF',
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps({k:record[k] for k in ('organization','title','date','pages','filename')}, ensure_ascii=False), flush=True)
+
+          lines = [
+              '普莱柯（603566.SH）券商深度报告包',
+              '',
+              '本包共3份完整公司研究报告，均为公开原始PDF。',
+              '筛选原则：优先明确的公司深度报告及20页以上的完整公司研究，排除几页的财报点评、摘要和行业报告。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {record['organization']}：《{record['title']}》",
+                  f"   日期：{record['date']}；页数：{record['pages']}页",
+                  f"   文件：{record['filename']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头和结构、实际页数、公司名称/证券代码、文件哈希、ZIP CRC。',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{record['sha256']}  {record['filename']}\n" for record in records), encoding='utf-8')
+
+          zip_path = Path(f'{PACKAGE}.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 3')
+          print('FINAL', zip_path, zip_path.stat().st_size, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulike-targeted-final-package
+          path: |
+            普莱柯_券商深度报告_3份_公开完整版/
+            普莱柯_券商深度报告_3份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
