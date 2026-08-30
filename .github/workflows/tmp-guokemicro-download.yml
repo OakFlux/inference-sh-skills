@@ -1,0 +1,410 @@
+name: Temporary Goke Micro report downloader
+
+on:
+  push:
+    branches:
+      - tmp/download-guokemicro-reports-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf zip
+
+      - name: Discover, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+
+          STOCK = "300672"
+          COMPANY_NAMES = ("国科微", "湖南国科微电子股份有限公司")
+          OUTPUT_DIR = Path("国科微_2020-2025年报及最新季报")
+          OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+          PREVIEW_DIR = Path("previews")
+          PREVIEW_DIR.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+          })
+
+          def compact_text(value: str) -> str:
+              return re.sub(r"\s+", "", value or "")
+
+          def query_announcements(begin: str, end: str, max_pages: int = 12) -> list[dict[str, Any]]:
+              endpoint = "https://np-anotice-stock.eastmoney.com/api/security/ann"
+              collected: list[dict[str, Any]] = []
+              seen_codes: set[str] = set()
+              for page_index in range(1, max_pages + 1):
+                  params = {
+                      "sr": "-1",
+                      "page_size": "100",
+                      "page_index": str(page_index),
+                      "ann_type": "A",
+                      "client_source": "web",
+                      "stock_list": STOCK,
+                      "f_node": "0",
+                      "s_node": "0",
+                      "begin_time": begin,
+                      "end_time": end,
+                  }
+                  response = session.get(
+                      endpoint,
+                      params=params,
+                      headers={
+                          "Referer": f"https://data.eastmoney.com/notices/stock/{STOCK}.html",
+                          "Accept": "application/json,text/plain,*/*",
+                      },
+                      timeout=90,
+                  )
+                  response.raise_for_status()
+                  payload = response.json()
+                  if not payload.get("success"):
+                      raise RuntimeError(f"Eastmoney announcement query failed: {payload}")
+                  items = ((payload.get("data") or {}).get("list") or [])
+                  print(
+                      f"Announcement query {begin}~{end}, page {page_index}: {len(items)} items",
+                      flush=True,
+                  )
+                  if not items:
+                      break
+                  for item in items:
+                      code = str(item.get("art_code") or "")
+                      if code and code not in seen_codes:
+                          collected.append(item)
+                          seen_codes.add(code)
+                  if len(items) < 100:
+                      break
+              return collected
+
+          def item_title(item: dict[str, Any]) -> str:
+              return str(item.get("title_ch") or item.get("title") or "")
+
+          def item_date(item: dict[str, Any]) -> datetime:
+              raw = str(item.get("notice_date") or item.get("display_time") or "")[:10]
+              try:
+                  return datetime.strptime(raw, "%Y-%m-%d")
+              except ValueError:
+                  return datetime.min
+
+          def pdf_url_from_item(item: dict[str, Any]) -> str:
+              art_code = str(item.get("art_code") or "")
+              if not art_code:
+                  raise RuntimeError(f"Announcement lacks art_code: {item}")
+              return f"https://pdf.dfcfw.com/pdf/H2_{art_code}_1.pdf"
+
+          def select_annual(year: int) -> tuple[str, str]:
+              items = query_announcements(f"{year + 1}-01-01", f"{year + 1}-12-31")
+              matches: list[dict[str, Any]] = []
+              for item in items:
+                  title = compact_text(item_title(item))
+                  if f"{year}年年度报告" not in title:
+                      continue
+                  if any(
+                      word in title
+                      for word in (
+                          "摘要",
+                          "英文",
+                          "取消",
+                          "提示性公告",
+                          "关于",
+                          "问询函",
+                          "回复",
+                          "说明会",
+                      )
+                  ):
+                      continue
+                  matches.append(item)
+              if not matches:
+                  raise RuntimeError(
+                      f"No full {year} annual report found; titles={[item_title(i) for i in items]}"
+                  )
+              matches.sort(
+                  key=lambda item: (
+                      1
+                      if any(
+                          word in compact_text(item_title(item))
+                          for word in ("修订", "更新", "更正")
+                      )
+                      else 0,
+                      item_date(item),
+                  ),
+                  reverse=True,
+              )
+              selected = matches[0]
+              print(f"Selected annual {year}: {item_title(selected)}", flush=True)
+              return item_title(selected), pdf_url_from_item(selected)
+
+          def select_latest_periodic() -> tuple[str, str, int, str]:
+              items = query_announcements("2025-01-01", "2026-08-30")
+              candidates: list[tuple[int, datetime, dict[str, Any], int, str]] = []
+              for item in items:
+                  title = compact_text(item_title(item))
+                  if any(word in title for word in ("摘要", "英文", "提示性公告", "关于")):
+                      continue
+                  if "2026年半年度报告" in title:
+                      candidates.append((40, item_date(item), item, 2026, "half"))
+                  elif "2026年第一季度报告" in title:
+                      candidates.append((30, item_date(item), item, 2026, "quarter"))
+                  elif "2025年第三季度报告" in title:
+                      candidates.append((20, item_date(item), item, 2025, "quarter"))
+                  elif "2025年半年度报告" in title:
+                      candidates.append((10, item_date(item), item, 2025, "half"))
+              if not candidates:
+                  raise RuntimeError(
+                      f"No recent periodic report found; titles={[item_title(i) for i in items]}"
+                  )
+              candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
+              _, _, selected, year, report_type = candidates[0]
+              print(f"Selected latest periodic report: {item_title(selected)}", flush=True)
+              return item_title(selected), pdf_url_from_item(selected), year, report_type
+
+          def page_count(path: Path) -> int:
+              result = subprocess.run(
+                  ["pdfinfo", str(path)],
+                  check=True,
+                  text=True,
+                  capture_output=True,
+              )
+              match = re.search(r"^Pages:\s+(\d+)", result.stdout, flags=re.M)
+              if not match:
+                  raise RuntimeError(f"Cannot determine page count for {path}")
+              return int(match.group(1))
+
+          def extract_text(path: Path, first_page: int, last_page: int) -> str:
+              result = subprocess.run(
+                  [
+                      "pdftotext",
+                      "-f",
+                      str(first_page),
+                      "-l",
+                      str(last_page),
+                      str(path),
+                      "-",
+                  ],
+                  text=True,
+                  capture_output=True,
+                  errors="ignore",
+              )
+              return compact_text(result.stdout)
+
+          def validate_pdf(path: Path, year: int, report_type: str, min_pages: int) -> int:
+              if path.stat().st_size < 50_000 or path.read_bytes()[:4] != b"%PDF":
+                  raise RuntimeError(f"Invalid PDF response: {path}")
+              pages = page_count(path)
+              if pages < min_pages:
+                  raise RuntimeError(f"Unexpectedly short document {path}: {pages} pages")
+
+              text = extract_text(path, 1, min(40, pages))
+              cover = extract_text(path, 1, min(3, pages))
+              if not any(name in text for name in COMPANY_NAMES):
+                  raise RuntimeError(f"Company-name validation failed: {path}")
+              if f"{year}年" not in text:
+                  raise RuntimeError(f"Year validation failed for {path}")
+
+              expected = {
+                  "annual": "年度报告",
+                  "half": "半年度报告",
+                  "quarter": "季度报告",
+              }[report_type]
+              if expected not in text:
+                  raise RuntimeError(f"Report-type validation failed for {path}: {expected}")
+
+              if report_type == "annual" and "年度报告摘要" in cover[:500]:
+                  raise RuntimeError(f"A summary was selected instead of the annual report: {path}")
+              if report_type == "half" and "半年度报告摘要" in cover[:500]:
+                  raise RuntimeError(f"A summary was selected instead of the half-year report: {path}")
+
+              qpdf = subprocess.run(
+                  ["qpdf", "--check", str(path)],
+                  text=True,
+                  capture_output=True,
+              )
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(
+                      f"qpdf structure check failed: {path}\n{qpdf.stdout}\n{qpdf.stderr}"
+                  )
+
+              stem = path.stem
+              subprocess.run(
+                  [
+                      "pdftoppm",
+                      "-f",
+                      "1",
+                      "-singlefile",
+                      "-png",
+                      "-r",
+                      "80",
+                      str(path),
+                      str(PREVIEW_DIR / f"{stem}_first"),
+                  ],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              )
+              subprocess.run(
+                  [
+                      "pdftoppm",
+                      "-f",
+                      str(pages),
+                      "-singlefile",
+                      "-png",
+                      "-r",
+                      "80",
+                      str(path),
+                      str(PREVIEW_DIR / f"{stem}_last"),
+                  ],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              )
+              return pages
+
+          def download_document(
+              title: str,
+              url: str,
+              destination: Path,
+              year: int,
+              report_type: str,
+              min_pages: int,
+          ) -> tuple[int, int, str, str, str]:
+              candidates = [
+                  url,
+                  url.replace("https://pdf.dfcfw.com", "http://pdf.dfcfw.com"),
+              ]
+              last_error: Exception | None = None
+              for candidate in candidates:
+                  for attempt in range(1, 5):
+                      temporary = destination.with_suffix(".pdf.part")
+                      temporary.unlink(missing_ok=True)
+                      try:
+                          print(f"Downloading {destination.name} from {candidate}", flush=True)
+                          with session.get(
+                              candidate,
+                              headers={
+                                  "Referer": "https://data.eastmoney.com/",
+                                  "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                              },
+                              stream=True,
+                              timeout=(30, 1200),
+                          ) as response:
+                              response.raise_for_status()
+                              with temporary.open("wb") as handle:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          handle.write(chunk)
+                          pages = validate_pdf(temporary, year, report_type, min_pages)
+                          temporary.replace(destination)
+                          data = destination.read_bytes()
+                          digest = hashlib.sha256(data).hexdigest()
+                          print(f"Verified {destination.name}: {pages} pages", flush=True)
+                          return pages, len(data), digest, candidate, title
+                      except Exception as exc:
+                          last_error = exc
+                          temporary.unlink(missing_ok=True)
+                          print(f"Attempt {attempt} failed for {candidate}: {exc}", flush=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(f"All download sources failed for {destination}: {last_error}")
+
+          selected_documents: list[tuple[str, str, Path, int, str, int]] = []
+          for year in range(2020, 2026):
+              title, url = select_annual(year)
+              selected_documents.append((
+                  title,
+                  url,
+                  OUTPUT_DIR / f"国科微_{year}年年度报告.pdf",
+                  year,
+                  "annual",
+                  100,
+              ))
+
+          latest_title, latest_url, latest_year, latest_type = select_latest_periodic()
+          latest_filename = (
+              f"国科微_{latest_year}年半年度报告.pdf"
+              if latest_type == "half"
+              else f"国科微_{latest_year}年最新季度报告.pdf"
+          )
+          selected_documents.append((
+              latest_title,
+              latest_url,
+              OUTPUT_DIR / latest_filename,
+              latest_year,
+              latest_type,
+              50,
+          ))
+
+          records: list[tuple[str, int, int, str, str, str]] = []
+          for title, url, destination, year, report_type, min_pages in selected_documents:
+              pages, size, digest, source, source_title = download_document(
+                  title, url, destination, year, report_type, min_pages
+              )
+              records.append((destination.name, pages, size, digest, source, source_title))
+
+          notes = [
+              "国科微（300672.SZ）定期报告包，共7份完整PDF。",
+              "",
+              "收录范围：2020—2025年年度报告，以及截至2026年8月30日最新一期完整定期报告。",
+              "所有年度报告和最新定期报告均为全文版，没有用摘要替代。",
+              "",
+              "文件清单：",
+          ]
+          for name, pages, size, digest, source, source_title in records:
+              notes.append(f"{name} | {pages}页 | {size}字节 | SHA256 {digest}")
+              notes.append(f"公告标题：{source_title}")
+              notes.append(f"下载来源：{source}")
+          notes.extend([
+              "",
+              "核验项目：PDF文件头、公司名称、报告年度与类型、最低页数、qpdf结构检查、首页及末页渲染、ZIP CRC。",
+          ])
+          (OUTPUT_DIR / "报告清单与核验说明.txt").write_text("\n".join(notes), encoding="utf-8")
+          (OUTPUT_DIR / "SHA256SUMS.txt").write_text(
+              "\n".join(f"{digest}  {name}" for name, _, _, digest, _, _ in records) + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("国科微_2020-2025年报及最新季报.zip")
+          with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for file_path in sorted(OUTPUT_DIR.rglob("*")):
+                  if file_path.is_file():
+                      archive.write(file_path, arcname=str(file_path))
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP CRC failed: {bad}")
+              pdfs = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f"Expected 7 PDFs, found {len(pdfs)}: {pdfs}")
+          print(f"Created {zip_path}: {zip_path.stat().st_size} bytes", flush=True)
+          PY
+
+          unzip -t '国科微_2020-2025年报及最新季报.zip'
+          ls -lh '国科微_2020-2025年报及最新季报.zip' '国科微_2020-2025年报及最新季报'
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: guokemicro-final-package
+          path: 国科微_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
