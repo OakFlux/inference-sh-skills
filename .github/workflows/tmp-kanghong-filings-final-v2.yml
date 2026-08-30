@@ -1,0 +1,194 @@
+name: Temporary Kanghong exact annual and quarterly filing package v2
+
+on:
+  push:
+    branches:
+      - 'tmp/kanghong-filings-final-v2-20260830'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Download, validate and package exact filing PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/kanghong_filings_v2.py <<'PY'
+          from __future__ import annotations
+
+          import concurrent.futures
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          filings = [
+              {'year': 2020, 'kind': 'annual', 'code': 'AN202104281488248004', 'date': '2021-04-28', 'title': '康弘药业：2020年年度报告', 'min_pages': 100},
+              {'year': 2021, 'kind': 'annual', 'code': 'AN202204291562374469', 'date': '2022-04-30', 'title': '康弘药业：2021年年度报告', 'min_pages': 100},
+              {'year': 2022, 'kind': 'annual', 'code': 'AN202304271585999194', 'date': '2023-04-28', 'title': '康弘药业：2022年年度报告', 'min_pages': 100},
+              {'year': 2023, 'kind': 'annual', 'code': 'AN202404241631143594', 'date': '2024-04-25', 'title': '康弘药业：2023年年度报告', 'min_pages': 100},
+              {'year': 2024, 'kind': 'annual', 'code': 'AN202504261662476884', 'date': '2025-04-26', 'title': '康弘药业：2024年年度报告', 'min_pages': 100},
+              {'year': 2025, 'kind': 'annual', 'code': 'AN202604221821463682', 'date': '2026-04-23', 'title': '康弘药业：2025年年度报告', 'min_pages': 100},
+              {'year': 2026, 'kind': 'quarter', 'code': 'AN202604221821463688', 'date': '2026-04-23', 'title': '康弘药业：2026年第一季度报告', 'min_pages': 5},
+          ]
+
+          chinese_years = {
+              2020: '二〇二〇', 2021: '二〇二一', 2022: '二〇二二', 2023: '二〇二三',
+              2024: '二〇二四', 2025: '二〇二五', 2026: '二〇二六',
+          }
+
+          def fetch_one(item: dict) -> tuple[dict | None, dict | None]:
+              code = item['code']
+              stamp = int(time.time() * 1000)
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf?{stamp}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf?{code}.pdf',
+              ]
+              errors = []
+              session = requests.Session()
+              headers = {
+                  'User-Agent': UA,
+                  'Referer': 'https://data.eastmoney.com/notices/stock/002773.html',
+                  'Accept': 'application/pdf,application/octet-stream,*/*',
+                  'Accept-Encoding': 'identity',
+              }
+              for url in urls:
+                  try:
+                      response = session.get(url, headers=headers, timeout=240, allow_redirects=True)
+                      response.raise_for_status()
+                      raw = response.content
+                      if len(raw) < 50_000 or not raw.startswith(b'%PDF-'):
+                          raise RuntimeError(f'invalid PDF: {len(raw)} bytes, head={raw[:20]!r}')
+                      reader = PdfReader(BytesIO(raw), strict=False)
+                      pages = len(reader.pages)
+                      if pages < item['min_pages']:
+                          raise RuntimeError(f'only {pages} pages, expected >= {item["min_pages"]}')
+
+                      indexes = sorted(set(list(range(min(10, pages))) + [pages - 1]))
+                      sample = ''
+                      for index in indexes:
+                          try:
+                              sample += ' ' + (reader.pages[index].extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = re.sub(r'\s+', '', sample)
+                      if not any(term in compact for term in ('康弘药业', '002773', '成都康弘')):
+                          raise RuntimeError('company identity not found')
+                      year_ok = str(item['year']) in compact or chinese_years[item['year']] in compact
+                      if not year_ok:
+                          raise RuntimeError(f'report year {item["year"]} not found')
+                      if item['kind'] == 'annual' and '年度报告' not in compact:
+                          raise RuntimeError('annual report identity not found')
+                      if item['kind'] == 'quarter' and not any(term in compact for term in ('第一季度报告', '一季度报告')):
+                          raise RuntimeError('quarterly report identity not found')
+
+                      label = '年度报告' if item['kind'] == 'annual' else '第一季度报告'
+                      filename = f'{item["year"]}_康弘药业_{label}_{pages}页.pdf'
+                      (REPORTS / filename).write_bytes(raw)
+                      return ({
+                          **item,
+                          'filename': filename,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': hashlib.sha256(raw).hexdigest(),
+                          'source': '东方财富公告原始PDF镜像',
+                          'url': response.url,
+                      }, None)
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              return (None, {**item, 'errors': errors})
+
+          results = []
+          failures = []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=7) as pool:
+              futures = {pool.submit(fetch_one, item): item for item in filings}
+              for future in concurrent.futures.as_completed(futures):
+                  result, failure = future.result()
+                  if result:
+                      results.append(result)
+                      print('OK', json.dumps(result, ensure_ascii=False))
+                  if failure:
+                      failures.append(failure)
+
+          results.sort(key=lambda x: x['year'])
+          DIAG.joinpath('results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          DIAG.joinpath('failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+          if len(results) != 7:
+              raise RuntimeError(f'Expected 7 validated reports, got {len(results)}: {failures}')
+
+          manifest = [
+              '康弘药业（002773）2020—2025年度报告及最新季度报告资料包',
+              '内容：2020—2025年度报告共6份，以及截至2026年8月30日最新季报——2026年第一季度报告，共7份。',
+              '全部为上市公司公告原始PDF；未收入年度报告摘要、英文版、审计附件或更正说明。',
+              '所有文件均已核验公司名称、报告期、实际页数、PDF结构及SHA-256；ZIP已通过完整性测试。',
+              '资料仅供研究参考，请遵守原公告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(results, 1):
+              manifest += [
+                  f'{index}. {item["title"]}',
+                  f'   披露日期：{item["date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   来源：{item["source"]}',
+                  f'   原始PDF：{item["url"]}',
+                  '',
+              ]
+          (REPORTS / '资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = DIST / '康弘药业_2020-2025年报及2026年一季报_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdfs}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/kanghong_filings_v2.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghong-annual-reports-and-latest-quarterly-final
+          path: dist/康弘药业_2020-2025年报及2026年一季报_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kanghong-filings-v2-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
