@@ -1,0 +1,117 @@
+name: Package two Mengtaigaoxin reports v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mengtaigaoxin-final-two-reports-v2-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet pypdf pillow img2pdf
+
+      - name: Build verified package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, io, json, time, zipfile
+          from pathlib import Path
+          import img2pdf, requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          pkg='蒙泰高新_券商研究报告_2份_公开完整版'
+          out=Path(pkg); out.mkdir(exist_ok=True)
+          page_dir=Path('_pages'); page_dir.mkdir(exist_ok=True)
+          s=requests.Session()
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+
+          def fetch(url, *, referer, accept, attempts=6):
+              last=None
+              for n in range(attempts):
+                  try:
+                      r=s.get(url,headers={'User-Agent':ua,'Referer':referer,'Accept':accept},timeout=(30,240))
+                      print('GET',url,r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+                      if r.status_code==200 and r.content:
+                          return r.content
+                      last=RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as e:
+                      last=e
+                  time.sleep(2*(n+1))
+              raise RuntimeError(f'{url}: {last}')
+
+          def digest(path):
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for block in iter(lambda:f.read(1024*1024),b''): h.update(block)
+              return h.hexdigest()
+
+          records=[]
+          # Original public PDF.
+          p1=out/'01_海通国际_蒙泰高新_上半年业绩承压_授予限制性股票彰显发展信心_2023-08-21_12页.pdf'
+          u1='https://pdf.dfcfw.com/pdf/H3_AP202308251595831687_1.pdf'
+          b1=fetch(u1,referer='https://data.eastmoney.com/',accept='application/pdf,*/*;q=0.8')
+          if not b1.startswith(b'%PDF-'): raise RuntimeError('report 1 is not PDF')
+          p1.write_bytes(b1)
+          r1=PdfReader(str(p1)); n1=len(r1.pages)
+          t1='\n'.join((p.extract_text() or '') for p in r1.pages[:3])
+          if n1!=12 or '蒙泰高新' not in t1 or '300876' not in t1: raise RuntimeError(f'report 1 verification failed: {n1}')
+          records.append({'organization':'海通国际','title':'公司公告点评：上半年业绩承压，授予限制性股票彰显发展信心','report_date':'2023-08-21','public_index_date':'2023-08-25','pages':n1,'filename':p1.name,'source_url':u1,'source_format':'公开原始PDF','bytes':p1.stat().st_size,'sha256':digest(p1)})
+
+          # Full ten-page public page sequence, converted losslessly into a PDF container.
+          base='https://oss.sdyanbao.com/page/2024/4/15/971902'
+          imgs=[]; dims=[]
+          for i in range(10):
+              u=f'{base}/{i}.png'
+              b=fetch(u,referer='https://www.sdyanbao.com/',accept='image/png,image/*;q=0.9,*/*;q=0.7')
+              q=page_dir/f'{i:03d}.png'; q.write_bytes(b)
+              with Image.open(io.BytesIO(b)) as im: im.verify()
+              with Image.open(q) as im: w,h=im.size; fmt=im.format
+              if w<700 or h<900 or fmt not in {'PNG','JPEG','WEBP'}: raise RuntimeError(f'bad page {i}: {w}x{h} {fmt}')
+              dims.append([w,h]); imgs.append(q)
+          tail=s.get(f'{base}/10.png',headers={'User-Agent':ua,'Referer':'https://www.sdyanbao.com/','Accept':'image/png,image/*'},timeout=(15,45))
+          if tail.status_code==200 and tail.content.startswith(b'\x89PNG'): raise RuntimeError('unexpected page after page 10')
+          p2=out/'02_海通国际_蒙泰高新_短期业绩承压_积极推进碳纤维项目落地_2024-04-02_10页.pdf'
+          p2.write_bytes(img2pdf.convert([str(x) for x in imgs]))
+          r2=PdfReader(str(p2)); n2=len(r2.pages)
+          if n2!=10: raise RuntimeError(f'report 2 page count: {n2}')
+          records.append({'organization':'海通国际','title':'公司年报点评：短期业绩承压，积极推进碳纤维项目落地','report_date':'2024-04-02','public_index_date':'2024-04-15','pages':n2,'filename':p2.name,'source_url':base,'source_format':'公开逐页原图合成为PDF；页面内容及顺序未改动','bytes':p2.stat().st_size,'sha256':digest(p2),'image_dimensions':dims})
+          if len({x['sha256'] for x in records})!=2: raise RuntimeError('duplicate files')
+
+          lines=['蒙泰高新（300876）券商研究报告包','',
+                 '本包包含2份公开完整公司研究报告。',
+                 '东北证券《丙纶长丝行业领跑者，双基地强势进军碳纤维》共33页，但公开阅览端仅开放前15页；为避免将残缺预览冒充完整版，该报告未装入本包。',
+                 '已排除4页短评、可转债报告、招股说明书、摘要和付费/登录后内容。','']
+          for i,x in enumerate(records,1):
+              lines += [f"{i}. {x['organization']}：《{x['title']}》",f"   报告日期：{x['report_date']}；公开索引日期：{x['public_index_date']}；页数：{x['pages']}页",f"   文件：{x['filename']}",f"   获取形式：{x['source_format']}",f"   SHA-256：{x['sha256']}",'']
+          lines += ['核验项目：PDF结构、实际页数、公司名称与证券代码（原始PDF）、公开页面连续性、文件哈希及ZIP CRC。','资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。']
+          (out/'报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['filename']}\n" for x in records),encoding='utf-8')
+          zp=Path(pkg+'.zip')
+          with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+              for f in sorted(out.iterdir()): z.write(f,arcname=f'{pkg}/{f.name}')
+          with zipfile.ZipFile(zp) as z:
+              if z.testzip(): raise RuntimeError('ZIP CRC failed')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=2: raise RuntimeError('ZIP PDF count failed')
+          print('FINAL',zp,zp.stat().st_size,flush=True)
+          print(json.dumps(records,ensure_ascii=False),flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mengtaigaoxin-two-full-reports-v2
+          path: |
+            蒙泰高新_券商研究报告_2份_公开完整版/
+            蒙泰高新_券商研究报告_2份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
