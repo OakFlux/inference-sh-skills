@@ -1,0 +1,69 @@
+name: Temporary Nike Fxbaogao fast page probe
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-fxbaogao-fast-probe.yml
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Probe and download likely page ranges
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages diagnostics
+          python3 - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          import hashlib,json,subprocess
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          docs=[
+            ('4742006','2025/03/23','Nike_FY2025Q3_Guosheng'),
+            ('4924081','2025/06/29','Nike_FY2025Q4_Guosheng'),
+            ('5083891','2025/10/08','Nike_FY2026Q1_Guosheng'),
+            ('5337859','2026/04/06','Nike_FY2026Q3_Huachuang'),
+          ]
+          root=Path('pages')
+          def dl(docid,date,label,page):
+              url=f'https://public.fxbaogao.com/report-image/{date}/{docid}-{page}.png'
+              out=root/label/f'{page:03d}.png'; out.parent.mkdir(parents=True,exist_ok=True)
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--connect-timeout','5','--max-time','20',
+                   '-A',UA,'-e',f'https://www.fxbaogao.com/detail/{docid}','-H','Accept-Encoding: identity',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode or not out.exists(): out.unlink(missing_ok=True); return {'page':page,'ok':False,'rc':p.returncode,'err':p.stderr[-100:]}
+              b=out.read_bytes()
+              if b[:8]!=b'\x89PNG\r\n\x1a\n' or len(b)<5000:
+                  preview=b[:100].decode('utf-8','replace'); out.unlink(missing_ok=True); return {'page':page,'ok':False,'size':len(b),'preview':preview}
+              return {'page':page,'ok':True,'size':len(b),'sha256':hashlib.sha256(b).hexdigest(),'file':str(out),'url':url}
+          manifest=[]
+          for docid,date,label in docs:
+              with ThreadPoolExecutor(max_workers=40) as ex:
+                  results=list(ex.map(lambda p: dl(docid,date,label,p), range(1,41)))
+              good=[r for r in results if r['ok']]
+              contiguous=0
+              for p in range(1,41):
+                  if any(r['page']==p for r in good): contiguous=p
+                  else: break
+              summary={'docid':docid,'date':date,'label':label,'contiguous':contiguous,'good':good,'results':results}
+              manifest.append(summary)
+              print('DOC',docid,'CONTIGUOUS',contiguous,'GOOD',len(good),'PAGES',[r['page'] for r in good])
+          Path('diagnostics/manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          find pages -type f -printf '%p\t%s\n' | sort | tail -80
+
+      - name: Upload pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-fxbaogao-fast-pages
+          path: |
+            pages/
+            diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
