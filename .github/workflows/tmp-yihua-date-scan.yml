@@ -1,0 +1,70 @@
+name: Temporary Yihua exact-date report scan
+
+on:
+  push:
+    branches:
+      - 'tmp/yihua-date-scan-20260830'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Scan Eastmoney global report index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          cat > /tmp/scan.py <<'PY'
+          import json, os, subprocess, tempfile, urllib.parse
+          from pathlib import Path
+
+          API='https://reportapi.eastmoney.com/report/list'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          def get(page):
+              params={'pageNo':str(page),'pageSize':'100','code':'*','industryCode':'*','industry':'*','rating':'*','ratingchange':'*','beginTime':'2022-03-08','endTime':'2022-03-09','fields':'','qType':'0'}
+              url=API+'?'+urllib.parse.urlencode(params)
+              fd,name=tempfile.mkstemp(suffix='.json'); os.close(fd)
+              path=Path(name)
+              try:
+                  p=subprocess.run(['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','20','--max-time','120','--user-agent',UA,'--referer','https://data.eastmoney.com/report/','--header','Accept-Encoding: identity','--output',str(path),url],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if p.returncode: raise RuntimeError(p.stderr[-800:])
+                  text=path.read_text(encoding='utf-8',errors='ignore').strip()
+                  if text and text[0] not in '[{' and '(' in text and text.endswith(')'):
+                      text=text[text.find('(')+1:text.rfind(')')]
+                  return json.loads(text)
+              finally:
+                  path.unlink(missing_ok=True)
+
+          first=get(1)
+          total=int(first.get('TotalPage') or first.get('totalPage') or 1)
+          objs=[first]
+          for page in range(2,total+1): objs.append(get(page))
+          rows=[]
+          for obj in objs:
+              rows += obj.get('data') or obj.get('result',{}).get('data') or []
+          matches=[]
+          for row in rows:
+              title=str(row.get('title') or row.get('reportTitle') or '')
+              code=str(row.get('stockCode') or row.get('code') or '')
+              name=str(row.get('stockName') or row.get('securityName') or '')
+              if code=='002897' or name=='意华股份' or '意华股份' in title or '深耕连接器领域' in title:
+                  matches.append(row)
+          Path('diagnostics/matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PAGES',total,'ROWS',len(rows),'MATCHES',len(matches))
+          for row in matches:
+              print(json.dumps({'date':row.get('publishDate') or row.get('publishTime'),'broker':row.get('orgSName') or row.get('orgName'),'title':row.get('title') or row.get('reportTitle'),'stockCode':row.get('stockCode'),'stockName':row.get('stockName'),'infoCode':row.get('infoCode') or row.get('infocode')},ensure_ascii=False))
+          PY
+          python /tmp/scan.py
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: yihua-date-scan-results
+          path: diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
