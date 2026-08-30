@@ -1,0 +1,80 @@
+name: Temporary Nike InnovestX PDF download
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-innovestx-download.yml
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Download official public Nike PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output pages previews
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import hashlib, html, json, re, subprocess
+
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          reports=[
+            ('2024-10-02','https://www.innovestx.co.th/cafeinvest/research/offshore-company-analysis/stock-update/nike-os-update-20241002'),
+            ('2025-06-27','https://www.innovestx.co.th/cafeinvest/research/offshore-company-analysis/stock-update/nike-update-20250627'),
+          ]
+          result=[]
+          for idx,(date,page_url) in enumerate(reports,1):
+              page=Path('pages')/f'{idx}.html'
+              cmd=['curl','--http1.1','-L','--fail','--retry','6','--retry-all-errors','--connect-timeout','20','--max-time','240','-A',ua,'-H','Accept-Encoding: identity',page_url,'-o',str(page)]
+              subprocess.run(cmd,check=True)
+              text=html.unescape(page.read_text(encoding='utf-8',errors='ignore')).replace('\\/','/')
+              links=[]
+              for v in re.findall(r'''(?:href|src)=["']([^"']+)["']|https?://[^\s"'<>]+\.pdf[^\s"'<>]*''',text,re.I):
+                  if isinstance(v,tuple): v=next((x for x in v if x),'')
+                  if not v: continue
+                  u=urljoin(page_url,v.replace('&amp;','&'))
+                  if '.pdf' in u.lower() and u not in links: links.append(u)
+              print('PAGE',date,'PDF_LINKS',len(links))
+              for u in links: print('LINK',u)
+              if not links: raise RuntimeError(f'No PDF link found: {page_url}')
+              pdf_url=next((u for u in links if 'contents.innovestx.co.th' in u),links[0])
+              pdf=Path('output')/f'{idx:02d}_Nike_InnovestX_Offshore_Stock_Update_{date.replace("-","")}.pdf'
+              cmd=['curl','--http1.1','-L','--fail','--retry','6','--retry-all-errors','--connect-timeout','30','--max-time','600','-A',ua,'-e',page_url,'-H','Accept: application/pdf,*/*;q=0.8',pdf_url,'-o',str(pdf)]
+              subprocess.run(cmd,check=True)
+              if pdf.read_bytes()[:4]!=b'%PDF': raise RuntimeError(f'Not PDF: {pdf_url}')
+              info=subprocess.check_output(['pdfinfo',str(pdf)],text=True,errors='replace')
+              m=re.search(r'^Pages:\s*(\d+)',info,re.M); pages=int(m.group(1)) if m else 0
+              if pages<2: raise RuntimeError(f'Unexpected page count {pages}')
+              txt=Path('pages')/f'{idx}.txt'
+              subprocess.run(['pdftotext',str(pdf),str(txt)],check=False)
+              compact=''.join(txt.read_text(errors='ignore').split()).lower() if txt.exists() else ''
+              if 'nike' not in compact and 'nke' not in compact: raise RuntimeError('Nike text not found')
+              for pno,tag in [(1,'first'),(pages,'last')]:
+                  subprocess.run(['pdftoppm','-f',str(pno),'-singlefile','-png','-r','100',str(pdf),str(Path('previews')/f'{idx:02d}_{tag}')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              result.append({'date':date,'page_url':page_url,'pdf_url':pdf_url,'pages':pages,'filename':pdf.name,'size_bytes':pdf.stat().st_size,'sha256':hashlib.sha256(pdf.read_bytes()).hexdigest()})
+          Path('output/manifest.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(result,ensure_ascii=False,indent=2))
+          PY
+          ls -lh output previews
+
+      - name: Upload official PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-innovestx-official-pdfs
+          path: |
+            output/
+            previews/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
