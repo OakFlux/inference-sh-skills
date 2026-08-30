@@ -1,0 +1,329 @@
+name: Temporary verified Sany Renewable Energy report package
+
+on:
+  push:
+    branches:
+      - tmp/download-sany-renewable-reports-20260830
+    paths:
+      - .github/workflows/tmp-sany-renewable-download.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Discover, download, and verify original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output previews diagnostic package
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import datetime as dt
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          import urllib.parse
+
+          API = 'https://reportapi.eastmoney.com/report/list'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          OUTPUT = Path('output')
+          PREVIEWS = Path('previews')
+          DIAG = Path('diagnostic')
+          PACKAGE = Path('package')
+
+          def fetch_catalog_page(page: int) -> dict:
+              params = {
+                  'industryCode': '*',
+                  'pageSize': '100',
+                  'industry': '*',
+                  'rating': '*',
+                  'ratingChange': '*',
+                  'beginTime': '2020-01-01',
+                  'endTime': '2030-12-31',
+                  'pageNo': str(page),
+                  'fields': '',
+                  'qType': '0',
+                  'orgCode': '',
+                  'code': '688349',
+                  'rcode': '',
+                  'p': str(page),
+                  'pageNum': str(page),
+                  'pageNumber': str(page),
+              }
+              url = API + '?' + urllib.parse.urlencode(params)
+              fd, name = tempfile.mkstemp(prefix=f'sany_{page}_', suffix='.json')
+              os.close(fd)
+              temp = Path(name)
+              try:
+                  cmd = [
+                      'curl', '--http1.1', '-L', '--fail', '--silent', '--show-error',
+                      '--retry', '8', '--retry-all-errors', '--retry-delay', '1',
+                      '--connect-timeout', '30', '--max-time', '240',
+                      '-A', UA, '-e', 'https://data.eastmoney.com/report/',
+                      '-H', 'Accept-Encoding: identity', url, '-o', str(temp),
+                  ]
+                  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  if proc.returncode:
+                      raise RuntimeError(proc.stderr[-1000:])
+                  raw = temp.read_text(encoding='utf-8', errors='ignore').strip()
+                  if raw.startswith('datatable(') and raw.endswith(')'):
+                      raw = raw[len('datatable('):-1]
+                  elif raw and raw[0] not in '[{' and '(' in raw and raw.endswith(')'):
+                      raw = raw[raw.find('(') + 1:raw.rfind(')')]
+                  return json.loads(raw)
+              finally:
+                  temp.unlink(missing_ok=True)
+
+          rows: list[dict] = []
+          page = 1
+          while page <= 10:
+              obj = fetch_catalog_page(page)
+              data = obj.get('data') or []
+              print('CATALOG_PAGE', page, 'ROWS', len(data), 'HITS', obj.get('hits'))
+              rows.extend(data)
+              if len(data) < 100:
+                  break
+              page += 1
+
+          # Keep exact-company rows only and deduplicate by report ID.
+          dedup: dict[str, dict] = {}
+          for row in rows:
+              if str(row.get('stockCode') or '') != '688349' and str(row.get('stockName') or '') != '三一重能':
+                  continue
+              key = str(row.get('infoCode') or json.dumps(row, ensure_ascii=False, sort_keys=True))
+              dedup[key] = row
+          rows = list(dedup.values())
+          rows.sort(key=lambda r: str(r.get('publishDate') or ''), reverse=True)
+          DIAG.joinpath('catalog.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          print('EXACT_COMPANY_REPORTS', len(rows))
+          for row in rows:
+              title = str(row.get('title') or '')
+              pages = int(row.get('attachPages') or 0)
+              if pages >= 15 or any(k in title for k in ['深度', '首次覆盖', '投资价值分析', '盈利能力拐点已现']):
+                  print('CANDIDATE', row.get('publishDate'), row.get('orgSName'), pages, row.get('infoCode'), title)
+
+          preferred = [
+              ('盈利能力拐点已现', 'Soochow'),
+              ('传承三一基因', 'Cinda'),
+              ('砥砺十载', 'Guosen'),
+              ('成本控制', 'Everbright'),
+              ('技术成本为基', 'Broker'),
+          ]
+
+          selected: list[tuple[dict, str]] = []
+          used_codes: set[str] = set()
+          for pattern, alias in preferred:
+              matches = [
+                  row for row in rows
+                  if pattern in str(row.get('title') or '')
+                  and str(row.get('infoCode') or '') not in used_codes
+              ]
+              if not matches:
+                  continue
+              matches.sort(
+                  key=lambda r: (str(r.get('publishDate') or ''), int(r.get('attachPages') or 0)),
+                  reverse=True,
+              )
+              chosen = matches[0]
+              selected.append((chosen, alias))
+              used_codes.add(str(chosen.get('infoCode') or ''))
+              if len(selected) == 3:
+                  break
+
+          # Fill gaps with the newest genuine long-form company studies.
+          if len(selected) < 3:
+              fallback = []
+              for row in rows:
+                  code = str(row.get('infoCode') or '')
+                  title = str(row.get('title') or '')
+                  pages = int(row.get('attachPages') or 0)
+                  if code in used_codes:
+                      continue
+                  if pages >= 20 or any(k in title for k in ['深度', '首次覆盖', '投资价值分析']):
+                      fallback.append(row)
+              fallback.sort(
+                  key=lambda r: (str(r.get('publishDate') or ''), int(r.get('attachPages') or 0)),
+                  reverse=True,
+              )
+              for row in fallback:
+                  selected.append((row, 'Broker'))
+                  used_codes.add(str(row.get('infoCode') or ''))
+                  if len(selected) == 3:
+                      break
+
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} qualifying reports found')
+
+          broker_alias = {
+              '东吴证券': 'Soochow',
+              '信达证券': 'Cinda',
+              '国信证券': 'Guosen',
+              '光大证券': 'Everbright',
+              '西南证券': 'Southwest',
+              '中国银河': 'China_Galaxy',
+              '中国银河证券': 'China_Galaxy',
+          }
+
+          verified: list[dict] = []
+          for index, (row, suggested_alias) in enumerate(selected, start=1):
+              code = str(row.get('infoCode') or '')
+              if not code:
+                  raise RuntimeError(f'Missing infoCode for {row}')
+              url = f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf'
+              temp = OUTPUT / f'temp_{index}.pdf'
+              cmd = [
+                  'curl', '--http1.1', '-L', '--fail', '--silent', '--show-error',
+                  '--retry', '10', '--retry-all-errors', '--retry-delay', '2',
+                  '--connect-timeout', '30', '--max-time', '900', '--compressed',
+                  '-A', UA, '-e', 'https://data.eastmoney.com/report/',
+                  '-H', 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  url, '-o', str(temp),
+              ]
+              proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              print('DOWNLOAD', code, 'RC', proc.returncode, 'SIZE', temp.stat().st_size if temp.exists() else 0, 'ERR', proc.stderr[-500:])
+              if proc.returncode or not temp.exists() or temp.stat().st_size < 25000:
+                  raise RuntimeError(f'Download failed for {code}: {proc.stderr[-1000:]}')
+              if temp.read_bytes()[:4] != b'%PDF':
+                  raise RuntimeError(f'Not a PDF: {code}')
+
+              pdfinfo = subprocess.check_output(['pdfinfo', str(temp)], text=True, errors='replace')
+              match = re.search(r'^Pages:\s*(\d+)', pdfinfo, re.M)
+              pages_actual = int(match.group(1)) if match else 0
+              if pages_actual < 10:
+                  raise RuntimeError(f'Report {code} has only {pages_actual} pages')
+
+              text_file = DIAG / f'{code}.txt'
+              subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(8, pages_actual)), str(temp), str(text_file)],
+                  check=True,
+              )
+              text = text_file.read_text(encoding='utf-8', errors='replace')
+              compact = ''.join(text.split())
+              if '三一重能' not in compact and '688349' not in compact:
+                  raise RuntimeError(f'Company name/code not found in {code}')
+
+              publish_date = str(row.get('publishDate') or '')[:10]
+              date_compact = publish_date.replace('-', '') or 'Undated'
+              broker = str(row.get('orgSName') or 'Broker')
+              alias = broker_alias.get(broker, suggested_alias or 'Broker')
+              filename = f'{index:02d}_Sany_Renewable_Energy_{alias}_{date_compact}_{pages_actual}p.pdf'
+              final_pdf = OUTPUT / filename
+              temp.replace(final_pdf)
+
+              # Verify first and last pages render.
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '100', str(final_pdf), str(PREVIEWS / f'{index:02d}_first')],
+                  check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              )
+              subprocess.run(
+                  ['pdftoppm', '-f', str(pages_actual), '-singlefile', '-png', '-r', '100', str(final_pdf), str(PREVIEWS / f'{index:02d}_last')],
+                  check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              )
+              if (PREVIEWS / f'{index:02d}_first.png').stat().st_size < 10000:
+                  raise RuntimeError(f'First-page render too small: {filename}')
+              if (PREVIEWS / f'{index:02d}_last.png').stat().st_size < 10000:
+                  raise RuntimeError(f'Last-page render too small: {filename}')
+
+              record = {
+                  'broker': broker,
+                  'publishDate': publish_date,
+                  'title': str(row.get('title') or ''),
+                  'pages': pages_actual,
+                  'catalogPages': int(row.get('attachPages') or 0),
+                  'rating': row.get('ratingName'),
+                  'reportType': row.get('reportType'),
+                  'infoCode': code,
+                  'sourceUrl': url,
+                  'filename': filename,
+                  'sizeBytes': final_pdf.stat().st_size,
+                  'sha256': hashlib.sha256(final_pdf.read_bytes()).hexdigest(),
+              }
+              verified.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False))
+
+          # Sort for user presentation: newest first.
+          verified.sort(key=lambda r: r['publishDate'], reverse=True)
+          for new_index, record in enumerate(verified, start=1):
+              old_path = OUTPUT / record['filename']
+              suffix = '_'.join(record['filename'].split('_')[1:])
+              new_name = f'{new_index:02d}_{suffix}'
+              new_path = OUTPUT / new_name
+              if new_path != old_path:
+                  old_path.replace(new_path)
+              record['filename'] = new_name
+
+          manifest = {
+              'company': '三一重能',
+              'stockCode': '688349.SH',
+              'generatedAtUtc': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'count': len(verified),
+              'reports': verified,
+          }
+          (PACKAGE / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          readme_lines = [
+              '三一重能（688349.SH）券商深度研究报告',
+              '',
+              f'共收录 {len(verified)} 份原始PDF，按发布日期由近到远排列。',
+              '',
+          ]
+          for i, record in enumerate(verified, start=1):
+              readme_lines.extend([
+                  f'{i}. {record["broker"]}，{record["publishDate"]}，{record["pages"]}页',
+                  f'   《{record["title"]}》',
+                  f'   类型：{record.get("reportType") or "公司研究"}；评级：{record.get("rating") or "见原报告"}。',
+                  f'   文件：{record["filename"]}',
+                  '',
+              ])
+          readme_lines.extend([
+              '核验说明：所有文件均为原始PDF；已检查PDF文件头、实际页数、公司名称/证券代码，',
+              '并完成首页与末页渲染。压缩包附有SHA-256校验值。',
+              '仅供研究资料整理，不构成投资建议。',
+          ])
+          (PACKAGE / '报告清单与核验说明.txt').write_text('\n'.join(readme_lines) + '\n', encoding='utf-8')
+
+          checksum_lines = [f'{record["sha256"]}  {record["filename"]}' for record in verified]
+          (PACKAGE / 'SHA256SUMS.txt').write_text('\n'.join(checksum_lines) + '\n', encoding='utf-8')
+
+          for record in verified:
+              source = OUTPUT / record['filename']
+              target = PACKAGE / record['filename']
+              target.write_bytes(source.read_bytes())
+
+          print('FINAL_COUNT', len(verified))
+          for record in verified:
+              print('FINAL', record['broker'], record['publishDate'], record['pages'], record['title'], record['filename'])
+          PY
+
+          (cd package && zip -q -9 ../Sany_Renewable_Energy_Broker_Deep_Reports_Verified.zip ./*)
+          unzip -t Sany_Renewable_Energy_Broker_Deep_Reports_Verified.zip
+          ls -lh output package previews Sany_Renewable_Energy_Broker_Deep_Reports_Verified.zip
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sany-renewable-energy-broker-deep-reports
+          path: |
+            Sany_Renewable_Energy_Broker_Deep_Reports_Verified.zip
+            output/*.pdf
+            package/manifest.json
+            package/报告清单与核验说明.txt
+            package/SHA256SUMS.txt
+            previews/*.png
+            diagnostic/catalog.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
