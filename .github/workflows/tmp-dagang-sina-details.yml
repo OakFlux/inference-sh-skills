@@ -1,0 +1,103 @@
+name: Temporary Dagang Sina report detail inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-sina-details.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect three deep-report detail pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from html import unescape
+          from urllib.parse import urljoin
+          import json, re, subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          ids=['517993930847','504776077041','359452745437']
+          base='https://stock.finance.sina.com.cn'
+          manifest=[]
+          for rid in ids:
+              url=f'{base}/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml'
+              raw_path=Path(f'diagnostic/{rid}.raw')
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',UA,'-e','https://stock.finance.sina.com.cn/','-H','Accept-Encoding: identity',url,'-o',str(raw_path)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',rid,'RC',p.returncode,'SIZE',raw_path.stat().st_size if raw_path.exists() else 0,'ERR',p.stderr[-500:])
+              if p.returncode or not raw_path.exists():
+                  continue
+              body=raw_path.read_bytes()
+              text=None
+              used=None
+              for enc in ['gb18030','gbk','utf-8','latin1']:
+                  try:
+                      text=body.decode(enc); used=enc; break
+                  except Exception:
+                      pass
+              if text is None:
+                  continue
+              Path(f'diagnostic/{rid}.html').write_text(text,encoding='utf-8')
+              clean=unescape(text)
+              title=''
+              m=re.search(r'<title[^>]*>(.*?)</title>',clean,re.I|re.S)
+              if m:
+                  title=re.sub(r'<[^>]+>',' ',m.group(1))
+                  title=' '.join(title.split())
+              print('TITLE',rid,title)
+              # Capture all URLs and link-like values.
+              found=[]
+              pats=[
+                  r'''(?:href|src)\s*=\s*["']([^"']+)["']''',
+                  r'''https?://[^\s"'<>]+''',
+                  r'''//[^\s"'<>]+''',
+                  r'''[^\s"'<>]+\.pdf(?:\?[^\s"'<>]*)?''',
+              ]
+              for pat in pats:
+                  for val in re.findall(pat,clean,re.I):
+                      if isinstance(val,tuple): val=val[0]
+                      val=val.strip()
+                      if not val: continue
+                      full=urljoin(url,val)
+                      if full not in found: found.append(full)
+              interesting=[u for u in found if any(k in u.lower() for k in ['pdf','file','down','attach','report','rpt','download'])]
+              print('INTERESTING_COUNT',rid,len(interesting))
+              for u in interesting:
+                  print('URL',rid,u[:1500])
+              # Print nearby text around likely attachment markers.
+              lines=clean.splitlines()
+              for i,line in enumerate(lines):
+                  low=line.lower()
+                  if any(k in low for k in ['pdf','download','附件','全文','file.finance','reportfile','rptid','研报摘要','报告日期','研究员','机构名称']):
+                      snippet=' '.join(re.sub(r'<[^>]+>',' ',line).split())
+                      if snippet:
+                          print('LINE',rid,i+1,snippet[:1800])
+              # Extract human-readable metadata text.
+              plain=re.sub(r'<script.*?</script>',' ',clean,flags=re.I|re.S)
+              plain=re.sub(r'<style.*?</style>',' ',plain,flags=re.I|re.S)
+              plain=re.sub(r'<[^>]+>','\n',plain)
+              plain='\n'.join(' '.join(x.split()) for x in plain.splitlines() if x.strip())
+              Path(f'diagnostic/{rid}.txt').write_text(plain,encoding='utf-8')
+              print('PLAIN_HEAD',rid,plain[:4000].replace('\n',' | '))
+              manifest.append({'rptid':rid,'detail_url':url,'encoding':used,'title':title,'interesting_urls':interesting})
+          Path('diagnostic/manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-sina-detail-pages
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
