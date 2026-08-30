@@ -1,0 +1,58 @@
+name: Probe SGPJBG links for Mengtaigaoxin report
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mengtaigaoxin-sgpjbg-link-probe-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch and parse links
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re,requests
+          from urllib.parse import urljoin
+          from html import unescape
+          urls=[
+            'https://www.sgpjbg.com/zhuanti/xianweixingyequshibaogao.html',
+            'https://www.sgpjbg.com/search.html?keyword=%E8%92%99%E6%B3%B0%E9%AB%98%E6%96%B0',
+          ]
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'}
+          out=[]
+          for u in urls:
+            try:
+              r=requests.get(u,headers=h,timeout=60)
+              print('FETCH',u,r.status_code,len(r.content),r.url,flush=True)
+              text=r.text
+            except Exception as e:
+              print('ERR',u,repr(e),flush=True); continue
+            open('page.html','w',encoding='utf-8').write(text)
+            for m in re.finditer(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+              href=urljoin(r.url,unescape(m.group(1)))
+              label=re.sub(r'<[^>]+>',' ',unescape(m.group(2)))
+              label=re.sub(r'\s+',' ',label).strip()
+              if '蒙泰高新' in label or '蒙泰高新' in href or '双基地强势进军碳纤维' in label:
+                rec={'page':r.url,'href':href,'label':label}
+                if rec not in out:
+                  out.append(rec); print('LINK',json.dumps(rec,ensure_ascii=False),flush=True)
+            # print contexts around title
+            for needle in ('蒙泰高新','双基地强势进军碳纤维','230613'):
+              idx=text.find(needle)
+              if idx>=0:
+                print('CTX',needle,text[max(0,idx-1200):idx+1800].replace('\n',' ')[:3000],flush=True)
+          open('links.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload links
+        uses: actions/upload-artifact@v4
+        with:
+          name: mengtaigaoxin-sgpjbg-link-probe
+          path: links.json
+          if-no-files-found: error
+          retention-days: 3
