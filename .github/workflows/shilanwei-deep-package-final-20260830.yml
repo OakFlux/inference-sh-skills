@@ -1,0 +1,135 @@
+name: Package final Shilanwei deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shilanwei-deep-package-final-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF dependency
+        run: python -m pip install --quiet pypdf
+      - name: Download, validate and package deep reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          out = Path('士兰微_券商深度报告_公开完整版')
+          out.mkdir(parents=True, exist_ok=True)
+          session = requests.Session()
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/600460.html',
+              'Accept': 'application/pdf,*/*;q=0.8',
+          }
+
+          reports = [
+              {
+                  'organization': '华金证券',
+                  'title': '加速产品布局优化，巩固国内IDM龙头优势',
+                  'date': '2023-04-04',
+                  'info_code': 'AP202304031585052555',
+                  'expected_pages': 13,
+                  'filename': '01_华金证券_士兰微_加速产品布局优化巩固国内IDM龙头优势_2023-04-04_13页.pdf',
+              },
+              {
+                  'organization': '国金证券',
+                  'title': '乘国产替代东风，IDM助功率器件、集成IC两翼齐飞',
+                  'date': '2023-01-03',
+                  'info_code': 'AP202301031581637899',
+                  'expected_pages': 37,
+                  'filename': '02_国金证券_士兰微_乘国产替代东风IDM助两翼齐飞_2023-01-03_37页.pdf',
+              },
+              {
+                  'organization': '国信证券',
+                  'title': '电气化时代多点开花，功率IDM龙头厚积薄发',
+                  'date': '2022-03-15',
+                  'info_code': 'AP202203151552796480',
+                  'expected_pages': 34,
+                  'filename': '03_国信证券_士兰微_电气化时代多点开花功率IDM龙头厚积薄发_2022-03-15_34页.pdf',
+              },
+          ]
+
+          downloaded = []
+          for item in reports:
+              url = f"https://pdf.dfcfw.com/pdf/H3_{item['info_code']}_1.pdf"
+              content = b''
+              last_error = None
+              for attempt in range(8):
+                  try:
+                      response = session.get(url, headers=headers, timeout=(30, 240))
+                      print('GET', url, response.status_code, response.headers.get('content-type'), len(response.content), flush=True)
+                      response.raise_for_status()
+                      if not response.content.startswith(b'%PDF-'):
+                          raise RuntimeError(f'not a PDF: {response.content[:100]!r}')
+                      content = response.content
+                      break
+                  except Exception as exc:
+                      last_error = exc
+                      time.sleep(2 * (attempt + 1))
+              if not content:
+                  raise RuntimeError(f"failed to download {item['title']}: {last_error}")
+
+              path = out / item['filename']
+              path.write_bytes(content)
+              reader = PdfReader(str(path))
+              page_count = len(reader.pages)
+              first_text = ''
+              for page in reader.pages[:2]:
+                  try:
+                      first_text += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              if page_count != item['expected_pages']:
+                  raise RuntimeError(f"page mismatch for {item['title']}: expected {item['expected_pages']}, got {page_count}")
+              if '士兰微' not in first_text:
+                  raise RuntimeError(f"identity check failed for {item['title']}")
+              sha256 = hashlib.sha256(content).hexdigest()
+              rec = {**item, 'url': url, 'pages': page_count, 'bytes': len(content), 'sha256': sha256}
+              downloaded.append(rec)
+              print('SAVED', json.dumps(rec, ensure_ascii=False), flush=True)
+
+          lines = ['士兰微（600460）券商深度报告', '']
+          for index, item in enumerate(downloaded, 1):
+              lines.extend([
+                  f"{index}. {item['organization']}：《{item['title']}》",
+                  f"   发布日期：{item['date']}",
+                  f"   页数：{item['pages']}页",
+                  f"   文件：{item['filename']}",
+                  '',
+              ])
+          lines.append('资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。')
+          (out / '报告清单.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(downloaded, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = Path('士兰微_券商深度报告_3份_公开完整版.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path, arcname=path.name)
+          print('ZIP', zip_path, zip_path.stat().st_size, flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shilanwei-deep-reports-final
+          path: |
+            士兰微_券商深度报告_公开完整版/
+            士兰微_券商深度报告_3份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
