@@ -1,0 +1,97 @@
+name: Temporary Nike SGPJBG alternate paths
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-sgpjbg-alt-paths.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Probe alternate pages and mobile hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages diagnostics assets
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import hashlib,json,re,subprocess
+          UA='Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro) AppleWebKit/537.36 Chrome/151 Mobile Safari/537.36'
+          urls=[
+            'https://m.sgpjbg.com/baogao/150331.html',
+            'https://m.sgpjbg.com/bgdown/150331.html?dtype=0',
+            'https://www.sgpjbg.com/baogao/150331.html?from=search',
+            'https://www.sgpjbg.com/baogao/150331.html?source=baidu',
+            'https://www.sgpjbg.com/baogao/150331.html?full=1',
+            'https://www.sgpjbg.com/baogao/150331.html?preview=1',
+            'https://www.sgpjbg.com/baogao/150331.html?isMobile=1',
+            'https://www.sgpjbg.com/baogao/150331.html/',
+            'https://www.sgpjbg.com/view-150331.html',
+            'https://www.sgpjbg.com/report/150331.html',
+            'https://www.sgpjbg.com/baogao/view/150331.html',
+            'https://www.sgpjbg.com/baogao/150331',
+            'https://r.jina.ai/http://www.sgpjbg.com/baogao/150331.html',
+            'https://r.jina.ai/https://www.sgpjbg.com/baogao/150331.html',
+          ]
+          manifest=[]; all_links=[]
+          for i,url in enumerate(urls,1):
+              out=Path('pages')/f'{i:02d}.bin'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','4','--retry-all-errors',
+                   '--connect-timeout','20','--max-time','240','--compressed','-A',UA,
+                   '-e','https://www.baidu.com/','-H','Accept-Language: zh-CN,zh;q=0.9',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              size=out.stat().st_size if out.exists() else 0
+              print('FETCH',i,'RC',p.returncode,'SIZE',size,'URL',url,'ERR',p.stderr[-200:])
+              if p.returncode or not out.exists(): manifest.append({'url':url,'error':p.stderr[-500:]}); continue
+              b=out.read_bytes(); kind='other'
+              if b[:4]==b'%PDF': kind='pdf'
+              elif b[:8]==b'\x89PNG\r\n\x1a\n': kind='png'
+              elif b[:3]==b'\xff\xd8\xff': kind='jpg'
+              if kind!='other':
+                  ext={'pdf':'.pdf','png':'.png','jpg':'.jpg'}[kind]; final=out.with_suffix(ext); out.rename(final)
+                  print('ASSET_PAGE',i,kind,size); manifest.append({'url':url,'kind':kind,'size':size,'file':str(final)}); continue
+              text=None; enc=None
+              for e in ['utf-8','gb18030','gbk','latin1']:
+                  try:text=b.decode(e);enc=e;break
+                  except:pass
+              if text is None: continue
+              html=out.with_suffix('.html'); out.rename(html); html.write_text(text,encoding='utf-8')
+              title=''; m=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              if m:title=' '.join(re.sub(r'<[^>]+>',' ',m.group(1)).split())
+              print('TITLE',i,title,'HAS',('利润率翘尾' in text),'SIZE',len(text))
+              found=[]
+              for pat in [r'''(?:href|src|data-src|data-original|url|file|pdf)\s*[:=]\s*["']([^"']+)["']''',r'''https?://[^\s"'<>]+''',r'''//[^\s"'<>]+''',r'''[^\s"'<>]+\.(?:pdf|png|jpg|jpeg|webp)(?:\?[^\s"'<>]*)?''']:
+                  for v in re.findall(pat,text,re.I):
+                      if isinstance(v,tuple):v=v[0]
+                      v=v.replace('\\/','/').replace('&amp;','&').strip()
+                      if not v or v.startswith(('javascript:','#','data:')):continue
+                      try:full=urljoin(url,v)
+                      except:continue
+                      if full not in found:found.append(full)
+              interesting=[u for u in found if any(k in u.lower() for k in ['150331','pdf','preview','download','viewer','image','page','file'])]
+              for u in interesting: print('LINK',i,u[:1800])
+              for u in interesting:
+                  if u not in all_links:all_links.append(u)
+              manifest.append({'url':url,'title':title,'encoding':enc,'size':len(b),'interesting':interesting})
+          Path('diagnostics/manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/links.txt').write_text('\n'.join(all_links)+'\n',encoding='utf-8')
+          PY
+          find pages diagnostics assets -type f -printf '%p\t%s\n' | sort
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-sgpjbg-alt-paths
+          path: |
+            pages/
+            diagnostics/
+            assets/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
