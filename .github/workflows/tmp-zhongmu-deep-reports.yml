@@ -1,0 +1,317 @@
+name: Temporary verified Zhongmu broker deep reports
+
+on:
+  push:
+    branches:
+      - tmp/download-zhongmu-reports-20260830
+    paths:
+      - .github/workflows/tmp-zhongmu-deep-reports.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Discover, download, verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output package previews diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import datetime as dt
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          import urllib.parse
+
+          API = 'https://reportapi.eastmoney.com/report/list'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          OUTPUT = Path('output')
+          PACKAGE = Path('package')
+          PREVIEWS = Path('previews')
+          DIAG = Path('diagnostic')
+
+          def fetch_catalog_page(page: int) -> dict:
+              params = {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': '2014-01-01', 'endTime': '2030-12-31',
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': '600195', 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+              url = API + '?' + urllib.parse.urlencode(params)
+              fd, temp_name = tempfile.mkstemp(prefix=f'zhongmu_{page}_', suffix='.json')
+              os.close(fd)
+              temp = Path(temp_name)
+              try:
+                  cmd = [
+                      'curl', '--http1.1', '-L', '--fail', '--silent', '--show-error',
+                      '--retry', '8', '--retry-all-errors', '--retry-delay', '1',
+                      '--connect-timeout', '30', '--max-time', '240',
+                      '-A', UA, '-e', 'https://data.eastmoney.com/report/',
+                      '-H', 'Accept-Encoding: identity', url, '-o', str(temp),
+                  ]
+                  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  if proc.returncode:
+                      raise RuntimeError(proc.stderr[-1000:])
+                  raw = temp.read_text(encoding='utf-8', errors='ignore').strip()
+                  if raw.startswith('datatable(') and raw.endswith(')'):
+                      raw = raw[len('datatable('):-1]
+                  elif raw and raw[0] not in '[{' and '(' in raw and raw.endswith(')'):
+                      raw = raw[raw.find('(') + 1:raw.rfind(')')]
+                  return json.loads(raw)
+              finally:
+                  temp.unlink(missing_ok=True)
+
+          rows: list[dict] = []
+          for page in range(1, 12):
+              obj = fetch_catalog_page(page)
+              data = obj.get('data') or []
+              print('CATALOG_PAGE', page, 'ROWS', len(data), 'HITS', obj.get('hits'))
+              rows.extend(data)
+              if len(data) < 100:
+                  break
+
+          dedup: dict[str, dict] = {}
+          for row in rows:
+              if str(row.get('stockCode') or '') != '600195' and str(row.get('stockName') or '') != '中牧股份':
+                  continue
+              key = str(row.get('infoCode') or json.dumps(row, ensure_ascii=False, sort_keys=True))
+              dedup[key] = row
+          rows = list(dedup.values())
+          rows.sort(key=lambda r: str(r.get('publishDate') or ''), reverse=True)
+          DIAG.joinpath('catalog.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          print('EXACT_COMPANY_REPORTS', len(rows))
+          for row in rows:
+              pages = int(row.get('attachPages') or 0)
+              title = str(row.get('title') or '')
+              if pages >= 10 or any(k in title for k in ['深度', '首次覆盖', '投资价值分析']):
+                  print('CATALOG_CANDIDATE', row.get('publishDate'), row.get('orgSName'), pages, row.get('infoCode'), title)
+
+          exclude_terms = ['季报点评', '年报点评', '中报点评', '半年报点评', '业绩点评', '事件点评', '重大事项点评', '快报点评', '跟踪点评']
+          deep_terms = ['深度', '首次覆盖', '投资价值分析', '首次评级', '公司研究报告']
+
+          def is_qualifying(row: dict) -> bool:
+              title = str(row.get('title') or '')
+              pages = int(row.get('attachPages') or 0)
+              has_deep = any(k in title for k in deep_terms)
+              if any(k in title for k in exclude_terms) and not has_deep:
+                  return False
+              return pages >= 15 or has_deep
+
+          candidates = [r for r in rows if is_qualifying(r)]
+
+          def score(row: dict) -> tuple:
+              title = str(row.get('title') or '')
+              pages = int(row.get('attachPages') or 0)
+              date = str(row.get('publishDate') or '')
+              deep = 1 if any(k in title for k in deep_terms) else 0
+              first = 1 if any(k in title for k in ['首次覆盖', '首次评级']) else 0
+              return (deep, first, date, pages)
+
+          candidates.sort(key=score, reverse=True)
+          selected: list[dict] = []
+          used_brokers: set[str] = set()
+
+          # First pass: distinct brokers and true deep/first coverage.
+          for row in candidates:
+              broker = str(row.get('orgSName') or '')
+              title = str(row.get('title') or '')
+              if broker in used_brokers:
+                  continue
+              if not any(k in title for k in deep_terms) and int(row.get('attachPages') or 0) < 20:
+                  continue
+              selected.append(row)
+              used_brokers.add(broker)
+              if len(selected) == 3:
+                  break
+
+          # Second pass: fill only with other long-form studies, still avoiding short commentary.
+          if len(selected) < 3:
+              used_codes = {str(r.get('infoCode') or '') for r in selected}
+              for row in candidates:
+                  code = str(row.get('infoCode') or '')
+                  if code in used_codes:
+                      continue
+                  if int(row.get('attachPages') or 0) < 15:
+                      continue
+                  selected.append(row)
+                  used_codes.add(code)
+                  if len(selected) == 3:
+                      break
+
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} qualifying long-form reports found')
+
+          broker_alias = {
+              '西南证券': 'Southwest',
+              '中信建投': 'CSC',
+              '中信建投证券': 'CSC',
+              '国金证券': 'Sinolink',
+              '华创证券': 'Huachuang',
+              '中邮证券': 'China_Post',
+              '太平洋': 'Pacific',
+              '太平洋证券': 'Pacific',
+              '财通证券': 'Caitong',
+              '中银证券': 'BOC',
+              '海通证券': 'Haitong',
+              '招商证券': 'China_Merchants',
+              '国泰君安': 'Guotai_Junan',
+              '申万宏源': 'Shenwan_Hongyuan',
+          }
+
+          verified: list[dict] = []
+          for index, row in enumerate(selected, start=1):
+              code = str(row.get('infoCode') or '')
+              if not code:
+                  raise RuntimeError('Selected row lacks infoCode')
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{str(row.get("publishDate") or "")[:10].replace("-", "")}.pdf=',
+                  f'https://pdf.dfcfw.com/pdf/{code}.pdf',
+              ]
+              temp = OUTPUT / f'temp_{index}.pdf'
+              source_url = None
+              for url in urls:
+                  temp.unlink(missing_ok=True)
+                  cmd = [
+                      'curl', '--http1.1', '-L', '--fail', '--silent', '--show-error',
+                      '--retry', '10', '--retry-all-errors', '--retry-delay', '2',
+                      '--connect-timeout', '30', '--max-time', '900', '--compressed',
+                      '-A', UA, '-e', 'https://data.eastmoney.com/report/',
+                      '-H', 'Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                      url, '-o', str(temp),
+                  ]
+                  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                  size = temp.stat().st_size if temp.exists() else 0
+                  magic = temp.read_bytes()[:8] if temp.exists() else b''
+                  print('TRY', code, 'RC', proc.returncode, 'SIZE', size, 'MAGIC', magic, 'URL', url, 'ERR', proc.stderr[-300:])
+                  if proc.returncode == 0 and size > 25000 and magic[:4] == b'%PDF':
+                      source_url = url
+                      break
+              if not source_url:
+                  raise RuntimeError(f'Unable to download valid PDF for {code}')
+
+              pdfinfo = subprocess.check_output(['pdfinfo', str(temp)], text=True, errors='replace')
+              match = re.search(r'^Pages:\s*(\d+)', pdfinfo, re.M)
+              pages_actual = int(match.group(1)) if match else 0
+              if pages_actual < 12:
+                  raise RuntimeError(f'Report {code} has only {pages_actual} pages')
+
+              text_file = DIAG / f'{code}.txt'
+              subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(12, pages_actual)), str(temp), str(text_file)],
+                  check=True,
+              )
+              text = text_file.read_text(encoding='utf-8', errors='replace')
+              compact = ''.join(text.split())
+              if '中牧股份' not in compact and '600195' not in compact:
+                  raise RuntimeError(f'Company name/code not found in {code}')
+
+              publish_date = str(row.get('publishDate') or '')[:10]
+              date_compact = publish_date.replace('-', '') or 'Undated'
+              broker = str(row.get('orgSName') or 'Broker')
+              alias = broker_alias.get(broker, re.sub(r'[^A-Za-z0-9_-]+', '_', broker) or 'Broker')
+              filename = f'{index:02d}_Zhongmu_{alias}_{date_compact}_{pages_actual}p.pdf'
+              final_pdf = OUTPUT / filename
+              temp.replace(final_pdf)
+
+              for page_no, tag in [(1, 'first'), (pages_actual, 'last')]:
+                  target = PREVIEWS / f'{index:02d}_{tag}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '100', str(final_pdf), str(target)],
+                      check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  )
+                  png = Path(str(target) + '.png')
+                  if not png.exists() or png.stat().st_size < 8000:
+                      raise RuntimeError(f'{filename}: {tag}-page render failed')
+
+              record = {
+                  'broker': broker,
+                  'publishDate': publish_date,
+                  'title': str(row.get('title') or ''),
+                  'pages': pages_actual,
+                  'catalogPages': int(row.get('attachPages') or 0),
+                  'rating': row.get('ratingName'),
+                  'reportType': row.get('reportType'),
+                  'infoCode': code,
+                  'sourceUrl': source_url,
+                  'filename': filename,
+                  'sizeBytes': final_pdf.stat().st_size,
+                  'sha256': hashlib.sha256(final_pdf.read_bytes()).hexdigest(),
+              }
+              verified.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False))
+
+          manifest = {
+              'company': '中牧股份',
+              'stockCode': '600195.SH',
+              'generatedAtUtc': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'count': len(verified),
+              'reports': verified,
+          }
+          (PACKAGE / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          readme = [
+              '中牧股份（600195.SH）券商深度研究报告', '',
+              f'共收录 {len(verified)} 份原始PDF，优先选择公司深度、首次覆盖及较长篇幅公司研究。',
+              '已排除普通季报/年报/事件短评。', '',
+          ]
+          for i, r in enumerate(verified, start=1):
+              readme.extend([
+                  f'{i}. {r["broker"]}，{r["publishDate"]}，{r["pages"]}页',
+                  f'   《{r["title"]}》',
+                  f'   评级：{r.get("rating") or "见原报告"}。',
+                  f'   文件名：{r["filename"]}', '',
+              ])
+          readme.extend([
+              '核验说明：所有文件均为原始PDF；已检查PDF文件头、实际页数、公司名称/证券代码，',
+              '并完成首页与末页渲染。压缩包附有SHA-256校验值。',
+              '仅供研究资料整理，不构成投资建议。',
+          ])
+          (PACKAGE / '报告清单与核验说明.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+          (PACKAGE / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{r["sha256"]}  {r["filename"]}' for r in verified) + '\n',
+              encoding='utf-8',
+          )
+          for r in verified:
+              (PACKAGE / r['filename']).write_bytes((OUTPUT / r['filename']).read_bytes())
+
+          print('FINAL_COUNT', len(verified))
+          for r in verified:
+              print('FINAL', r['broker'], r['publishDate'], r['pages'], r['title'], r['filename'])
+          PY
+
+          (cd package && zip -q -9 ../Zhongmu_Broker_Deep_Reports_Verified.zip ./*)
+          unzip -t Zhongmu_Broker_Deep_Reports_Verified.zip
+          ls -lh output package previews Zhongmu_Broker_Deep_Reports_Verified.zip
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongmu-broker-deep-reports
+          path: |
+            Zhongmu_Broker_Deep_Reports_Verified.zip
+            output/*.pdf
+            package/manifest.json
+            package/报告清单与核验说明.txt
+            package/SHA256SUMS.txt
+            previews/*.png
+            diagnostic/catalog.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
