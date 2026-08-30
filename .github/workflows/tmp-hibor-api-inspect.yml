@@ -1,0 +1,62 @@
+name: Temporary Hibor report API inspection
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-hibor-api-inspect.yml
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Inspect dynamic report page and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept':'text/html,application/json,text/javascript,*/*'})
+          url='https://www.hibor.com.cn/docdetail_81532.html'
+          r=s.get(url,timeout=90)
+          print('PAGE',r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+          text=r.text
+          print('COOKIES',s.cookies.get_dict())
+          print('HTML_HEAD',text[:12000])
+          print('\nMATCHES')
+          for needle in ['81532','docdetail','download','api','ajax','report','pdf','file']:
+              hits=[m.start() for m in re.finditer(needle,text,re.I)]
+              print('NEEDLE',needle,'COUNT',len(hits))
+              for p in hits[:20]: print('CTX',needle,text[max(0,p-500):p+1800].replace('\n',' ')[:2300])
+          soup=BeautifulSoup(text,'html.parser')
+          scripts=[]
+          for tag in soup.find_all('script'):
+              if tag.get('src'):
+                  scripts.append(urllib.parse.urljoin(r.url,tag['src']))
+              elif tag.string:
+                  print('INLINE',tag.string[:8000])
+          print('SCRIPTS',json.dumps(scripts,ensure_ascii=False,indent=2))
+          for u in scripts:
+              try:
+                  x=s.get(u,timeout=90)
+                  t=x.text
+                  print('\nSCRIPT',u,'HTTP',x.status_code,'LEN',len(x.content))
+                  if any(k in t.lower() for k in ['docdetail','download','pdf','reportdetail','report/detail','document']):
+                      for needle in ['docdetail','download','pdf','report','detail','file']:
+                          hits=[m.start() for m in re.finditer(needle,t,re.I)]
+                          if hits: print('SCRIPT_NEEDLE',needle,'COUNT',len(hits))
+                          for p in hits[:30]: print('SCRIPT_CTX',needle,t[max(0,p-800):p+2600].replace('\n',' ')[:3400])
+                      for pat in [r'https?://[^\s"\'<>]+',r'["\'](/[^"\']*(?:api|report|doc|download|file)[^"\']*)["\']']:
+                          vals=sorted(set(re.findall(pat,t,re.I)))
+                          for v in vals[:200]: print('URL_MATCH',v[:2000])
+              except Exception as e: print('SCRIPT_ERR',u,repr(e))
+          PY
