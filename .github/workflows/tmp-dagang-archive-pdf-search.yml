@@ -1,0 +1,131 @@
+name: Temporary Dagang archived PDF discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-archive-pdf-search.yml
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Search Wayback and Common Crawl indexes for historical PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import json, time, urllib.parse, urllib.request
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':UA,'Accept':'application/json,text/plain,*/*'}
+          out=[]
+
+          def get(url, timeout=180):
+              req=urllib.request.Request(url,headers=headers)
+              return urllib.request.urlopen(req,timeout=timeout).read().decode('utf-8','replace')
+
+          # Wayback CDX searches, ranging from broad stock-code patterns to likely host families.
+          wayback_queries=[
+              {'url':'*002077*.pdf','from':'2010','to':'2026'},
+              {'url':'*20160531*.pdf','from':'2015','to':'2026'},
+              {'url':'*20151230*.pdf','from':'2015','to':'2026'},
+              {'url':'*20110523*.pdf','from':'2011','to':'2026'},
+              {'url':'file.finance.sina.com.cn/*','from':'2010','to':'2020','filter':'original:002077'},
+              {'url':'*.book118.com/*002077*','from':'2010','to':'2026'},
+              {'url':'*.hibor.com.cn/*002077*','from':'2010','to':'2026'},
+              {'url':'*.dfcfw.com/*002077*','from':'2010','to':'2026'},
+              {'url':'*.eastmoney.com/*002077*','from':'2010','to':'2026'},
+          ]
+          for i,q in enumerate(wayback_queries,1):
+              params={'url':q['url'],'output':'json','fl':'timestamp,original,statuscode,mimetype,digest,length','filter':['statuscode:200'],'collapse':'digest','limit':'5000'}
+              if q.get('from'): params['from']=q['from']
+              if q.get('to'): params['to']=q['to']
+              # urllib cannot encode repeated filter directly; add optional filter manually.
+              url='https://web.archive.org/cdx/search/cdx?'+urllib.parse.urlencode(params,doseq=True)
+              if q.get('filter'): url+='&filter='+urllib.parse.quote(q['filter'],safe=':')
+              try:
+                  raw=get(url)
+                  Path(f'diagnostic/wayback_{i}.json').write_text(raw,encoding='utf-8')
+                  print('WAYBACK',i,q['url'],'SIZE',len(raw))
+                  try:
+                      data=json.loads(raw)
+                      if data and isinstance(data,list):
+                          head=data[0]
+                          for row in data[1:]:
+                              rec=dict(zip(head,row)); rec['source']='wayback'; rec['query']=q['url']; out.append(rec)
+                              print('WB_RESULT',json.dumps(rec,ensure_ascii=False))
+                  except Exception as e:
+                      print('WAYBACK_PARSE',i,repr(e),raw[:500])
+              except Exception as e:
+                  print('WAYBACK_ERR',i,q['url'],repr(e))
+              time.sleep(.3)
+
+          # Select one crawl per year plus recent crawls, so removed files from 2011-2016 can still surface.
+          try:
+              colls=json.loads(get('https://index.commoncrawl.org/collinfo.json'))
+          except Exception as e:
+              print('COLLINFO_ERR',repr(e)); colls=[]
+          chosen=[]; years=set()
+          for c in colls:
+              cid=c.get('id','')
+              try: year=int(cid.split('-')[2])
+              except Exception: continue
+              if year>=2010 and year not in years:
+                  chosen.append(c); years.add(year)
+              if len(chosen)>=18: break
+          # Add the newest three explicitly.
+          for c in colls[:3]:
+              if c not in chosen: chosen.append(c)
+          patterns=['*002077*.pdf','*20160531*.pdf','*20151230*.pdf','*20110523*.pdf','*002077*']
+          for c in chosen:
+              idx=c.get('cdx-api') or f"https://index.commoncrawl.org/{c.get('id')}-index"
+              cid=c.get('id')
+              for pat in patterns:
+                  url=idx+'?'+urllib.parse.urlencode({'url':pat,'output':'json','filter':'status:200','collapse':'digest'})
+                  try:
+                      raw=get(url,120)
+                      if raw.strip():
+                          safe=pat.replace('*','STAR').replace('/','_').replace('.','_')
+                          Path(f'diagnostic/cc_{cid}_{safe}.jsonl').write_text(raw,encoding='utf-8')
+                          lines=raw.splitlines()
+                          print('CC',cid,pat,'LINES',len(lines))
+                          for line in lines[:1000]:
+                              try:
+                                  rec=json.loads(line); rec['source']='commoncrawl'; rec['crawl']=cid; rec['query']=pat; out.append(rec)
+                                  print('CC_RESULT',json.dumps(rec,ensure_ascii=False))
+                              except Exception:
+                                  pass
+                  except Exception as e:
+                      print('CC_ERR',cid,pat,repr(e))
+                  time.sleep(.1)
+
+          # De-duplicate and save a compact list of potentially relevant URLs.
+          seen=set(); compact=[]
+          for r in out:
+              u=r.get('url') or r.get('original') or ''
+              if not u or u in seen: continue
+              seen.add(u)
+              low=u.lower()
+              if any(k in low for k in ['002077','20160531','20151230','20110523','dagang']):
+                  compact.append(r)
+          Path('diagnostic/compact_results.json').write_text(json.dumps(compact,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('COMPACT_COUNT',len(compact))
+          for r in compact: print('COMPACT',json.dumps(r,ensure_ascii=False))
+          PY
+
+      - name: Upload archive search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-archive-pdf-search
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
