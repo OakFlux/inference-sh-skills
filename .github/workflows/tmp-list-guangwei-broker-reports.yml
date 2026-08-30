@@ -1,4 +1,4 @@
-name: List Guangwei broker reports
+name: Package verified Guangwei broker reports
 
 on:
   push:
@@ -8,10 +8,17 @@ permissions:
   contents: read
 
 jobs:
-  list:
+  package:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - run: python -m pip install --quiet requests
-      - run: python .github/scripts/list_guangwei_broker_reports.py
+      - run: python -m pip install --quiet requests pypdf pymupdf
+      - run: python .github/scripts/package_guangwei_broker_reports.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guangwei-broker-reports
+          path: 光威复材_券商深度报告_3份_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
