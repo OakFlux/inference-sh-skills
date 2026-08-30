@@ -171,7 +171,6 @@ def main() -> None:
         'expected_year=2022, kind="prospectus"',
         f'PROSPECTUS_DATE = "{PROSPECTUS_DATE}"',
         f'LATEST_HALF_DATE = "{LATEST_HALF_DATE}"',
-        f"{prospectus_id}.PDF",
         "必易微_全部年报_招股说明书_2026年最新半年报_完整PDF.zip",
         "if len(documents) != 6:",
         "if len(pdfs) != 6:",
