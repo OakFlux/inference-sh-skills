@@ -22,161 +22,347 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import hashlib, html, re, subprocess, time, urllib.parse, zipfile
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
           from pathlib import Path
+
           import requests
 
-          out = Path('万盛股份_2020-2025年报及最新季报')
-          out.mkdir(exist_ok=True)
-          s = requests.Session()
-          s.headers.update({
-              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
-              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          PACKAGE_DIR = Path("万盛股份_2020-2025年报及最新季报")
+          PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
           })
 
-          annual = {
-              2020: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2021/2021-3/2021-03-23/6964909.PDF'],
-              2021: ['https://static.cninfo.com.cn/finalpage/2022-04-30/1213266702.PDF'],
-              2022: ['https://static.cninfo.com.cn/finalpage/2023-03-28/1216233681.PDF', 'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2023/2023-3/2023-03-28/8914181.PDF'],
-              2023: ['https://static.cninfo.com.cn/finalpage/2024-03-26/1219401525.PDF', 'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2024/2024-3/2024-03-26/9894661.PDF'],
-              2024: ['https://static.cninfo.com.cn/finalpage/2025-03-25/1222880125.PDF', 'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2025/2025-3/2025-03-25/10802825.PDF'],
-              2025: ['https://static.cninfo.com.cn/finalpage/2026-03-24/1225025123.PDF', 'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2026/2026-3/2026-03-24/12011254.PDF'],
+          annual_sources: dict[int, list[str]] = {
+              2020: [
+                  "http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2021/2021-3/2021-03-23/6964909.PDF",
+              ],
+              2021: [
+                  "https://static.cninfo.com.cn/finalpage/2022-04-30/1213266702.PDF",
+              ],
+              2022: [
+                  "https://static.cninfo.com.cn/finalpage/2023-03-28/1216233681.PDF",
+                  "http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2023/2023-3/2023-03-28/8914181.PDF",
+              ],
+              2023: [
+                  "https://static.cninfo.com.cn/finalpage/2024-03-26/1219401525.PDF",
+                  "http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2024/2024-3/2024-03-26/9894661.PDF",
+              ],
+              2024: [
+                  "https://static.cninfo.com.cn/finalpage/2025-03-25/1222880125.PDF",
+                  "http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2025/2025-3/2025-03-25/10802825.PDF",
+              ],
+              2025: [
+                  "https://static.cninfo.com.cn/finalpage/2026-03-24/1225025123.PDF",
+                  "http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2026/2026-3/2026-03-24/12011254.PDF",
+              ],
           }
 
-          def decode(raw):
-              for enc in ('utf-8', 'gb18030', 'gbk'):
-                  try:
-                      text = raw.decode(enc)
-                  except UnicodeDecodeError:
-                      continue
-                  if '万盛股份' in text or '半年度报告' in text:
-                      return text
-              return raw.decode('utf-8', errors='replace')
+          def clean_title(value: str) -> str:
+              value = re.sub(r"<[^>]+>", "", value, flags=re.S)
+              return re.sub(r"\s+", "", html.unescape(value))
 
-          def latest_from_cfi():
-              pages = [
-                  'https://gg.cfi.cn/quote.aspx?client=phone&contenttype=cbgg&stockid=20665',
-                  'https://gg.cfi.cn/cbgg/20665/603010.html',
-                  'https://gg.cfi.cn/quote.aspx?client=pc&lm=cbgg&stockid=20665',
+          def discover_latest_half_year_report() -> list[str]:
+              payloads = [
+                  {
+                      "stock": "603010,gssh0603010",
+                      "tabName": "fulltext",
+                      "pageNum": "1",
+                      "pageSize": "100",
+                      "column": "sse",
+                      "plate": "sh",
+                      "searchkey": "",
+                      "secid": "",
+                      "category": "category_bndbg_szsh;",
+                      "trade": "",
+                      "seDate": "2026-08-20~2026-08-30",
+                      "sortName": "",
+                      "sortType": "",
+                      "isHLtitle": "true",
+                  },
+                  {
+                      "stock": "603010,gssh0603010",
+                      "tabName": "fulltext",
+                      "pageNum": "1",
+                      "pageSize": "100",
+                      "column": "sse",
+                      "plate": "sh",
+                      "searchkey": "2026年半年度报告",
+                      "secid": "",
+                      "category": "",
+                      "trade": "",
+                      "seDate": "2026-08-20~2026-08-30",
+                      "sortName": "",
+                      "sortType": "",
+                      "isHLtitle": "true",
+                  },
               ]
-              found = []
-              for page in pages:
-                  try:
-                      r = s.get(page, timeout=90)
-                      r.raise_for_status()
-                      text = decode(r.content).replace('\\/', '/')
-                      print('CFI', page, len(text), flush=True)
-                      for row in re.findall(r'<tr\b.*?</tr>', text, flags=re.I|re.S):
-                          plain = html.unescape(re.sub(r'<[^>]+>', '', row, flags=re.S))
-                          compact = re.sub(r'\s+', '', plain)
-                          if '2026年半年度报告' not in compact or '摘要' in compact:
-                              continue
-                          for href in re.findall(r'href=["\']([^"\']+)["\']', row, flags=re.I):
-                              href = html.unescape(href).replace('\\/', '/')
-                              if 'static.cninfo.com.cn' in href and '.pdf' in href.lower():
-                                  found.append(urllib.parse.urljoin(page, href))
-                      if not found:
-                          for m in re.finditer('2026年半年度报告', text):
-                              window = text[max(0,m.start()-1200):m.end()+1800]
-                              for href in re.findall(r'["\']([^"\']*static\.cninfo\.com\.cn[^"\']+?\.PDF[^"\']*)["\']', window, flags=re.I):
-                                  found.append(html.unescape(href).replace('\\/', '/'))
-                  except Exception as e:
-                      print('CFI discovery error', page, repr(e), flush=True)
-              unique=[]
-              for u in found:
-                  if u not in unique:
-                      unique.append(u)
-              print('latest candidates', unique, flush=True)
-              return unique
+              headers = {
+                  "User-Agent": session.headers["User-Agent"],
+                  "Accept": "application/json, text/javascript, */*; q=0.01",
+                  "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                  "Referer": "http://www.cninfo.com.cn/new/commonUrl?url=disclosure/list/search",
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Origin": "http://www.cninfo.com.cn",
+              }
+              endpoints = [
+                  "http://www.cninfo.com.cn/new/hisAnnouncement/query",
+                  "https://www.cninfo.com.cn/new/hisAnnouncement/query",
+              ]
+              errors: list[str] = []
+              for endpoint in endpoints:
+                  for payload in payloads:
+                      try:
+                          response = session.post(
+                              endpoint,
+                              data=payload,
+                              headers=headers,
+                              timeout=90,
+                              allow_redirects=True,
+                          )
+                          print(
+                              "CNINFO query",
+                              endpoint,
+                              "status=",
+                              response.status_code,
+                              "content-type=",
+                              response.headers.get("content-type"),
+                              "final-url=",
+                              response.url,
+                              flush=True,
+                          )
+                          response.raise_for_status()
+                          data = response.json()
+                          announcements = data.get("announcements") or []
+                          print("CNINFO announcements:", len(announcements), flush=True)
+                          candidates: list[str] = []
+                          for item in announcements:
+                              title = clean_title(str(item.get("announcementTitle", "")))
+                              adjunct = str(item.get("adjunctUrl", ""))
+                              print("CNINFO item:", title, "|", adjunct, flush=True)
+                              if (
+                                  "2026年半年度报告" in title
+                                  and "摘要" not in title
+                                  and adjunct
+                              ):
+                                  candidates.append(
+                                      urllib.parse.urljoin(
+                                          "https://static.cninfo.com.cn/", adjunct
+                                      )
+                                  )
+                          if candidates:
+                              return list(dict.fromkeys(candidates))
+                      except Exception as exc:
+                          snippet = ""
+                          try:
+                              snippet = response.text[:500]
+                          except Exception:
+                              pass
+                          errors.append(f"{endpoint}: {exc}; {snippet}")
+                          print("CNINFO attempt failed:", errors[-1], flush=True)
+              raise RuntimeError("Unable to discover latest half-year report: " + " | ".join(errors))
 
-          def pdf_pages(path):
-              p = subprocess.run(['pdfinfo', str(path)], check=True, text=True, capture_output=True)
-              m = re.search(r'^Pages:\s+(\d+)', p.stdout, flags=re.M)
-              if not m:
-                  raise RuntimeError('page count unavailable')
-              return int(m.group(1))
+          def pdf_page_count(path: Path) -> int:
+              result = subprocess.run(
+                  ["pdfinfo", str(path)],
+                  check=True,
+                  text=True,
+                  capture_output=True,
+              )
+              match = re.search(r"^Pages:\s+(\d+)", result.stdout, flags=re.M)
+              if not match:
+                  raise RuntimeError(f"Cannot determine page count for {path}")
+              return int(match.group(1))
 
-          def validate(path, year, kind, min_pages):
-              pages = pdf_pages(path)
+          def validate_pdf(
+              path: Path,
+              year: int,
+              report_type: str,
+              min_pages: int,
+          ) -> int:
+              if path.stat().st_size < 20_000 or path.read_bytes()[:4] != b"%PDF":
+                  raise RuntimeError("Downloaded content is not a valid PDF")
+
+              pages = pdf_page_count(path)
               if pages < min_pages:
-                  raise RuntimeError(f'only {pages} pages')
-              p = subprocess.run(['pdftotext','-f','1','-l',str(min(35,pages)),str(path),'-'], text=True, capture_output=True, errors='ignore')
-              text = re.sub(r'\s+', '', p.stdout)
-              if '万盛股份' not in text and '浙江万盛股份有限公司' not in text:
-                  raise RuntimeError('company name not found')
-              if f'{year}年' not in text:
-                  raise RuntimeError('year not found')
-              expected = '年度报告' if kind == 'annual' else '半年度报告'
-              if expected not in text:
-                  raise RuntimeError(expected + ' not found')
-              if '摘要' in text[:500]:
-                  raise RuntimeError('summary file')
-              q = subprocess.run(['qpdf','--check',str(path)], text=True, capture_output=True)
-              if q.returncode not in (0,3):
-                  raise RuntimeError('qpdf check failed')
+                  raise RuntimeError(f"Unexpectedly short report: {pages} pages")
+
+              extracted = subprocess.run(
+                  [
+                      "pdftotext",
+                      "-f",
+                      "1",
+                      "-l",
+                      str(min(35, pages)),
+                      str(path),
+                      "-",
+                  ],
+                  text=True,
+                  capture_output=True,
+                  errors="ignore",
+              ).stdout
+              compact = re.sub(r"\s+", "", extracted)
+              if "万盛股份" not in compact and "浙江万盛股份有限公司" not in compact:
+                  raise RuntimeError("Company-name validation failed")
+              if f"{year}年" not in compact:
+                  raise RuntimeError("Report-year validation failed")
+              expected = "年度报告" if report_type == "annual" else "半年度报告"
+              if expected not in compact:
+                  raise RuntimeError(f"Report-type validation failed: {expected}")
+              if "摘要" in compact[:500]:
+                  raise RuntimeError("The selected document is a summary, not the full report")
+
+              qpdf = subprocess.run(
+                  ["qpdf", "--check", str(path)],
+                  text=True,
+                  capture_output=True,
+              )
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(
+                      f"qpdf structure check failed: {qpdf.stdout}\n{qpdf.stderr}"
+                  )
               return pages
 
-          def obtain(urls, dest, year, kind, min_pages):
-              last = None
+          def download_validated(
+              urls: list[str],
+              destination: Path,
+              year: int,
+              report_type: str,
+              min_pages: int,
+          ) -> tuple[str, int, int, str]:
+              last_error: Exception | None = None
               for url in urls:
-                  for attempt in range(1,4):
-                      tmp = dest.with_suffix('.pdf.part')
-                      tmp.unlink(missing_ok=True)
+                  for attempt in range(1, 4):
+                      temp_path = destination.with_suffix(".pdf.part")
+                      temp_path.unlink(missing_ok=True)
                       try:
-                          print('Trying', dest.name, url, flush=True)
-                          ref = 'https://gg.cfi.cn/' if 'cninfo' in url else 'https://money.finance.sina.com.cn/'
-                          with s.get(url, headers={'Referer':ref,'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'}, stream=True, timeout=(30,900)) as r:
-                              r.raise_for_status()
-                              with tmp.open('wb') as f:
-                                  for chunk in r.iter_content(1024*1024):
-                                      if chunk: f.write(chunk)
-                          if tmp.stat().st_size < 20000 or tmp.read_bytes()[:4] != b'%PDF':
-                              raise RuntimeError(f'not PDF ({tmp.stat().st_size} bytes)')
-                          pages = validate(tmp, year, kind, min_pages)
-                          tmp.replace(dest)
-                          data = dest.read_bytes()
-                          return url, pages, len(data), hashlib.sha256(data).hexdigest()
-                      except Exception as e:
-                          last=e
-                          print('failed', attempt, repr(e), flush=True)
-                          tmp.unlink(missing_ok=True)
-                          time.sleep(attempt*2)
-              raise RuntimeError(f'all candidates failed for {dest}: {last}')
+                          print("Downloading", destination.name, "from", url, flush=True)
+                          referer = (
+                              "https://www.cninfo.com.cn/"
+                              if "cninfo" in url
+                              else "https://money.finance.sina.com.cn/"
+                          )
+                          with session.get(
+                              url,
+                              headers={
+                                  "Referer": referer,
+                                  "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                              },
+                              stream=True,
+                              timeout=(30, 900),
+                              allow_redirects=True,
+                          ) as response:
+                              response.raise_for_status()
+                              with temp_path.open("wb") as output:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          output.write(chunk)
 
-          rows=[]
-          for year in range(2020,2026):
-              dest=out/f'万盛股份_{year}年年度报告.pdf'
-              src,pages,size,digest=obtain(annual[year],dest,year,'annual',120)
-              rows.append((dest.name,pages,size,digest,src))
-              print('Verified',dest.name,pages,flush=True)
+                          pages = validate_pdf(
+                              temp_path, year, report_type, min_pages
+                          )
+                          temp_path.replace(destination)
+                          data = destination.read_bytes()
+                          return (
+                              url,
+                              pages,
+                              len(data),
+                              hashlib.sha256(data).hexdigest(),
+                          )
+                      except Exception as exc:
+                          last_error = exc
+                          print(
+                              f"Download/validation attempt {attempt} failed for {url}: {exc}",
+                              flush=True,
+                          )
+                          temp_path.unlink(missing_ok=True)
+                          time.sleep(attempt * 2)
+              raise RuntimeError(
+                  f"All sources failed for {destination.name}: {last_error}"
+              )
 
-          latest=latest_from_cfi()
-          if not latest:
-              raise RuntimeError('CFI did not expose the 2026 half-year full-report PDF mirror')
-          dest=out/'万盛股份_2026年半年度报告.pdf'
-          src,pages,size,digest=obtain(latest,dest,2026,'half',60)
-          rows.append((dest.name,pages,size,digest,src))
-          print('Verified',dest.name,pages,flush=True)
+          rows: list[tuple[str, int, int, str, str]] = []
+          for year in range(2020, 2026):
+              destination = PACKAGE_DIR / f"万盛股份_{year}年年度报告.pdf"
+              source, pages, size, digest = download_validated(
+                  annual_sources[year], destination, year, "annual", 120
+              )
+              rows.append((destination.name, pages, size, digest, source))
+              print("Verified", destination.name, pages, "pages", flush=True)
 
-          notes=['万盛股份（603010.SH）定期报告包，共7份完整PDF。','',
-                 '收录：2020—2025年年度报告，以及截至2026年8月30日最新的2026年半年度报告。',
-                 '所有年度报告均为全文版，不以摘要替代。','']
-          for name,pages,size,digest,src in rows:
-              notes += [f'{name} | {pages}页 | {size}字节 | SHA256 {digest}', f'来源：{src}']
-          notes += ['', '核验：PDF文件头、公司名称、报告年度和类型、最低页数、qpdf结构及ZIP CRC。']
-          (out/'报告清单与核验说明.txt').write_text('\n'.join(notes),encoding='utf-8')
-          (out/'SHA256SUMS.txt').write_text('\n'.join(f'{d}  {n}' for n,_,_,d,_ in rows)+'\n',encoding='utf-8')
+          latest_urls = discover_latest_half_year_report()
+          print("Latest report candidates:", latest_urls, flush=True)
+          latest_destination = PACKAGE_DIR / "万盛股份_2026年半年度报告.pdf"
+          source, pages, size, digest = download_validated(
+              latest_urls, latest_destination, 2026, "half", 60
+          )
+          rows.append((latest_destination.name, pages, size, digest, source))
+          print("Verified", latest_destination.name, pages, "pages", flush=True)
 
-          z=Path('万盛股份_2020-2025年报及最新季报.zip')
-          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as a:
-              for p in sorted(out.rglob('*')):
-                  if p.is_file(): a.write(p,arcname=str(p))
-          with zipfile.ZipFile(z) as a:
-              bad=a.testzip()
-              if bad: raise RuntimeError('ZIP CRC failed: '+bad)
-              if sum(n.lower().endswith('.pdf') for n in a.namelist()) != 7:
-                  raise RuntimeError('ZIP does not contain 7 PDFs')
-          print('Created',z,z.stat().st_size,flush=True)
+          notes = [
+              "万盛股份（603010.SH）定期报告包，共7份完整PDF。",
+              "",
+              "收录范围：2020—2025年年度报告，以及截至2026年8月30日最新的2026年半年度报告。",
+              "所有年度报告均为全文版，不以摘要替代。",
+              "",
+          ]
+          for name, pages, size, digest, source in rows:
+              notes.append(
+                  f"{name} | {pages}页 | {size}字节 | SHA256 {digest}"
+              )
+              notes.append(f"来源：{source}")
+          notes.extend([
+              "",
+              "核验项目：PDF文件头、公司名称、报告年度与类型、最低页数、qpdf结构检查及ZIP CRC。",
+          ])
+          (PACKAGE_DIR / "报告清单与核验说明.txt").write_text(
+              "\n".join(notes), encoding="utf-8"
+          )
+          (PACKAGE_DIR / "SHA256SUMS.txt").write_text(
+              "\n".join(
+                  f"{digest}  {name}"
+                  for name, _, _, digest, _ in rows
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+
+          zip_path = Path("万盛股份_2020-2025年报及最新季报.zip")
+          with zipfile.ZipFile(
+              zip_path,
+              "w",
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+              allowZip64=True,
+          ) as archive:
+              for path in sorted(PACKAGE_DIR.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=str(path))
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad_member = archive.testzip()
+              if bad_member:
+                  raise RuntimeError(f"ZIP CRC check failed: {bad_member}")
+              pdf_names = [
+                  name for name in archive.namelist() if name.lower().endswith(".pdf")
+              ]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(
+                      f"Expected seven PDF reports, found {len(pdf_names)}"
+                  )
+          print("Created", zip_path, zip_path.stat().st_size, "bytes", flush=True)
           PY
 
           unzip -t '万盛股份_2020-2025年报及最新季报.zip'
