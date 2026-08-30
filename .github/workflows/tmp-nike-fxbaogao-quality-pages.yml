@@ -1,0 +1,93 @@
+name: Temporary Nike Fxbaogao quality-page recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-fxbaogao-quality-pages.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download full sequential page images
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages diagnostics
+          python3 - <<'PY'
+          from __future__ import annotations
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          import hashlib,json,subprocess,time
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          docs=[
+            {'id':'4742006','date':'2025/03/23','label':'Nike_FY2025Q3_Guosheng'},
+            {'id':'4924081','date':'2025/06/29','label':'Nike_FY2025Q4_Guosheng'},
+            {'id':'5083891','date':'2025/10/08','label':'Nike_FY2026Q1_Guosheng'},
+            {'id':'5337859','date':'2026/04/06','label':'Nike_FY2026Q3_Huachuang'},
+          ]
+          root=Path('pages')
+
+          def download(doc,page):
+              base=f"https://public.fxbaogao.com/report-image/{doc['date']}/{doc['id']}-{page}.png"
+              # q_100 keeps the original PNG while warming a reliable CDN route.
+              url=base+'?x-oss-process=image/quality,q_100'
+              out=root/doc['label']/f'{page:03d}.png'; out.parent.mkdir(parents=True,exist_ok=True)
+              last_err=''
+              for attempt in range(1,5):
+                  cmd=['curl','--http1.1','-L','--silent','--show-error','--connect-timeout','15','--max-time','90',
+                       '-A',UA,'-e',f"https://www.fxbaogao.com/detail/{doc['id']}",
+                       '-H','Accept: image/avif,image/webp,image/png,image/*,*/*;q=0.8',
+                       '-H','Accept-Encoding: identity',url,'-o',str(out)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if p.returncode==0 and out.exists():
+                      b=out.read_bytes()
+                      if b[:8]==b'\x89PNG\r\n\x1a\n' and len(b)>5000:
+                          return {'page':page,'ok':True,'size':len(b),'file':str(out),'url':url,
+                                  'sha256':hashlib.sha256(b).hexdigest(),'attempt':attempt}
+                      last_err=f'invalid size={len(b)} magic={b[:16]!r} preview={b[:100]!r}'
+                  else:
+                      last_err=p.stderr[-300:]
+                  out.unlink(missing_ok=True)
+                  time.sleep(attempt*.5)
+              return {'page':page,'ok':False,'url':url,'error':last_err}
+
+          manifests=[]
+          for doc in docs:
+              with ThreadPoolExecutor(max_workers=24) as ex:
+                  fm={ex.submit(download,doc,p):p for p in range(1,61)}
+                  results=[f.result() for f in as_completed(fm)]
+              results.sort(key=lambda r:r['page'])
+              good=[r for r in results if r['ok']]
+              contiguous=0
+              for p in range(1,61):
+                  if any(r['page']==p for r in good): contiguous=p
+                  else: break
+              # Remove any pages beyond the first gap to avoid accidental unrelated objects.
+              for r in good:
+                  if r['page']>contiguous:
+                      Path(r['file']).unlink(missing_ok=True)
+              selected=[r for r in good if r['page']<=contiguous]
+              manifests.append({'doc':doc,'contiguous_pages':contiguous,'selected':selected,'results':results})
+              print('DOC',doc['id'],'CONTIGUOUS',contiguous,'DOWNLOADED',len(selected),
+                    'SIZES',[r['size'] for r in selected[:3]],'LAST_SIZE',selected[-1]['size'] if selected else None)
+              print('FAIL_HEAD',[(r['page'],r.get('error','')[:100]) for r in results if not r['ok']][:5])
+          Path('diagnostics/manifest.json').write_text(json.dumps(manifests,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          find pages -type f -printf '%p\t%s\n' | sort | tail -100
+
+      - name: Upload page sets
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-fxbaogao-quality-pages
+          path: |
+            pages/
+            diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
