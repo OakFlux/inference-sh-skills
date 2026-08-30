@@ -1,0 +1,85 @@
+name: Temporary Actions Technology broker report metadata discovery
+
+on:
+  push:
+    branches:
+      - 'tmp/actions-tech-meta-20260830'
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and rank broker report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          curl --http1.1 --location --fail --silent --show-error \
+            --retry 7 --retry-all-errors --retry-delay 1 \
+            --connect-timeout 20 --max-time 180 \
+            --user-agent "$UA" \
+            --referer 'https://data.eastmoney.com/report/688049.html' \
+            --header 'Accept-Encoding: identity' \
+            --get 'https://reportapi.eastmoney.com/report/list' \
+            --data-urlencode 'industryCode=*' \
+            --data-urlencode 'pageSize=100' \
+            --data-urlencode 'industry=*' \
+            --data-urlencode 'rating=*' \
+            --data-urlencode 'ratingChange=*' \
+            --data-urlencode 'beginTime=2021-01-01' \
+            --data-urlencode 'endTime=2026-08-30' \
+            --data-urlencode 'pageNo=1' \
+            --data-urlencode 'fields=' \
+            --data-urlencode 'qType=0' \
+            --data-urlencode 'orgCode=' \
+            --data-urlencode 'code=688049' \
+            --data-urlencode 'rcode=' \
+            --data-urlencode 'p=1' \
+            --data-urlencode 'pageNum=1' \
+            --data-urlencode 'pageNumber=1' \
+            --output diagnostics/raw.txt
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          text=Path('diagnostics/raw.txt').read_text(encoding='utf-8',errors='ignore').strip()
+          if text and text[0] not in '[{' and '(' in text and text.endswith(')'):
+              text=text[text.find('(')+1:text.rfind(')')]
+          obj=json.loads(text)
+          rows=obj.get('data') or obj.get('result',{}).get('data') or []
+          def t(r): return str(r.get('title') or r.get('reportTitle') or '')
+          def b(r): return str(r.get('orgSName') or r.get('orgName') or '')
+          def d(r):
+              x=str(r.get('publishDate') or r.get('publishTime') or '')
+              m=re.search(r'20\d{2}-\d{2}-\d{2}',x); return m.group(0) if m else x[:10]
+          def c(r): return str(r.get('infoCode') or r.get('infocode') or r.get('info_code') or '')
+          pos=['深度','首次覆盖','公司深度','AIoT','端侧AI','智能音频','SoC','蓝牙音频','低功耗','存内计算','成长空间','芯片设计','无线音频','智能穿戴','国产替代','平台型']
+          neg=['一季报点评','中报点评','半年报点评','年报点评','三季报点评','季报点评','业绩点评','事件点评','公告点评','点评报告','业绩快报','公司信息更新','简评','业绩预告点评']
+          def sc(r):
+              x=re.sub(r'\s+','',t(r)); v=0
+              if '深度' in x:v+=500
+              if '首次覆盖' in x:v+=500
+              if '公司深度' in x:v+=180
+              v+=sum(70 for k in pos if re.sub(r'\s+','',k) in x)
+              v-=sum(300 for k in neg if re.sub(r'\s+','',k) in x)
+              try:y=int(d(r)[:4])
+              except:y=0
+              v+={2026:110,2025:90,2024:75,2023:60,2022:50,2021:40}.get(y,0)
+              return v
+          out=sorted([{'score':sc(r),'date':d(r),'broker':b(r),'title':t(r),'infoCode':c(r)} for r in rows],key=lambda x:(x['score'],x['date']),reverse=True)
+          Path('diagnostics/candidates.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL',len(rows))
+          for x in out[:100]: print(json.dumps(x,ensure_ascii=False))
+          PY
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: actions-tech-report-metadata
+          path: diagnostics/candidates.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
