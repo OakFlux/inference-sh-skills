@@ -1,0 +1,219 @@
+name: Temporary Zhongtai Chemical deep report package
+
+on:
+  push:
+    branches:
+      - tmp/download-zhongtai-chemical-reports-20260830
+    paths:
+      - .github/workflows/tmp-zhongtai-chemical-package.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF verification tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+          python -m pip install --quiet pypdf requests
+
+      - name: Download and validate original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output verify
+          cat > /tmp/download_verify.py <<'PY'
+          import hashlib
+          import io
+          import json
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('output')
+          VERIFY = Path('verify')
+          OUT.mkdir(exist_ok=True)
+          VERIFY.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'order': 1,
+                  'broker': '东兴证券',
+                  'date': '2018-11-08',
+                  'title': '深度报告：氯碱行业龙头，一体化优势与资源优势带来成本优势',
+                  'info_code': 'AP201811081240729004',
+                  'expected_pages': 20,
+                  'rating': '买入',
+                  'filename': '01_东兴证券_氯碱行业龙头_一体化优势与资源优势带来成本优势_20181108_20页.pdf',
+                  'type': '公司深度报告',
+              },
+              {
+                  'order': 2,
+                  'broker': '信达证券',
+                  'date': '2018-10-24',
+                  'title': '首次覆盖报告：行业大变革前夜，强推龙头',
+                  'info_code': 'AP201810241220082629',
+                  'expected_pages': 25,
+                  'rating': '买入',
+                  'filename': '02_信达证券_行业大变革前夜_强推龙头_20181024_25页.pdf',
+                  'type': '首次覆盖报告',
+              },
+          ]
+
+          user_agents = [
+              'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+          ]
+
+          manifest = []
+          for report in reports:
+              base = f"https://pdf.dfcfw.com/pdf/H3_{report['info_code']}_1.pdf"
+              urls = [
+                  base,
+                  base + '?download=1',
+                  base + f'?t={int(time.time()*1000)}',
+                  base + f'?{int(time.time()*1000)}.pdf',
+              ]
+              content = None
+              final_url = None
+              errors = []
+              for cycle in range(1, 7):
+                  for ua in user_agents:
+                      for url in urls:
+                          try:
+                              response = requests.get(
+                                  url,
+                                  headers={
+                                      'User-Agent': ua,
+                                      'Referer': 'https://data.eastmoney.com/report/002092.html',
+                                      'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                                      'Cache-Control': 'no-cache',
+                                  },
+                                  timeout=(30, 240),
+                                  allow_redirects=True,
+                              )
+                              if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 100_000:
+                                  content = response.content
+                                  final_url = response.url
+                                  break
+                              errors.append(
+                                  f"cycle {cycle} HTTP {response.status_code}, type={response.headers.get('content-type')}, bytes={len(response.content)}, url={url}"
+                              )
+                          except Exception as exc:
+                              errors.append(f"cycle {cycle} {exc!r}, url={url}")
+                      if content is not None:
+                          break
+                  if content is not None:
+                      break
+                  time.sleep(cycle * 3)
+              if content is None:
+                  raise RuntimeError(f"下载失败：{report['title']}；最后错误：{' | '.join(errors[-12:])}")
+
+              path = OUT / report['filename']
+              path.write_bytes(content)
+              reader = PdfReader(io.BytesIO(content), strict=False)
+              pages = len(reader.pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(f"页数不符：{path.name}，预期{report['expected_pages']}页，实际{pages}页")
+              if reader.is_encrypted:
+                  try:
+                      reader.decrypt('')
+                  except Exception:
+                      raise RuntimeError(f"PDF被加密且无法读取：{path.name}")
+
+              extracted_parts = []
+              for pageno in range(min(8, pages)):
+                  try:
+                      extracted_parts.append(reader.pages[pageno].extract_text() or '')
+                  except Exception as exc:
+                      extracted_parts.append(f'[extract error: {exc}]')
+              extracted = '\n'.join(extracted_parts)
+              compact = re.sub(r'\s+', '', extracted)
+              if not ('中泰化学' in compact or '002092' in compact or 'ZHONGTAI' in compact.upper()):
+                  raise RuntimeError(f"公司身份核验失败：{path.name}")
+
+              sha256 = hashlib.sha256(content).hexdigest()
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '120',
+                  str(path), str(VERIFY / f"{report['order']:02d}_page1")
+              ], check=True)
+              subprocess.run([
+                  'pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90',
+                  str(path), str(VERIFY / f"{report['order']:02d}_last_page")
+              ], check=True)
+              (VERIFY / f"{report['order']:02d}_text.txt").write_text(extracted, encoding='utf-8')
+
+              manifest.append({
+                  'filename': report['filename'],
+                  'broker': report['broker'],
+                  'date': report['date'],
+                  'title': report['title'],
+                  'type': report['type'],
+                  'rating': report['rating'],
+                  'pages': pages,
+                  'bytes': len(content),
+                  'source_url': final_url,
+                  'info_code': report['info_code'],
+                  'sha256': sha256,
+                  'identity_check': '通过：前8页识别到中泰化学、002092或ZHONGTAI',
+              })
+
+          lines = [
+              '中泰化学（002092.SZ）券商深度报告清单与核验说明',
+              '',
+              '本压缩包包含2份可从公开PDF地址取得的券商深度/首次覆盖报告原文件。',
+              '已核验PDF文件头、实际页数、公司名称/证券代码、加密状态，并成功渲染首页和末页。',
+              '',
+          ]
+          for i, item in enumerate(manifest, 1):
+              lines.extend([
+                  f"{i}. {item['broker']}：《{item['title']}》",
+                  f"   类型：{item['type']}；日期：{item['date']}；评级：{item['rating']}；页数：{item['pages']}页",
+                  f"   文件：{item['filename']}",
+                  f"   公开PDF：{item['source_url']}",
+                  f"   SHA-256：{item['sha256']}",
+                  f"   身份核验：{item['identity_check']}",
+                  '',
+              ])
+          lines.append('资料仅供研究参考，不构成投资建议。')
+
+          (OUT / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (OUT / 'SHA256SUMS.txt').open('w', encoding='utf-8') as fh:
+              for item in manifest:
+                  fh.write(f"{item['sha256']}  {item['filename']}\n")
+          (VERIFY / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+          python /tmp/download_verify.py | tee verify/run.log
+          find output -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+          find verify -maxdepth 1 -type f -printf '%f %s bytes\n' | sort
+
+      - name: Upload verified report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongtai-chemical-deep-reports-2
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
+
+      - name: Upload verification evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongtai-chemical-deep-reports-verification
+          path: verify/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 6
