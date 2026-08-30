@@ -1,0 +1,63 @@
+name: Query Sdyanbao public file API for Tianfulong
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-sdyanbao-old-api.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe public file search/detail endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json, text/plain, */*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/','Device':'1','X-Token':''}
+          bodies=[
+            {'keyword':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'keywords':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'keyword':'天富龙','pageNum':1,'pageSize':100,'opFrom':1},
+            {'keywords':'天富龙','pageNum':1,'pageSize':100,'opFrom':1},
+            {'search':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'title':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'key':'天富龙','page':1,'pageSize':100,'opFrom':1},
+            {'wd':'天富龙','page':1,'pageSize':100,'opFrom':1},
+          ]
+          def walk(x):
+            if isinstance(x,dict):
+              yield x
+              for v in x.values(): yield from walk(v)
+            elif isinstance(x,list):
+              for v in x: yield from walk(v)
+          ids=[]
+          for body in bodies:
+            try:
+              r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=body,timeout=60)
+              print('\nBODY',json.dumps(body,ensure_ascii=False),'STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'BYTES',len(r.content),flush=True)
+              print(r.text[:15000],flush=True)
+              obj=r.json()
+            except Exception as e:
+              print('ERR',repr(e),flush=True); continue
+            for d in walk(obj):
+              blob=json.dumps(d,ensure_ascii=False,default=str)
+              if '天富龙' in blob:
+                print('MATCH',blob[:6000],flush=True)
+                for k in ('id','rid','file_id','report_id'):
+                  if d.get(k) not in (None,''):
+                    ids.append(str(d[k])); break
+          for i in list(dict.fromkeys(ids))[:20]:
+            for method in ('post-json','post-form'):
+              try:
+                if method=='post-json': q=s.post('https://api.sdyanbao.com/api/file/detail',headers=h,json={'id':i,'opFrom':1},timeout=60)
+                else: q=s.post('https://api.sdyanbao.com/api/file/detail',headers={k:v for k,v in h.items() if k!='Content-Type'},data={'id':i,'opFrom':1},timeout=60)
+                print('\nDETAIL',method,i,q.status_code,q.headers.get('content-type'),len(q.content),flush=True)
+                print(q.text[:20000],flush=True)
+              except Exception as e: print('DETAILERR',i,method,repr(e),flush=True)
+          PY
