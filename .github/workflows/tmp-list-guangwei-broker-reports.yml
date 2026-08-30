@@ -1,0 +1,17 @@
+name: List Guangwei broker reports
+
+on:
+  push:
+    branches: [tmp/guangwei-broker-reports-20260830]
+
+permissions:
+  contents: read
+
+jobs:
+  list:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python .github/scripts/list_guangwei_broker_reports.py
