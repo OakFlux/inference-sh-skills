@@ -1,0 +1,38 @@
+name: Temporary Fxbaogao JS only
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-fxbaogao-js-only.yml
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch and inspect JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p js diagnostics
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          curl --http1.1 -L --fail --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
+            -A "$UA" -e 'https://www.fxbaogao.com/detail/4742006' -H 'Accept-Encoding: identity' \
+            'https://static.fxbaogao.com/detail_source/js/app-v1.js' -o js/app-v1.js
+          wc -c js/app-v1.js
+          grep -nE 'download|pdf|docId|fileUrl|report-image|searchReportData|api/|getReport|detail/' js/app-v1.js > diagnostics/hits.txt || true
+          cat diagnostics/hits.txt
+
+      - name: Upload JavaScript
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-js
+          path: |
+            js/
+            diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
