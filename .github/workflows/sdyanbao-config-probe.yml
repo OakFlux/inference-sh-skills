@@ -1,0 +1,50 @@
+name: Inspect Sdyanbao runtime API configuration
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sdyanbao-config-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect page and bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import html, re, requests
+          from urllib.parse import urljoin
+          h={'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9'}
+          page='https://www.sdyanbao.com/detail/791620'
+          r=requests.get(page,headers=h,timeout=90)
+          print('PAGE',r.status_code,r.url,r.headers.get('content-type'),len(r.content),flush=True)
+          text=r.text.replace('\\/','/')
+          for needle in ['api.sdyanbao.com','runtimeConfig','apiBase','baseURL','apiUrl','X-Secret-Key','secret_key','file.5kcrm.com','pdf.shuididp.cn']:
+              pos=[m.start() for m in re.finditer(re.escape(needle.lower()),text.lower())]
+              if pos:
+                  print('\nPAGE NEEDLE',needle,len(pos),flush=True)
+                  for p in pos[:10]: print(text[max(0,p-1000):p+2500],flush=True)
+          scripts=[]
+          for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']',text,re.I):
+              scripts.append(urljoin(r.url,html.unescape(src)))
+          print('SCRIPTS',len(scripts),flush=True)
+          for u in scripts:
+              try:
+                  q=requests.get(u,headers=h,timeout=90)
+                  js=q.text.replace('\\/','/')
+                  hits=[]
+                  for needle in ['original_search','research/report/detail','api.sdyanbao.com','baseURL','apiUrl','X-Secret-Key','secret_key','file.5kcrm.com','pdf.shuididp.cn','/api/']:
+                      if needle.lower() in js.lower(): hits.append(needle)
+                  if not hits: continue
+                  print('\nSCRIPT',u,q.status_code,len(q.content),'HITS',hits,flush=True)
+                  for needle in hits:
+                      poss=[m.start() for m in re.finditer(re.escape(needle.lower()),js.lower())]
+                      print(' NEEDLE',needle,'COUNT',len(poss),flush=True)
+                      for p in poss[:12]: print(js[max(0,p-1200):p+3500],flush=True)
+              except Exception as e: print('ERR',u,repr(e),flush=True)
+          PY
