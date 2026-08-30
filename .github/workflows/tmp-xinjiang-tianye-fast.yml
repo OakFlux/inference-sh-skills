@@ -1,0 +1,140 @@
+name: Temporary Xinjiang Tianye fast report package
+
+on:
+  push:
+    branches:
+      - 'tmp/xinjiang-tianye-fast-20260830'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --disable-pip-version-check pypdf
+
+      - name: Download candidate reports in parallel and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/fast.py <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          from pypdf import PdfReader
+
+          DIST=Path('dist'); REPORTS=DIST/'reports'; DIAG=Path('diagnostics')
+          REPORTS.mkdir(parents=True,exist_ok=True); DIAG.mkdir(parents=True,exist_ok=True)
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+          candidates=[
+            {'infoCode':'AP202606021823158423','date':'2026-06-02','broker':'开源证券','title':'公司首次覆盖报告：氯碱行业景气度底部向上，煤制天然气项目打开公司远期发展空间','min_pages':18},
+            {'infoCode':'AP202603271820794587','date':'2026-03-27','broker':'大同证券','title':'氯碱化工领军企业，多元发展展现竞争优势','min_pages':10},
+            {'infoCode':'AP201702030310302404','date':'2017-02-03','broker':'太平洋证券','title':'特种PVC盈利稳定，利润有保障具备一定安全边际','min_pages':10},
+            {'infoCode':'AP201707110710027498','date':'2017-07-11','broker':'太平洋证券','title':'氯碱景气带动业绩高增长，投建乙二醇打开成长空间','min_pages':10},
+            {'infoCode':'AP201706270671887290','date':'2017-06-27','broker':'国金证券','title':'设立60万吨煤制乙二醇项目，继续巩固公司龙头地位','min_pages':8},
+          ]
+
+          def safe(s,n=90):
+            s=re.sub(r'[\\/:*?"<>|\r\n]+','_',s); s=re.sub(r'\s+','',s).strip(' ._')
+            return (s or '报告')[:n]
+
+          def fetch(item):
+            code=item['infoCode']; stamp=int(time.time()*1000)
+            urls=[f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?{stamp}.pdf',f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf']
+            errors=[]
+            for attempt,url in enumerate(urls,1):
+              temp=DIST/f'_{code}_{attempt}.pdf'; temp.unlink(missing_ok=True)
+              p=subprocess.run([
+                'curl','--http1.1','-L','--fail','--silent','--show-error',
+                '--retry','2','--retry-all-errors','--retry-delay','1',
+                '--connect-timeout','15','--max-time','150','--user-agent',UA,
+                '--referer',f'https://data.eastmoney.com/report/info/{code}.html',
+                '--header','Accept-Encoding: identity','--header','Accept: application/pdf,application/octet-stream,*/*',
+                '-o',str(temp),url
+              ],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode:
+                errors.append(f'{url}: {p.stderr[-700:]}'); temp.unlink(missing_ok=True); continue
+              try:
+                raw=temp.read_bytes()
+                if len(raw)<150000 or not raw.startswith(b'%PDF-'): raise RuntimeError(f'invalid size/header {len(raw)}')
+                reader=PdfReader(str(temp),strict=False); pages=len(reader.pages)
+                if pages<item['min_pages']: raise RuntimeError(f'only {pages} pages')
+                sample=''
+                idxs=list(range(min(8,pages))) + ([pages-1] if pages>8 else [])
+                for i in idxs:
+                  try: sample+=' '+(reader.pages[i].extract_text() or '')
+                  except Exception: pass
+                compact=re.sub(r'\s+','',sample)
+                if '新疆天业' not in compact and '600075' not in compact: raise RuntimeError('company identity missing')
+                digest=hashlib.sha256(raw).hexdigest()
+                out=REPORTS/f'{item["date"]}_{safe(item["broker"],20)}_{safe(item["title"])}_{pages}页.pdf'
+                out.write_bytes(raw)
+                return {**item,'filename':out.name,'pages':pages,'size':len(raw),'sha256':digest,'url':url,'ok':True}
+              except Exception as exc:
+                errors.append(f'{url}: {exc!r}')
+              finally:
+                temp.unlink(missing_ok=True)
+            return {**item,'ok':False,'errors':errors}
+
+          records=[]
+          with ThreadPoolExecutor(max_workers=5) as pool:
+            futs=[pool.submit(fetch,x) for x in candidates]
+            for fut in as_completed(futs): records.append(fut.result())
+          order={x['infoCode']:i for i,x in enumerate(candidates)}
+          records.sort(key=lambda x:order[x['infoCode']])
+          successes=[x for x in records if x.get('ok')]
+          failures=[x for x in records if not x.get('ok')]
+          DIAG.joinpath('results.json').write_text(json.dumps(successes,ensure_ascii=False,indent=2),encoding='utf-8')
+          DIAG.joinpath('failures.json').write_text(json.dumps(failures,ensure_ascii=False,indent=2),encoding='utf-8')
+          if len(successes)<2: raise RuntimeError(f'Only {len(successes)} validated reports')
+
+          selected=[]; used=set()
+          for x in successes:
+            if x['broker'] in used: continue
+            selected.append(x); used.add(x['broker'])
+            if len(selected)==3: break
+          for x in successes:
+            if len(selected)==3: break
+            if x not in selected: selected.append(x)
+          keep={x['filename'] for x in selected}
+          for p in REPORTS.glob('*.pdf'):
+            if p.name not in keep: p.unlink()
+
+          lines=['新疆天业（600075）券商深度报告资料包','优先首次覆盖及长篇公司研究，短篇点评已剔除。','PDF已核验文件头、公司名称、页数和SHA-256。','']
+          for i,x in enumerate(selected,1):
+            lines += [f'{i}. {x["title"]}',f'   券商：{x["broker"]}',f'   日期：{x["date"]}',f'   页数：{x["pages"]}',f'   文件：{x["filename"]}',f'   SHA-256：{x["sha256"]}',f'   公开来源：{x["url"]}','']
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(lines),encoding='utf-8')
+          final=DIST/f'新疆天业_券商深度报告_{len(selected)}份_完整原始PDF.zip'
+          with zipfile.ZipFile(final,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(REPORTS.iterdir()): z.write(p,p.name)
+          with zipfile.ZipFile(final) as z:
+            bad=z.testzip(); assert not bad,bad
+            assert len([n for n in z.namelist() if n.lower().endswith('.pdf')])==len(selected)
+          print('SELECTED',json.dumps(selected,ensure_ascii=False))
+          print('FINAL_ZIP',final,final.stat().st_size)
+          PY
+          python /tmp/fast.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinjiang-tianye-fast-final
+          path: dist/新疆天业_券商深度报告_*份_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinjiang-tianye-fast-results
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
