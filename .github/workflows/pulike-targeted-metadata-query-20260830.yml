@@ -1,0 +1,99 @@
+name: Query targeted Pulike broker report metadata
+
+on:
+  push:
+    paths:
+      - '.github/workflows/pulike-targeted-metadata-query-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Query public report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import requests
+
+          s = requests.Session()
+          headers = {
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept':'application/json, text/plain, */*',
+              'Content-Type':'application/json;charset=UTF-8',
+              'Origin':'https://www.sdyanbao.com',
+              'Referer':'https://www.sdyanbao.com/',
+              'Device':'1',
+              'X-Token':'',
+          }
+          queries = [
+              '普莱柯 深度报告',
+              '普莱柯 首次覆盖',
+              '普莱柯 公司研究',
+              '普莱柯 研发创新',
+              '普莱柯 动物疫苗龙头',
+              '普莱柯 动保龙头',
+              '普莱柯 宠物疫苗',
+              '普莱柯 非洲猪瘟疫苗',
+              '兽用疫苗创新 普莱柯',
+              '动物保健 普莱柯 603566',
+          ]
+          found = []
+          seen = set()
+          for query in queries:
+              try:
+                  r = s.post('https://api.sdyanbao.com/api/file/search', headers=headers, json={'keyword':query,'page':1,'pageSize':100,'opFrom':1}, timeout=(15,45))
+                  print('QUERY',query,r.status_code,len(r.content),flush=True)
+                  if r.status_code != 200:
+                      continue
+                  obj = r.json()
+              except Exception as exc:
+                  print('ERROR',query,repr(exc),flush=True)
+                  continue
+              data = obj.get('data') if isinstance(obj,dict) else None
+              files = data.get('files') if isinstance(data,dict) else []
+              if not isinstance(files,list):
+                  continue
+              for item in files:
+                  if not isinstance(item,dict):
+                      continue
+                  blob = json.dumps(item,ensure_ascii=False,default=str)
+                  stock = item.get('stock') if isinstance(item.get('stock'),dict) else {}
+                  if str(stock.get('code') or '') != '603566' and '普莱柯' not in blob:
+                      continue
+                  key = str(item.get('id') or item.get('data_source_uuid') or blob)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  row = {
+                      'id':item.get('id'),
+                      'name':item.get('name'),
+                      'time_text':item.get('time_text'),
+                      'page_count':item.get('page_count'),
+                      'file_size':item.get('file_size'),
+                      'original_id':item.get('original_id'),
+                      'data_source_uuid':item.get('data_source_uuid'),
+                      'page_url':item.get('page_url'),
+                      'share_url':item.get('share_url'),
+                      'organization':item.get('organization'),
+                      'researcher':item.get('researcher'),
+                      'type':item.get('type'),
+                      'stock':item.get('stock'),
+                  }
+                  found.append(row)
+                  print('MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+          with open('pulike_metadata.json','w',encoding='utf-8') as f:
+              json.dump(found,f,ensure_ascii=False,indent=2)
+          print('TOTAL',len(found),flush=True)
+          PY
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulike-targeted-metadata
+          path: pulike_metadata.json
+          if-no-files-found: error
+          retention-days: 3
