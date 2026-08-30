@@ -1,0 +1,85 @@
+name: Discover Shilanwei deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shilanwei-discover-deep-reports-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query Eastmoney report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, time
+          from pathlib import Path
+          import requests
+
+          s=requests.Session()
+          headers={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+            'Accept':'application/json,text/plain,*/*',
+            'Referer':'https://data.eastmoney.com/report/600460.html',
+            'Origin':'https://data.eastmoney.com',
+          }
+          all_rows=[]
+          diagnostics=[]
+          base='https://reportapi.eastmoney.com/report/list'
+          for qtype in [0,1,2,3]:
+            for code_key in ['code','stockCode']:
+              for page in range(1,11):
+                params={
+                  'pageNo':page,
+                  'pageSize':100,
+                  'qType':qtype,
+                  code_key:'600460',
+                  'beginTime':'2020-01-01',
+                  'endTime':'2026-08-30',
+                }
+                rec={'qtype':qtype,'code_key':code_key,'page':page,'params':params}
+                try:
+                  r=s.get(base,params=params,headers=headers,timeout=(30,180))
+                  rec.update({'status':r.status_code,'type':r.headers.get('content-type'),'bytes':len(r.content),'head':r.text[:300]})
+                  print('QUERY',json.dumps(rec,ensure_ascii=False),flush=True)
+                  if r.status_code != 200:
+                    diagnostics.append(rec); break
+                  obj=r.json()
+                  rows=obj.get('data') if isinstance(obj,dict) else None
+                  if isinstance(rows,dict): rows=rows.get('data') or rows.get('list') or rows.get('items') or []
+                  if not isinstance(rows,list):
+                    diagnostics.append({**rec,'json':obj}); break
+                  for item in rows:
+                    blob=json.dumps(item,ensure_ascii=False)
+                    if '士兰微' in blob or '600460' in blob:
+                      all_rows.append(item)
+                      print('MATCH',json.dumps(item,ensure_ascii=False),flush=True)
+                  if len(rows)<100: break
+                except Exception as e:
+                  rec['error']=repr(e); diagnostics.append(rec); print('ERROR',json.dumps(rec,ensure_ascii=False),flush=True); break
+                time.sleep(.3)
+
+          # dedupe
+          dedup={}
+          for item in all_rows:
+            key=str(item.get('infoCode') or item.get('infocode') or item.get('reportId') or json.dumps(item,ensure_ascii=False,sort_keys=True))
+            dedup[key]=item
+          rows=list(dedup.values())
+          rows.sort(key=lambda x:str(x.get('publishDate') or x.get('publishTime') or ''),reverse=True)
+          Path('shilanwei_discovery.json').write_text(json.dumps({'reports':rows,'diagnostics':diagnostics},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_COUNT',len(rows),flush=True)
+          for x in rows:
+            print('FINAL',json.dumps({k:x.get(k) for k in ['infoCode','title','orgSName','publishDate','attachPages','stockName','stockCode']},ensure_ascii=False),flush=True)
+          PY
+      - name: Upload discovery result
+        uses: actions/upload-artifact@v4
+        with:
+          name: shilanwei-deep-report-discovery
+          path: shilanwei_discovery.json
+          if-no-files-found: error
+          retention-days: 7
