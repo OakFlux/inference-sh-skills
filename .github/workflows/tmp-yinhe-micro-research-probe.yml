@@ -1,0 +1,130 @@
+name: Temporary Yinhe Micro research report probe
+
+on:
+  push:
+    branches:
+      - tmp/download-yinhe-micro-research-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Query report API and inspect PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import subprocess
+          import time
+          from pathlib import Path
+
+          import requests
+
+          endpoint = "https://reportapi.eastmoney.com/report/list"
+          params = {
+              "industryCode": "*",
+              "pageSize": "100",
+              "industry": "*",
+              "rating": "*",
+              "ratingChange": "*",
+              "beginTime": "2020-01-01",
+              "endTime": "2026-08-30",
+              "fields": "",
+              "qType": "0",
+              "orgCode": "",
+              "code": "688689",
+              "pageNo": "1",
+              "p": "1",
+              "pageNum": "1",
+          }
+          headers = {
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36",
+              "Referer": "https://data.eastmoney.com/report/688689.html",
+              "Accept": "application/json,text/plain,*/*",
+          }
+          response = requests.get(endpoint, params=params, headers=headers, timeout=90)
+          print("STATUS", response.status_code, response.url, flush=True)
+          print("CONTENT-TYPE", response.headers.get("content-type"), flush=True)
+          response.raise_for_status()
+          payload = response.json()
+          print("TOP KEYS", list(payload.keys()), flush=True)
+          print("COUNT", payload.get("count"), "HITS", payload.get("hits"), flush=True)
+          data = payload.get("data") or []
+          print("DATA LEN", len(data), flush=True)
+          Path("reports").mkdir(exist_ok=True)
+
+          def pages(path: Path) -> int:
+              proc = subprocess.run(["pdfinfo", str(path)], text=True, capture_output=True)
+              match = re.search(r"^Pages:\s+(\d+)", proc.stdout, flags=re.M)
+              return int(match.group(1)) if match else 0
+
+          for index, item in enumerate(data, start=1):
+              info_code = str(item.get("infoCode") or item.get("INFO_CODE") or "")
+              title = str(item.get("title") or item.get("TITLE") or "")
+              org = str(item.get("orgSName") or item.get("ORG_SNAME") or item.get("orgName") or "")
+              date = str(item.get("publishDate") or item.get("PUBLISH_DATE") or "")
+              researcher = str(item.get("researcher") or item.get("RESEARCHER") or "")
+              rating = str(item.get("emRatingName") or item.get("EM_RATING_NAME") or item.get("rating") or "")
+              print("\nITEM", index, json.dumps({
+                  "infoCode": info_code,
+                  "title": title,
+                  "org": org,
+                  "date": date,
+                  "researcher": researcher,
+                  "rating": rating,
+                  "keys": list(item.keys()),
+              }, ensure_ascii=False), flush=True)
+              if not info_code:
+                  continue
+
+              candidates = [
+                  f"https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf",
+                  f"https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf",
+              ]
+              destination = Path("reports") / f"{index:02d}_{info_code}.pdf"
+              ok = False
+              for url in candidates:
+                  try:
+                      r = requests.get(
+                          url,
+                          headers={
+                              "User-Agent": headers["User-Agent"],
+                              "Referer": "https://data.eastmoney.com/",
+                              "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                          },
+                          timeout=(30, 300),
+                      )
+                      print("TRY", url, "status", r.status_code, "bytes", len(r.content), flush=True)
+                      r.raise_for_status()
+                      if len(r.content) < 10000 or r.content[:4] != b"%PDF":
+                          continue
+                      destination.write_bytes(r.content)
+                      count = pages(destination)
+                      text = subprocess.run(
+                          ["pdftotext", "-f", "1", "-l", str(min(5, count or 5)), str(destination), "-"],
+                          text=True,
+                          capture_output=True,
+                          errors="ignore",
+                      ).stdout
+                      compact = re.sub(r"\s+", " ", text).strip()[:1200]
+                      print("PDF", destination.name, "PAGES", count, "FIRST_TEXT", compact, flush=True)
+                      ok = True
+                      break
+                  except Exception as exc:
+                      print("DOWNLOAD ERROR", url, repr(exc), flush=True)
+                      time.sleep(1)
+              if not ok:
+                  print("NO PDF FOR", info_code, flush=True)
+          PY
