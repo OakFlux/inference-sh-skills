@@ -1,0 +1,103 @@
+name: Temporary Nike report search engine discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-search-engine-discovery.yml
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search public web for exact report files
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages diagnostics
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import quote, urljoin, unquote
+          import html,json,re,subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          queries=[
+            '"耐克 NIKE 首次覆盖" pdf',
+            '"利润率翘尾因素开始积累" pdf',
+            '"20231228-海通国际-耐克-NKE.US"',
+            '"Nike FY2025Q3季报营收同比下降7%" pdf',
+            '"Nike FY2025Q4营收同比下降12%" pdf',
+            '"Nike FY2026Q1营收同比下降1%" pdf',
+            '"NIKE：北美重拾增长，大中华区仍需时日" pdf',
+          ]
+          engines=[]
+          for q in queries:
+              enc=quote(q)
+              engines += [
+                ('bing',q,f'https://www.bing.com/search?q={enc}&count=50'),
+                ('ddg',q,f'https://html.duckduckgo.com/html/?q={enc}'),
+                ('baidu',q,f'https://www.baidu.com/s?wd={enc}&rn=50'),
+                ('sogou',q,f'https://www.sogou.com/web?query={enc}&num=50'),
+                ('so360',q,f'https://www.so.com/s?q={enc}'),
+                ('jina_bing',q,f'https://r.jina.ai/http://www.bing.com/search?q={enc}'),
+              ]
+          rows=[]; all_links=[]
+          for i,(engine,q,url) in enumerate(engines,1):
+              out=Path('pages')/f'{i:03d}_{engine}.html'
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','4','--retry-all-errors',
+                   '--connect-timeout','20','--max-time','180','-A',UA,'-e','https://www.google.com/',
+                   '-H','Accept-Encoding: identity',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',i,engine,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'Q',q,'ERR',p.stderr[-300:])
+              if p.returncode or not out.exists():
+                  rows.append({'engine':engine,'query':q,'url':url,'error':p.stderr[-500:]}); continue
+              body=out.read_bytes(); text=None; enc_used=None
+              for enc in ['utf-8','gb18030','gbk','latin1']:
+                  try: text=body.decode(enc); enc_used=enc; break
+                  except Exception: pass
+              if text is None: continue
+              # Unescape and extract all outgoing links.
+              clean=html.unescape(text).replace('\\/','/')
+              links=[]
+              for pat in [r'''href=["']([^"']+)["']''',r'''https?://[^\s"'<>]+''']:
+                  for v in re.findall(pat,clean,re.I):
+                      if isinstance(v,tuple): v=v[0]
+                      v=v.strip()
+                      if v.startswith('/url?') or v.startswith('/link?'):
+                          # Try common redirect query parameters.
+                          for key in ['url=','target=','u=']:
+                              if key in v:
+                                  v=unquote(v.split(key,1)[1].split('&',1)[0]); break
+                      try: full=urljoin(url,v)
+                      except Exception: continue
+                      if not full.startswith(('http://','https://')): continue
+                      if full not in links: links.append(full)
+              interesting=[u for u in links if any(k in u.lower() for k in ['pdf','nike','nke','耐克','fxbaogao','sgpjbg','hangyan','book118','nxny','dfcfw','report'])]
+              for u in interesting:
+                  if u not in all_links: all_links.append(u)
+              for line in clean.splitlines():
+                  if any(k.lower() in line.lower() for k in ['利润率翘尾因素','nike fy2025q3','nike fy2025q4','nike fy2026q1','北美重拾增长']):
+                      print('LINE',i,' '.join(re.sub(r'<[^>]+>',' ',line).split())[:3000])
+              for u in interesting[:100]: print('LINK',i,u[:2000])
+              rows.append({'engine':engine,'query':q,'url':url,'encoding':enc_used,'size':len(body),'interesting':interesting})
+          Path('diagnostics/search_results.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostics/all_links.txt').write_text('\n'.join(all_links)+'\n',encoding='utf-8')
+          print('UNIQUE_LINKS',len(all_links))
+          PY
+          ls -lh pages diagnostics
+          tail -200 diagnostics/all_links.txt || true
+
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-search-engine-results
+          path: |
+            pages/
+            diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
