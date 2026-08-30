@@ -1,0 +1,112 @@
+name: Temporary Yinhe Micro Ruishu JS endpoint probe
+
+on:
+  push:
+    branches:
+      - tmp/download-yinhe-micro-research-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Inspect Ruishu application bundles and public APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import re
+          from urllib.parse import urljoin
+
+          import requests
+
+          base = 'https://www.ruishubaogao.com'
+          page_url = f'{base}/report-detail/10018'
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Connection': 'close',
+          }
+
+          page = requests.get(page_url, headers=headers, timeout=(25,120))
+          page.raise_for_status()
+          text = page.text.replace('\\/', '/')
+          scripts = []
+          for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', text, flags=re.I):
+              scripts.append(urljoin(page_url, html.unescape(src)))
+          for href in re.findall(r'<link[^>]+(?:rel=["\'][^"\']*(?:modulepreload|prefetch)[^"\']*["\'])[^>]+href=["\']([^"\']+)["\']', text, flags=re.I):
+              if href.endswith('.js'):
+                  scripts.append(urljoin(page_url, html.unescape(href)))
+          scripts = list(dict.fromkeys(scripts))
+          print('SCRIPT COUNT', len(scripts), flush=True)
+
+          needles = [
+              'download', 'pdf', 'has_file', 'pdf_is_original', 'report-detail',
+              'reportDetail', 'report/detail', 'file_url', 'fileUrl', 'source_url',
+              'sourceUrl', 'cos.ap-beijing', 'api.ruishubaogao.com', 'presign',
+              'signed', 'preview', 'getReport', 'reportFile', 'downloadReport',
+              '/report/', '/file/', '/download/', '/api/', 'token', 'is_login',
+          ]
+
+          all_matches = []
+          for index, script_url in enumerate(scripts, 1):
+              try:
+                  r = requests.get(script_url, headers=headers, timeout=(25,120))
+                  print('\nSCRIPT', index, r.status_code, len(r.content), script_url, flush=True)
+                  r.raise_for_status()
+                  js = r.text.replace('\\/', '/')
+                  low = js.lower()
+                  hit = False
+                  for needle in needles:
+                      positions = [m.start() for m in re.finditer(re.escape(needle.lower()), low)]
+                      if not positions:
+                          continue
+                      hit = True
+                      print(' NEEDLE', needle, 'COUNT', len(positions), flush=True)
+                      for pos in positions[:12]:
+                          snippet = js[max(0,pos-800):pos+1800]
+                          print('  CONTEXT', snippet[:2600], flush=True)
+                          all_matches.append(snippet)
+
+                  # Extract string literals that resemble endpoints or file URLs.
+                  candidate_strings = []
+                  for pat in [
+                      r'["\'](https?://[^"\']+)["\']',
+                      r'["\'](/[^"\']{1,180})["\']',
+                  ]:
+                      for value in re.findall(pat, js):
+                          v = html.unescape(value).replace('\\/', '/')
+                          if any(k in v.lower() for k in ('report','pdf','file','download','preview','api','cos','oss')):
+                              candidate_strings.append(v)
+                  if candidate_strings:
+                      print(' ENDPOINT-LIKE STRINGS', flush=True)
+                      for value in list(dict.fromkeys(candidate_strings))[:300]:
+                          print('  STRING', value, flush=True)
+              except Exception as exc:
+                  print(' SCRIPT ERROR', repr(exc), flush=True)
+
+          # Probe conservative unauthenticated candidate routes inferred from naming conventions.
+          candidates = [
+              'https://api.ruishubaogao.com/report/detail/10018',
+              'https://api.ruishubaogao.com/report/10018',
+              'https://api.ruishubaogao.com/report/download/10018',
+              'https://api.ruishubaogao.com/report/file/10018',
+              'https://api.ruishubaogao.com/api/report/detail/10018',
+              'https://api.ruishubaogao.com/api/report/10018',
+              'https://api.ruishubaogao.com/api/report/download/10018',
+              'https://api.ruishubaogao.com/api/report/file/10018',
+              'https://www.ruishubaogao.com/report/download/10018',
+              'https://www.ruishubaogao.com/download/report/10018',
+          ]
+          for url in candidates:
+              try:
+                  r = requests.get(url, headers={**headers, 'Referer':page_url}, timeout=(25,90), allow_redirects=False)
+                  print('\nPROBE', url, 'STATUS', r.status_code, 'TYPE', r.headers.get('content-type'), 'BYTES', len(r.content), 'LOCATION', r.headers.get('location'), 'HEAD', r.content[:100], flush=True)
+              except Exception as exc:
+                  print('\nPROBE ERROR', url, repr(exc), flush=True)
+          PY
