@@ -1,0 +1,123 @@
+name: Temporary final Lanjian Electronics research and IPO materials package
+
+on:
+  push:
+    branches:
+      - tmp/download-lanjian-electronics-reports-20260830
+    paths:
+      - .github/workflows/tmp-lanjian-final-package.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Download, verify, and package selected original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/previews work/text
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, re, subprocess
+
+          OUT=Path('output'); PRE=Path('work/previews'); TXT=Path('work/text')
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          reports=[
+            {
+              'index':1,
+              'kind':'严格券商研究报告',
+              'broker':'华金证券',
+              'date':'2023-07-20',
+              'title':'新股覆盖研究：蓝箭电子',
+              'url':'https://pdf.dfcfw.com/pdf/H3_AP202307201592487353_1.pdf',
+              'referer':'https://data.eastmoney.com/report/',
+              'base':'Lanjian_Electronics_Huajin_New_Stock_Coverage_20230720',
+              'needles':['蓝箭电子','新股覆盖研究'],
+            },
+            {
+              'index':2,
+              'kind':'券商IPO保荐深度材料（非卖方研报）',
+              'broker':'金元证券',
+              'date':'2023-07-19',
+              'title':'首次公开发行股票并在创业板上市的发行保荐书',
+              'url':'https://static.cninfo.com.cn/finalpage/2023-07-19/1217324472.PDF',
+              'referer':'https://www.cninfo.com.cn/',
+              'base':'Lanjian_Electronics_Jinyuan_Issuance_Sponsorship_20230719',
+              'needles':['蓝箭电子','发行保荐书'],
+            },
+            {
+              'index':3,
+              'kind':'券商IPO保荐深度材料（非卖方研报）',
+              'broker':'金元证券',
+              'date':'2023-08-09',
+              'title':'首次公开发行股票并在创业板上市的上市保荐书',
+              'url':'https://static.cninfo.com.cn/finalpage/2023-08-09/1217492215.PDF',
+              'referer':'https://www.cninfo.com.cn/',
+              'base':'Lanjian_Electronics_Jinyuan_Listing_Sponsorship_20230809',
+              'needles':['蓝箭电子','上市保荐书'],
+            },
+          ]
+          selected=[]
+          for r in reports:
+              tmp=OUT/f"tmp_{r['index']:02d}.pdf"
+              cmd=['curl','-L','--fail','--retry','6','--retry-delay','2','--retry-all-errors',
+                   '--connect-timeout','30','--max-time','600','--compressed','-A',UA,
+                   '-e',r['referer'],'-H','Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                   r['url'],'-o',str(tmp)]
+              subprocess.run(cmd,check=True)
+              if tmp.stat().st_size<25000 or tmp.read_bytes()[:4]!=b'%PDF':
+                  raise SystemExit(f"Invalid PDF: {r['url']}")
+              info=subprocess.check_output(['pdfinfo',str(tmp)],text=True,errors='replace')
+              m=re.search(r'^Pages:\s*(\d+)',info,re.M)
+              pages=int(m.group(1)) if m else 0
+              if pages<5: raise SystemExit(f"Unexpected short PDF {pages}: {r['url']}")
+              txt=TXT/f"{r['index']:02d}.txt"
+              subprocess.run(['pdftotext','-f','1','-l',str(min(10,pages)),str(tmp),str(txt)],check=True)
+              compact=''.join(txt.read_text(errors='replace').split())
+              for needle in r['needles']:
+                  if ''.join(needle.split()) not in compact:
+                      raise SystemExit(f"Missing verification text {needle} in {r['url']}")
+              final=OUT/f"{r['index']:02d}_{r['base']}_{pages}p.pdf"
+              tmp.replace(final)
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','100',str(final),str(PRE/f"{r['index']:02d}_first")],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              subprocess.run(['pdftoppm','-f',str(pages),'-singlefile','-png','-r','100',str(final),str(PRE/f"{r['index']:02d}_last")],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              for p in [PRE/f"{r['index']:02d}_first.png",PRE/f"{r['index']:02d}_last.png"]:
+                  if not p.exists() or p.stat().st_size<10000: raise SystemExit(f'Render failed {p}')
+              rr=dict(r); rr['pages']=pages; rr['filename']=final.name; rr['size_bytes']=final.stat().st_size; rr['sha256']=hashlib.sha256(final.read_bytes()).hexdigest(); selected.append(rr)
+
+          manifest={'company':'蓝箭电子','stock_code':'301348.SZ','count':len(selected),'strict_broker_reports':1,'supplemental_broker_ipo_materials':2,'reports':selected}
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open(OUT/'报告清单与核验说明.txt','w',encoding='utf-8') as f:
+              f.write('蓝箭电子（301348.SZ）券商研究及IPO深度材料，共3份\n\n')
+              f.write('说明：公开可直接下载的严格卖方公司研报仅确认到1份华金证券新股覆盖。为补足研究资料，另附2份金元证券IPO保荐文件；后两份是券商尽调/保荐材料，不属于卖方研报。\n\n')
+              for r in selected:
+                  f.write(f"{r['index']}. {r['broker']}，{r['date']}，{r['pages']}页\n")
+                  f.write(f"   《{r['title']}》\n")
+                  f.write(f"   类型：{r['kind']}。\n\n")
+              f.write('三份均为原始、完整、可检索PDF。已核验PDF文件头、实际页数、公司及标题文字，并完成首页和末页渲染。\n')
+              f.write('仅供研究资料整理，不构成投资建议。\n')
+          print(json.dumps(manifest,ensure_ascii=False,indent=2))
+          PY
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          (cd output && zip -q -9 Lanjian_Electronics_Broker_Research_and_IPO_Materials_3_Verified.zip ./*.pdf ./manifest.json ./报告清单与核验说明.txt ./SHA256SUMS.txt)
+          unzip -t output/Lanjian_Electronics_Broker_Research_and_IPO_Materials_3_Verified.zip
+          ls -lh output work/previews
+
+      - name: Upload verified final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanjian-electronics-final-package
+          path: output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
