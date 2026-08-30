@@ -1,4 +1,4 @@
-name: Temporary Wansheng CNINFO probe
+name: Temporary Wansheng CFI probe
 
 on:
   push:
@@ -12,37 +12,72 @@ jobs:
   probe:
     runs-on: ubuntu-24.04
     steps:
-      - name: Query CNINFO APIs
+      - name: Probe CFI article range
         shell: bash
         run: |
           python - <<'PY'
-          import json, requests
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import html
+          import re
+          import requests
 
-          s=requests.Session()
-          s.headers.update({'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9'})
-          url='https://www.cninfo.com.cn/new/information/topSearch/query'
-          r=s.get(url,params={'keyWord':'603010','maxNum':20},headers={'Referer':'https://www.cninfo.com.cn/'},timeout=60)
-          print('top status',r.status_code,r.url)
-          print('top body',r.text[:10000])
-          r.raise_for_status()
-          data=r.json()
-          print('top json',json.dumps(data,ensure_ascii=False)[:20000])
-          org=None
-          for item in data:
-              if '603010' in str(item.get('code','')) or '万盛股份' in str(item):
-                  org=item.get('orgId')
-                  print('selected',item)
-                  break
-          if not org:
-              raise RuntimeError('orgId not found')
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
 
-          endpoint='https://www.cninfo.com.cn/new/hisAnnouncement/query'
-          variants=[]
-          for column in ['sse','szse']:
-            for category in ['category_bndbg_szsh;','']:
-              for searchkey in ['','2026年半年度报告']:
-                payload={'pageNum':1,'pageSize':100,'column':column,'tabName':'fulltext','plate':'sh','stock':f'603010,{org}','searchkey':searchkey,'secid':'','category':category,'trade':'','seDate':'2026-08-20~2026-08-30','sortName':'','sortType':'','isHLtitle':'true'}
-                rr=s.post(endpoint,data=payload,headers={'Referer':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=603010&orgId={org}','X-Requested-With':'XMLHttpRequest','Origin':'https://www.cninfo.com.cn'},timeout=90)
-                print('\nvariant',column,category,searchkey,'status',rr.status_code,'type',rr.headers.get('content-type'))
-                print(rr.text[:20000])
+          def decode(raw: bytes) -> str:
+              for enc in ('utf-8', 'gb18030', 'gbk'):
+                  try:
+                      text = raw.decode(enc)
+                  except UnicodeDecodeError:
+                      continue
+                  if '中财网' in text or '万盛股份' in text:
+                      return text
+              return raw.decode('utf-8', errors='replace')
+
+          def fetch(seq: int):
+              url = f'https://www.cfi.net.cn/p20260824{seq:06d}.html'
+              try:
+                  r = requests.get(url, headers=headers, timeout=25)
+                  text = decode(r.content)
+                  if r.status_code == 200 and ('万盛股份' in text or '603010' in text):
+                      return seq, url, text
+              except Exception:
+                  return None
+              return None
+
+          matches = []
+          with ThreadPoolExecutor(max_workers=20) as executor:
+              futures = [executor.submit(fetch, seq) for seq in range(4900, 5251)]
+              for future in as_completed(futures):
+                  item = future.result()
+                  if item:
+                      matches.append(item)
+
+          print('MATCH COUNT', len(matches), flush=True)
+          for seq, url, text in sorted(matches):
+              title_match = re.search(r'<title[^>]*>(.*?)</title>', text, flags=re.I|re.S)
+              title = html.unescape(re.sub(r'<[^>]+>', '', title_match.group(1))) if title_match else ''
+              compact = re.sub(r'\s+', '', re.sub(r'<[^>]+>', '', text))
+              print('\nMATCH', seq, url, 'LEN', len(text), 'TITLE', title, flush=True)
+              print('HAS FULL TITLE', '2026年半年度报告' in compact, 'HAS SUMMARY', '2026年半年度报告摘要' in compact, flush=True)
+              urls = []
+              for pattern in [
+                  r'https?://[^"\'<>\s]+',
+                  r'//[^"\'<>\s]+',
+                  r'href=["\']([^"\']+)["\']',
+              ]:
+                  for value in re.findall(pattern, text, flags=re.I):
+                      if isinstance(value, tuple):
+                          value = value[0]
+                      value = html.unescape(value).replace('\\/', '/')
+                      if any(k in value.lower() for k in ('pdf', 'cninfo', 'sse.com.cn', 'disclosure')):
+                          urls.append(value)
+              for value in dict.fromkeys(urls):
+                  print('URL', value, flush=True)
+              for marker in ('static.cninfo', '.PDF', '2026年半年度报告'):
+                  pos = text.find(marker)
+                  if pos >= 0:
+                      print('CONTEXT', marker, text[max(0,pos-500):pos+1200].replace('\n',' ')[:1700], flush=True)
           PY
