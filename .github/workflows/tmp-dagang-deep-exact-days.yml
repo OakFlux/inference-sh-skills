@@ -1,0 +1,92 @@
+name: Temporary Dagang deep-report exact-day lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-deep-exact-days.yml
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Scan all report catalog pages on historical deep-report dates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, os, subprocess, tempfile, urllib.parse, time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+
+          API='https://reportapi.eastmoney.com/report/list'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          DATES=['2016-05-31','2016-06-01','2015-12-30','2015-12-31','2011-05-23','2011-05-24','2015-05-12','2015-05-13']
+          TARGETS=['大港股份','瞄准IC产业新趋势','转型独立测试产业','半导体+军工双轮驱动','国企改革迈出坚实一步','规模扩张迅速','业绩增长确定','定增推进转型','镇江国资改革']
+          OUT=Path('diagnostic')
+
+          def fetch(day:str,page:int):
+              params={'pageNo':str(page),'pageSize':'100','code':'*','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':day,'endTime':day,'fields':'','qType':'0','orgCode':'','rcode':''}
+              url=API+'?'+urllib.parse.urlencode(params)
+              fd,name=tempfile.mkstemp(prefix=f'dagangdeep_{day}_{page}_',suffix='.json'); os.close(fd)
+              path=Path(name)
+              try:
+                  cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors','--retry-delay','1','--connect-timeout','20','--max-time','120','--user-agent',UA,'--referer','https://data.eastmoney.com/report/','--header','Accept-Encoding: identity',url,'-o',str(path)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if p.returncode: raise RuntimeError(p.stderr[-1200:])
+                  s=path.read_text(encoding='utf-8',errors='ignore').strip()
+                  if s and s[0] not in '[{' and '(' in s and s.endswith(')'): s=s[s.find('(')+1:s.rfind(')')]
+                  return json.loads(s)
+              finally:
+                  path.unlink(missing_ok=True)
+
+          objs={}; tasks=[]
+          for day in DATES:
+              obj=fetch(day,1); objs[(day,1)]=obj
+              rows=obj.get('data') or []
+              pages=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+              print('FIRST',day,'HITS',obj.get('hits'),'ROWS',len(rows),'PAGES',pages)
+              tasks += [(day,p) for p in range(2,pages+1)]
+          print('TASKS',len(tasks))
+          with ThreadPoolExecutor(max_workers=20) as ex:
+              fm={ex.submit(fetch,d,p):(d,p) for d,p in tasks}
+              for i,f in enumerate(as_completed(fm),1):
+                  d,p=fm[f]
+                  try: objs[(d,p)]=f.result()
+                  except Exception as e:
+                      print('RETRY',d,p,repr(e)); time.sleep(.3); objs[(d,p)]=fetch(d,p)
+                  if i%25==0: print('DONE',i)
+
+          matches=[]; seen=set()
+          for (day,page),obj in sorted(objs.items()):
+              for r in obj.get('data') or []:
+                  stock_code=str(r.get('stockCode') or '')
+                  stock_name=str(r.get('stockName') or '')
+                  title=str(r.get('title') or '')
+                  if stock_code=='002077' or stock_name=='大港股份' or any(t in title for t in TARGETS):
+                      info=str(r.get('infoCode') or '')
+                      key=info or json.dumps(r,ensure_ascii=False,sort_keys=True)
+                      if key not in seen:
+                          seen.add(key)
+                          rr=dict(r); rr['_day']=day; rr['_page']=page; matches.append(rr)
+          matches.sort(key=lambda r:str(r.get('publishDate') or ''),reverse=True)
+          OUT.joinpath('matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCH_COUNT',len(matches))
+          for r in matches:
+              print('MATCH',json.dumps({'date':r.get('publishDate'),'broker':r.get('orgSName'),'title':r.get('title'),'stockCode':r.get('stockCode'),'stockName':r.get('stockName'),'infoCode':r.get('infoCode'),'attachPages':r.get('attachPages'),'attachSize':r.get('attachSize'),'page':r.get('_page')},ensure_ascii=False))
+          PY
+
+      - name: Upload lookup results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-deep-exact-day-results
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
