@@ -1,0 +1,79 @@
+name: Search Tianfulong on Sdyanbao
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-sdyanbao-search.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Query public report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json
+          import requests
+
+          base = 'https://api.sdyanbao.com'
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept': 'application/json, text/plain, */*',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Device': '1',
+              'opFrom': '1',
+          }
+          s = requests.Session()
+
+          def post(path, payload):
+              r = s.post(base + path, headers=headers, json=payload, timeout=(30, 180))
+              print('\nPOST', path, 'PAYLOAD', json.dumps(payload, ensure_ascii=False), flush=True)
+              print('STATUS', r.status_code, 'TYPE', r.headers.get('content-type'), 'BYTES', len(r.content), flush=True)
+              print('TEXT', r.text[:200000], flush=True)
+              r.raise_for_status()
+              try:
+                  return r.json()
+              except Exception:
+                  return None
+
+          searches = [
+              {'pageNum': 1, 'pageSize': 100, 'type': 0, 'keyword': '天富龙', 'sort': 0, 'onlyTitle': 1, 'startTime': '', 'endTime': '', 'orgName': '', 'industry': '', 'id': ''},
+              {'pageNum': 1, 'pageSize': 100, 'type': 0, 'keyword': '注册制新股纵览：天富龙', 'sort': 0, 'onlyTitle': 1, 'startTime': '', 'endTime': '', 'orgName': '', 'industry': '', 'id': ''},
+              {'pageNum': 1, 'pageSize': 100, 'type': 0, 'keyword': '国内差别化和再生涤短产能规模靠前企业', 'sort': 0, 'onlyTitle': 0, 'startTime': '', 'endTime': '', 'orgName': '', 'industry': '', 'id': ''},
+          ]
+          ids = []
+          for payload in searches:
+              obj = post('/api/file/search', payload)
+              if not isinstance(obj, dict):
+                  continue
+              data = obj.get('data')
+              rows = []
+              if isinstance(data, dict):
+                  for key in ('list', 'rows', 'records', 'data', 'items'):
+                      if isinstance(data.get(key), list):
+                          rows = data[key]
+                          break
+              elif isinstance(data, list):
+                  rows = data
+              for row in rows:
+                  title = str(row.get('title') or row.get('name') or '')
+                  if '天富龙' in title:
+                      print('MATCH', json.dumps(row, ensure_ascii=False), flush=True)
+                      rid = row.get('id')
+                      if rid is not None and rid not in ids:
+                          ids.append(rid)
+
+          print('\nMATCH IDS', ids, flush=True)
+          for rid in ids:
+              detail = post('/api/file/detail', {'id': rid})
+              # Publicly test the site's own download endpoint without credentials.
+              post('/api/file/download', {'id': rid})
+          PY
