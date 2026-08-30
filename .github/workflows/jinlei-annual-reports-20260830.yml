@@ -1,0 +1,379 @@
+name: Package Jinlei annual and latest periodic reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jinlei-annual-reports-20260830.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF dependency
+        run: python -m pip install --quiet pypdf beautifulsoup4
+
+      - name: Discover, download, verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK_CODE = '300443'
+          COMPANY_KEYWORDS = ('金雷股份', '金雷科技', '金雷风电')
+          PACKAGE = '金雷股份_2020-2025年报及最新季报'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_jinlei_periodic_work')
+          work.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          html_headers = {
+              'User-Agent': ua,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+          }
+
+          def fetch(url: str, *, headers: dict, attempts: int = 7, timeout=(30, 360)) -> requests.Response:
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      print('GET', url, response.status_code, response.headers.get('content-type'), len(response.content), flush=True)
+                      if response.status_code == 200 and response.content:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}, {len(response.content)} bytes')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(2 * (attempt + 1))
+              raise RuntimeError(f'Unable to fetch {url}: {last}')
+
+          def decode_html(response: requests.Response) -> str:
+              for encoding in ('utf-8', 'gb18030', 'gbk'):
+                  try:
+                      text = response.content.decode(encoding)
+                      if '金雷' in text or '年度报告' in text or '半年度报告' in text:
+                          return text
+                  except Exception:
+                      pass
+              response.encoding = response.apparent_encoding or 'utf-8'
+              return response.text
+
+          def parse_sina_listing(page_type: str) -> list[dict]:
+              url = f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_CODE}/page_type/{page_type}.phtml'
+              response = fetch(url, headers={**html_headers, 'Referer': 'https://money.finance.sina.com.cn/'}, timeout=(25, 120))
+              text = decode_html(response)
+              soup = BeautifulSoup(text, 'html.parser')
+              rows = []
+              for anchor in soup.find_all('a', href=True):
+                  label = ' '.join(anchor.get_text(' ', strip=True).split())
+                  href = urljoin(response.url, html.unescape(anchor['href']))
+                  if 'vCB_AllBulletinDetail.php' not in href:
+                      continue
+                  if '金雷' not in label:
+                      continue
+                  parent_text = ' '.join(anchor.parent.get_text(' ', strip=True).split()) if anchor.parent else label
+                  date_match = re.search(r'(20\d{2}-\d{2}-\d{2})', parent_text)
+                  rows.append({'title': label, 'detail_url': href, 'date': date_match.group(1) if date_match else ''})
+              print('SINA_LIST', page_type, json.dumps(rows, ensure_ascii=False), flush=True)
+              return rows
+
+          def extract_sina_pdf(detail_url: str) -> str:
+              response = fetch(detail_url, headers={**html_headers, 'Referer': 'https://money.finance.sina.com.cn/'}, timeout=(25, 180))
+              text = decode_html(response)
+              patterns = [
+                  r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+?\.PDF',
+                  r'https?:\\/\\/file\.finance\.sina\.com\.cn\\/[^\"\'<>\s]+?\.PDF',
+              ]
+              candidates = []
+              for pattern in patterns:
+                  for match in re.findall(pattern, text, flags=re.I):
+                      candidate = html.unescape(match).replace('\\/', '/')
+                      if candidate not in candidates:
+                          candidates.append(candidate)
+              if not candidates:
+                  soup = BeautifulSoup(text, 'html.parser')
+                  for anchor in soup.find_all('a', href=True):
+                      href = urljoin(response.url, html.unescape(anchor['href']))
+                      if 'file.finance.sina.com.cn' in href and href.lower().endswith('.pdf'):
+                          candidates.append(href)
+              if not candidates:
+                  raise RuntimeError(f'No Sina PDF link found in {detail_url}')
+              print('SINA_PDF', detail_url, candidates, flush=True)
+              return candidates[0]
+
+          annual_rows = parse_sina_listing('ndbg')
+          half_rows = parse_sina_listing('zqbg')
+
+          targets: list[dict] = []
+          for year in range(2020, 2026):
+              exact = [
+                  row for row in annual_rows
+                  if f'{year}年年度报告' in row['title'] and '摘要' not in row['title']
+              ]
+              if not exact:
+                  raise RuntimeError(f'Sina listing missing full {year} annual report')
+              row = sorted(exact, key=lambda item: item['date'], reverse=True)[0]
+              targets.append({
+                  'year': year,
+                  'type': '年度报告',
+                  'title': f'{year}年年度报告',
+                  'source_kind': 'sina',
+                  'source_url': extract_sina_pdf(row['detail_url']),
+                  'disclosure_date': row['date'],
+                  'min_pages': 100,
+              })
+
+          # Prefer the live Sina half-year list for the latest complete periodic report.
+          latest_half = [row for row in half_rows if '半年度报告' in row['title'] and '摘要' not in row['title']]
+          latest_row = sorted(latest_half, key=lambda item: item['date'], reverse=True)[0] if latest_half else None
+          if latest_row and '2026年半年度报告' in latest_row['title']:
+              targets.append({
+                  'year': 2026,
+                  'type': '半年度报告',
+                  'title': '2026年半年度报告',
+                  'source_kind': 'sina',
+                  'source_url': extract_sina_pdf(latest_row['detail_url']),
+                  'disclosure_date': latest_row['date'],
+                  'min_pages': 50,
+              })
+          else:
+              # Fallback to the public report index. It exposes the official announcement UUID.
+              api_headers = {
+                  'User-Agent': ua,
+                  'Accept': 'application/json, text/plain, */*',
+                  'Content-Type': 'application/json;charset=UTF-8',
+                  'Origin': 'https://www.sdyanbao.com',
+                  'Referer': 'https://www.sdyanbao.com/',
+                  'Device': '1',
+                  'X-Token': '',
+              }
+              api_response = session.post(
+                  'https://api.sdyanbao.com/api/file/search',
+                  headers=api_headers,
+                  json={'keyword': '金雷股份', 'page': 1, 'pageSize': 100, 'opFrom': 1},
+                  timeout=(30, 120),
+              )
+              print('SD_SEARCH', api_response.status_code, len(api_response.content), api_response.text[:300], flush=True)
+              api_response.raise_for_status()
+              obj = api_response.json()
+              data = obj.get('data') if isinstance(obj, dict) else None
+              files = data.get('files') if isinstance(data, dict) else []
+              matches = []
+              for item in files if isinstance(files, list) else []:
+                  stock = item.get('stock') if isinstance(item.get('stock'), dict) else {}
+                  name = str(item.get('name') or '')
+                  if str(stock.get('code') or '') != STOCK_CODE:
+                      continue
+                  if name == '2026年半年度报告' or name.endswith('2026年半年度报告'):
+                      matches.append(item)
+              if not matches:
+                  raise RuntimeError('Unable to locate 2026 half-year report in public index')
+              item = matches[0]
+              uuid = str(item.get('data_source_uuid') or '')
+              page_url = str(item.get('page_url') or '')
+              page_count = int(item.get('page_count') or 0)
+              candidates = []
+              if uuid.startswith('AP'):
+                  candidates.extend([
+                      f'https://pdf.dfcfw.com/pdf/H3_{uuid}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{uuid}_1.pdf',
+                  ])
+              targets.append({
+                  'year': 2026,
+                  'type': '半年度报告',
+                  'title': '2026年半年度报告',
+                  'source_kind': 'eastmoney_or_pages',
+                  'source_candidates': candidates,
+                  'page_url': page_url,
+                  'expected_pages': page_count,
+                  'disclosure_date': str(item.get('time_text') or '2026-08-24')[:10],
+                  'min_pages': 50,
+              })
+
+          print('TARGETS', json.dumps(targets, ensure_ascii=False, indent=2), flush=True)
+
+          records = []
+          for index, target in enumerate(targets, 1):
+              year = target['year']
+              report_type = target['type']
+              filename = f'{index:02d}_金雷股份_{year}年{report_type}.pdf'
+              dest = out / filename
+              pdf_bytes = b''
+              used_url = ''
+
+              source_urls = []
+              if target.get('source_url'):
+                  source_urls.append(target['source_url'])
+              source_urls.extend(target.get('source_candidates') or [])
+
+              for url in source_urls:
+                  referers = [
+                      'https://money.finance.sina.com.cn/',
+                      'https://data.eastmoney.com/',
+                      'https://www.cninfo.com.cn/',
+                  ]
+                  for referer in referers:
+                      try:
+                          response = fetch(url, headers={**pdf_headers, 'Referer': referer}, attempts=4, timeout=(30, 600))
+                      except Exception as exc:
+                          print('PDF_FETCH_ERROR', url, referer, repr(exc), flush=True)
+                          continue
+                      if response.content.startswith(b'%PDF-'):
+                          pdf_bytes = response.content
+                          used_url = url
+                          break
+                  if pdf_bytes:
+                      break
+
+              # Last-resort reconstruction from a complete public page sequence.
+              if not pdf_bytes and target.get('page_url') and int(target.get('expected_pages') or 0) > 0:
+                  import img2pdf
+                  from PIL import Image
+                  page_url = target['page_url']
+                  expected = int(target['expected_pages'])
+                  page_dir = work / f'{year}_{report_type}'
+                  page_dir.mkdir(exist_ok=True)
+                  images = []
+                  complete = True
+                  for page_number in range(expected):
+                      url = f'{page_url}/{page_number}.png'
+                      try:
+                          response = fetch(
+                              url,
+                              headers={'User-Agent': ua, 'Referer': 'https://www.sdyanbao.com/', 'Accept': 'image/png,image/*;q=0.9,*/*;q=0.7'},
+                              attempts=3,
+                              timeout=(20, 120),
+                          )
+                      except Exception:
+                          complete = False
+                          break
+                      data = response.content
+                      if not data.startswith(b'\x89PNG'):
+                          complete = False
+                          break
+                      image_path = page_dir / f'{page_number:04d}.png'
+                      image_path.write_bytes(data)
+                      try:
+                          with Image.open(image_path) as image:
+                              width, height = image.size
+                              image.verify()
+                      except Exception:
+                          complete = False
+                          break
+                      if width < 700 or height < 900:
+                          complete = False
+                          break
+                      images.append(image_path)
+                  if complete and len(images) == expected:
+                      pdf_bytes = img2pdf.convert([str(path) for path in images])
+                      used_url = page_url
+
+              if not pdf_bytes:
+                  raise RuntimeError(f'Failed to download {year} {report_type}')
+              dest.write_bytes(pdf_bytes)
+
+              reader = PdfReader(str(dest))
+              pages = len(reader.pages)
+              if pages < int(target['min_pages']):
+                  raise RuntimeError(f'{filename} is unexpectedly short: {pages} pages')
+              text = '\n'.join((page.extract_text() or '') for page in reader.pages[:12])
+              compact = re.sub(r'\s+', '', text)
+              if not any(keyword in compact for keyword in COMPANY_KEYWORDS) and STOCK_CODE not in compact:
+                  raise RuntimeError(f'Company identity validation failed for {filename}')
+              year_pattern = str(year)
+              if year_pattern not in compact:
+                  raise RuntimeError(f'Report year validation failed for {filename}')
+              if report_type == '年度报告' and '年度报告' not in compact:
+                  raise RuntimeError(f'Annual-report type validation failed for {filename}')
+              if report_type == '半年度报告' and '半年度报告' not in compact:
+                  raise RuntimeError(f'Half-year-report type validation failed for {filename}')
+
+              digest = hashlib.sha256(pdf_bytes).hexdigest()
+              record = {
+                  'filename': filename,
+                  'year': year,
+                  'report_type': report_type,
+                  'pages': pages,
+                  'bytes': len(pdf_bytes),
+                  'sha256': digest,
+                  'source_url': used_url,
+                  'disclosure_date': target.get('disclosure_date') or '',
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 reports, got {len(records)}')
+          if len({record['sha256'] for record in records}) != 7:
+              raise RuntimeError('Duplicate report files detected')
+
+          lines = [
+              '金雷股份（300443.SZ）2020—2025年年度报告及最新定期报告',
+              '',
+              '本包共7份完整PDF：2020—2025年年度报告，以及截至2026年8月30日最新的2026年半年度报告。',
+              '所有年度报告均为全文版，未使用年度报告摘要替代。',
+              '',
+          ]
+          for record in records:
+              lines.extend([
+                  f"- {record['filename']}｜{record['pages']}页｜披露日期：{record['disclosure_date']}",
+                  f"  SHA-256：{record['sha256']}",
+              ])
+          lines.extend([
+              '',
+              '核验项目：PDF文件头和结构、实际页数、公司名称/证券代码、报告年份和类型、文件哈希、ZIP CRC。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(f'{PACKAGE}.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 7')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinlei-periodic-reports-final
+          path: |
+            金雷股份_2020-2025年报及最新季报/
+            金雷股份_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
