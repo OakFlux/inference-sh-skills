@@ -1,0 +1,174 @@
+name: Temporary Dagang archived detail-page recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-archived-detail-pages.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Find and fetch archived report detail pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic pages
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import gzip, io, json, re, struct, time, urllib.parse, urllib.request, zlib
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':UA,'Accept':'application/json,text/plain,*/*'}
+          rids=['517993930847','504776077041','359452745437']
+          urls=[]
+          for rid in rids:
+              urls += [
+                f'http://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml',
+                f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml',
+                f'http://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/url',
+                f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/url',
+              ]
+
+          def get(url, timeout=180, hdrs=None):
+              h=dict(headers)
+              if hdrs: h.update(hdrs)
+              req=urllib.request.Request(url,headers=h)
+              return urllib.request.urlopen(req,timeout=timeout).read()
+
+          # Wayback: collect all captures and fetch the earliest and latest usable snapshots.
+          wayback_rows=[]
+          for i,url in enumerate(urls,1):
+              cdx='https://web.archive.org/cdx/search/cdx?'+urllib.parse.urlencode({
+                  'url':url,'output':'json','fl':'timestamp,original,statuscode,mimetype,digest,length',
+                  'filter':['statuscode:200'],'collapse':'digest','from':'2010','to':'2026','limit':'1000'
+              },doseq=True)
+              try:
+                  raw=get(cdx,120).decode('utf-8','replace')
+                  Path(f'diagnostic/wb_{i}.json').write_text(raw,encoding='utf-8')
+                  data=json.loads(raw)
+                  if data and len(data)>1:
+                      head=data[0]
+                      rows=[dict(zip(head,r)) for r in data[1:]]
+                      print('WB',url,'ROWS',len(rows))
+                      for r in rows:
+                          r['_query_url']=url; wayback_rows.append(r)
+                          print('WB_ROW',json.dumps(r,ensure_ascii=False))
+                      for pos,r in enumerate([rows[0],rows[-1]]):
+                          ts=r['timestamp']; orig=r['original']
+                          snap=f'https://web.archive.org/web/{ts}id_/{orig}'
+                          try:
+                              body=get(snap,180)
+                              p=Path(f'pages/wayback_{rids[(i-1)//4]}_{i}_{pos}_{ts}.bin')
+                              p.write_bytes(body)
+                              print('WB_FETCH',snap,'SIZE',len(body),'MAGIC',body[:12])
+                          except Exception as e:
+                              print('WB_FETCH_ERR',snap,repr(e))
+              except Exception as e:
+                  print('WB_ERR',url,repr(e))
+              time.sleep(.2)
+
+          # Common Crawl: query exact URLs across one index per year and newest crawls.
+          try:
+              colls=json.loads(get('https://index.commoncrawl.org/collinfo.json',120).decode())
+          except Exception as e:
+              print('COLL_ERR',repr(e)); colls=[]
+          chosen=[]; years=set()
+          for c in colls:
+              cid=c.get('id','')
+              try: year=int(cid.split('-')[2])
+              except Exception: continue
+              if 2010<=year<=2026 and year not in years:
+                  chosen.append(c); years.add(year)
+              if len(chosen)>=17: break
+          for c in colls[:3]:
+              if c not in chosen: chosen.append(c)
+
+          cc_rows=[]
+          for c in chosen:
+              cid=c.get('id'); idx=c.get('cdx-api') or f'https://index.commoncrawl.org/{cid}-index'
+              for url in urls:
+                  q=idx+'?'+urllib.parse.urlencode({'url':url,'output':'json','filter':'status:200'})
+                  try:
+                      raw=get(q,90).decode('utf-8','replace')
+                      for line in raw.splitlines():
+                          try:
+                              r=json.loads(line); r['_crawl']=cid; r['_query_url']=url; cc_rows.append(r)
+                              print('CC_ROW',json.dumps(r,ensure_ascii=False))
+                          except Exception: pass
+                  except Exception as e:
+                      pass
+              time.sleep(.05)
+          Path('diagnostic/wayback_rows.json').write_text(json.dumps(wayback_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/cc_rows.json').write_text(json.dumps(cc_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Recover up to 20 unique Common Crawl payloads by byte-range from WARC files.
+          seen=set(); count=0
+          for r in cc_rows:
+              key=(r.get('filename'),r.get('offset'),r.get('length'))
+              if key in seen: continue
+              seen.add(key)
+              fn,off,length=key
+              if not fn or off is None or length is None: continue
+              warc_url='https://data.commoncrawl.org/'+fn
+              try:
+                  req=urllib.request.Request(warc_url,headers={'User-Agent':UA,'Range':f'bytes={off}-{int(off)+int(length)-1}'})
+                  blob=urllib.request.urlopen(req,timeout=180).read()
+                  try: rec=gzip.decompress(blob)
+                  except Exception: rec=blob
+                  # Strip WARC and embedded HTTP headers.
+                  sep=rec.find(b'\r\n\r\n')
+                  rem=rec[sep+4:] if sep>=0 else rec
+                  sep2=rem.find(b'\r\n\r\n')
+                  payload=rem[sep2+4:] if sep2>=0 else rem
+                  rid='unknown'
+                  m=re.search(r'rptid/(\d+)',str(r.get('url') or r.get('_query_url') or ''))
+                  if m: rid=m.group(1)
+                  p=Path(f'pages/cc_{rid}_{count}_{r.get("timestamp","")}.bin')
+                  p.write_bytes(payload)
+                  print('CC_FETCH',warc_url,off,length,'PAYLOAD',len(payload),'MAGIC',payload[:12])
+                  count+=1
+                  if count>=20: break
+              except Exception as e:
+                  print('CC_FETCH_ERR',key,repr(e))
+
+          # Scan all recovered page payloads for hidden URLs, PDF/file identifiers, and report titles.
+          results=[]
+          for p in Path('pages').glob('*'):
+              body=p.read_bytes()
+              text=None
+              enc=None
+              for e in ['gb18030','utf-8','latin1']:
+                  try: text=body.decode(e); enc=e; break
+                  except Exception: pass
+              if text is None: continue
+              urls_found=sorted(set(re.findall(r'https?://[^\s"\'<>]+|//[^\s"\'<>]+|[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',text,re.I)))
+              interesting=[u for u in urls_found if any(k in u.lower() for k in ['pdf','file','attach','down','report','rpt'])]
+              markers=[]
+              for pat in ['file.finance','pdf','download','附件','全文','reporturl','report_url','rptid','sourceurl','source_url']:
+                  if pat.lower() in text.lower(): markers.append(pat)
+              rec={'file':p.name,'encoding':enc,'size':len(body),'interesting_urls':interesting,'markers':markers}
+              results.append(rec)
+              print('SCAN',json.dumps(rec,ensure_ascii=False))
+              for u in interesting[:100]: print('FOUND_URL',p.name,u[:1500])
+              # Save normalized UTF-8 copy for manual inspection.
+              Path('diagnostic/'+p.name+'.txt').write_text(text,encoding='utf-8')
+          Path('diagnostic/scan_results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload recovered pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-archived-detail-pages
+          path: |
+            diagnostic/
+            pages/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
