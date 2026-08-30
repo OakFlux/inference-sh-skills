@@ -1,0 +1,328 @@
+name: Discover and package public Jinlei research reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jinlei-report-discovery-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet pypdf pillow img2pdf
+
+      - name: Search public indexes and download valid reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY_NAMES = ('金雷股份', '金雷科技')
+          CODE = '300443'
+          OUT = Path('jinlei_discovery')
+          OUT.mkdir(exist_ok=True)
+          PAGE_ROOT = Path('_jinlei_pages')
+          PAGE_ROOT.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          em_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+          sd_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json, text/plain, */*',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Device': '1',
+              'X-Token': '',
+          }
+
+          def company_match(text: str) -> bool:
+              return CODE in text or any(name in text for name in COMPANY_NAMES)
+
+          def safe_name(value: str) -> str:
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', str(value)).strip('_')[:100]
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def first_text_and_pages(pdf_bytes: bytes):
+              tmp = OUT / '_probe.pdf'
+              tmp.write_bytes(pdf_bytes)
+              try:
+                  reader = PdfReader(str(tmp))
+                  pages = len(reader.pages)
+                  text = '\n'.join((page.extract_text() or '') for page in reader.pages[:8])
+                  return pages, text
+              finally:
+                  tmp.unlink(missing_ok=True)
+
+          metadata = {}
+          diagnostics = []
+
+          # Search public Sdyanbao index, which often contains page counts and report types.
+          for keyword in ('金雷股份', '金雷科技', '300443', '金雷股份 深度', '金雷股份 公司研究', '金雷股份 首次覆盖'):
+              for page in (1, 2, 3):
+                  body = {'keyword': keyword, 'page': page, 'pageSize': 100, 'opFrom': 1}
+                  try:
+                      r = session.post('https://api.sdyanbao.com/api/file/search', headers=sd_headers, json=body, timeout=(20, 90))
+                      diagnostics.append({'source':'sdyanbao','keyword':keyword,'page':page,'status':r.status_code,'bytes':len(r.content),'head':r.text[:160]})
+                      if r.status_code != 200:
+                          continue
+                      obj = r.json()
+                  except Exception as exc:
+                      diagnostics.append({'source':'sdyanbao','keyword':keyword,'page':page,'error':repr(exc)})
+                      continue
+                  data = obj.get('data') if isinstance(obj, dict) else None
+                  files = data.get('files') if isinstance(data, dict) else None
+                  if not isinstance(files, list):
+                      continue
+                  for item in files:
+                      blob = json.dumps(item, ensure_ascii=False, default=str)
+                      stock = item.get('stock') if isinstance(item.get('stock'), dict) else {}
+                      if not company_match(blob) and str(stock.get('code') or '') != CODE:
+                          continue
+                      key = str(item.get('data_source_uuid') or item.get('id') or hashlib.sha256(blob.encode()).hexdigest())
+                      metadata[f'sd-{key}'] = {'metadata_source':'sdyanbao', **item}
+
+          # Query Eastmoney company-report API using both stock code and compact date windows.
+          for qtype in range(0, 6):
+              for begin, end in (
+                  ('2019-01-01','2026-08-30'),
+                  ('2019-01-01','2022-12-31'),
+                  ('2023-01-01','2024-12-31'),
+                  ('2025-01-01','2026-08-30'),
+              ):
+                  for page in range(1, 8):
+                      params = {
+                          'pageNo': page,
+                          'pageSize': 100,
+                          'qType': qtype,
+                          'code': CODE,
+                          'beginTime': begin,
+                          'endTime': end,
+                      }
+                      try:
+                          r = session.get('https://reportapi.eastmoney.com/report/list', params=params, headers=em_headers, timeout=(12, 60))
+                          diagnostics.append({'source':'eastmoney','qtype':qtype,'begin':begin,'end':end,'page':page,'status':r.status_code,'bytes':len(r.content),'url':r.url,'head':r.text[:160]})
+                          if r.status_code != 200 or not r.content:
+                              break
+                          obj = r.json()
+                      except Exception as exc:
+                          diagnostics.append({'source':'eastmoney','qtype':qtype,'begin':begin,'end':end,'page':page,'error':repr(exc)})
+                          break
+                      rows = obj.get('data') if isinstance(obj, dict) else None
+                      if isinstance(rows, dict):
+                          rows = rows.get('data') or rows.get('list') or rows.get('items') or []
+                      if not isinstance(rows, list) or not rows:
+                          break
+                      for item in rows:
+                          blob = json.dumps(item, ensure_ascii=False, default=str)
+                          if not company_match(blob):
+                              continue
+                          info = str(item.get('infoCode') or item.get('infocode') or item.get('reportId') or '')
+                          if info:
+                              metadata[f'em-{info}'] = {'metadata_source':'eastmoney', **item}
+                      if len(rows) < 100:
+                          break
+
+          (OUT / 'all_metadata.json').write_text(json.dumps(list(metadata.values()), ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'diagnostics.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          candidates = []
+          for item in metadata.values():
+              source = item.get('metadata_source')
+              if source == 'eastmoney':
+                  info = str(item.get('infoCode') or item.get('infocode') or '')
+                  title = str(item.get('title') or item.get('reportTitle') or '')
+                  org = str(item.get('orgSName') or item.get('orgName') or '')
+                  date = str(item.get('publishDate') or item.get('date') or '')[:10]
+                  hint = item.get('attachPages') or item.get('pageCount') or item.get('pages')
+                  page_url = ''
+                  report_type = str(item.get('reportType') or item.get('qType') or '')
+              else:
+                  uuid = str(item.get('data_source_uuid') or '')
+                  info = uuid if uuid.startswith('AP') else ''
+                  title = str(item.get('name') or '')
+                  org_obj = item.get('organization') if isinstance(item.get('organization'), dict) else {}
+                  org = str(org_obj.get('name') or '')
+                  date = str(item.get('time_text') or '')[:10]
+                  hint = item.get('page_count')
+                  page_url = str(item.get('page_url') or '')
+                  type_obj = item.get('type') if isinstance(item.get('type'), dict) else {}
+                  report_type = str(type_obj.get('name') or '')
+              candidates.append({
+                  'infoCode': info,
+                  'title': title,
+                  'organization': org,
+                  'date': date,
+                  'pages_hint': hint,
+                  'page_url': page_url,
+                  'report_type': report_type,
+                  'metadata_source': source,
+              })
+
+          # Dedupe candidates on infoCode, otherwise title/date/page_url.
+          dedup = {}
+          for item in candidates:
+              key = item['infoCode'] or f"{item['title']}|{item['date']}|{item['page_url']}"
+              dedup[key] = item
+          candidates = list(dedup.values())
+          (OUT / 'candidate_metadata.json').write_text(json.dumps(candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          downloaded = []
+          seen_sha = set()
+
+          def save_pdf(data: bytes, item: dict, source_url: str, source_format: str) -> bool:
+              if not data.startswith(b'%PDF-'):
+                  return False
+              try:
+                  pages, text = first_text_and_pages(data)
+              except Exception:
+                  return False
+              if pages < 8 or not company_match(text):
+                  return False
+              digest = sha256_bytes(data)
+              if digest in seen_sha:
+                  return False
+              seen_sha.add(digest)
+              filename = f"{len(downloaded)+1:02d}_{safe_name(item.get('organization') or '券商')}_{safe_name(item.get('title') or '金雷股份研报')}_{safe_name(item.get('date') or '')}_{pages}页.pdf"
+              path = OUT / filename
+              path.write_bytes(data)
+              downloaded.append({**item, 'filename':filename, 'pages':pages, 'bytes':len(data), 'sha256':digest, 'source_url':source_url, 'source_format':source_format, 'first_pages_text':text[:4500]})
+              print('SAVED', json.dumps({k:downloaded[-1].get(k) for k in ('organization','title','date','pages','filename','source_url')}, ensure_ascii=False), flush=True)
+              return True
+
+          # Prefer publicly downloadable original PDFs.
+          for item in sorted(candidates, key=lambda x: (int(x['pages_hint'] or 0), x['date']), reverse=True):
+              info = item.get('infoCode') or ''
+              if not info:
+                  continue
+              for prefix in ('H3', 'H2'):
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  try:
+                      r = session.get(url, headers={**em_headers,'Accept':'application/pdf,*/*;q=0.8'}, timeout=(25, 180))
+                      print('PDF', url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                      if r.status_code == 200 and save_pdf(r.content, item, url, '公开原始PDF'):
+                          break
+                  except Exception as exc:
+                      print('PDF_ERROR', url, repr(exc), flush=True)
+              if len(downloaded) >= 12:
+                  break
+
+          # If still sparse, reconstruct only reports whose full indexed page sequence is publicly accessible.
+          if len(downloaded) < 6:
+              for item in sorted(candidates, key=lambda x: int(x['pages_hint'] or 0), reverse=True):
+                  page_url = str(item.get('page_url') or '')
+                  try:
+                      expected = int(item.get('pages_hint') or 0)
+                  except Exception:
+                      expected = 0
+                  if not page_url or expected < 8 or expected > 80:
+                      continue
+                  page_dir = PAGE_ROOT / hashlib.sha256(page_url.encode()).hexdigest()[:16]
+                  page_dir.mkdir(exist_ok=True)
+                  image_paths = []
+                  full = True
+                  for number in range(expected):
+                      url = f'{page_url}/{number}.png'
+                      try:
+                          r = session.get(url, headers={'User-Agent':ua,'Referer':'https://www.sdyanbao.com/','Accept':'image/png,image/*;q=0.9,*/*;q=0.7'}, timeout=(15, 60))
+                      except Exception:
+                          full = False
+                          break
+                      if r.status_code != 200 or not r.content.startswith(b'\x89PNG'):
+                          full = False
+                          break
+                      image_path = page_dir / f'{number:03d}.png'
+                      image_path.write_bytes(r.content)
+                      try:
+                          with Image.open(io.BytesIO(r.content)) as im:
+                              im.verify()
+                          with Image.open(image_path) as im:
+                              w, h = im.size
+                      except Exception:
+                          full = False
+                          break
+                      if w < 700 or h < 900:
+                          full = False
+                          break
+                      image_paths.append(image_path)
+                  if not full or len(image_paths) != expected:
+                      continue
+                  try:
+                      data = img2pdf.convert([str(p) for p in image_paths])
+                  except Exception:
+                      continue
+                  # Image-only PDF cannot be text-validated; metadata and complete page sequence are retained in the manifest.
+                  digest = sha256_bytes(data)
+                  if digest in seen_sha:
+                      continue
+                  seen_sha.add(digest)
+                  filename = f"{len(downloaded)+1:02d}_{safe_name(item.get('organization') or '券商')}_{safe_name(item.get('title') or '金雷股份研报')}_{safe_name(item.get('date') or '')}_{expected}页_逐页原图.pdf"
+                  path = OUT / filename
+                  path.write_bytes(data)
+                  reader = PdfReader(str(path))
+                  if len(reader.pages) != expected:
+                      path.unlink(missing_ok=True)
+                      continue
+                  downloaded.append({**item,'filename':filename,'pages':expected,'bytes':len(data),'sha256':digest,'source_url':page_url,'source_format':'公开完整逐页原图合成为PDF；页面内容和顺序未改动'})
+                  print('RECONSTRUCTED', json.dumps({k:downloaded[-1].get(k) for k in ('organization','title','date','pages','filename')}, ensure_ascii=False), flush=True)
+                  if len(downloaded) >= 12:
+                      break
+
+          (OUT / 'downloaded_reports.json').write_text(json.dumps(downloaded, ensure_ascii=False, indent=2), encoding='utf-8')
+          lines = [f'金雷股份/金雷科技（{CODE}）公开券商研报候选', '']
+          for i, item in enumerate(downloaded, 1):
+              lines += [
+                  f"{i}. {item.get('organization')}：《{item.get('title')}》",
+                  f"   日期：{item.get('date')}；页数：{item.get('pages')}；文件：{item.get('filename')}",
+                  f"   来源形式：{item.get('source_format')}",
+                  '',
+              ]
+          (OUT / '候选清单.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          zip_path = Path('金雷股份_券商研报候选.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for path in sorted(OUT.iterdir()):
+                  zf.write(path, arcname=f'金雷股份_券商研报候选/{path.name}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+          print('TOTAL_METADATA', len(metadata), 'CANDIDATES', len(candidates), 'DOWNLOADED', len(downloaded), 'ZIP', zip_path.stat().st_size, flush=True)
+          PY
+
+      - name: Upload discovery package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinlei-report-discovery
+          path: |
+            jinlei_discovery/
+            金雷股份_券商研报候选.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
