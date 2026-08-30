@@ -1,0 +1,100 @@
+name: Probe Tianfulong report sources
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-source-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe report pages and download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          from urllib.parse import urljoin, quote
+          import requests
+
+          s = requests.Session()
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+          urls = [
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/806412714702/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/lastest/rptid/806412714702/index.phtml',
+              'https://www.nxny.com/report/view_6023564.html',
+              'https://max.book118.com/html/2025/0718/8120111016007113.shtm',
+          ]
+
+          def show_page(url):
+              print('\n===== PAGE', url, flush=True)
+              try:
+                  r = s.get(url, headers=headers, timeout=(30, 150), allow_redirects=True)
+                  print('STATUS', r.status_code, 'FINAL', r.url, 'TYPE', r.headers.get('content-type'), 'BYTES', len(r.content), flush=True)
+                  print('COOKIES', s.cookies.get_dict(), flush=True)
+                  text = r.text.replace('\\/', '/')
+                  print('HEAD', repr(text[:1500]), flush=True)
+                  patterns = [
+                      r'https?://[^"\'<>\s]+',
+                      r'(?:href|src|action)\s*=\s*["\']([^"\']+)["\']',
+                      r'["\']([^"\']*(?:pdf|download|down|report|rptid|file|doc|attach|preview)[^"\']*)["\']',
+                  ]
+                  vals=[]
+                  for pat in patterns:
+                      for m in re.findall(pat, text, flags=re.I):
+                          v=m if isinstance(m,str) else m[0]
+                          v=html.unescape(v).strip()
+                          if v and len(v)<1000:
+                              vals.append(urljoin(r.url,v))
+                  print('URL-LIKE')
+                  for v in list(dict.fromkeys(vals))[:500]:
+                      print(v, flush=True)
+                  for needle in ['下载', '.pdf', 'download', 'rptid', 'ReportService', 'openapi', 'docId', 'filePath', 'preview', 'sourceUrl', 'attachment']:
+                      low=text.lower(); nlow=needle.lower(); poss=[m.start() for m in re.finditer(re.escape(nlow),low)]
+                      if poss:
+                          print('NEEDLE', needle, 'COUNT', len(poss), flush=True)
+                          for p in poss[:15]:
+                              print(text[max(0,p-700):p+1800], flush=True)
+                  return r, text
+              except Exception as e:
+                  print('ERROR', repr(e), flush=True)
+                  return None, ''
+
+          pages=[]
+          for u in urls:
+              pages.append(show_page(u))
+
+          guesses = [
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Down/kind/search/rptid/806412714702/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Down/kind/lastest/rptid/806412714702/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Download/kind/search/rptid/806412714702/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_Download/kind/lastest/rptid/806412714702/index.phtml',
+              'https://stock.finance.sina.com.cn/stock/api/openapi.php/ReportService.getReportContent?rid=806412714702',
+              'https://stock.finance.sina.com.cn/stock/api/openapi.php/ReportService.getReportInfo?rid=806412714702',
+              'https://stock.finance.sina.com.cn/stock/api/openapi.php/ReportService.getReportById?rid=806412714702',
+              'https://quotes.sina.cn/cn/api/openapi.php/ReportService.getReportContent?rid=806412714702',
+              'https://quotes.sina.cn/cn/api/openapi.php/ReportService.getReportInfo?rid=806412714702',
+              'https://www.nxny.com/report/download_6023564.html',
+              'https://www.nxny.com/report/down_6023564.html',
+              'https://www.nxny.com/report/download/6023564',
+              'https://www.nxny.com/report/down/6023564',
+          ]
+          print('\n===== GUESSES', flush=True)
+          for u in guesses:
+              try:
+                  r=s.get(u,headers={**headers,'Referer':urls[0]},timeout=(20,90),allow_redirects=False)
+                  print('GUESS',u,'STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'BYTES',len(r.content),'LOC',r.headers.get('location'),'HEAD',repr(r.content[:160]),flush=True)
+              except Exception as e:
+                  print('GUESS ERROR',u,repr(e),flush=True)
+          PY
