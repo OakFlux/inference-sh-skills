@@ -1,0 +1,48 @@
+name: Temporary Nike report image proxy test
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-image-proxy-test.yml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Test public image proxy variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          origin='public.fxbaogao.com/report-image/2025/03/23/4742006-1.png'
+          urls=(
+            "https://images.weserv.nl/?url=${origin}&output=png"
+            "https://wsrv.nl/?url=${origin}&output=png"
+            "https://images.weserv.nl/?url=https://public.fxbaogao.com/report-image/2025/03/23/4742006-1.png&output=png"
+            "https://imageproxy.ifunny.co/crop:x-20,resize:640x,quality:90x75/images.weserv.nl/?url=${origin}"
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            i=$((i+1))
+            curl --http1.1 -L -sS -D "out/$i.headers" -o "out/$i.bin" \
+              --connect-timeout 20 --max-time 180 --retry 3 --retry-all-errors \
+              -A "$UA" -H 'Accept-Encoding: identity' "$url" || true
+            echo === $i "$url" ===
+            cat "out/$i.headers" || true
+            echo SIZE $(stat -c%s "out/$i.bin" 2>/dev/null || echo 0) MAGIC $(head -c 32 "out/$i.bin" 2>/dev/null | xxd -p || true) TYPE $(file -b "out/$i.bin" 2>/dev/null || true)
+          done
+          ls -lh out
+
+      - name: Upload tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-image-proxy-test
+          path: out/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
