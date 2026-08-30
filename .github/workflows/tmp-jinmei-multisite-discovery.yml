@@ -1,0 +1,106 @@
+name: Temporary Jinmei multi-site report discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-jinmei-multisite-discovery.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Inspect public search pages, scripts and APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          sites=[
+              ('yanbaoke','https://pc.yanbaoke.cn/'),
+              ('fxbaogao','https://www.fxbaogao.com/'),
+              ('baogaobox','https://www.baogaobox.com/'),
+          ]
+          keywords=['丹化科技','金煤科技','600844','斯尔邦借壳登录资本市场','产业链一体化布局打造中国版高端新材料企业','拥有世界领先技术的煤化工龙头']
+          sessions={}
+
+          for name,url in sites:
+              print('\n===== SITE',name,url,'=====')
+              s=requests.Session(); sessions[name]=s
+              s.headers.update({'User-Agent':UA,'Accept':'text/html,application/json,text/javascript,*/*'})
+              try:
+                  r=s.get(url,timeout=90,allow_redirects=True)
+                  print('HOME',r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+                  text=r.text
+                  print('HEAD',text[:4000].replace('\n',' ')[:4000])
+                  soup=BeautifulSoup(text,'html.parser')
+                  scripts=[urllib.parse.urljoin(r.url,t['src']) for t in soup.find_all('script',src=True)]
+                  print('SCRIPTS',json.dumps(scripts[:80],ensure_ascii=False,indent=2))
+                  for script in scripts[:80]:
+                      try:
+                          x=s.get(script,timeout=90)
+                          st=x.text
+                          print('SCRIPT',script,x.status_code,len(x.content))
+                          if any(k in st.lower() for k in ['search','report','download','api','keyword','pdf']):
+                              for pat in [
+                                  r'https?://[^\s"\'<>]+',
+                                  r'["\'](/[^"\']*(?:api|search|report|download|file|pdf)[^"\']*)["\']',
+                              ]:
+                                  vals=sorted(set(re.findall(pat,st,re.I)))
+                                  for v in vals[:150]: print('JS_URL',name,str(v)[:2000])
+                              for needle in ['search','keyword','report','download','pdf','api']:
+                                  hits=[m.start() for m in re.finditer(needle,st,re.I)]
+                                  for p in hits[:12]: print('JS_CTX',name,needle,st[max(0,p-500):p+1600].replace('\n',' ')[:2100])
+                      except Exception as e: print('SCRIPT_ERR',script,repr(e))
+              except Exception as e: print('HOME_ERR',name,repr(e))
+
+          # Probe common public search URL patterns without authentication.
+          patterns={
+              'yanbaoke':[
+                  'https://pc.yanbaoke.cn/search?keyword={q}',
+                  'https://pc.yanbaoke.cn/search?q={q}',
+                  'https://pc.yanbaoke.cn/api/search?keyword={q}',
+              ],
+              'fxbaogao':[
+                  'https://www.fxbaogao.com/search?keyword={q}',
+                  'https://www.fxbaogao.com/search?q={q}',
+                  'https://www.fxbaogao.com/api/search?keyword={q}',
+              ],
+              'baogaobox':[
+                  'https://www.baogaobox.com/search?keyword={q}',
+                  'https://www.baogaobox.com/search?q={q}',
+              ],
+          }
+          for name,urls in patterns.items():
+              s=sessions[name]
+              for kw in keywords:
+                  q=urllib.parse.quote(kw)
+                  for tmpl in urls:
+                      u=tmpl.format(q=q)
+                      try:
+                          r=s.get(u,timeout=60,allow_redirects=True,headers={'User-Agent':UA,'Referer':sites[[x[0] for x in sites].index(name)][1]})
+                          print('\nPROBE',name,kw,u,'HTTP',r.status_code,'LEN',len(r.content),'TYPE',r.headers.get('content-type'),'FINAL',r.url)
+                          body=r.text
+                          hit=any(t in body for t in ['丹化科技','金煤科技','600844','斯尔邦'])
+                          print('HIT',hit,'BODY',body[:5000].replace('\n',' ')[:5000])
+                          if hit:
+                              soup=BeautifulSoup(body,'html.parser')
+                              for a in soup.find_all('a',href=True):
+                                  label=' '.join(a.get_text(' ',strip=True).split())
+                                  blob=label+' '+a['href']
+                                  if any(t in blob for t in ['丹化科技','金煤科技','600844','斯尔邦','煤制乙二醇']):
+                                      print('RESULT_LINK',name,json.dumps({'label':label,'href':urllib.parse.urljoin(r.url,a['href'])},ensure_ascii=False))
+                              for pat in [r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',r'https?://[^\s"\'<>]+(?:download|file|oss|cdn)[^\s"\'<>]*']:
+                                  for v in sorted(set(re.findall(pat,body,re.I))): print('RESULT_ASSET',name,v[:2000])
+                      except Exception as e: print('PROBE_ERR',name,kw,u,repr(e))
+          PY
