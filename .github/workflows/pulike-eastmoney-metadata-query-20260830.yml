@@ -1,0 +1,76 @@
+name: Query Eastmoney metadata for Pulike reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/pulike-eastmoney-metadata-query-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Query public Eastmoney report index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import requests
+
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Accept':'application/json,text/plain,*/*','Referer':'https://data.eastmoney.com/'}
+          all_rows=[]
+          seen=set()
+          for qtype in range(0,6):
+            for page in range(1,6):
+              p={'pageNo':page,'pageSize':100,'code':'603566','qType':qtype,'beginTime':'2015-01-01','endTime':'2026-08-30'}
+              try:
+                r=s.get('https://reportapi.eastmoney.com/report/list',params=p,headers=h,timeout=(10,30))
+                print('QUERY',qtype,page,r.status_code,len(r.content),r.url,flush=True)
+                print('HEAD',r.text[:120],flush=True)
+                if r.status_code!=200 or not r.content: break
+                o=r.json()
+              except Exception as e:
+                print('ERROR',qtype,page,repr(e),flush=True); break
+              data=o.get('data') if isinstance(o,dict) else None
+              rows=data if isinstance(data,list) else (data.get('data') or data.get('list') or data.get('items') or [] if isinstance(data,dict) else [])
+              if not isinstance(rows,list) or not rows: break
+              for x in rows:
+                if not isinstance(x,dict): continue
+                blob=json.dumps(x,ensure_ascii=False,default=str)
+                code=str(x.get('stockCode') or x.get('code') or x.get('securityCode') or '')
+                if code!='603566' and '普莱柯' not in blob: continue
+                key=str(x.get('infoCode') or x.get('infocode') or x.get('reportId') or x.get('id') or blob)
+                if key in seen: continue
+                seen.add(key)
+                row={
+                  'title':x.get('title') or x.get('reportTitle'),
+                  'stockName':x.get('stockName'),
+                  'stockCode':x.get('stockCode'),
+                  'orgSName':x.get('orgSName'),
+                  'orgName':x.get('orgName'),
+                  'publishDate':x.get('publishDate'),
+                  'infoCode':x.get('infoCode') or x.get('infocode'),
+                  'attachPages':x.get('attachPages') or x.get('pageCount') or x.get('pages'),
+                  'emRatingName':x.get('emRatingName'),
+                  'researcher':x.get('researcher'),
+                  'indvInduName':x.get('indvInduName'),
+                  'qtype':qtype,
+                }
+                all_rows.append(row)
+                print('MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+              if len(rows)<100: break
+          with open('pulike_eastmoney_metadata.json','w',encoding='utf-8') as f:
+            json.dump(all_rows,f,ensure_ascii=False,indent=2)
+          print('TOTAL',len(all_rows),flush=True)
+          PY
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulike-eastmoney-metadata
+          path: pulike_eastmoney_metadata.json
+          if-no-files-found: error
+          retention-days: 3
