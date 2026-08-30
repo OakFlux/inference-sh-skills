@@ -1,0 +1,90 @@
+name: Temporary Jinmei Technology fast Hibor scan
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-jinmei-tech-hibor-fast.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Concurrently scan historical report archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, requests, urllib.parse
+          from bs4 import BeautifulSoup
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          terms=['丹化科技','600844','丹科B股','煤制乙二醇']
+          months=[f'{y}{m:02d}' for y in range(2008,2015) for m in range(1,13)]
+
+          def scan_month(ym):
+              url=f'https://www.hibor.com.cn/archiver_houtai/{ym}.html'
+              try:
+                  r=requests.get(url,headers={'User-Agent':UA},timeout=25)
+                  if r.status_code!=200 or len(r.content)<1000:
+                      return ym,[],f'HTTP {r.status_code} {len(r.content)}'
+                  texts=[]
+                  for enc in ['utf-8','gb18030','latin1']:
+                      try: texts.append(r.content.decode(enc,'ignore'))
+                      except: pass
+                  links={}
+                  for text in texts:
+                      if not any(t in text for t in terms): continue
+                      soup=BeautifulSoup(text,'html.parser')
+                      for a in soup.find_all('a',href=True):
+                          label=' '.join(a.get_text(' ',strip=True).split())
+                          blob=label+' '+a['href']
+                          if any(t in blob for t in terms):
+                              href=urllib.parse.urljoin(url,a['href']).replace('http://','https://')
+                              links[href]=label
+                  return ym,list(links.items()),None
+              except Exception as e:
+                  return ym,[],repr(e)
+
+          found={}
+          with ThreadPoolExecutor(max_workers=16) as ex:
+              futures=[ex.submit(scan_month,ym) for ym in months]
+              for fut in as_completed(futures):
+                  ym,links,err=fut.result()
+                  if err: print('MONTH_ERR',ym,err)
+                  for href,label in links:
+                      found[href]=label
+                      print('ARCHIVE_MATCH',json.dumps({'ym':ym,'label':label,'href':href},ensure_ascii=False))
+          print('LINK_COUNT',len(found))
+
+          def inspect(item):
+              href,label=item
+              try:
+                  r=requests.get(href,headers={'User-Agent':UA},timeout=35,allow_redirects=True)
+                  text=r.text if len(r.content)>200 else ''
+                  soup=BeautifulSoup(text,'html.parser') if text else None
+                  visible=' '.join(soup.get_text(' ',strip=True).split()) if soup else ''
+                  title=soup.title.get_text(' ',strip=True) if soup and soup.title else ''
+                  def field(name):
+                      m=re.search(re.escape(name)+r'\s*([^：]{0,80}?)(?=\s+(?:研报|股票|分享|推荐|我要|报告|$))',visible)
+                      return m.group(1).strip() if m else ''
+                  assets=[]
+                  for pat in [r'https?://[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',r'https?://[^\s"\'<>]+(?:download|down|file|attachment)[^\s"\'<>]*']:
+                      assets.extend(re.findall(pat,text,re.I))
+                  return {'href':href,'label':label,'http':r.status_code,'bytes':len(r.content),'title':title,'page_context':visible[:3500],'assets':sorted(set(assets))[:20]}
+              except Exception as e:
+                  return {'href':href,'label':label,'error':repr(e)}
+
+          with ThreadPoolExecutor(max_workers=10) as ex:
+              futures=[ex.submit(inspect,item) for item in found.items()]
+              for fut in as_completed(futures):
+                  print('REPORT',json.dumps(fut.result(),ensure_ascii=False))
+          PY
