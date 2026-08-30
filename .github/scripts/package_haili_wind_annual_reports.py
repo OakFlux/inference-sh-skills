@@ -132,6 +132,11 @@ def main() -> None:
             "    )\n\n"
             "    replacements = [",
         ),
+        (
+            "    code = code.replace(original_download, replacement_download, 1)",
+            "    code = code.replace(original_download, original_download, 1)",
+        ),
+        ('        f"{prospectus_id}.PDF",\n', ""),
     ]
     for old, new in replacements:
         code = code.replace(old, new)
@@ -149,6 +154,7 @@ def main() -> None:
         "CNSESZ_STOCK",
         "海力风电_全部年报_招股说明书_2026年最新半年报_完整PDF.zip",
         '.replace("科创板", "创业板")',
+        "code.replace(original_download, original_download, 1)",
     ]
     missing = [token for token in required if token not in code]
     if missing:
