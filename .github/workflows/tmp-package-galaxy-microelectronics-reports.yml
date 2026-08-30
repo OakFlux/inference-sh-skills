@@ -20,7 +20,7 @@ jobs:
         run: python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
 
       - name: Download, verify, and package reports
-        run: python .github/scripts/package_galaxy_microelectronics_final.py
+        run: python .github/scripts/package_galaxy_microelectronics_v2.py
 
       - name: Upload verified ZIP
         uses: actions/upload-artifact@v4
