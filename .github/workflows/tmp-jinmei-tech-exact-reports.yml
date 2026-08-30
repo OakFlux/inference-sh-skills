@@ -1,0 +1,78 @@
+name: Temporary Jinmei exact 2019 deep report lookup
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-jinmei-tech-exact-reports.yml
+
+permissions:
+  contents: read
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Query exact titles and test public full-page assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+
+          s=requests.Session()
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/',
+              'Content-Type':'application/json;charset=UTF-8','Accept':'application/json,text/plain,*/*'
+          })
+          queries=[
+              '斯尔邦借壳登录资本市场 产业链一体化定位高端',
+              '产业链一体化布局 打造中国版高端新材料企业',
+              '丹化科技 斯尔邦借壳',
+              '丹化科技 中信建投 深度报告',
+              '丹化科技 天风证券 首次覆盖报告',
+          ]
+          rows=[]; seen=set()
+          for q in queries:
+              for page in range(1,6):
+                  payload={'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':page,'pageSize':100,'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':[],'industryIds':[]}
+                  r=s.post('https://api.sdyanbao.com/api/file/search',json=payload,timeout=90)
+                  print('QUERY',q,page,r.status_code,len(r.content))
+                  r.raise_for_status(); data=(r.json().get('data') or {}); files=data.get('files') or []
+                  print('TOTAL',data.get('total'),'COUNT',len(files))
+                  for f in files:
+                      fid=f.get('id')
+                      if fid in seen: continue
+                      seen.add(fid)
+                      row={
+                          'id':fid,'name':f.get('name'),'date':f.get('time_text'),'pages':f.get('page_count'),
+                          'size':f.get('file_size'),'type':(f.get('type') or {}).get('name'),
+                          'organization':(f.get('organization') or {}).get('name'),'stock':f.get('stock'),
+                          'uuid':f.get('data_source_uuid'),'data_source':f.get('data_source'),
+                          'original_id':f.get('original_id'),'page_url':f.get('page_url'),
+                          'share_url':f.get('share_url'),'summary':str(f.get('summary') or '')[:700],
+                      }
+                      blob=' '.join(str(row.get(k) or '') for k in ['name','organization','stock','summary'])
+                      if ('丹化科技' in blob or '600844' in blob or '斯尔邦' in blob or
+                          '产业链一体化布局' in blob or '借壳登录资本市场' in blob):
+                          rows.append(row)
+                          print('MATCH',json.dumps(row,ensure_ascii=False))
+                  if not files or page*100>=int(data.get('total') or 0): break
+
+          for row in rows:
+              root=row.get('page_url'); pages=int(row.get('pages') or 0)
+              if not root or pages<=0: continue
+              ok=0; failures=[]
+              for i in range(pages):
+                  u=root.rstrip('/')+f'/{i}.png'
+                  try:
+                      x=requests.get(u,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.sdyanbao.com/'},timeout=45)
+                      valid=x.status_code==200 and x.content[:8]==b'\x89PNG\r\n\x1a\n' and len(x.content)>10000
+                      if valid: ok+=1
+                      else: failures.append({'i':i,'status':x.status_code,'bytes':len(x.content),'head':x.content[:8].hex()})
+                  except Exception as e: failures.append({'i':i,'error':repr(e)})
+              print('PAGE_CHECK',json.dumps({'name':row.get('name'),'declared':pages,'ok':ok,'failures':failures[:15]},ensure_ascii=False))
+          PY
