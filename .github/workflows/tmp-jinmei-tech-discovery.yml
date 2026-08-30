@@ -1,0 +1,85 @@
+name: Temporary Jinmei Technology brokerage report discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-jinmei-tech-reports-20260830
+    paths:
+      - .github/workflows/tmp-jinmei-tech-discovery.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Query Eastmoney public report catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, math, requests
+
+          CODE='600844'
+          session=requests.Session()
+          session.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Referer':f'https://data.eastmoney.com/report/{CODE}.html',
+              'Accept':'application/json,text/plain,*/*',
+          })
+          rows=[]
+          for qtype in ('0','1','2'):
+              for page in range(1,30):
+                  params={
+                      'pageNo':str(page),'pageSize':'100','code':CODE,
+                      'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':'2008-01-01','endTime':'2026-08-30','fields':'',
+                      'qType':qtype,'orgCode':'','rcode':'','p':str(page),
+                      'pageNum':str(page),'pageNumber':str(page),
+                  }
+                  r=session.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=60)
+                  print('HTTP',qtype,page,r.status_code,len(r.content),r.url)
+                  r.raise_for_status(); obj=r.json(); data=obj.get('data') or []
+                  rows.extend(data)
+                  total=int(obj.get('TotalPage') or math.ceil(int(obj.get('hits') or 0)/100) or 1)
+                  if page>=total: break
+
+          dedup={}
+          for row in rows:
+              dedup[row.get('infoCode') or (row.get('title'),row.get('publishDate'),row.get('orgSName'))]=row
+          rows=sorted(dedup.values(),key=lambda x:str(x.get('publishDate') or ''),reverse=True)
+          print('TOTAL',len(rows))
+          print('\n=== CANDIDATES ===')
+          for row in rows:
+              title=str(row.get('title') or '')
+              pages=int(row.get('attachPages') or 0)
+              if pages>=10 or any(k in title for k in ['深度','首次覆盖','首次','专题','价值分析','全产业链','龙头']):
+                  info=row.get('infoCode')
+                  meta={
+                      'date':str(row.get('publishDate') or '')[:10],
+                      'broker':row.get('orgSName') or row.get('orgName'),
+                      'title':title,'pages':pages,'size_kb':row.get('attachSize'),
+                      'infoCode':info,'rating':row.get('emRatingName') or row.get('sRatingName'),
+                      'researcher':row.get('researcher'),'stockName':row.get('stockName'),
+                  }
+                  print('CANDIDATE',json.dumps(meta,ensure_ascii=False))
+                  if info:
+                      url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+                      try:
+                          rr=session.get(url,headers={'Range':'bytes=0-4095','Accept':'application/pdf,*/*'},timeout=45,allow_redirects=True)
+                          print('PDF',info,rr.status_code,rr.headers.get('content-type'),rr.headers.get('content-range'),len(rr.content),rr.content[:8],rr.url)
+                      except Exception as exc:
+                          print('PDFERR',info,repr(exc))
+          print('\n=== ALL REPORTS ===')
+          for row in rows:
+              print('REPORT',json.dumps({
+                  'date':str(row.get('publishDate') or '')[:10],
+                  'broker':row.get('orgSName') or row.get('orgName'),
+                  'title':row.get('title'),'pages':row.get('attachPages'),
+                  'infoCode':row.get('infoCode'),'rating':row.get('emRatingName') or row.get('sRatingName'),
+                  'stockName':row.get('stockName')
+              },ensure_ascii=False))
+          PY
