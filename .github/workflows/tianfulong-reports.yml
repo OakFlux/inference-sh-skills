@@ -1,0 +1,215 @@
+name: Download Tianfulong broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-reports.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and verify public broker PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+
+          OUT = Path('tianfulong_reports')
+          OUT.mkdir(parents=True, exist_ok=True)
+
+          HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          def parse_json_response(resp: requests.Response):
+              text = resp.text.strip()
+              try:
+                  return resp.json()
+              except Exception:
+                  m = re.match(r'^[^(]+\((.*)\)\s*;?$', text, flags=re.S)
+                  if m:
+                      return json.loads(m.group(1))
+                  raise RuntimeError(f'Not JSON/JSONP: {text[:300]}')
+
+          def query_report_api(qtype: int, begin: str, end: str, code: str | None = None):
+              url = 'https://reportapi.eastmoney.com/report/list'
+              params = {
+                  'pageNo': 1,
+                  'pageSize': 500,
+                  'qType': qtype,
+                  'beginTime': begin,
+                  'endTime': end,
+              }
+              if code:
+                  params['code'] = code
+              r = requests.get(url, params=params, headers=HEADERS, timeout=(20, 120))
+              print('API', r.url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+              r.raise_for_status()
+              obj = parse_json_response(r)
+              data = obj.get('data') if isinstance(obj, dict) else None
+              if isinstance(data, dict):
+                  for key in ('data', 'list', 'items', 'reports'):
+                      if isinstance(data.get(key), list):
+                          return data[key]
+              if isinstance(data, list):
+                  return data
+              for key in ('list', 'items', 'reports'):
+                  if isinstance(obj, dict) and isinstance(obj.get(key), list):
+                      return obj[key]
+              return []
+
+          def field(item: dict, *keys: str) -> str:
+              for key in keys:
+                  value = item.get(key)
+                  if value is not None:
+                      return str(value)
+              return ''
+
+          candidates: list[dict] = []
+          seen = set()
+          queries = [
+              (0, '2025-07-15', '2025-07-25', '603406'),
+              (2, '2025-07-18', '2025-07-24', '603406'),
+              (2, '2025-07-18', '2025-07-24', None),
+              (1, '2025-07-18', '2025-07-24', '603406'),
+          ]
+          for qtype, begin, end, code in queries:
+              try:
+                  rows = query_report_api(qtype, begin, end, code)
+              except Exception as exc:
+                  print('QUERY ERROR', qtype, begin, end, code, repr(exc), flush=True)
+                  continue
+              print('ROWS', qtype, len(rows), flush=True)
+              for item in rows:
+                  title = field(item, 'title', 'reportName', 'reportTitle', 'name')
+                  info = field(item, 'infoCode', 'infocode', 'reportId', 'id')
+                  org = field(item, 'orgSName', 'orgName', 'organization', 'publishOrg')
+                  date = field(item, 'publishDate', 'date', 'publishTime')
+                  if '天富龙' in title:
+                      print('MATCH', json.dumps({'title': title, 'infoCode': info, 'org': org, 'date': date}, ensure_ascii=False), flush=True)
+                      key = info or (title, org, date)
+                      if key not in seen:
+                          seen.add(key)
+                          candidates.append({'title': title, 'infoCode': info, 'org': org, 'date': date, 'raw': item})
+
+          # Known public Eastmoney entry for Huajin report, used as a deterministic fallback.
+          if not any(c.get('infoCode') == 'AP202507201712567083' for c in candidates):
+              candidates.append({
+                  'title': '新股覆盖研究：天富龙',
+                  'infoCode': 'AP202507201712567083',
+                  'org': '华金证券',
+                  'date': '2025-07-20',
+                  'raw': {},
+              })
+
+          # Prefer the two independently authored reports requested.
+          wanted = []
+          for c in candidates:
+              title = c['title']
+              org = c['org']
+              if ('新股覆盖研究' in title and ('华金' in org or c['infoCode'] == 'AP202507201712567083')):
+                  wanted.append(c)
+              elif ('注册制新股纵览' in title and ('申万' in org or '申银万国' in org)):
+                  wanted.append(c)
+
+          # De-duplicate and retain a maximum of three.
+          dedup = []
+          used = set()
+          for c in wanted:
+              if c['infoCode'] and c['infoCode'] not in used:
+                  used.add(c['infoCode'])
+                  dedup.append(c)
+          wanted = dedup[:3]
+
+          def safe_name(text: str) -> str:
+              text = re.sub(r'[\\/:*?"<>|]+', '_', text)
+              text = re.sub(r'\s+', ' ', text).strip()
+              return text[:140]
+
+          downloaded = []
+          for idx, c in enumerate(wanted, 1):
+              info = c['infoCode']
+              if not info:
+                  continue
+              pdf_url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              print('DOWNLOAD', pdf_url, flush=True)
+              r = requests.get(pdf_url, headers=HEADERS, timeout=(30, 180))
+              print('PDF RESPONSE', r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+              r.raise_for_status()
+              if not r.content.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF for {c}: {r.content[:100]!r}')
+              org = c['org'] or '券商'
+              date = (c['date'] or '')[:10]
+              filename = f'{idx:02d}_{safe_name(org)}_{safe_name(c["title"])}_{date}.pdf'
+              path = OUT / filename
+              path.write_bytes(r.content)
+              # Basic page count without an external dependency.
+              page_count = len(re.findall(rb'/Type\s*/Page\b', r.content))
+              print('SAVED', path, len(r.content), 'approx_pages', page_count, flush=True)
+              downloaded.append({
+                  'file': filename,
+                  'title': c['title'],
+                  'organization': org,
+                  'date': date,
+                  'infoCode': info,
+                  'source_url': pdf_url,
+                  'bytes': len(r.content),
+                  'approx_pages': page_count,
+              })
+              time.sleep(1)
+
+          if len(downloaded) < 2:
+              print('ALL CANDIDATES', json.dumps(candidates, ensure_ascii=False, indent=2), flush=True)
+              raise RuntimeError(f'Only downloaded {len(downloaded)} qualifying reports; need at least 2')
+
+          readme = OUT / '报告清单.txt'
+          lines = [
+              '天富龙（603406）券商研究报告',
+              '',
+          ]
+          for i, d in enumerate(downloaded, 1):
+              lines.extend([
+                  f'{i}. {d["organization"]}：《{d["title"]}》',
+                  f'   发布日期：{d["date"]}',
+                  f'   文件：{d["file"]}',
+                  f'   PDF大小：{d["bytes"]} bytes',
+                  '',
+              ])
+          lines.extend([
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          readme.write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'metadata.json').write_text(json.dumps(downloaded, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = Path('天富龙_券商研究报告_2025.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+              for path in sorted(OUT.iterdir()):
+                  zf.write(path, arcname=path.name)
+          print('ZIP', zip_path, zip_path.stat().st_size, flush=True)
+          PY
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tianfulong-broker-reports
+          path: 天富龙_券商研究报告_2025.zip
+          if-no-files-found: error
+          retention-days: 7
