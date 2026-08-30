@@ -1,0 +1,317 @@
+name: Probe exact APIs for public Tianfulong broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-exact-api.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Search public report APIs and package valid PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+
+          OUT = Path('tianfulong_exact')
+          OUT.mkdir(exist_ok=True)
+          session = requests.Session()
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          base_headers = {
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+          sd_headers = {
+              **base_headers,
+              'Accept': 'application/json, text/plain, */*',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'X-Secret-Key': 'secret_key',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+          em_headers = {
+              **base_headers,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+
+          def compact(obj, maxlen=4000):
+              text = json.dumps(obj, ensure_ascii=False, default=str)
+              return text if len(text) <= maxlen else text[:maxlen] + '...'
+
+          def dicts_with_keyword(obj, keyword='天富龙'):
+              out = []
+              def walk(x):
+                  if isinstance(x, dict):
+                      blob = json.dumps(x, ensure_ascii=False, default=str)
+                      if keyword in blob:
+                          out.append(x)
+                      for v in x.values():
+                          walk(v)
+                  elif isinstance(x, list):
+                      for v in x:
+                          walk(v)
+              walk(obj)
+              unique = []
+              seen = set()
+              for d in out:
+                  marker = compact(d, 1500)
+                  if marker not in seen:
+                      seen.add(marker)
+                      unique.append(d)
+              return unique
+
+          def first_value(d, keys):
+              if not isinstance(d, dict):
+                  return None
+              for k in keys:
+                  if k in d and d[k] not in (None, '', []):
+                      return d[k]
+              return None
+
+          found_meta = []
+          candidate_details = []
+          keywords = [
+              '天富龙',
+              '注册制新股纵览 天富龙',
+              '新股覆盖研究 天富龙',
+              '天富龙 国内差别化 再生涤短',
+          ]
+          orders = ['', 'default', 'release_time']
+          for kw in keywords:
+              for order in orders:
+                  params = {
+                      'category_code': '',
+                      'keywords': kw,
+                      'order': order,
+                      'pageNum': 1,
+                      'pageSize': 100,
+                      'brand_code': '',
+                  }
+                  url = 'https://api.sdyanbao.com/discover/report/original_search'
+                  try:
+                      r = session.get(url, params=params, headers=sd_headers, timeout=(25, 120))
+                      print('SD SEARCH', r.url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                      print('SD BODY', r.text[:1200], flush=True)
+                      if r.status_code != 200:
+                          continue
+                      obj = r.json()
+                  except Exception as exc:
+                      print('SD SEARCH ERROR', kw, order, repr(exc), flush=True)
+                      continue
+                  matches = dicts_with_keyword(obj)
+                  print('SD MATCH DICTS', kw, order, len(matches), flush=True)
+                  for d in matches[:50]:
+                      print('SD MATCH', compact(d, 2500), flush=True)
+                      rid = first_value(d, ['rid', 'report_id', 'reportId', 'id', '_id'])
+                      title = str(first_value(d, ['title', 'report_title', 'reportTitle', 'name']) or '')
+                      if rid is not None:
+                          candidate_details.append((str(rid), title, d))
+
+          # De-duplicate candidate report IDs, then call the exact public detail endpoint.
+          seen_rid = set()
+          public_pdf_candidates = []
+          for rid, fallback_title, raw in candidate_details:
+              if rid in seen_rid:
+                  continue
+              seen_rid.add(rid)
+              params = {'rid': rid, 'mark_code': ''}
+              try:
+                  r = session.get('https://api.sdyanbao.com/research/report/detail', params=params, headers=sd_headers, timeout=(25, 120))
+                  print('SD DETAIL', r.url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                  print('SD DETAIL BODY', r.text[:2500], flush=True)
+                  if r.status_code != 200:
+                      continue
+                  obj = r.json()
+              except Exception as exc:
+                  print('SD DETAIL ERROR', rid, repr(exc), flush=True)
+                  continue
+              matches = dicts_with_keyword(obj)
+              data = obj.get('data') if isinstance(obj, dict) else None
+              if isinstance(data, dict):
+                  details = [data] + matches
+              else:
+                  details = matches
+              for d in details:
+                  title = str(first_value(d, ['title', 'report_title', 'reportTitle', 'name']) or fallback_title)
+                  org = str(first_value(d, ['institution_name', 'organization', 'org_name', 'brand_name', 'source']) or '')
+                  pages = first_value(d, ['pages', 'page_count', 'pageCount'])
+                  free = first_value(d, ['free', 'is_free', 'isFree', 'free_status'])
+                  path = first_value(d, ['original_pdf_path', 'originalPdfPath', 'pdf_path', 'pdf_url', 'file_url', 'download_url'])
+                  record = {'rid': rid, 'title': title, 'org': org, 'pages': pages, 'free': free, 'original_pdf_path': path}
+                  if '天富龙' in compact(d, 6000):
+                      print('SD DETAIL MATCH', compact(record), flush=True)
+                      found_meta.append(record)
+                  if path and '天富龙' in (title + compact(d, 6000)):
+                      public_pdf_candidates.append(record)
+
+          # Query all relevant Eastmoney report categories with pagination.
+          em_matches = {}
+          for qtype in [0, 1, 2, 3, 4]:
+              for code in (['603406', None] if qtype in [0, 1, 2, 3] else [None]):
+                  for page in range(1, 31):
+                      params = {
+                          'pageNo': page,
+                          'pageSize': 100,
+                          'qType': qtype,
+                          'beginTime': '2025-06-01',
+                          'endTime': '2026-08-30',
+                      }
+                      if code:
+                          params['code'] = code
+                      try:
+                          r = session.get('https://reportapi.eastmoney.com/report/list', params=params, headers=em_headers, timeout=(20, 120))
+                          if page == 1:
+                              print('EM QUERY', r.url, r.status_code, len(r.content), flush=True)
+                          if r.status_code != 200:
+                              break
+                          obj = r.json()
+                      except Exception as exc:
+                          print('EM ERROR', qtype, code, page, repr(exc), flush=True)
+                          break
+                      rows = obj.get('data') if isinstance(obj, dict) else None
+                      if isinstance(rows, dict):
+                          rows = rows.get('data') or rows.get('list') or rows.get('items') or []
+                      if not isinstance(rows, list) or not rows:
+                          break
+                      for item in rows:
+                          title = str(item.get('title') or item.get('reportTitle') or '')
+                          stock_name = str(item.get('stockName') or '')
+                          if '天富龙' in title or '天富龙' in stock_name:
+                              info = str(item.get('infoCode') or item.get('infocode') or '')
+                              key = info or compact(item, 1200)
+                              em_matches[key] = item
+                              print('EM MATCH', compact(item, 2500), flush=True)
+                      if len(rows) < 100:
+                          break
+
+          # Always include the verified Huajin report as a deterministic public candidate.
+          em_matches.setdefault('AP202507201712567083', {
+              'title': '新股覆盖研究：天富龙',
+              'stockName': '天富龙',
+              'orgSName': '华金证券',
+              'publishDate': '2025-07-21',
+              'infoCode': 'AP202507201712567083',
+              'attachPages': 11,
+          })
+
+          downloaded = []
+          seen_sha = set()
+          def save_pdf(content: bytes, title: str, org: str, date: str, source: str, pages_hint=None):
+              if not content.startswith(b'%PDF-'):
+                  return False
+              sha = hashlib.sha256(content).hexdigest()
+              if sha in seen_sha:
+                  return False
+              seen_sha.add(sha)
+              safe = lambda s: re.sub(r'[\\/:*?"<>|\s]+', '_', str(s)).strip('_')[:90]
+              idx = len(downloaded) + 1
+              filename = f'{idx:02d}_{safe(org or "券商")}_{safe(title)}_{safe(date[:10])}.pdf'
+              path = OUT / filename
+              path.write_bytes(content)
+              pages = len(re.findall(rb'/Type\s*/Page\b', content))
+              rec = {
+                  'file': filename,
+                  'title': title,
+                  'organization': org,
+                  'date': date[:10],
+                  'source_url': source,
+                  'bytes': len(content),
+                  'approx_pages': pages,
+                  'pages_hint': pages_hint,
+                  'sha256': sha,
+              }
+              downloaded.append(rec)
+              print('SAVED', compact(rec), flush=True)
+              return True
+
+          for item in em_matches.values():
+              info = str(item.get('infoCode') or item.get('infocode') or '')
+              if not info:
+                  continue
+              title = str(item.get('title') or item.get('reportTitle') or '天富龙研报')
+              org = str(item.get('orgSName') or item.get('orgName') or item.get('organization') or '券商')
+              date = str(item.get('publishDate') or item.get('date') or '')
+              url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              try:
+                  r = session.get(url, headers=em_headers, timeout=(30, 180))
+                  print('EM PDF', url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                  if r.status_code == 200:
+                      save_pdf(r.content, title, org, date, url, item.get('attachPages'))
+              except Exception as exc:
+                  print('EM PDF ERROR', url, repr(exc), flush=True)
+
+          # Only save Sdyanbao PDFs that the public API explicitly marks free.
+          for rec in public_pdf_candidates:
+              free_raw = rec.get('free')
+              is_free = free_raw in (True, 1, '1', 'true', 'True', '免费', 'free')
+              if not is_free:
+                  print('SD PDF SKIP NONFREE/UNKNOWN', compact(rec), flush=True)
+                  continue
+              raw_url = str(rec.get('original_pdf_path') or '')
+              urls = []
+              if raw_url.startswith('http'):
+                  urls.append(raw_url)
+              else:
+                  clean = raw_url.lstrip('/')
+                  urls.extend([
+                      urljoin('https://file.5kcrm.com/', clean),
+                      urljoin('https://pdf.shuididp.cn/', clean),
+                  ])
+              for url in urls:
+                  try:
+                      r = session.get(url, headers={**base_headers, 'Referer': 'https://www.sdyanbao.com/'}, timeout=(30, 180))
+                      print('SD PDF', url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                      if r.status_code == 200 and save_pdf(r.content, rec.get('title') or '天富龙研报', rec.get('org') or '券商', '', url, rec.get('pages')):
+                          break
+                  except Exception as exc:
+                      print('SD PDF ERROR', url, repr(exc), flush=True)
+
+          (OUT / 'diagnostics.json').write_text(json.dumps({
+              'sdyanbao_metadata': found_meta,
+              'eastmoney_matches': list(em_matches.values()),
+              'downloaded': downloaded,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          lines = ['天富龙（603406）券商研究报告', '']
+          for i, d in enumerate(downloaded, 1):
+              lines += [
+                  f'{i}. {d["organization"]}：《{d["title"]}》',
+                  f'   发布日期：{d["date"]}',
+                  f'   页数：{d["pages_hint"] or d["approx_pages"]}',
+                  f'   文件：{d["file"]}',
+                  '',
+              ]
+          lines.append('资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。')
+          (OUT / '报告清单.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          zip_path = Path('天富龙_券商深度报告_公开完整版.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+              for p in sorted(OUT.iterdir()):
+                  zf.write(p, p.name)
+          print('FINAL COUNT', len(downloaded), 'ZIP', zip_path, zip_path.stat().st_size, flush=True)
+          PY
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tianfulong-exact-api-results
+          path: |
+            tianfulong_exact/
+            天富龙_券商深度报告_公开完整版.zip
+          if-no-files-found: warn
