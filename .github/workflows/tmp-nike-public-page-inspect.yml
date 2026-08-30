@@ -1,0 +1,128 @@
+name: Temporary Nike public report page inspector
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-public-page-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect public report mirrors and downloadable assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages assets diagnostics
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import hashlib, json, re, subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          urls=[
+              ('sgpjbg_nike_2023','https://www.sgpjbg.com/baogao/150331.html'),
+              ('sgpjbg_nike_2023_down','https://www.sgpjbg.com/bgdown/150331.html?dtype=0'),
+              ('hangyan_nike_2023','https://www.hangyan.co/reports/3268347704287168331'),
+              ('fx_nike_q3_2025','https://www.fxbaogao.com/detail/4742006'),
+              ('fx_nike_q4_2025','https://www.fxbaogao.com/detail/4924081'),
+              ('fx_nike_q1_2026','https://www.fxbaogao.com/detail/5083891'),
+              ('fx_nike_q3_2026','https://www.fxbaogao.com/detail/5337859'),
+              ('nxny_global_sports_2026','https://www.nxny.com/report/view_6330325.html'),
+              ('nxny_nike_track_2026','https://www.nxny.com/report/view_6258941.html'),
+          ]
+          manifest=[]
+          for name,url in urls:
+              out=Path('pages')/f'{name}.bin'
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors',
+                   '--retry-delay','1','--connect-timeout','20','--max-time','240','-A',UA,
+                   '-e',url,'-H','Accept-Encoding: identity',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',name,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'ERR',p.stderr[-500:])
+              if p.returncode or not out.exists():
+                  manifest.append({'name':name,'url':url,'error':p.stderr[-1000:]}); continue
+              body=out.read_bytes(); text=None; enc=None
+              for e in ['utf-8','gb18030','gbk','latin1']:
+                  try: text=body.decode(e); enc=e; break
+                  except Exception: pass
+              if text is None:
+                  manifest.append({'name':name,'url':url,'size':len(body),'binary':True}); continue
+              html=Path('pages')/f'{name}.html'; html.write_text(text,encoding='utf-8')
+              title=''
+              m=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              if m: title=' '.join(re.sub(r'<[^>]+>',' ',m.group(1)).split())
+              print('TITLE',name,title)
+              found=[]
+              patterns=[
+                  r'''(?:href|src|data-src|data-original|file|url|pdfUrl|downloadUrl|previewUrl)\s*[:=]\s*["']([^"']+)["']''',
+                  r'''https?://[^\s"'<>]+''',
+                  r'''//[^\s"'<>]+''',
+                  r'''[^\s"'<>]+\.(?:pdf|jpg|jpeg|png|webp)(?:\?[^\s"'<>]*)?''',
+              ]
+              for pat in patterns:
+                  for val in re.findall(pat,text,re.I):
+                      if isinstance(val,tuple): val=val[0]
+                      val=val.replace('\\/','/').replace('&amp;','&').strip()
+                      if not val or val.startswith(('javascript:','#','data:')): continue
+                      full=urljoin(url,val)
+                      if full not in found: found.append(full)
+              interesting=[u for u in found if any(k in u.lower() for k in ['pdf','download','down','file','attach','preview','150331','4742006','4924081','5083891','5337859','6330325','6258941'])]
+              print('INTERESTING',name,len(interesting))
+              for u in interesting[:300]: print('URL',name,u[:1800])
+              # Print source lines likely containing asset metadata.
+              for i,line in enumerate(text.splitlines(),1):
+                  low=line.lower()
+                  if any(k in low for k in ['pdfurl','downloadurl','preview','150331','docid','reportid','fileurl','pagecount','page_count','imageurl','imgurl']):
+                      snip=' '.join(re.sub(r'<[^>]+>',' ',line).split())
+                      if snip: print('LINE',name,i,snip[:2500])
+              manifest.append({'name':name,'url':url,'encoding':enc,'title':title,'size':len(body),'interesting_urls':interesting})
+
+          Path('diagnostics/manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Probe unique interesting asset URLs. Save only public PDFs and page images.
+          all_urls=[]
+          for row in manifest:
+              for u in row.get('interesting_urls') or []:
+                  if u not in all_urls: all_urls.append(u)
+          for i,u in enumerate(all_urls[:800],1):
+              low=u.lower()
+              if not any(ext in low for ext in ['.pdf','.jpg','.jpeg','.png','.webp']) and not any(k in low for k in ['download','down','preview','file']):
+                  continue
+              dest=Path('assets')/f'{i:04d}.bin'
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','3','--retry-all-errors',
+                   '--connect-timeout','15','--max-time','120','-A',UA,'-e','https://www.sgpjbg.com/',
+                   '-H','Accept-Encoding: identity',u,'-o',str(dest)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode or not dest.exists():
+                  dest.unlink(missing_ok=True); continue
+              b=dest.read_bytes(); magic=b[:16]
+              kind='other'; ext='.bin'
+              if b[:4]==b'%PDF': kind='pdf'; ext='.pdf'
+              elif b[:8]==b'\x89PNG\r\n\x1a\n': kind='png'; ext='.png'
+              elif b[:3]==b'\xff\xd8\xff': kind='jpg'; ext='.jpg'
+              elif b[:4] in [b'RIFF']: kind='webp'; ext='.webp'
+              if kind!='other' and dest.stat().st_size>5000:
+                  final=dest.with_suffix(ext); dest.rename(final)
+                  print('ASSET',i,kind,final.stat().st_size,u)
+                  Path('diagnostics/assets.tsv').open('a',encoding='utf-8').write(f'{i}\t{kind}\t{final.stat().st_size}\t{hashlib.sha256(final.read_bytes()).hexdigest()}\t{u}\n')
+              else:
+                  dest.unlink(missing_ok=True)
+          PY
+          ls -lh pages assets diagnostics
+
+      - name: Upload inspection results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-public-page-inspection
+          path: |
+            pages/
+            assets/
+            diagnostics/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
