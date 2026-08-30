@@ -1,0 +1,74 @@
+name: Temporary Dagang broker report catalog
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-catalog.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query public broker report catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          import json, pathlib, urllib.parse, urllib.request
+
+          API='https://reportapi.eastmoney.com/report/list'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          rows={}
+          for page in range(1,21):
+              params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':'2008-01-01','endTime':'2030-12-31','pageNo':str(page),'fields':'',
+                  'qType':'0','orgCode':'','code':'002077','rcode':'','p':str(page),
+                  'pageNum':str(page),'pageNumber':str(page)
+              }
+              url=API+'?'+urllib.parse.urlencode(params)
+              req=urllib.request.Request(url,headers={
+                  'User-Agent':UA,
+                  'Referer':'https://data.eastmoney.com/report/',
+                  'Accept':'application/json,text/plain,*/*',
+              })
+              raw=urllib.request.urlopen(req,timeout=90).read().decode('utf-8','replace').strip()
+              if raw.startswith('datatable(') and raw.endswith(')'):
+                  raw=raw[len('datatable('):-1]
+              obj=json.loads(raw)
+              data=obj.get('data') or []
+              for r in data:
+                  title=r.get('title') or ''
+                  if r.get('stockCode')=='002077' or r.get('stockName')=='大港股份' or '大港股份' in title:
+                      key=r.get('infoCode') or json.dumps(r,ensure_ascii=False,sort_keys=True)
+                      rows[key]=r
+              if len(data)<100:
+                  break
+          vals=list(rows.values())
+          vals.sort(key=lambda r:str(r.get('publishDate') or ''),reverse=True)
+          pathlib.Path('diagnostic/catalog.json').write_text(json.dumps(vals,ensure_ascii=False,indent=2),encoding='utf-8')
+          with open('diagnostic/catalog.tsv','w',encoding='utf-8') as f:
+              f.write('date\tbroker\tpages\ttype\trating\tinfoCode\ttitle\tpdf_url\n')
+              for r in vals:
+                  info=r.get('infoCode') or ''
+                  pdf=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf' if info else ''
+                  row=[str(r.get('publishDate') or '')[:10],r.get('orgSName') or '',r.get('attachPages') or '',r.get('reportType') or '',r.get('ratingName') or '',info,r.get('title') or '',pdf]
+                  f.write('\t'.join(str(v).replace('\t',' ') for v in row)+'\n')
+          print('CATALOG_COUNT',len(vals))
+          print(pathlib.Path('diagnostic/catalog.tsv').read_text(encoding='utf-8'))
+          PY
+
+      - name: Upload catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-broker-report-catalog
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
