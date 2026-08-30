@@ -1,0 +1,52 @@
+name: Temporary Dagang Sina original URL probe
+
+on:
+  push:
+    branches:
+      - tmp/download-dagang-reports-20260830
+    paths:
+      - .github/workflows/tmp-dagang-sina-url-probe.yml
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Probe archived original-report URL endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic payloads
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          for rid in 517993930847 504776077041 359452745437; do
+            endpoint="https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/${rid}/url"
+            echo "=== $rid ==="
+            curl --http1.1 -sS -D "diagnostic/${rid}_headers_nofollow.txt" -o "payloads/${rid}_nofollow.bin" \
+              --connect-timeout 20 --max-time 180 -A "$UA" -e "https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/${rid}/index.phtml" \
+              -H 'Accept-Encoding: identity' "$endpoint" || true
+            curl --http1.1 -L -sS -D "diagnostic/${rid}_headers_follow.txt" -o "payloads/${rid}_follow.bin" \
+              --connect-timeout 30 --max-time 300 --retry 5 --retry-all-errors --retry-delay 1 \
+              -A "$UA" -e "https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/${rid}/index.phtml" \
+              -H 'Accept-Encoding: identity' "$endpoint" || true
+            echo 'NOFOLLOW HEADERS'
+            cat "diagnostic/${rid}_headers_nofollow.txt" || true
+            echo 'FOLLOW HEADERS'
+            cat "diagnostic/${rid}_headers_follow.txt" || true
+            for f in "payloads/${rid}_nofollow.bin" "payloads/${rid}_follow.bin"; do
+              echo "FILE $f SIZE $(stat -c%s "$f" 2>/dev/null || echo 0) MAGIC $(head -c 16 "$f" 2>/dev/null | xxd -p || true) TYPE $(file -b "$f" 2>/dev/null || true)"
+              strings -n 6 "$f" 2>/dev/null | head -40 || true
+            done
+          done
+          ls -lh diagnostic payloads
+
+      - name: Upload probe results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dagang-sina-url-probe
+          path: |
+            diagnostic/
+            payloads/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
