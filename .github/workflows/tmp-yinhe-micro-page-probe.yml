@@ -1,0 +1,78 @@
+name: Temporary Yinhe Micro page source probe
+
+on:
+  push:
+    branches:
+      - tmp/download-yinhe-micro-research-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Inspect report listing and hosting pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import re
+          import requests
+
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+          urls = [
+              'https://stock.stockstar.com/report/data_fn_p7.html',
+              'https://www.baogaobox.com/reports/260416000100559.html',
+              'https://m.sgpjbg.com.cn/info/edd24426b5c5d62edb0efd081f4646f9.html',
+              'https://data.cfi.cn/ybyl/107379/688689.html',
+              'https://news.10jqka.com.cn/field/sr/19700101/57353251.shtml',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=sh688689',
+          ]
+
+          for url in urls:
+              print('\n\n===== URL', url, '=====', flush=True)
+              try:
+                  response = requests.get(url, headers=headers, timeout=90)
+                  print('STATUS', response.status_code, 'TYPE', response.headers.get('content-type'), 'BYTES', len(response.content), 'FINAL', response.url, flush=True)
+                  response.raise_for_status()
+                  encoding = response.apparent_encoding or response.encoding or 'utf-8'
+                  text = response.content.decode(encoding, errors='replace').replace('\\/', '/')
+                  lower = text.lower()
+                  print('ENCODING', encoding, 'TEXTLEN', len(text), flush=True)
+
+                  markers = ['688689', '银河微电', '深耕半导体分立器件', '260416000100559', '.pdf', 'pdfurl', 'downurl', 'download', 'fileurl', '附件']
+                  for marker in markers:
+                      positions = [m.start() for m in re.finditer(re.escape(marker.lower()), lower)]
+                      if positions:
+                          print('MARKER', marker, 'COUNT', len(positions), flush=True)
+                          for pos in positions[:5]:
+                              snippet = text[max(0, pos-1000):pos+2200]
+                              print('CONTEXT', marker, html.unescape(snippet).replace('\n',' ')[:3200], flush=True)
+
+                  all_urls = []
+                  patterns = [
+                      r'https?://[^\"\'<>\s]+',
+                      r'//[^\"\'<>\s]+',
+                      r'href=[\"\']([^\"\']+)[\"\']',
+                      r'src=[\"\']([^\"\']+)[\"\']',
+                  ]
+                  for pattern in patterns:
+                      for value in re.findall(pattern, text, flags=re.I):
+                          if isinstance(value, tuple):
+                              value = value[0]
+                          value = html.unescape(value).replace('\\/', '/')
+                          if any(term in value.lower() for term in ('pdf', 'download', 'report', '688689', '260416000100559', '57353251')):
+                              all_urls.append(value)
+                  print('CANDIDATE URLS', flush=True)
+                  for value in dict.fromkeys(all_urls):
+                      print(value, flush=True)
+              except Exception as exc:
+                  print('ERROR', repr(exc), flush=True)
+          PY
