@@ -1,0 +1,452 @@
+name: Temporary Jiete Biotech annual reports prospectus and latest quarter package
+
+on:
+  push:
+    branches:
+      - 'tmp/jiete-biotech-filings-20260830'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check requests pypdf
+
+      - name: Discover, download, validate and package filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/reports diagnostics
+          cat > /tmp/jiete_filings.py <<'PY'
+          from __future__ import annotations
+
+          import concurrent.futures
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from dataclasses import dataclass
+          from datetime import datetime
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from pypdf import PdfReader
+
+          DIST = Path('dist')
+          REPORTS = DIST / 'reports'
+          DIAG = Path('diagnostics')
+          REPORTS.mkdir(parents=True, exist_ok=True)
+          DIAG.mkdir(parents=True, exist_ok=True)
+
+          STOCK_CODE = '688026'
+          COMPANY_KEYS = ('洁特生物', '广州洁特', '688026')
+          CURRENT_DATE = '2026-08-30'
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151.0 Safari/537.36'
+
+          @dataclass(frozen=True)
+          class Notice:
+              title: str
+              date: str
+              art_code: str
+
+          def clean_title(value: str) -> str:
+              value = re.sub(r'<[^>]+>', '', value or '')
+              return re.sub(r'\s+', '', value).strip()
+
+          def normalize_date(value: Any) -> str:
+              text = str(value or '')
+              match = re.search(r'20\d{2}-\d{2}-\d{2}', text)
+              if match:
+                  return match.group(0)
+              if isinstance(value, (int, float)):
+                  number = float(value)
+                  if number > 10_000_000_000:
+                      number /= 1000.0
+                  try:
+                      return datetime.fromtimestamp(number).strftime('%Y-%m-%d')
+                  except Exception:
+                      pass
+              return text[:10]
+
+          def fetch_notice_page(page: int) -> list[dict[str, Any]]:
+              session = requests.Session()
+              session.headers.update({
+                  'User-Agent': UA,
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                  'Accept-Encoding': 'gzip, deflate',
+              })
+              endpoint = 'https://np-anotice-stock.eastmoney.com/api/security/ann'
+              params = {
+                  'sr': '-1',
+                  'page_size': '100',
+                  'page_index': str(page),
+                  'ann_type': 'A',
+                  'client_source': 'web',
+                  'stock_list': STOCK_CODE,
+              }
+              response = session.get(
+                  endpoint,
+                  params=params,
+                  headers={'Referer': f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html'},
+                  timeout=120,
+              )
+              response.raise_for_status()
+              DIAG.joinpath(f'notices_page_{page}.json').write_bytes(response.content)
+              obj = response.json()
+              return (obj.get('data') or {}).get('list') or obj.get('list') or []
+
+          rows: list[dict[str, Any]] = []
+          page_errors: list[str] = []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
+              future_map = {pool.submit(fetch_notice_page, page): page for page in range(1, 16)}
+              for future in concurrent.futures.as_completed(future_map):
+                  page = future_map[future]
+                  try:
+                      rows.extend(future.result())
+                  except Exception as exc:
+                      page_errors.append(f'page {page}: {exc!r}')
+
+          DIAG.joinpath('page_errors.txt').write_text('\n'.join(page_errors), encoding='utf-8')
+
+          notices: list[Notice] = []
+          seen_codes: set[str] = set()
+          for row in rows:
+              code = str(row.get('art_code') or row.get('artCode') or '')
+              if not code or code in seen_codes:
+                  continue
+              seen_codes.add(code)
+              title = clean_title(str(row.get('title') or row.get('notice_title') or ''))
+              if not title:
+                  continue
+              notices.append(Notice(
+                  title=title,
+                  date=normalize_date(row.get('notice_date') or row.get('display_time')),
+                  art_code=code,
+              ))
+
+          notices.sort(key=lambda n: (n.date, n.art_code), reverse=True)
+          DIAG.joinpath('all_notices.json').write_text(
+              json.dumps([n.__dict__ for n in notices], ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          if not notices:
+              raise RuntimeError(f'No announcement metadata found; page errors: {page_errors}')
+
+          def annual_year(title: str) -> int | None:
+              match = re.search(r'(20\d{2})年年度报告', clean_title(title))
+              return int(match.group(1)) if match else None
+
+          def annual_score(notice: Notice) -> int:
+              title = clean_title(notice.title)
+              year = annual_year(title)
+              if year is None:
+                  return -100000
+              if any(term in title for term in (
+                  '摘要', '英文版', '取消', '审计报告', '社会责任报告', '环境、社会及治理',
+                  'ESG报告', '关于' + str(year) + '年年度报告', '董事会报告', '监事会报告',
+              )):
+                  return -100000
+              score = 0
+              if title.endswith(f'{year}年年度报告'):
+                  score += 500
+              if any(term in title for term in ('修订版', '更新后', '更正版')):
+                  score += 120
+              if '年度报告' in title:
+                  score += 200
+              score += int((notice.date or '0000-00-00').replace('-', '') or 0) // 100
+              return score
+
+          annual_by_year: dict[int, Notice] = {}
+          for year in range(2019, 2026):
+              candidates = [n for n in notices if annual_year(n.title) == year]
+              candidates.sort(key=lambda n: (annual_score(n), n.date), reverse=True)
+              if not candidates or annual_score(candidates[0]) < 0:
+                  relevant = [n.title for n in notices if str(year) in n.title and '年度' in n.title]
+                  raise RuntimeError(f'Missing full annual report for {year}; relevant titles={relevant}')
+              annual_by_year[year] = candidates[0]
+
+          def prospectus_score(notice: Notice) -> int:
+              title = clean_title(notice.title)
+              if '招股说明书' not in title:
+                  return -100000
+              if any(term in title for term in (
+                  '摘要', '提示性公告', '上市公告书', '问询回复', '保荐书', '法律意见书',
+                  '审核问询函', '专项说明', '差异对照表',
+              )):
+                  return -100000
+              score = 0
+              if '首次公开发行股票并在科创板上市招股说明书' in title:
+                  score += 800
+              if '注册稿' in title or '申报稿' in title:
+                  score -= 250
+              else:
+                  score += 300
+              if title.endswith('招股说明书'):
+                  score += 200
+              score += int((notice.date or '0000-00-00').replace('-', '') or 0) // 100
+              return score
+
+          prospectus_candidates = sorted(
+              notices,
+              key=lambda n: (prospectus_score(n), n.date),
+              reverse=True,
+          )
+          if not prospectus_candidates or prospectus_score(prospectus_candidates[0]) < 0:
+              relevant = [n.title for n in notices if '招股' in n.title]
+              raise RuntimeError(f'No final prospectus metadata found; relevant titles={relevant}')
+          prospectus = prospectus_candidates[0]
+
+          def quarter_identity(title: str) -> tuple[int, int] | None:
+              normalized = clean_title(title)
+              match = re.search(r'(20\d{2})年(第一|第三)季度报告', normalized)
+              if not match:
+                  return None
+              quarter = 1 if match.group(2) == '第一' else 3
+              return int(match.group(1)), quarter
+
+          def quarter_score(notice: Notice) -> tuple[int, int, int, str]:
+              title = clean_title(notice.title)
+              identity = quarter_identity(title)
+              if identity is None or any(term in title for term in ('摘要', '英文版', '取消', '更正公告')):
+                  return (-1, -1, -1, '')
+              year, quarter = identity
+              exact = 1 if title.endswith('季度报告') else 0
+              return (year, quarter, exact, notice.date)
+
+          quarterly_candidates = [n for n in notices if quarter_score(n)[0] >= 0]
+          quarterly_candidates.sort(key=quarter_score, reverse=True)
+          if not quarterly_candidates:
+              raise RuntimeError('No quarterly report metadata found')
+          latest_quarter = quarterly_candidates[0]
+          latest_quarter_year, latest_quarter_number = quarter_identity(latest_quarter.title) or (0, 0)
+
+          selected = [
+              {
+                  'kind': 'annual',
+                  'year': year,
+                  'label': '年度报告',
+                  'notice': annual_by_year[year],
+                  'min_pages': 60,
+              }
+              for year in sorted(annual_by_year)
+          ]
+          selected.append({
+              'kind': 'prospectus',
+              'year': 2020,
+              'label': '首次公开发行股票并在科创板上市招股说明书',
+              'notice': prospectus,
+              'min_pages': 150,
+          })
+          selected.append({
+              'kind': 'quarter',
+              'year': latest_quarter_year,
+              'quarter': latest_quarter_number,
+              'label': f'{latest_quarter_year}年第{latest_quarter_number}季度报告',
+              'notice': latest_quarter,
+              'min_pages': 5,
+          })
+
+          DIAG.joinpath('selected_metadata.json').write_text(
+              json.dumps([
+                  {
+                      **{key: value for key, value in item.items() if key != 'notice'},
+                      **item['notice'].__dict__,
+                  }
+                  for item in selected
+              ], ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          chinese_years = {
+              2019: ('二〇一九', '二零一九'),
+              2020: ('二〇二〇', '二零二零'),
+              2021: ('二〇二一', '二零二一'),
+              2022: ('二〇二二', '二零二二'),
+              2023: ('二〇二三', '二零二三'),
+              2024: ('二〇二四', '二零二四'),
+              2025: ('二〇二五', '二零二五'),
+              2026: ('二〇二六', '二零二六'),
+          }
+
+          def fetch_pdf(item: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+              notice: Notice = item['notice']
+              stamp = int(time.time() * 1000)
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H2_{notice.art_code}_1.pdf?{stamp}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{notice.art_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{notice.art_code}_1.pdf?{notice.art_code}.pdf',
+              ]
+              errors: list[str] = []
+              session = requests.Session()
+              headers = {
+                  'User-Agent': UA,
+                  'Referer': f'https://data.eastmoney.com/notices/stock/{STOCK_CODE}.html',
+                  'Accept': 'application/pdf,application/octet-stream,*/*',
+                  'Accept-Encoding': 'identity',
+              }
+              for url in urls:
+                  try:
+                      response = session.get(url, headers=headers, timeout=300, allow_redirects=True)
+                      response.raise_for_status()
+                      raw = response.content
+                      if len(raw) < 50_000 or not raw.startswith(b'%PDF-'):
+                          raise RuntimeError(f'invalid PDF: {len(raw)} bytes, head={raw[:20]!r}')
+                      reader = PdfReader(BytesIO(raw), strict=False)
+                      pages = len(reader.pages)
+                      if pages < item['min_pages']:
+                          raise RuntimeError(f'only {pages} pages; expected >= {item["min_pages"]}')
+
+                      sample_indexes = sorted(set(list(range(min(14, pages))) + [pages - 1]))
+                      sample_text = ''
+                      for index in sample_indexes:
+                          try:
+                              sample_text += ' ' + (reader.pages[index].extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = re.sub(r'\s+', '', sample_text)
+                      if not any(key in compact for key in COMPANY_KEYS):
+                          raise RuntimeError('company identity not found in sampled pages')
+
+                      year = int(item['year'])
+                      year_ok = str(year) in compact or any(token in compact for token in chinese_years.get(year, ()))
+                      if item['kind'] != 'prospectus' and not year_ok:
+                          raise RuntimeError(f'report year {year} not found')
+                      if item['kind'] == 'annual' and '年度报告' not in compact:
+                          raise RuntimeError('annual report identity not found')
+                      if item['kind'] == 'prospectus' and '招股说明书' not in compact:
+                          raise RuntimeError('prospectus identity not found')
+                      if item['kind'] == 'quarter' and '季度报告' not in compact:
+                          raise RuntimeError('quarterly report identity not found')
+
+                      if item['kind'] == 'annual':
+                          filename = f'{year}_洁特生物_年度报告_{pages}页.pdf'
+                      elif item['kind'] == 'prospectus':
+                          filename = f'洁特生物_首次公开发行股票并在科创板上市招股说明书_{pages}页.pdf'
+                      else:
+                          quarter_cn = '第一' if item.get('quarter') == 1 else '第三'
+                          filename = f'{year}_洁特生物_{quarter_cn}季度报告_{pages}页.pdf'
+
+                      destination = REPORTS / filename
+                      destination.write_bytes(raw)
+                      return ({
+                          'kind': item['kind'],
+                          'year': year,
+                          'quarter': item.get('quarter'),
+                          'title': notice.title,
+                          'disclosure_date': notice.date,
+                          'art_code': notice.art_code,
+                          'filename': filename,
+                          'pages': pages,
+                          'size': len(raw),
+                          'sha256': hashlib.sha256(raw).hexdigest(),
+                          'source': '东方财富公告原始PDF镜像',
+                          'url': response.url,
+                      }, None)
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              return (None, {
+                  'kind': item['kind'],
+                  'year': item['year'],
+                  'title': notice.title,
+                  'art_code': notice.art_code,
+                  'errors': errors,
+              })
+
+          results: list[dict[str, Any]] = []
+          failures: list[dict[str, Any]] = []
+          with concurrent.futures.ThreadPoolExecutor(max_workers=9) as pool:
+              future_map = {pool.submit(fetch_pdf, item): item for item in selected}
+              for future in concurrent.futures.as_completed(future_map):
+                  result, failure = future.result()
+                  if result:
+                      results.append(result)
+                      print('OK', json.dumps(result, ensure_ascii=False))
+                  if failure:
+                      failures.append(failure)
+
+          results.sort(key=lambda item: (
+              0 if item['kind'] == 'prospectus' else 1 if item['kind'] == 'annual' else 2,
+              item['year'],
+              item.get('quarter') or 0,
+          ))
+          DIAG.joinpath('results.json').write_text(
+              json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          DIAG.joinpath('failures.json').write_text(
+              json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+
+          expected_count = len(selected)
+          if len(results) != expected_count:
+              raise RuntimeError(f'Expected {expected_count} validated PDFs, got {len(results)}; failures={failures}')
+
+          result_annual_years = sorted(item['year'] for item in results if item['kind'] == 'annual')
+          if result_annual_years != list(range(2019, 2026)):
+              raise RuntimeError(f'Annual-year coverage mismatch: {result_annual_years}')
+          if len([item for item in results if item['kind'] == 'prospectus']) != 1:
+              raise RuntimeError('Prospectus count mismatch')
+          if len([item for item in results if item['kind'] == 'quarter']) != 1:
+              raise RuntimeError('Quarterly-report count mismatch')
+
+          manifest = [
+              '洁特生物（688026）全部年度报告、招股说明书及最新季度报告资料包',
+              '内容：2019—2025年度报告共7份，首次公开发行股票并在科创板上市招股说明书1份，以及截至2026年8月30日最新季度报告1份。',
+              '筛选规则：仅保留完整年度报告，排除年报摘要、英文版、审计附件、ESG/社会责任报告及更正说明；招股说明书优先最终公开版。',
+              '所有PDF均已核验公司名称、报告期、实际页数、PDF结构及SHA-256；ZIP已通过完整性测试。',
+              '资料仅供研究参考，请遵守原公告版权声明和使用限制。',
+              '',
+          ]
+          for index, item in enumerate(results, 1):
+              manifest.extend([
+                  f'{index}. {item["title"]}',
+                  f'   类型：{item["kind"]}',
+                  f'   披露日期：{item["disclosure_date"]}',
+                  f'   页数：{item["pages"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  f'   来源：{item["source"]}',
+                  f'   原始PDF：{item["url"]}',
+                  '',
+              ])
+          REPORTS.joinpath('资料清单与校验信息.txt').write_text('\n'.join(manifest), encoding='utf-8')
+
+          final_zip = DIST / '洁特生物_全部年报_招股说明书及最新季报_完整原始PDF.zip'
+          with zipfile.ZipFile(final_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(REPORTS.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(final_zip, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity error: {bad}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != expected_count:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_names}')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size)
+          PY
+          python /tmp/jiete_filings.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiete-biotech-all-annuals-prospectus-latest-quarter
+          path: dist/洁特生物_全部年报_招股说明书及最新季报_完整原始PDF.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiete-biotech-filings-diagnostics
+          path: diagnostics/
+          if-no-files-found: warn
+          retention-days: 2
+          compression-level: 9
