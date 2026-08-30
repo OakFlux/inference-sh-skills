@@ -1,0 +1,297 @@
+name: Discover Mengtaigaoxin research reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mengtaigaoxin-report-discovery-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF tools
+        run: |
+          python -m pip install --quiet pypdf
+
+      - name: Query public report indexes and download candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          company = '蒙泰高新'
+          code = '300876'
+          out = Path('mengtaigaoxin_discovery')
+          out.mkdir(exist_ok=True)
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          em_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+          sd_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json, text/plain, */*',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Device': '1',
+              'X-Token': '',
+          }
+
+          def as_rows(obj):
+              if isinstance(obj, list):
+                  return obj
+              if not isinstance(obj, dict):
+                  return []
+              data = obj.get('data')
+              if isinstance(data, list):
+                  return data
+              if isinstance(data, dict):
+                  for key in ('data', 'list', 'items', 'rows', 'reports'):
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          return value
+              for key in ('list', 'items', 'rows', 'reports'):
+                  value = obj.get(key)
+                  if isinstance(value, list):
+                      return value
+              return []
+
+          def blob(item):
+              return json.dumps(item, ensure_ascii=False, default=str)
+
+          matches = {}
+          diagnostics = []
+
+          # Eastmoney individual/company report API.
+          for qtype in range(0, 6):
+              for page in range(1, 8):
+                  params = {
+                      'pageNo': page,
+                      'pageSize': 100,
+                      'code': code,
+                      'qType': qtype,
+                      'beginTime': '2019-01-01',
+                      'endTime': '2026-08-30',
+                  }
+                  try:
+                      r = session.get(
+                          'https://reportapi.eastmoney.com/report/list',
+                          params=params,
+                          headers=em_headers,
+                          timeout=(30, 120),
+                      )
+                      diagnostics.append({
+                          'source': 'eastmoney', 'qtype': qtype, 'page': page,
+                          'status': r.status_code, 'bytes': len(r.content),
+                          'url': r.url, 'head': r.text[:180],
+                      })
+                      if r.status_code != 200 or not r.content:
+                          break
+                      obj = r.json()
+                  except Exception as exc:
+                      diagnostics.append({'source': 'eastmoney', 'qtype': qtype, 'page': page, 'error': repr(exc)})
+                      break
+                  rows = as_rows(obj)
+                  if not rows:
+                      break
+                  for item in rows:
+                      text = blob(item)
+                      stock_code = str(item.get('stockCode') or item.get('code') or item.get('securityCode') or '')
+                      if company in text or stock_code == code:
+                          info = str(item.get('infoCode') or item.get('infocode') or item.get('reportId') or item.get('id') or '')
+                          key = info or hashlib.sha256(text.encode('utf-8')).hexdigest()
+                          matches[key] = {'source': 'eastmoney', **item}
+                  if len(rows) < 100:
+                      break
+
+          # Public Sdyanbao search index, useful for older and sparse coverage.
+          for keyword in (company, code, f'{company} 深度', f'{company} 首次覆盖', f'{company} 公司研究'):
+              body = {'keyword': keyword, 'page': 1, 'pageSize': 100, 'opFrom': 1}
+              try:
+                  r = session.post(
+                      'https://api.sdyanbao.com/api/file/search',
+                      headers=sd_headers,
+                      json=body,
+                      timeout=(30, 120),
+                  )
+                  diagnostics.append({
+                      'source': 'sdyanbao', 'keyword': keyword,
+                      'status': r.status_code, 'bytes': len(r.content),
+                      'head': r.text[:180],
+                  })
+                  if r.status_code != 200:
+                      continue
+                  obj = r.json()
+              except Exception as exc:
+                  diagnostics.append({'source': 'sdyanbao', 'keyword': keyword, 'error': repr(exc)})
+                  continue
+              data = obj.get('data') if isinstance(obj, dict) else None
+              files = data.get('files') if isinstance(data, dict) else None
+              if not isinstance(files, list):
+                  continue
+              for item in files:
+                  text = blob(item)
+                  stock = item.get('stock') if isinstance(item.get('stock'), dict) else {}
+                  if company not in text and str(stock.get('code') or '') != code:
+                      continue
+                  uid = str(item.get('data_source_uuid') or item.get('id') or '')
+                  key = f'sd-{uid}'
+                  matches[key] = {'source': 'sdyanbao', **item}
+
+          (out / 'all_matches.json').write_text(
+              json.dumps(list(matches.values()), ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          (out / 'diagnostics.json').write_text(
+              json.dumps(diagnostics, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          candidates = []
+          for key, item in matches.items():
+              source = item.get('source')
+              if source == 'eastmoney':
+                  info = str(item.get('infoCode') or item.get('infocode') or '')
+                  if not info:
+                      continue
+                  title = str(item.get('title') or item.get('reportTitle') or '')
+                  org = str(item.get('orgSName') or item.get('orgName') or item.get('organization') or '')
+                  date = str(item.get('publishDate') or item.get('date') or '')[:10]
+                  hint = item.get('attachPages') or item.get('pageCount') or item.get('pages')
+              else:
+                  uuid = str(item.get('data_source_uuid') or '')
+                  if not uuid.startswith('AP'):
+                      continue
+                  info = uuid
+                  title = str(item.get('name') or item.get('summary') or '')
+                  orgobj = item.get('organization') if isinstance(item.get('organization'), dict) else {}
+                  org = str(orgobj.get('name') or '')
+                  date = str(item.get('time_text') or '')[:10]
+                  hint = item.get('page_count')
+              candidates.append({
+                  'infoCode': info,
+                  'title': title,
+                  'organization': org,
+                  'date': date,
+                  'pages_hint': hint,
+                  'metadata_source': source,
+              })
+
+          # Dedupe by infoCode.
+          dedup = {}
+          for item in candidates:
+              dedup[item['infoCode']] = item
+          candidates = list(dedup.values())
+          downloaded = []
+          seen_sha = set()
+
+          def safe_name(value):
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', str(value)).strip('_')[:95]
+
+          for item in candidates:
+              info = item['infoCode']
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+              ]
+              content = b''
+              used_url = ''
+              for url in urls:
+                  for attempt in range(3):
+                      try:
+                          r = session.get(
+                              url,
+                              headers={**em_headers, 'Accept': 'application/pdf,*/*;q=0.8'},
+                              timeout=(30, 180),
+                          )
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-'):
+                              content = r.content
+                              used_url = url
+                              break
+                      except Exception:
+                          pass
+                      time.sleep(1 + attempt)
+                  if content:
+                      break
+              if not content:
+                  continue
+              sha = hashlib.sha256(content).hexdigest()
+              if sha in seen_sha:
+                  continue
+              seen_sha.add(sha)
+              tmp = out / f'_tmp_{info}.pdf'
+              tmp.write_bytes(content)
+              try:
+                  reader = PdfReader(str(tmp))
+                  pages = len(reader.pages)
+                  extracted = ''
+                  for page in reader.pages[:6]:
+                      extracted += (page.extract_text() or '') + '\n'
+              except Exception as exc:
+                  tmp.unlink(missing_ok=True)
+                  diagnostics.append({'source': 'pdf-parse', 'infoCode': info, 'error': repr(exc)})
+                  continue
+              if company not in extracted and code not in extracted:
+                  # Keep only documents verifiably about the company.
+                  tmp.unlink(missing_ok=True)
+                  continue
+              filename = f"{len(downloaded)+1:02d}_{safe_name(item['organization'] or '券商')}_{safe_name(item['title'] or company)}_{safe_name(item['date'])}.pdf"
+              final_path = out / filename
+              tmp.rename(final_path)
+              downloaded.append({
+                  **item,
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(content),
+                  'sha256': sha,
+                  'source_url': used_url,
+                  'first_pages_text': extracted[:4000],
+              })
+
+          (out / 'downloaded_candidates.json').write_text(
+              json.dumps(downloaded, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          lines = [f'{company}（{code}）公开券商研报候选清单', '']
+          for i, item in enumerate(downloaded, 1):
+              lines += [
+                  f"{i}. {item['organization']}：《{item['title']}》",
+                  f"   日期：{item['date']}；页数：{item['pages']}页；文件：{item['filename']}",
+                  '',
+              ]
+          (out / '候选清单.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          with zipfile.ZipFile('蒙泰高新_券商研报候选.zip', 'w', zipfile.ZIP_DEFLATED) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path, arcname=path.name)
+          print('MATCHES', len(matches), 'CANDIDATES', len(candidates), 'DOWNLOADED', len(downloaded), flush=True)
+          for item in downloaded:
+              print(json.dumps({k: item.get(k) for k in ('organization','title','date','pages','filename','infoCode')}, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload discovery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mengtaigaoxin-report-discovery
+          path: |
+            mengtaigaoxin_discovery/
+            蒙泰高新_券商研报候选.zip
+          if-no-files-found: error
+          retention-days: 7
