@@ -1,0 +1,132 @@
+name: Deep search Eastmoney for Tianfulong reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tianfulong-eastmoney-deep-search.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Search all report categories and pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          import requests
+
+          url='https://reportapi.eastmoney.com/report/list'
+          H={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+            'Accept':'application/json,text/plain,*/*',
+            'Referer':'https://data.eastmoney.com/report/',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          def parse(r):
+            try:return r.json()
+            except Exception:
+              m=re.search(r'^[^(]*\((.*)\)\s*;?$',r.text,re.S)
+              return json.loads(m.group(1)) if m else None
+
+          def rows_and_pages(obj):
+            if not isinstance(obj,dict):return [],None,None
+            rows=[]; pages=None; total=None
+            data=obj.get('data')
+            if isinstance(data,list): rows=data
+            elif isinstance(data,dict):
+              for k in ('data','list','items','reports','rows'):
+                if isinstance(data.get(k),list): rows=data[k]; break
+              for k in ('TotalPage','totalPage','pages','pageCount'):
+                if data.get(k) is not None: pages=data.get(k); break
+              for k in ('TotalCount','totalCount','total','count','hits'):
+                if data.get(k) is not None: total=data.get(k); break
+            if not rows:
+              for k in ('data','list','items','reports','rows'):
+                if isinstance(obj.get(k),list): rows=obj[k]; break
+            for k in ('TotalPage','totalPage','pages','pageCount'):
+              if obj.get(k) is not None: pages=obj.get(k); break
+            for k in ('TotalCount','totalCount','total','count','hits'):
+              if obj.get(k) is not None: total=obj.get(k); break
+            return rows,pages,total
+
+          def val(row,*keys):
+            for k in keys:
+              if row.get(k) is not None:return str(row.get(k))
+            return ''
+
+          matches=[]
+          seen=set()
+          # Single-day and tight-window searches reduce pagination volume.
+          windows=[('2025-07-20','2025-07-22'),('2025-07-01','2025-08-15')]
+          for qtype in range(0,13):
+            for begin,end in windows:
+              for page in range(1,31):
+                params={'pageNo':page,'pageSize':100,'qType':qtype,'beginTime':begin,'endTime':end}
+                try:
+                  r=requests.get(url,params=params,headers=H,timeout=(20,120))
+                  print('\nREQ',r.url,'STATUS',r.status_code,'BYTES',len(r.content),flush=True)
+                  r.raise_for_status(); obj=parse(r)
+                except Exception as e:
+                  print('ERROR',repr(e),flush=True); break
+                rows,pages,total=rows_and_pages(obj)
+                print('META qtype',qtype,'window',begin,end,'page',page,'rows',len(rows),'pages',pages,'total',total,flush=True)
+                if page==1:
+                  print('SCHEMA',json.dumps(obj,ensure_ascii=False)[:2500],flush=True)
+                if not rows: break
+                for row in rows:
+                  title=val(row,'title','reportName','reportTitle','name')
+                  org=val(row,'orgSName','orgName','organization','publishOrg')
+                  author=val(row,'researcher','researcherName','author','authors')
+                  code=val(row,'stockCode','code','secuCode','securityCode')
+                  info=val(row,'infoCode','infocode','reportId','id')
+                  date=val(row,'publishDate','date','publishTime')
+                  blob=' '.join((title,org,author,code,info,json.dumps(row,ensure_ascii=False)))
+                  if any(x in blob for x in ['天富龙','806412714702','彭文玉','任奕璇','国内差别化和再生涤短产能规模靠前企业']):
+                    key=info or json.dumps(row,sort_keys=True,ensure_ascii=False)
+                    if key not in seen:
+                      seen.add(key); matches.append(row)
+                      print('MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+                if pages is not None:
+                  try:
+                    if page>=int(pages):break
+                  except Exception:pass
+                if len(rows)<100: break
+                time.sleep(.25)
+
+          # Also test the code-specific individual-stock endpoint over a broad window.
+          for qtype in range(0,13):
+            params={'pageNo':1,'pageSize':500,'qType':qtype,'beginTime':'2025-01-01','endTime':'2026-08-30','code':'603406'}
+            try:
+              r=requests.get(url,params=params,headers=H,timeout=(20,120)); r.raise_for_status(); obj=parse(r)
+              rows,_,_=rows_and_pages(obj)
+              print('\nCODE SEARCH QTYPE',qtype,'ROWS',len(rows),flush=True)
+              for row in rows:
+                print('CODE ROW',json.dumps(row,ensure_ascii=False),flush=True)
+                blob=json.dumps(row,ensure_ascii=False)
+                if '天富龙' in blob:
+                  info=val(row,'infoCode','infocode','reportId','id')
+                  key=info or blob
+                  if key not in seen:seen.add(key);matches.append(row)
+            except Exception as e:print('CODE ERROR',qtype,repr(e),flush=True)
+
+          print('\n===== FINAL MATCHES',len(matches),flush=True)
+          print(json.dumps(matches,ensure_ascii=False,indent=2),flush=True)
+
+          # Verify likely direct PDFs for every matched infoCode.
+          for row in matches:
+            info=val(row,'infoCode','infocode','reportId','id')
+            if not info or not info.startswith('AP'):continue
+            for suffix in ('_1.pdf','_0.pdf','.pdf'):
+              pdf=f'https://pdf.dfcfw.com/pdf/H3_{info}{suffix}'
+              try:
+                rr=requests.get(pdf,headers=H,timeout=(20,120),allow_redirects=True)
+                print('PDF PROBE',pdf,rr.status_code,rr.headers.get('content-type'),len(rr.content),rr.content[:8],flush=True)
+              except Exception as e:print('PDF ERROR',pdf,repr(e),flush=True)
+          PY
