@@ -1,0 +1,94 @@
+name: Temporary Yinhe Micro Vzkoo and Ruishu probe
+
+on:
+  push:
+    branches:
+      - tmp/download-yinhe-micro-research-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Inspect public document pages and API hints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          from urllib.parse import urljoin
+
+          import requests
+
+          H = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Connection': 'close',
+          }
+
+          urls = [
+              'https://www.vzkoo.com/document/202505125f7709b25db227cd846dcc47.html',
+              'https://www.vzkoo.com/read/20250513b0f3f72188b872f53954370b.html',
+              'https://www.ruishubaogao.com/report-detail/10018',
+              'https://www.ruishubaogao.com/api/report-detail/10018',
+              'https://www.ruishubaogao.com/api/report/10018',
+          ]
+
+          def decode(resp):
+              for enc in [resp.encoding, resp.apparent_encoding, 'utf-8', 'gb18030']:
+                  if not enc:
+                      continue
+                  try:
+                      text = resp.content.decode(enc)
+                  except Exception:
+                      continue
+                  if '<html' in text.lower() or '{' in text:
+                      return text
+              return resp.content.decode('utf-8', errors='replace')
+
+          for url in urls:
+              print('\n\n===== FETCH', url, '=====', flush=True)
+              try:
+                  r = requests.get(url, headers=H, timeout=(25,120), allow_redirects=True)
+                  print('STATUS', r.status_code, 'FINAL', r.url, 'TYPE', r.headers.get('content-type'), 'BYTES', len(r.content), flush=True)
+                  text = decode(r).replace('\\/', '/')
+                  print('TEXTLEN', len(text), flush=True)
+                  print('HEAD', text[:1500].replace('\n',' '), flush=True)
+
+                  for marker in [
+                      '202505125f7709b25db227cd846dcc47', '10018', '__NEXT_DATA__', 'nuxt',
+                      'pdf', 'download', 'fileUrl', 'file_url', 'sourceUrl', 'source_url',
+                      'document', 'report-detail', 'oss', 'cos', 'cdn', 'api/', 'graphql'
+                  ]:
+                      positions = [m.start() for m in re.finditer(re.escape(marker.lower()), text.lower())]
+                      if positions:
+                          print('\nMARKER', marker, 'COUNT', len(positions), flush=True)
+                          for pos in positions[:15]:
+                              print('CONTEXT', html.unescape(text[max(0,pos-900):pos+2200]).replace('\n',' ')[:3100], flush=True)
+
+                  links=[]
+                  for pattern in [
+                      r'https?://[^\"\'<>\s]+',
+                      r'//[^\"\'<>\s]+',
+                      r'href\s*=\s*[\"\']([^\"\']+)[\"\']',
+                      r'src\s*=\s*[\"\']([^\"\']+)[\"\']',
+                  ]:
+                      for value in re.findall(pattern, text, flags=re.I):
+                          if isinstance(value, tuple): value=value[0]
+                          value=html.unescape(value).replace('\\/','/')
+                          absolute=urljoin(r.url,value)
+                          if any(k in absolute.lower() for k in ('pdf','download','document','report','api','_next','js')):
+                              links.append(absolute)
+                  print('\nLINKS', len(set(links)), flush=True)
+                  for link in list(dict.fromkeys(links))[:300]:
+                      print('LINK', link, flush=True)
+              except Exception as exc:
+                  print('ERROR', repr(exc), flush=True)
+          PY
