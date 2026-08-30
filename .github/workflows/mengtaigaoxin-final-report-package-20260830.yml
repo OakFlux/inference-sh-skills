@@ -1,0 +1,256 @@
+name: Package final Mengtaigaoxin broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mengtaigaoxin-final-report-package-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF and image dependencies
+        run: |
+          python -m pip install --quiet pypdf pillow img2pdf
+
+      - name: Download, reconstruct, verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE_NAME = '蒙泰高新_券商深度报告_3份_公开完整版'
+          out = Path(PACKAGE_NAME)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_mengtaigaoxin_work')
+          work.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              'Referer': 'https://www.sdyanbao.com/',
+          }
+
+          records = []
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for block in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(block)
+              return h.hexdigest()
+
+          def get_bytes(url: str, accept: str, attempts: int = 6) -> bytes:
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      r = session.get(
+                          url,
+                          headers={**headers, 'Accept': accept},
+                          timeout=(30, 240),
+                      )
+                      print('GET', url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                      if r.status_code == 200 and r.content:
+                          return r.content
+                      last = RuntimeError(f'HTTP {r.status_code}, {len(r.content)} bytes')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(2 * (attempt + 1))
+              raise RuntimeError(f'Unable to download {url}: {last}')
+
+          def make_pdf_from_public_pages(
+              *,
+              organization: str,
+              title: str,
+              report_date: str,
+              indexed_date: str,
+              base_url: str,
+              page_count: int,
+              filename: str,
+          ) -> None:
+              page_dir = work / filename.removesuffix('.pdf')
+              page_dir.mkdir(parents=True, exist_ok=True)
+              image_paths: list[Path] = []
+              dimensions = []
+              for number in range(page_count):
+                  url = f'{base_url}/{number}.png'
+                  content = get_bytes(url, 'image/png,image/*;q=0.9,*/*;q=0.7')
+                  image_path = page_dir / f'{number:03d}.png'
+                  image_path.write_bytes(content)
+                  try:
+                      with Image.open(io.BytesIO(content)) as im:
+                          im.verify()
+                      with Image.open(image_path) as im:
+                          width, height = im.size
+                          fmt = im.format
+                  except Exception as exc:
+                      raise RuntimeError(f'Invalid image page {number} from {url}: {exc}') from exc
+                  if width < 700 or height < 900:
+                      raise RuntimeError(f'Unexpectedly small page image {number}: {width}x{height}')
+                  if fmt not in {'PNG', 'JPEG', 'WEBP'}:
+                      raise RuntimeError(f'Unexpected image format on page {number}: {fmt}')
+                  dimensions.append((width, height))
+                  image_paths.append(image_path)
+
+              target = out / filename
+              target.write_bytes(img2pdf.convert([str(path) for path in image_paths]))
+              reader = PdfReader(str(target))
+              actual_pages = len(reader.pages)
+              if actual_pages != page_count:
+                  raise RuntimeError(f'Page count mismatch for {filename}: {actual_pages} != {page_count}')
+              records.append({
+                  'organization': organization,
+                  'title': title,
+                  'report_date': report_date,
+                  'public_index_date': indexed_date,
+                  'pages': actual_pages,
+                  'filename': filename,
+                  'source_page_url': base_url,
+                  'source_format': '公开逐页原图合成为PDF，未改动页面内容',
+                  'bytes': target.stat().st_size,
+                  'sha256': sha256_file(target),
+                  'image_dimensions': dimensions,
+              })
+              print('CREATED', filename, actual_pages, target.stat().st_size, flush=True)
+
+          def download_original_pdf(
+              *,
+              organization: str,
+              title: str,
+              report_date: str,
+              indexed_date: str,
+              url: str,
+              expected_pages: int,
+              filename: str,
+          ) -> None:
+              content = get_bytes(url, 'application/pdf,*/*;q=0.8')
+              if not content.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Non-PDF response for {url}')
+              target = out / filename
+              target.write_bytes(content)
+              reader = PdfReader(str(target))
+              actual_pages = len(reader.pages)
+              if actual_pages != expected_pages:
+                  raise RuntimeError(f'Page count mismatch for {filename}: {actual_pages} != {expected_pages}')
+              first_text = '\n'.join((page.extract_text() or '') for page in reader.pages[:3])
+              if '蒙泰高新' not in first_text or '300876' not in first_text:
+                  raise RuntimeError(f'Company identity check failed for {filename}')
+              records.append({
+                  'organization': organization,
+                  'title': title,
+                  'report_date': report_date,
+                  'public_index_date': indexed_date,
+                  'pages': actual_pages,
+                  'filename': filename,
+                  'source_page_url': url,
+                  'source_format': '公开原始PDF',
+                  'bytes': target.stat().st_size,
+                  'sha256': sha256_file(target),
+              })
+              print('DOWNLOADED', filename, actual_pages, target.stat().st_size, flush=True)
+
+          make_pdf_from_public_pages(
+              organization='东北证券',
+              title='丙纶长丝行业领跑者，双基地强势进军碳纤维',
+              report_date='2023-06-13',
+              indexed_date='2023-06-15',
+              base_url='https://oss.sdyanbao.com/page/2023/6/15/555344',
+              page_count=33,
+              filename='01_东北证券_蒙泰高新_丙纶长丝行业领跑者_双基地强势进军碳纤维_2023-06-13_33页.pdf',
+          )
+
+          download_original_pdf(
+              organization='海通国际',
+              title='公司公告点评：上半年业绩承压，授予限制性股票彰显发展信心',
+              report_date='2023-08-21',
+              indexed_date='2023-08-25',
+              url='https://pdf.dfcfw.com/pdf/H3_AP202308251595831687_1.pdf',
+              expected_pages=12,
+              filename='02_海通国际_蒙泰高新_上半年业绩承压_授予限制性股票彰显发展信心_2023-08-21_12页.pdf',
+          )
+
+          make_pdf_from_public_pages(
+              organization='海通国际',
+              title='公司年报点评：短期业绩承压，积极推进碳纤维项目落地',
+              report_date='2024-04-02',
+              indexed_date='2024-04-15',
+              base_url='https://oss.sdyanbao.com/page/2024/4/15/971902',
+              page_count=10,
+              filename='03_海通国际_蒙泰高新_短期业绩承压_积极推进碳纤维项目落地_2024-04-02_10页.pdf',
+          )
+
+          # Verify uniqueness and write user-facing documentation.
+          if len(records) != 3:
+              raise RuntimeError(f'Expected 3 reports, got {len(records)}')
+          if len({r['sha256'] for r in records}) != 3:
+              raise RuntimeError('Duplicate PDFs detected')
+
+          lines = [
+              '蒙泰高新（300876）券商研究报告包',
+              '',
+              '本包共3份完整报告。其中东北证券33页报告为公司深度研究；另外两份为内容较完整的公司跟踪/年报点评。',
+              '已排除4页短评、可转债报告、招股说明书、摘要及付费预览。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {record['organization']}：《{record['title']}》",
+                  f"   报告日期：{record['report_date']}；公开索引日期：{record['public_index_date']}；页数：{record['pages']}页",
+                  f"   文件：{record['filename']}",
+                  f"   获取形式：{record['source_format']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头/结构、实际页数、公司名称与证券代码（原始PDF）、公开页面连续性、文件哈希、ZIP CRC。',
+              '逐页公开原图生成的PDF仅改变文件容器，页面内容和顺序保持不变。',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          with (out / 'SHA256SUMS.txt').open('w', encoding='utf-8') as f:
+              for record in records:
+                  f.write(f"{record['sha256']}  {record['filename']}\n")
+
+          zip_path = Path(f'{PACKAGE_NAME}.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path, arcname=f'{PACKAGE_NAME}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_members = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_members) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdf_members)} PDFs instead of 3')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, flush=True)
+          print(json.dumps(records, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: mengtaigaoxin-final-reports
+          path: |
+            蒙泰高新_券商深度报告_3份_公开完整版/
+            蒙泰高新_券商深度报告_3份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
