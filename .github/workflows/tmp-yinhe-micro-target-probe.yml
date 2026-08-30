@@ -1,0 +1,148 @@
+name: Temporary Yinhe Micro targeted report source probe
+
+on:
+  push:
+    branches:
+      - tmp/download-yinhe-micro-research-20260830
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Probe candidate pages and files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+
+          H = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Connection': 'close',
+          }
+
+          pages = [
+              'https://data.cfi.cn/ybdata.aspx?id=20260416000363',
+              'https://data.cfi.cn/bigimage.aspx?stockid=107379&date=20260416',
+              'https://www.sgpjbg.com.cn/baogao/1192267.html',
+              'https://www.sgpjbg.com/baogao/1192267.html',
+              'https://m.sgpjbg.com.cn/baogao/1192267.html',
+              'https://m.sgpjbg.com.cn/info/edd24426b5c5d62edb0efd081f4646f9.html',
+              'https://www.baogaobox.com/reports/260416000100559.html',
+          ]
+
+          candidate_files = [
+              'https://file.sgpjbg.com/BookSublimate/1192267.pdf',
+              'https://file.sgpjbg.com/BookSublimateFile/1192267.pdf',
+              'https://file.sgpjbg.com/Book/1192267.pdf',
+              'https://file.sgpjbg.com/PDF/1192267.pdf',
+              'https://file.sgpjbg.com/UploadFile/1192267.pdf',
+              'https://www.sgpjbg.com.cn/baogao/down/1192267.html',
+              'https://www.sgpjbg.com/baogao/down/1192267.html',
+          ]
+
+          def decode_content(resp: requests.Response) -> str:
+              candidates = [resp.encoding, resp.apparent_encoding, 'utf-8', 'gb18030', 'gbk']
+              for enc in candidates:
+                  if not enc:
+                      continue
+                  try:
+                      text = resp.content.decode(enc)
+                  except Exception:
+                      continue
+                  if any(k in text for k in ('银河微电', '中财网', '三个皮匠', '招股说明书', '<html')):
+                      return text
+              return resp.content.decode('utf-8', errors='replace')
+
+          for url in pages:
+              print('\n\n================ PAGE', url, '================', flush=True)
+              try:
+                  r = requests.get(url, headers=H, timeout=(25,120), allow_redirects=True)
+                  print('STATUS', r.status_code, 'FINAL', r.url, 'TYPE', r.headers.get('content-type'), 'BYTES', len(r.content), flush=True)
+                  r.raise_for_status()
+                  text = decode_content(r).replace('\\/', '/')
+                  print('TEXTLEN', len(text), flush=True)
+
+                  title = re.search(r'<title[^>]*>(.*?)</title>', text, flags=re.I|re.S)
+                  if title:
+                      print('TITLE', html.unescape(re.sub(r'<[^>]+>', '', title.group(1))).strip(), flush=True)
+
+                  hidden = re.findall(r'<input\b[^>]*>', text, flags=re.I|re.S)
+                  print('HIDDEN/INPUT TAGS', len(hidden), flush=True)
+                  for tag in hidden[:100]:
+                      if any(k in tag.lower() for k in ('value=', 'book', 'file', 'report', 'pdf', 'id=', 'download')):
+                          print('INPUT', html.unescape(tag)[:1000], flush=True)
+
+                  markers = [
+                      '1192267', '20260416000363', '260416000100559', 'BookSublimate',
+                      'download', 'DownLoad', '.pdf', 'pdfurl', 'fileurl', 'filepath',
+                      'bookid', 'infoid', 'reportid', 'documentid', 'ajax', 'api/',
+                      '银河微电', '华源证券', '深耕半导体分立器件'
+                  ]
+                  lower = text.lower()
+                  for marker in markers:
+                      positions = [m.start() for m in re.finditer(re.escape(marker.lower()), lower)]
+                      if positions:
+                          print('\nMARKER', marker, 'COUNT', len(positions), flush=True)
+                          for pos in positions[:10]:
+                              snippet = text[max(0,pos-900):pos+2000]
+                              print('CONTEXT', html.unescape(snippet).replace('\n',' ')[:2900], flush=True)
+
+                  found = []
+                  for pattern in [
+                      r'https?://[^\"\'<>\s]+',
+                      r'//[^\"\'<>\s]+',
+                      r'href\s*=\s*[\"\']([^\"\']+)[\"\']',
+                      r'src\s*=\s*[\"\']([^\"\']+)[\"\']',
+                      r'url\s*[:=]\s*[\"\']([^\"\']+)[\"\']',
+                  ]:
+                      for value in re.findall(pattern, text, flags=re.I):
+                          if isinstance(value, tuple):
+                              value = value[0]
+                          value = html.unescape(value).replace('\\/', '/')
+                          absolute = urljoin(r.url, value)
+                          if any(k in absolute.lower() for k in ('pdf', 'download', 'down/', '1192267', '20260416000363', 'book', 'report', 'file.sgpjbg')):
+                              found.append(absolute)
+                  print('\nCANDIDATE LINKS', len(set(found)), flush=True)
+                  for link in dict.fromkeys(found):
+                      print('LINK', link, flush=True)
+              except Exception as exc:
+                  print('PAGE ERROR', repr(exc), flush=True)
+
+          out = Path('candidate_files')
+          out.mkdir(exist_ok=True)
+          for i, url in enumerate(candidate_files, 1):
+              print('\n\n================ FILE', url, '================', flush=True)
+              try:
+                  r = requests.get(url, headers={**H, 'Referer':'https://www.sgpjbg.com.cn/'}, timeout=(25,180), allow_redirects=True)
+                  print('STATUS', r.status_code, 'FINAL', r.url, 'TYPE', r.headers.get('content-type'), 'BYTES', len(r.content), 'HEAD', r.content[:20], flush=True)
+                  if r.status_code == 200 and len(r.content) > 10000 and r.content[:4] == b'%PDF':
+                      path = out/f'{i}.pdf'
+                      path.write_bytes(r.content)
+                      p = subprocess.run(['pdfinfo', str(path)], text=True, capture_output=True)
+                      print('PDFINFO', p.stdout[:1200], flush=True)
+                      t = subprocess.run(['pdftotext','-f','1','-l','5',str(path),'-'],text=True,capture_output=True,errors='ignore')
+                      print('TEXT', re.sub(r'\s+',' ',t.stdout)[:2000], flush=True)
+                  else:
+                      print('BODY', decode_content(r)[:1000].replace('\n',' '), flush=True)
+              except Exception as exc:
+                  print('FILE ERROR', repr(exc), flush=True)
+          PY
