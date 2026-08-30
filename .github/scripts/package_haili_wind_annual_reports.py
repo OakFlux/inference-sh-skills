@@ -18,6 +18,9 @@ SHORT_NAME = "海力风电"
 TICKER = "301155.SZ"
 PROSPECTUS_DATE = "2021-11-19"
 LATEST_HALF_DATE = "2026-08-29"
+PROSPECTUS_ATTACHMENT_URL = (
+    "https://govt-atts.chinadaily.com.cn/stream/files/619729fe498e26b83b9e3343"
+)
 
 
 def decode_html(response: requests.Response) -> str:
@@ -133,10 +136,11 @@ def main() -> None:
             "    replacements = [",
         ),
         (
-            "    code = code.replace(original_download, replacement_download, 1)",
-            "    code = code.replace(original_download, original_download, 1)",
+            '    direct_http = direct_plain.replace("https://", "http://", 1)\n'
+            "    replacement_download = f'''",
+            f'    direct_encoded = direct_plain = direct_http = "{PROSPECTUS_ATTACHMENT_URL}"\n'
+            "    replacement_download = f'''",
         ),
-        ('        f"{prospectus_id}.PDF",\n', ""),
     ]
     for old, new in replacements:
         code = code.replace(old, new)
@@ -154,7 +158,8 @@ def main() -> None:
         "CNSESZ_STOCK",
         "海力风电_全部年报_招股说明书_2026年最新半年报_完整PDF.zip",
         '.replace("科创板", "创业板")',
-        "code.replace(original_download, original_download, 1)",
+        PROSPECTUS_ATTACHMENT_URL,
+        "code.replace(original_download, replacement_download, 1)",
     ]
     missing = [token for token in required if token not in code]
     if missing:
