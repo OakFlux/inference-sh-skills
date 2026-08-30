@@ -1,0 +1,138 @@
+name: Temporary Nike catalog release
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-catalog-release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build public catalog diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urlencode, quote
+          import json, re, subprocess, urllib.request, xml.etree.ElementTree as ET
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          out=Path('diagnostic')
+
+          def fetch_json(req, timeout=120):
+              return json.loads(urllib.request.urlopen(req,timeout=timeout).read().decode('utf-8','replace'))
+
+          # Public Fxbaogao metadata API.
+          fx_api='https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth'
+          all_fx=[]
+          for kw in ['耐克','Nike','NKE','NIKE公司','耐克公司','运动鞋服耐克']:
+              for page in range(1,8):
+                  body=json.dumps({'keywords':kw,'pageIndex':page,'pageSize':100,'order':2,'nop':-1},ensure_ascii=False).encode('utf-8')
+                  req=urllib.request.Request(fx_api,data=body,headers={'User-Agent':UA,'Content-Type':'application/json'},method='POST')
+                  try: obj=fetch_json(req)
+                  except Exception as e:
+                      print('FX_ERR',kw,page,repr(e)); break
+                  rows=(obj.get('data') or {}).get('dataList') or []
+                  for r in rows:
+                      rr=dict(r); rr['_keyword']=kw; all_fx.append(rr)
+                  if len(rows)<100: break
+          seen={}
+          for r in all_fx:
+              key=str(r.get('docId') or r.get('id') or json.dumps(r,ensure_ascii=False,sort_keys=True))
+              seen[key]=r
+          fx=list(seen.values())
+          fx.sort(key=lambda r:(r.get('pubTime') or 0,r.get('pageNum') or 0),reverse=True)
+          out.joinpath('fxbaogao_results.json').write_text(json.dumps(fx,ensure_ascii=False,indent=2),encoding='utf-8')
+          with out.joinpath('fxbaogao_summary.tsv').open('w',encoding='utf-8') as f:
+              f.write('keyword\tdocId\tpubTime\torgName\tpageNum\ttitle\tfileName\tfileUrl\tdownloadUrl\n')
+              for r in fx:
+                  f.write('\t'.join(str(r.get(k,'')).replace('\t',' ').replace('\n',' ') for k in ['_keyword','docId','pubTime','orgName','pageNum','title','fileName','fileUrl','downloadUrl'])+'\n')
+
+          # Bing RSS search.
+          queries=[
+              '耐克 券商 深度报告 PDF',
+              '耐克 公司深度 研报 PDF',
+              '耐克 首次覆盖 券商 报告',
+              'Nike NKE equity research report PDF',
+              'Nike company deep dive broker report PDF',
+              '耐克 华泰证券 研究报告',
+              '耐克 中金公司 研究报告',
+              '耐克 招银国际 研究报告',
+              '耐克 国金证券 报告',
+              '耐克 浦银国际 研究报告',
+              'site:pdf.dfcfw.com Nike OR 耐克',
+              'site:fxbaogao.com 耐克 OR Nike',
+              'site:hangyan.co 耐克 OR Nike',
+              'site:sgpjbg.com 耐克 OR Nike',
+              'site:reportify.cn 耐克 OR Nike',
+              'filetype:pdf Nike initiation coverage equity research',
+          ]
+          results=[]
+          for qi,q in enumerate(queries,1):
+              url='https://www.bing.com/search?'+urlencode({'q':q,'format':'rss','count':'50'})
+              p=out/f'bing_{qi}.xml'
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',UA,'-H','Accept-Encoding: identity',url,'-o',str(p)]
+              r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if r.returncode or not p.exists():
+                  print('BING_ERR',q,r.returncode,r.stderr[-300:]); continue
+              try:
+                  root=ET.fromstring(p.read_bytes())
+                  for item in root.findall('.//item'):
+                      row={'query':q,'title':(item.findtext('title') or '').strip(),'link':(item.findtext('link') or '').strip(),'description':(item.findtext('description') or '').strip()}
+                      results.append(row)
+              except Exception as e: print('BING_PARSE_ERR',q,repr(e))
+          out.joinpath('bing_results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          with out.joinpath('bing_summary.tsv').open('w',encoding='utf-8') as f:
+              f.write('query\ttitle\tlink\tdescription\n')
+              for r in results:
+                  f.write('\t'.join(str(r.get(k,'')).replace('\t',' ').replace('\n',' ') for k in ['query','title','link','description'])+'\n')
+
+          # Query reportify search API/page and selected public sites.
+          urls=[
+              ('fx_search','https://www.fxbaogao.com/search?keyword='+quote('耐克')),
+              ('sgpjbg_cn','https://www.sgpjbg.com.cn/search?keyword='+quote('耐克')),
+              ('sgpjbg','https://www.sgpjbg.com/search?keyword='+quote('Nike')),
+              ('hangyan','https://www.hangyan.co/search?keyword='+quote('耐克')),
+              ('baogaobox','https://www.baogaobox.com/search?keyword='+quote('耐克')),
+              ('reportify','https://www.reportify.cn/search?q='+quote('耐克')),
+              ('nxny','https://www.nxny.com/?s='+quote('耐克')),
+          ]
+          for name,u in urls:
+              p=out/f'{name}.html'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','4','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',UA,'-H','Accept-Encoding: identity',u,'-o',str(p)]
+              r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('SITE',name,r.returncode,p.stat().st_size if p.exists() else 0,u,r.stderr[-300:])
+
+          PY
+          (cd diagnostic && zip -q -9 ../nike_catalog_diagnostics.zip ./*)
+          sha256sum nike_catalog_diagnostics.zip > nike_catalog_diagnostics.sha256
+
+      - name: Publish deterministic temporary release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG='tmp-nike-report-catalog-20260830'
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          git init -q temp-repo
+          cd temp-repo
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git commit --allow-empty -m 'temporary Nike report catalog' >/dev/null
+          git tag "$TAG"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin "$TAG" --force >/dev/null
+          cd ..
+          gh release create "$TAG" nike_catalog_diagnostics.zip nike_catalog_diagnostics.sha256 \
+            --repo "$GITHUB_REPOSITORY" --title 'Temporary Nike report catalog' \
+            --notes 'Temporary diagnostic asset; safe to delete.'
