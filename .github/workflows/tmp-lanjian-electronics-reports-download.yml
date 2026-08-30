@@ -1,0 +1,200 @@
+name: Temporary verified Lanjian Electronics broker reports
+
+on:
+  push:
+    branches:
+      - tmp/download-lanjian-electronics-reports-20260830
+    paths:
+      - .github/workflows/tmp-lanjian-electronics-reports-download.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Discover, download, verify, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output work/downloads work/previews
+          python3 - <<'PY'
+          from __future__ import annotations
+          import datetime
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import subprocess
+          import urllib.parse
+          import urllib.request
+
+          OUT = pathlib.Path('output')
+          WORK = pathlib.Path('work')
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          API = 'https://reportapi.eastmoney.com/report/list'
+
+          def fetch_page(page: int):
+              params = {
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':'2022-01-01','endTime':'2030-12-31','pageNo':str(page),'fields':'',
+                  'qType':'0','orgCode':'','code':'301348','rcode':'','p':str(page),
+                  'pageNum':str(page),'pageNumber':str(page)
+              }
+              url = API + '?' + urllib.parse.urlencode(params)
+              req = urllib.request.Request(url, headers={
+                  'User-Agent': UA,
+                  'Referer': 'https://data.eastmoney.com/report/',
+                  'Accept': 'application/json,text/plain,*/*',
+              })
+              raw = urllib.request.urlopen(req, timeout=90).read().decode('utf-8','replace').strip()
+              if raw.startswith('datatable(') and raw.endswith(')'):
+                  raw = raw[len('datatable('):-1]
+              return json.loads(raw)
+
+          rows = {}
+          for page in range(1, 11):
+              obj = fetch_page(page)
+              data = obj.get('data') or []
+              for row in data:
+                  title = row.get('title') or ''
+                  if row.get('stockCode') == '301348' or row.get('stockName') == '蓝箭电子' or '蓝箭电子' in title:
+                      key = row.get('infoCode') or json.dumps(row, ensure_ascii=False, sort_keys=True)
+                      rows[key] = row
+              if len(data) < 100:
+                  break
+
+          rows = list(rows.values())
+          (WORK / 'catalog.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('CATALOG_COUNT', len(rows))
+          for r in sorted(rows, key=lambda x: str(x.get('publishDate') or ''), reverse=True):
+              print(json.dumps({
+                  'date': r.get('publishDate'), 'broker': r.get('orgSName'), 'title': r.get('title'),
+                  'pages': r.get('attachPages'), 'type': r.get('reportType'), 'rating': r.get('ratingName'),
+                  'infoCode': r.get('infoCode')
+              }, ensure_ascii=False))
+
+          def dt(row):
+              s = str(row.get('publishDate') or '')[:10]
+              try: return datetime.datetime.strptime(s, '%Y-%m-%d')
+              except Exception: return datetime.datetime(1900,1,1)
+
+          def score(row):
+              title = row.get('title') or ''
+              pages = int(row.get('attachPages') or 0)
+              s = 0
+              if any(k in title for k in ['深度','首次覆盖','首次评级','公司研究','新股覆盖','半导体','封装','封测','功率器件','分立器件','芯片']):
+                  s += 160
+              if any(k in title for k in ['首次覆盖','首次评级','新股覆盖']):
+                  s += 80
+              s += min(pages, 60) * 4
+              s += max(0, dt(row).year - 2022) * 10
+              return s
+
+          candidates = [r for r in rows if int(r.get('attachPages') or 0) >= 8 and r.get('infoCode')]
+          if len(candidates) < 2:
+              candidates = [r for r in rows if int(r.get('attachPages') or 0) >= 5 and r.get('infoCode')]
+          candidates.sort(key=lambda r: (score(r), dt(r)), reverse=True)
+          if not candidates:
+              raise SystemExit('No usable Lanjian Electronics broker reports found in catalog')
+
+          selected = []
+          used_orgs = set()
+          attempted = set()
+
+          def safe(text):
+              return re.sub(r'[\\/:*?"<>|\r\n\t]+', '_', str(text)).strip(' ._')[:72] or 'report'
+
+          def try_one(row, distinct_org=True):
+              info = row.get('infoCode') or ''
+              if not info or info in attempted: return False
+              attempted.add(info)
+              org = row.get('orgSName') or row.get('orgName') or 'Broker'
+              if distinct_org and org in used_orgs: return False
+              url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              tmp = WORK / 'downloads' / f'{info}.pdf'
+              cmd = [
+                  'curl','-L','--fail','--retry','6','--retry-delay','2','--retry-all-errors',
+                  '--connect-timeout','30','--max-time','600','--compressed',
+                  '-A',UA,'-e','https://data.eastmoney.com/report/',
+                  '-H','Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  url,'-o',str(tmp)
+              ]
+              try:
+                  subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              except Exception:
+                  tmp.unlink(missing_ok=True); return False
+              if not tmp.exists() or tmp.stat().st_size < 25000 or tmp.read_bytes()[:4] != b'%PDF':
+                  tmp.unlink(missing_ok=True); return False
+              try:
+                  info_text = subprocess.check_output(['pdfinfo', str(tmp)], text=True, errors='replace')
+                  m = re.search(r'^Pages:\s*(\d+)', info_text, re.M)
+                  pages = int(m.group(1)) if m else 0
+              except Exception:
+                  tmp.unlink(missing_ok=True); return False
+              if pages < 5:
+                  tmp.unlink(missing_ok=True); return False
+              txt = WORK / 'previews' / f'{info}.txt'
+              subprocess.run(['pdftotext','-f','1','-l',str(min(5,pages)),str(tmp),str(txt)], check=False)
+              first = txt.read_text(errors='replace') if txt.exists() else ''
+              if '蓝箭电子' not in first and '301348' not in first:
+                  tmp.unlink(missing_ok=True); return False
+              idx = len(selected) + 1
+              date = str(row.get('publishDate') or '')[:10].replace('-','') or 'unknown'
+              title = row.get('title') or '公司研究报告'
+              filename = f'{idx:02d}_{safe(org)}_Lanjian_Electronics_{date}_{pages}p.pdf'
+              dest = OUT / filename
+              tmp.replace(dest)
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','90',str(dest),str(WORK/'previews'/f'{idx:02d}_first')], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              subprocess.run(['pdftoppm','-f',str(pages),'-singlefile','-png','-r','90',str(dest),str(WORK/'previews'/f'{idx:02d}_last')], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              selected.append({
+                  'index': idx, 'broker': org, 'publishDate': str(row.get('publishDate') or '')[:10],
+                  'title': title, 'pages': pages, 'reportType': row.get('reportType') or '',
+                  'rating': row.get('ratingName') or '', 'infoCode': info, 'pdf_url': url,
+                  'filename': filename, 'size_bytes': dest.stat().st_size,
+                  'sha256': hashlib.sha256(dest.read_bytes()).hexdigest(),
+              })
+              used_orgs.add(org)
+              return True
+
+          for r in candidates:
+              if len(selected) >= 3: break
+              try_one(r, True)
+          if len(selected) < 3:
+              for r in candidates:
+                  if len(selected) >= 3: break
+                  try_one(r, False)
+          if len(selected) < 2:
+              raise SystemExit(f'Only {len(selected)} verified reports found')
+
+          manifest = {'company':'蓝箭电子','stock_code':'301348.SZ','count':len(selected),'reports':selected}
+          (OUT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          with open(OUT / '报告清单与核验说明.txt', 'w', encoding='utf-8') as f:
+              f.write(f'蓝箭电子（301348.SZ）券商研究报告，共{len(selected)}份\n\n')
+              for r in selected:
+                  f.write(f"{r['index']}. {r['broker']}，{r['publishDate']}，{r['pages']}页\n")
+                  f.write(f"   《{r['title']}》\n")
+                  f.write(f"   类型：{r['reportType'] or '公司研究'}；评级：{r['rating'] or '未标注'}。\n\n")
+              f.write('所有文件均为原始、完整、可检索PDF。已检查PDF文件头、实际页数、公司文字，并完成首页和末页渲染。\n')
+              f.write('仅供研究资料整理，不构成投资建议。\n')
+          print('SELECTED', json.dumps(manifest, ensure_ascii=False, indent=2))
+          PY
+
+          (cd output && sha256sum ./*.pdf > SHA256SUMS.txt)
+          (cd output && zip -q -9 Lanjian_Electronics_Broker_Reports_Verified.zip ./*.pdf ./manifest.json ./报告清单与核验说明.txt ./SHA256SUMS.txt)
+          unzip -t output/Lanjian_Electronics_Broker_Reports_Verified.zip
+          ls -lh output work/previews
+
+      - name: Upload verified report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanjian-electronics-broker-reports
+          path: output/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
