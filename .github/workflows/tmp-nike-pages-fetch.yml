@@ -1,0 +1,48 @@
+name: Temporary Nike report pages fetch
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-pages-fetch.yml
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch report mirror pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          fetch_page() {
+            local name="$1"; local url="$2"
+            curl --http1.1 -L --fail --retry 6 --retry-all-errors --retry-delay 1 \
+              --connect-timeout 20 --max-time 300 -A "$UA" -e "$url" \
+              -H 'Accept-Encoding: identity' "$url" -o "pages/${name}.html" || true
+            echo "$url" > "pages/${name}.url.txt"
+            wc -c "pages/${name}.html" 2>/dev/null || true
+          }
+          fetch_page sgpjbg_nike_2023 'https://www.sgpjbg.com/baogao/150331.html'
+          fetch_page sgpjbg_nike_2023_down 'https://www.sgpjbg.com/bgdown/150331.html?dtype=0'
+          fetch_page hangyan_nike_2023 'https://www.hangyan.co/reports/3268347704287168331'
+          fetch_page fx_nike_q3_2025 'https://www.fxbaogao.com/detail/4742006'
+          fetch_page fx_nike_q4_2025 'https://www.fxbaogao.com/detail/4924081'
+          fetch_page fx_nike_q1_2026 'https://www.fxbaogao.com/detail/5083891'
+          fetch_page fx_nike_q3_2026 'https://www.fxbaogao.com/detail/5337859'
+          fetch_page nxny_global_sports_2026 'https://www.nxny.com/report/view_6330325.html'
+          fetch_page nxny_nike_track_2026 'https://www.nxny.com/report/view_6258941.html'
+          ls -lh pages
+
+      - name: Upload pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-report-pages
+          path: pages/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
