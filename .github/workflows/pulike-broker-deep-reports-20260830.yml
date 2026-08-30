@@ -1,0 +1,472 @@
+name: Discover and package public Pulike broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/pulike-broker-deep-reports-20260830.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          python -m pip install --quiet pypdf pillow img2pdf
+
+      - name: Discover, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY = '普莱柯'
+          FULL_COMPANY = '普莱柯生物工程股份有限公司'
+          CODE = '603566'
+          PACKAGE = '普莱柯_券商深度报告_公开完整版'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_pulike_broker_work')
+          work.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36'
+          em_json_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+          em_pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+          sd_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json, text/plain, */*',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Device': '1',
+              'X-Token': '',
+          }
+
+          def clean_text(value: object) -> str:
+              return re.sub(r'\s+', '', str(value or ''))
+
+          def safe(value: object) -> str:
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', str(value or '')).strip('_')[:100]
+
+          def company_match(text: str) -> bool:
+              compact = clean_text(text)
+              return COMPANY in compact or FULL_COMPANY in compact or CODE in compact
+
+          def as_rows(obj: object) -> list[dict]:
+              if isinstance(obj, list):
+                  return [x for x in obj if isinstance(x, dict)]
+              if not isinstance(obj, dict):
+                  return []
+              data = obj.get('data')
+              if isinstance(data, list):
+                  return [x for x in data if isinstance(x, dict)]
+              if isinstance(data, dict):
+                  for key in ('data', 'list', 'items', 'rows', 'reports'):
+                      value = data.get(key)
+                      if isinstance(value, list):
+                          return [x for x in value if isinstance(x, dict)]
+              for key in ('list', 'items', 'rows', 'reports'):
+                  value = obj.get(key)
+                  if isinstance(value, list):
+                      return [x for x in value if isinstance(x, dict)]
+              return []
+
+          def request_get(url: str, headers: dict, attempts: int = 4, timeout=(20, 180)) -> requests.Response | None:
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      print('GET', url, response.status_code, response.headers.get('content-type'), len(response.content), flush=True)
+                      if response.status_code == 200 and response.content:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1.5 * (attempt + 1))
+              print('GET_FAILED', url, repr(last), flush=True)
+              return None
+
+          candidates: dict[str, dict] = {}
+          diagnostics: list[dict] = []
+
+          # Eastmoney company-report index.
+          for qtype in range(0, 6):
+              for page in range(1, 8):
+                  params = {
+                      'pageNo': page,
+                      'pageSize': 100,
+                      'code': CODE,
+                      'qType': qtype,
+                      'beginTime': '2017-01-01',
+                      'endTime': '2026-08-30',
+                  }
+                  try:
+                      response = session.get(
+                          'https://reportapi.eastmoney.com/report/list',
+                          params=params,
+                          headers=em_json_headers,
+                          timeout=(20, 90),
+                      )
+                      diagnostics.append({'source':'eastmoney','qtype':qtype,'page':page,'status':response.status_code,'bytes':len(response.content),'url':response.url})
+                      print('EM_QUERY', qtype, page, response.status_code, len(response.content), flush=True)
+                      if response.status_code != 200 or not response.content:
+                          break
+                      obj = response.json()
+                  except Exception as exc:
+                      diagnostics.append({'source':'eastmoney','qtype':qtype,'page':page,'error':repr(exc)})
+                      break
+                  rows = as_rows(obj)
+                  if not rows:
+                      break
+                  for item in rows:
+                      blob = json.dumps(item, ensure_ascii=False, default=str)
+                      stock_code = str(item.get('stockCode') or item.get('code') or item.get('securityCode') or '')
+                      if stock_code != CODE and not company_match(blob):
+                          continue
+                      info = str(item.get('infoCode') or item.get('infocode') or item.get('reportId') or item.get('id') or '')
+                      if not info:
+                          continue
+                      title = str(item.get('title') or item.get('reportTitle') or '')
+                      org = str(item.get('orgSName') or item.get('orgName') or item.get('organization') or '')
+                      date = str(item.get('publishDate') or item.get('date') or '')[:10]
+                      candidates[info] = {
+                          'infoCode': info,
+                          'organization': org,
+                          'title': title,
+                          'date': date,
+                          'pages_hint': item.get('attachPages') or item.get('pageCount') or item.get('pages'),
+                          'report_type': '公司研究',
+                          'metadata_source': '东方财富公开研报索引',
+                      }
+                  if len(rows) < 100:
+                      break
+
+          # Public Sdyanbao index is useful for older sparse coverage and reports without an AP code.
+          search_terms = [
+              '普莱柯',
+              '普莱柯 深度报告',
+              '普莱柯 首次覆盖',
+              '普莱柯 公司研究',
+              '普莱柯 动物疫苗',
+              '普莱柯 兽用疫苗',
+              '普莱柯 宠物疫苗',
+              '普莱柯 非洲猪瘟疫苗',
+              '普莱柯 研发创新',
+          ]
+          raw_sd_rows: list[dict] = []
+          for keyword in search_terms:
+              for page in (1, 2, 3):
+                  try:
+                      response = session.post(
+                          'https://api.sdyanbao.com/api/file/search',
+                          headers=sd_headers,
+                          json={'keyword': keyword, 'page': page, 'pageSize': 100, 'opFrom': 1},
+                          timeout=(20, 90),
+                      )
+                      diagnostics.append({'source':'sdyanbao','keyword':keyword,'page':page,'status':response.status_code,'bytes':len(response.content)})
+                      print('SD_QUERY', keyword, page, response.status_code, len(response.content), flush=True)
+                      if response.status_code != 200:
+                          continue
+                      obj = response.json()
+                  except Exception as exc:
+                      diagnostics.append({'source':'sdyanbao','keyword':keyword,'page':page,'error':repr(exc)})
+                      continue
+                  data = obj.get('data') if isinstance(obj, dict) else None
+                  files = data.get('files') if isinstance(data, dict) else None
+                  if not isinstance(files, list):
+                      continue
+                  for item in files:
+                      if not isinstance(item, dict):
+                          continue
+                      blob = json.dumps(item, ensure_ascii=False, default=str)
+                      stock = item.get('stock') if isinstance(item.get('stock'), dict) else {}
+                      if str(stock.get('code') or '') != CODE and not company_match(blob):
+                          continue
+                      raw_sd_rows.append(item)
+                      uuid = str(item.get('data_source_uuid') or '')
+                      org_obj = item.get('organization') if isinstance(item.get('organization'), dict) else {}
+                      type_obj = item.get('type') if isinstance(item.get('type'), dict) else {}
+                      title = str(item.get('name') or item.get('summary') or '')
+                      date = str(item.get('time_text') or '')[:10]
+                      key = uuid or f"sd|{item.get('id')}|{title}|{date}"
+                      entry = {
+                          'infoCode': uuid if uuid.startswith('AP') else '',
+                          'organization': str(org_obj.get('name') or ''),
+                          'title': title,
+                          'date': date,
+                          'pages_hint': item.get('page_count'),
+                          'page_url': str(item.get('page_url') or ''),
+                          'report_type': str(type_obj.get('name') or ''),
+                          'metadata_source': '水滴研报公开索引',
+                      }
+                      if entry['infoCode']:
+                          candidates[entry['infoCode']] = {**candidates.get(entry['infoCode'], {}), **entry}
+                      else:
+                          candidates[key] = entry
+
+          (out / '检索元数据_东方财富.json').write_text(json.dumps(list(candidates.values()), ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / '检索元数据_水滴研报.json').write_text(json.dumps(raw_sd_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / '检索诊断.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def title_quality(item: dict) -> int:
+              title = clean_text(item.get('title'))
+              pages_hint = 0
+              try:
+                  pages_hint = int(item.get('pages_hint') or 0)
+              except Exception:
+                  pass
+              score = pages_hint
+              if '深度' in title:
+                  score += 3000
+              if '首次覆盖' in title or '首次给予' in title:
+                  score += 2500
+              if any(word in title for word in ('龙头', '研发', '疫苗', '成长', '创新', '新蓝海', '平台')):
+                  score += 250
+              if any(word in title for word in ('点评', '季报', '年报', '中报', '月报', '周报', '跟踪')):
+                  score -= 1000
+              if str(item.get('report_type') or '') == '公司研究':
+                  score += 100
+              return score
+
+          records: list[dict] = []
+          seen_sha: set[str] = set()
+
+          def validate_pdf(data: bytes, item: dict, source_url: str, source_format: str) -> bool:
+              if not data.startswith(b'%PDF-'):
+                  return False
+              probe = work / '_probe.pdf'
+              probe.write_bytes(data)
+              try:
+                  reader = PdfReader(str(probe))
+                  pages = len(reader.pages)
+                  text = '\n'.join((page.extract_text() or '') for page in reader.pages[:10])
+              except Exception as exc:
+                  print('PARSE_ERROR', item.get('title'), repr(exc), flush=True)
+                  probe.unlink(missing_ok=True)
+                  return False
+              probe.unlink(missing_ok=True)
+              if pages < 8 or not company_match(text):
+                  return False
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in seen_sha:
+                  return False
+              seen_sha.add(sha)
+              filename = f"{len(records)+1:02d}_{safe(item.get('organization') or '券商')}_{safe(item.get('title') or COMPANY)}_{safe(item.get('date') or '')}_{pages}页.pdf"
+              path = out / filename
+              path.write_bytes(data)
+              record = {
+                  **item,
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'source_url': source_url,
+                  'source_format': source_format,
+                  'first_pages_text': text[:6000],
+              }
+              records.append(record)
+              print('SAVED', json.dumps({k:record.get(k) for k in ('organization','title','date','pages','filename')}, ensure_ascii=False), flush=True)
+              return True
+
+          # Download all public original PDFs first.
+          ordered = sorted(candidates.values(), key=title_quality, reverse=True)
+          for item in ordered:
+              info = str(item.get('infoCode') or '')
+              if not info:
+                  continue
+              for prefix in ('H3', 'H2'):
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  response = request_get(url, em_pdf_headers, attempts=3, timeout=(20, 180))
+                  if response is None:
+                      continue
+                  if validate_pdf(response.content, item, url, '公开原始PDF'):
+                      break
+
+          # Reconstruct only potentially substantive non-AP reports when all indexed pages are public.
+          non_ap = [item for item in ordered if not item.get('infoCode') and item.get('page_url')]
+          non_ap = sorted(non_ap, key=title_quality, reverse=True)[:12]
+          for item in non_ap:
+              try:
+                  expected = int(item.get('pages_hint') or 0)
+              except Exception:
+                  expected = 0
+              if expected < 8 or expected > 90:
+                  continue
+              title = clean_text(item.get('title'))
+              if expected < 15 and not any(word in title for word in ('深度', '首次覆盖', '首次给予')):
+                  continue
+              page_url = str(item.get('page_url') or '')
+              page_dir = work / hashlib.sha256(page_url.encode()).hexdigest()[:16]
+              page_dir.mkdir(exist_ok=True)
+              images: list[Path] = []
+              complete = True
+              for page_number in range(expected):
+                  url = f'{page_url}/{page_number}.png'
+                  response = request_get(
+                      url,
+                      {'User-Agent':ua,'Referer':'https://www.sdyanbao.com/','Accept':'image/png,image/*;q=0.9,*/*;q=0.7'},
+                      attempts=2,
+                      timeout=(12, 60),
+                  )
+                  if response is None or not response.content.startswith(b'\x89PNG'):
+                      complete = False
+                      break
+                  image_path = page_dir / f'{page_number:03d}.png'
+                  image_path.write_bytes(response.content)
+                  try:
+                      with Image.open(io.BytesIO(response.content)) as image:
+                          image.verify()
+                      with Image.open(image_path) as image:
+                          width, height = image.size
+                  except Exception:
+                      complete = False
+                      break
+                  if width < 700 or height < 900:
+                      complete = False
+                      break
+                  images.append(image_path)
+              if not complete or len(images) != expected:
+                  print('INCOMPLETE_PUBLIC_PAGES', item.get('title'), expected, len(images), flush=True)
+                  continue
+              pdf_data = img2pdf.convert([str(path) for path in images])
+              # Image PDFs have no extractable text, but metadata search already verified company identity.
+              sha = hashlib.sha256(pdf_data).hexdigest()
+              if sha in seen_sha:
+                  continue
+              seen_sha.add(sha)
+              filename = f"{len(records)+1:02d}_{safe(item.get('organization') or '券商')}_{safe(item.get('title') or COMPANY)}_{safe(item.get('date') or '')}_{expected}页_逐页原图.pdf"
+              path = out / filename
+              path.write_bytes(pdf_data)
+              records.append({
+                  **item,
+                  'filename': filename,
+                  'pages': expected,
+                  'bytes': len(pdf_data),
+                  'sha256': sha,
+                  'source_url': page_url,
+                  'source_format': '公开完整逐页原图合成为PDF；页面内容和顺序未改动',
+              })
+              print('RECONSTRUCTED', json.dumps({k:records[-1].get(k) for k in ('organization','title','date','pages','filename')}, ensure_ascii=False), flush=True)
+
+          def final_score(item: dict) -> tuple[int, int, str]:
+              title = clean_text(item.get('title'))
+              pages = int(item.get('pages') or 0)
+              score = pages * 5
+              if '深度' in title:
+                  score += 5000
+              if '首次覆盖' in title or '首次给予' in title:
+                  score += 4000
+              if pages >= 30:
+                  score += 1500
+              elif pages >= 20:
+                  score += 1000
+              elif pages >= 15:
+                  score += 500
+              if any(word in title for word in ('龙头', '创新', '研发', '疫苗', '成长', '平台', '新蓝海')):
+                  score += 300
+              if any(word in title for word in ('点评', '季报', '年报', '中报', '月报', '周报', '跟踪')):
+                  score -= 2500
+              return score, pages, str(item.get('date') or '')
+
+          ranked = sorted(records, key=final_score, reverse=True)
+          selected: list[dict] = []
+          # Prefer reports of at least 12 pages; allow one 8-11 page company report only if needed.
+          for item in ranked:
+              title = clean_text(item.get('title'))
+              pages = int(item.get('pages') or 0)
+              if pages < 12 and not any(word in title for word in ('深度', '首次覆盖', '首次给予')):
+                  continue
+              selected.append(item)
+              if len(selected) >= 3:
+                  break
+          if len(selected) < 2:
+              for item in ranked:
+                  if item in selected:
+                      continue
+                  if int(item.get('pages') or 0) >= 8:
+                      selected.append(item)
+                  if len(selected) >= 2:
+                      break
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} valid public company reports found')
+
+          selected_names = {item['filename'] for item in selected}
+          for path in out.glob('*.pdf'):
+              if path.name not in selected_names:
+                  path.unlink()
+
+          lines = [
+              f'{COMPANY}（{CODE}.SH）券商研究报告包',
+              '',
+              f'本包共{len(selected)}份完整PDF，优先保留明确标注深度/首次覆盖及页数较长的公司研究。',
+              '已排除无法取得完整版的付费预览、摘要、行业报告，以及过短的日常财报点评。',
+              '',
+          ]
+          for index, item in enumerate(selected, 1):
+              lines.extend([
+                  f"{index}. {item.get('organization')}：《{item.get('title')}》",
+                  f"   日期：{item.get('date')}；页数：{item.get('pages')}页",
+                  f"   文件：{item.get('filename')}",
+                  f"   获取形式：{item.get('source_format')}",
+                  f"   SHA-256：{item.get('sha256')}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头和结构、实际页数、公司名称/证券代码、文件哈希、ZIP CRC。',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{item['sha256']}  {item['filename']}\n" for item in selected), encoding='utf-8')
+
+          zip_name = f'普莱柯_券商深度报告_{len(selected)}份_公开完整版.zip'
+          zip_path = Path(zip_name)
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(selected):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+          print('FINAL', zip_path, zip_path.stat().st_size, flush=True)
+          print('SELECTED', json.dumps([{k:item.get(k) for k in ('organization','title','date','pages','filename','source_url')} for item in selected], ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: pulike-broker-deep-reports-final
+          path: |
+            普莱柯_券商深度报告_公开完整版/
+            普莱柯_券商深度报告_*份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
