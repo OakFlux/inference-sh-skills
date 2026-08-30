@@ -1,0 +1,54 @@
+name: Temporary Nike Fxbaogao search for SWHY reports
+
+on:
+  push:
+    branches:
+      - tmp/download-nike-reports-20260830
+    paths:
+      - .github/workflows/tmp-nike-fxbaogao-search-swhy.yml
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search exact report titles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          import json, pathlib, urllib.request
+          api='https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          queries=[
+              '专业功能品牌彰显韧性 Nike拐点将至',
+              'Nike单季营收正增长 Adidas积极备战世界杯',
+              '全球体育用品品牌2025年二季度跟踪深度报告',
+              '全球体育用品品牌2025年三季度跟踪深度报告',
+              '望远镜系列11 Nike FY2025Q4',
+          ]
+          all_rows=[]
+          for i,q in enumerate(queries,1):
+              body=json.dumps({'keywords':q,'pageIndex':1,'pageSize':100,'order':2,'nop':-1},ensure_ascii=False).encode('utf-8')
+              req=urllib.request.Request(api,data=body,headers={'User-Agent':ua,'Content-Type':'application/json'},method='POST')
+              raw=urllib.request.urlopen(req,timeout=120).read().decode('utf-8','replace')
+              pathlib.Path(f'diagnostic/query_{i}.json').write_text(raw,encoding='utf-8')
+              obj=json.loads(raw)
+              rows=(obj.get('data') or {}).get('dataList') or []
+              print('QUERY',i,q,'COUNT',len(rows))
+              for r in rows:
+                  print('ROW',json.dumps({k:r.get(k) for k in ['docId','title','orgName','pageNum','pubTime','fileSize','categoryName']},ensure_ascii=False))
+                  rr=dict(r);rr['_query']=q;all_rows.append(rr)
+          pathlib.Path('diagnostic/all_rows.json').write_text(json.dumps(all_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nike-fxbaogao-swhy-search
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
