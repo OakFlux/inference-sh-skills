@@ -1,19 +1,11 @@
 from __future__ import annotations
 
 import html
-import json
 import re
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-
-URLS = [
-    "https://www.sdyanbao.com/detail/886501",
-    "https://www.fxbaogao.com/detail/4788440",
-    "https://max.book118.com/html/2025/0701/5104021001012234.shtm",
-    "https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/804068768795/index.phtml",
-]
 
 session = requests.Session()
 session.headers.update(
@@ -26,49 +18,77 @@ session.headers.update(
     }
 )
 
-for url in URLS:
-    print("\n\n================", url, "================")
+
+def fetch_text(url: str) -> tuple[str, str]:
+    response = session.get(url, timeout=(20, 120), allow_redirects=True)
+    print("FETCH", response.status_code, len(response.content), response.url)
+    response.raise_for_status()
+    return html.unescape(response.text).replace("\\/", "/"), response.url
+
+
+print("=== SDYANBAO PAGE AND JS ===")
+page, final = fetch_text("https://www.sdyanbao.com/detail/886501")
+soup = BeautifulSoup(page, "html.parser")
+for tag in soup.find_all("script", src=True):
+    js_url = urljoin(final, tag["src"])
     try:
-        response = session.get(url, timeout=(20, 120), allow_redirects=True)
-        print("STATUS", response.status_code, "FINAL", response.url, "BYTES", len(response.content))
-        response.raise_for_status()
-        text = html.unescape(response.text).replace("\\/", "/")
-        soup = BeautifulSoup(text, "html.parser")
-
-        print("TITLE", soup.title.get_text(" ", strip=True) if soup.title else "")
-        print("ALL LINKS")
-        for tag in soup.find_all(["a", "iframe", "embed", "source", "script"], limit=5000):
-            value = tag.get("href") or tag.get("src") or tag.get("data-src") or ""
-            if value:
-                absolute = urljoin(response.url, value)
-                lower = absolute.lower()
-                if any(k in lower for k in ("pdf", "download", "file", "doc", "preview", "attachment")):
-                    print(tag.name, absolute, "TEXT=", tag.get_text(" ", strip=True)[:160])
-
-        print("REGEX URLS")
-        patterns = [
-            r'https?://[^\"\'<>\s]+?\.pdf(?:\?[^\"\'<>\s]*)?',
-            r'https?://[^\"\'<>\s]+?(?:download|attachment|preview|file)[^\"\'<>\s]*',
-            r'/(?:api|download|file|preview)[^\"\'<>\s]{1,300}',
-        ]
-        found: list[str] = []
-        for pattern in patterns:
-            found.extend(re.findall(pattern, text, flags=re.I))
-        for item in dict.fromkeys(found):
-            print(item[:600])
-
-        print("KEYWORD CONTEXTS")
-        for keyword in ("886501", "4788440", "5104021001012234", "download", "pdf", "fileUrl", "downUrl", "attachment"):
-            starts = [m.start() for m in re.finditer(re.escape(keyword), text, flags=re.I)]
-            print("KEY", keyword, "COUNT", len(starts))
-            for pos in starts[:12]:
-                snippet = re.sub(r"\s+", " ", text[max(0, pos - 400):pos + 800])
-                print(snippet[:1300])
-
-        # Print JSON script tags separately.
-        for tag in soup.find_all("script"):
-            body = tag.string or tag.get_text() or ""
-            if any(k.lower() in body.lower() for k in ("886501", "4788440", "510402", "download", ".pdf", "fileurl")):
-                print("SCRIPT", tag.get("id"), tag.get("type"), re.sub(r"\s+", " ", body)[:5000])
+        js, js_final = fetch_text(js_url)
     except Exception as exc:
-        print("ERROR", repr(exc))
+        print("JS_ERROR", js_url, repr(exc))
+        continue
+    for keyword in ("download", "online_url", "original_id", "unlock", "page_url", "report/download", "/download"):
+        positions = [m.start() for m in re.finditer(re.escape(keyword), js, flags=re.I)]
+        if positions:
+            print("JS", js_final, "KEY", keyword, "COUNT", len(positions))
+            for pos in positions[:20]:
+                print(re.sub(r"\s+", " ", js[max(0, pos - 500):pos + 1000])[:1600])
+
+print("\n=== SDYANBAO PUBLIC FILE CANDIDATES ===")
+candidates = [
+    "https://oss.sdyanbao.com/page/2025/5/7/1192119.pdf",
+    "https://oss.sdyanbao.com/page/2025/5/7/1192119/1192119.pdf",
+    "https://oss.sdyanbao.com/pdf/2025/5/7/1192119.pdf",
+    "https://oss.sdyanbao.com/file/2025/5/7/1192119.pdf",
+    "https://oss.sdyanbao.com/report/2025/5/7/1192119.pdf",
+    "https://oss.sdyanbao.com/pdf/1192119.pdf",
+    "https://oss.sdyanbao.com/file/1192119.pdf",
+    "https://oss.sdyanbao.com/2025/5/7/1192119.pdf",
+]
+for url in candidates:
+    try:
+        response = session.get(url, headers={"Range": "bytes=0-31"}, timeout=(15, 60), allow_redirects=True)
+        print(url, response.status_code, response.headers.get("Content-Type"), response.headers.get("Content-Length"), response.content[:16])
+    except Exception as exc:
+        print(url, "ERROR", repr(exc))
+
+print("\n=== FXBAOGAO DETAIL/VIEW ===")
+for url in (
+    "https://www.fxbaogao.com/detail/4788440",
+    "https://www.fxbaogao.com/view?id=4788440",
+    "https://m.fxbaogao.com/detail/4788440",
+    "https://m.fxbaogao.com/view?id=4788440",
+):
+    try:
+        text, final_url = fetch_text(url)
+    except Exception as exc:
+        print("PAGE_ERROR", url, repr(exc))
+        continue
+    print("PAGE", final_url)
+    for keyword in ("4788440", "report-image", "download", "fileUrl", "pdfUrl", "sourceUrl", "__NEXT_DATA__"):
+        positions = [m.start() for m in re.finditer(re.escape(keyword), text, flags=re.I)]
+        print("KEY", keyword, len(positions))
+        for pos in positions[:15]:
+            print(re.sub(r"\s+", " ", text[max(0, pos - 500):pos + 1200])[:1800])
+    for match in re.findall(r'https?://[^\"\'<>\s]+', text, flags=re.I):
+        lower = match.lower()
+        if any(k in lower for k in ("4788440", ".pdf", "report-image", "download")):
+            print("URL", match[:1000])
+
+print("\n=== FXBAOGAO PAGE IMAGES ===")
+for page_no in range(1, 15):
+    url = f"https://public.fxbaogao.com/report-image/2025/04/17/4788440-{page_no}.png"
+    try:
+        response = session.get(url, headers={"Range": "bytes=0-31"}, timeout=(15, 60), allow_redirects=True)
+        print(page_no, response.status_code, response.headers.get("Content-Type"), response.headers.get("Content-Length"), response.content[:16])
+    except Exception as exc:
+        print(page_no, "ERROR", repr(exc))
