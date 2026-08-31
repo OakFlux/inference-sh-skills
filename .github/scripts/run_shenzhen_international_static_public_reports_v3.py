@@ -26,6 +26,10 @@ replacements = [
         'timeout=(20, 120),',
         'timeout=(15, 45),',
     ),
+    (
+        '        ("风险提示", "風險提示", "风险因素", "風險因素"),\n',
+        '',
+    ),
 ]
 
 for old, new in replacements:
