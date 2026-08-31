@@ -1,0 +1,66 @@
+name: Temporary Shenzhen International F10 research list
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-f10.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch and parse F10 research pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html,json,re,subprocess
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          urls=[
+              'https://webf10.gw.com.cn/HK/B11/HK00152_B11.html',
+              'https://webf10.gw.com.cn/HK/B11/HK0152_B11.html',
+              'https://webf10.gw.com.cn/HK/B11/HK00152_B11.html?source=web',
+          ]
+          all_rows=[]
+          for i,url in enumerate(urls,1):
+              p=Path('diagnostic')/f'{i}.html'
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','20','--max-time','180','-A',ua,'-H','Accept-Encoding: identity',url,'-o',str(p)]
+              r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',i,r.returncode,p.stat().st_size if p.exists() else 0,url,r.stderr[-300:])
+              if r.returncode or not p.exists():continue
+              body=p.read_bytes();text=None;enc=None
+              for e in ['utf-8','gb18030','gbk','big5','latin1']:
+                  try:text=body.decode(e);enc=e;break
+                  except:pass
+              if text is None:continue
+              text=html.unescape(text);p.write_text(text,encoding='utf-8')
+              for line_no,line in enumerate(text.splitlines(),1):
+                  plain=' '.join(re.sub(r'<[^>]+>',' ',line).split())
+                  if any(k in plain for k in ['深圳国际','深圳國際','0152','00152','首次覆盖','深度报告','物流园']):
+                      print('LINE',i,line_no,plain[:5000],line[:5000])
+              anchors=[]
+              for m in re.finditer(r'<a\b([^>]*)>(.*?)</a>',text,re.I|re.S):
+                  hm=re.search(r'href\s*=\s*["\']([^"\']+)["\']',m.group(1),re.I)
+                  if not hm:continue
+                  href=urljoin(url,hm.group(1));label=' '.join(re.sub(r'<[^>]+>',' ',m.group(2)).split())
+                  if any(k.lower() in (label+' '+href).lower() for k in ['深圳国际','0152','research','report','研报','pdf']):
+                      a={'label':label,'href':href};anchors.append(a);print('ANCHOR',json.dumps(a,ensure_ascii=False))
+              all_rows.append({'url':url,'encoding':enc,'anchors':anchors})
+          Path('diagnostic/manifest.json').write_text(json.dumps(all_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload F10 pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-f10
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
