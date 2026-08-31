@@ -1,0 +1,184 @@
+name: Temporary Shenzhen International broker-report assets
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-report-assets.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect report mirror pages, scripts and public assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages scripts assets diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin, unquote
+          import hashlib, html, json, re, subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36'
+          targets=[
+              ('sdy_886501','https://www.sdyanbao.com/detail/886501'),
+              ('fx_4788440','https://www.fxbaogao.com/detail/4788440'),
+              ('book118_shenwan','https://max.book118.com/html/2025/0701/5104021001012234.shtm'),
+          ]
+          manifest=[]; script_urls=[]; candidate_urls=[]
+
+          def decode(body:bytes):
+              for enc in ['utf-8','gb18030','gbk','big5','latin1']:
+                  try:return body.decode(enc),enc
+                  except Exception:pass
+              return None,None
+
+          for name,url in targets:
+              out=Path('pages')/f'{name}.bin'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','6','--retry-all-errors',
+                   '--retry-delay','1','--connect-timeout','25','--max-time','300','--compressed',
+                   '-A',UA,'-e',url,'-H','Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                   '-H','Accept-Language: zh-CN,zh;q=0.9,en;q=0.8','-H','Accept-Encoding: identity',
+                   url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',name,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'ERR',p.stderr[-500:])
+              if p.returncode or not out.exists():
+                  manifest.append({'name':name,'url':url,'error':p.stderr[-1000:]});continue
+              body=out.read_bytes(); text,enc=decode(body)
+              if text is None:
+                  manifest.append({'name':name,'url':url,'size':len(body),'binary':True});continue
+              text=html.unescape(text).replace('\\/','/')
+              hp=out.with_suffix('.html');out.unlink();hp.write_text(text,encoding='utf-8')
+              title='';m=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              if m:title=' '.join(re.sub(r'<[^>]+>',' ',m.group(1)).split())
+              print('TITLE',name,title)
+
+              scripts=[]
+              for src in re.findall(r'<script[^>]+src\s*=\s*["\']([^"\']+)["\']',text,re.I):
+                  full=urljoin(url,src.strip())
+                  if full not in scripts:scripts.append(full)
+                  if full not in script_urls:script_urls.append(full)
+
+              found=[]
+              pats=[
+                r'''(?:href|src|data-src|data-original|data-url|data-file|data-pdf|url|file|fileurl|pdfurl|downloadurl|previewurl|sourceurl|imgurl|imageurl)\s*[:=]\s*["']([^"']+)["']''',
+                r'''https?://[^\s"'<>]+''',
+                r'''//[^\s"'<>]+''',
+                r'''[^\s"'<>]+\.(?:pdf|png|jpg|jpeg|webp)(?:\?[^\s"'<>]*)?''',
+              ]
+              for pat in pats:
+                  for v in re.findall(pat,text,re.I):
+                      if isinstance(v,tuple):v=v[0]
+                      v=v.strip().replace('&amp;','&').replace('\\u002F','/').replace('\\u0026','&')
+                      if not v or v.startswith(('javascript:','#','data:')):continue
+                      try:full=urljoin(url,v)
+                      except Exception:continue
+                      if full not in found:found.append(full)
+              interesting=[]
+              for u in found:
+                  low=u.lower()
+                  if any(k in low for k in ['886501','4788440','5104021001012234','pdf','download','down','file','attach','preview','viewer','report','doc','page','oss','cos','static']):
+                      interesting.append(u)
+                      if u not in candidate_urls:candidate_urls.append(u)
+              for u in interesting[:500]:print('PAGE_URL',name,u[:2500])
+
+              # Dump embedded JSON and lines that may expose IDs/APIs.
+              for n,line in enumerate(text.splitlines(),1):
+                  low=line.lower()
+                  if any(k in low for k in ['886501','4788440','5104021001012234','download','pdfurl','fileurl','previewurl','docid','reportid','pagecount','pagenum','attach','oss','cos','api/','report-image','file.sgpjbg','book118']):
+                      plain=' '.join(re.sub(r'<[^>]+>',' ',line).split())
+                      print('PAGE_LINE',name,n,plain[:4500],line[:4500])
+              for idx,m in enumerate(re.finditer(r'<script[^>]*type=["\']application/(?:ld\+json|json)["\'][^>]*>(.*?)</script>',text,re.I|re.S),1):
+                  block=m.group(1).strip()
+                  Path('diagnostic',f'{name}_embedded_{idx}.json').write_text(block,encoding='utf-8')
+
+              manifest.append({'name':name,'url':url,'encoding':enc,'title':title,'size':len(body),'scripts':scripts,'interesting_urls':interesting})
+
+          # Fetch JavaScript assets and scan for public API patterns.
+          script_manifest=[]
+          for i,u in enumerate(script_urls,1):
+              out=Path('scripts')/f'{i:03d}.js'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','4','--retry-all-errors',
+                   '--connect-timeout','20','--max-time','240','-A',UA,'-e','https://www.sdyanbao.com/',
+                   '-H','Accept-Encoding: identity',u,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              size=out.stat().st_size if out.exists() else 0
+              print('SCRIPT_FETCH',i,'RC',p.returncode,'SIZE',size,'URL',u,'ERR',p.stderr[-300:])
+              if p.returncode or not out.exists():
+                  out.unlink(missing_ok=True);script_manifest.append({'url':u,'error':p.stderr[-500:]});continue
+              text=out.read_text(encoding='utf-8',errors='ignore').replace('\\/','/')
+              hits=[]
+              for pat in [
+                  r'''https?://[^\s"'<>]+''',r'''//[^\s"'<>]+''',
+                  r'''/[A-Za-z0-9_./?=&%{}:-]*(?:download|pdf|file|preview|report|detail|api|doc)[A-Za-z0-9_./?=&%{}:-]*'''
+              ]:
+                  for v in re.findall(pat,text,re.I):
+                      if isinstance(v,tuple):v=v[0]
+                      try:full=urljoin(u,v.replace('\\u002F','/').replace('\\u0026','&'))
+                      except Exception:continue
+                      if any(k in full.lower() for k in ['download','pdf','file','preview','report','detail','api','doc','886501','4788440']):
+                          if full not in hits:hits.append(full)
+                          if full not in candidate_urls:candidate_urls.append(full)
+              for h in hits[:300]:print('SCRIPT_URL',i,h[:2500])
+              for keyword in ['download','pdfUrl','fileUrl','previewUrl','docId','reportId','pageCount','886501','4788440','searchReportData']:
+                  pos=0;count=0
+                  while True:
+                      pos=text.lower().find(keyword.lower(),pos)
+                      if pos<0 or count>=20:break
+                      start=max(0,pos-600);end=min(len(text),pos+1400)
+                      print('SCRIPT_CONTEXT',i,keyword,text[start:end].replace('\n',' ')[:2200])
+                      pos=end;count+=1
+              script_manifest.append({'url':u,'size':size,'hits':hits})
+
+          Path('diagnostic/manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/script_manifest.json').write_text(json.dumps(script_manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/candidates.txt').write_text('\n'.join(candidate_urls)+'\n',encoding='utf-8')
+
+          # Probe likely public PDFs/images/JSON endpoints. Keep valid assets only.
+          probe_results=[]
+          for i,u in enumerate(candidate_urls[:3000],1):
+              low=u.lower()
+              if not any(k in low for k in ['886501','4788440','5104021001012234','.pdf','download','file','preview','report','doc','attach','api']):continue
+              out=Path('assets')/f'{i:04d}.bin'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','2','--retry-all-errors',
+                   '--connect-timeout','12','--max-time','90','-A',UA,'-e','https://www.sdyanbao.com/detail/886501',
+                   '-H','Accept: application/pdf,application/json,image/avif,image/webp,image/png,image/jpeg,text/html,*/*;q=0.8',
+                   '-H','Accept-Encoding: identity',u,'-o',str(out),'-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              if p.returncode or not out.exists():
+                  out.unlink(missing_ok=True);probe_results.append({'url':u,'ok':False,'error':p.stderr[-300:]});continue
+              b=out.read_bytes();kind='other';ext='.bin'
+              if b[:4]==b'%PDF':kind='pdf';ext='.pdf'
+              elif b[:8]==b'\x89PNG\r\n\x1a\n':kind='png';ext='.png'
+              elif b[:3]==b'\xff\xd8\xff':kind='jpg';ext='.jpg'
+              elif b[:4]==b'RIFF' and b[8:12]==b'WEBP':kind='webp';ext='.webp'
+              elif b[:1] in [b'{',b'[']:kind='json';ext='.json'
+              elif b.lstrip()[:15].lower().startswith(b'<!doctype') or b.lstrip()[:5].lower()==b'<html':kind='html';ext='.html'
+              if kind in ['pdf','png','jpg','webp','json'] and len(b)>200:
+                  final=out.with_suffix(ext);out.rename(final)
+                  rec={'url':u,'ok':True,'kind':kind,'size':len(b),'file':str(final),'curl_meta':p.stdout,'sha256':hashlib.sha256(b).hexdigest()}
+                  print('ASSET',i,kind,len(b),p.stdout,u);probe_results.append(rec)
+              else:
+                  preview=b[:500].decode('utf-8','replace');out.unlink(missing_ok=True)
+                  probe_results.append({'url':u,'ok':False,'kind':kind,'size':len(b),'curl_meta':p.stdout,'preview':preview})
+          Path('diagnostic/probe_results.json').write_text(json.dumps(probe_results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          find pages scripts assets diagnostic -type f -printf '%p\t%s\n' | sort | tail -200
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-broker-assets
+          path: |
+            pages/
+            scripts/
+            assets/
+            diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
