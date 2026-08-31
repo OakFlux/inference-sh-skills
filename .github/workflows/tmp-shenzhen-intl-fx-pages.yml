@@ -1,0 +1,117 @@
+name: Temporary recover Southwest Shenzhen International report pages
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-fx-pages.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install image/PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq img2pdf poppler-utils
+
+      - name: Probe public page CDN and build page-image PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output pages diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          import hashlib,json,subprocess
+
+          docid='4788440'
+          dates=['2025/04/17','2025/05/07','2025/04/16','2025/04/18','2025/05/06','2025/05/08']
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          def fetch(url,out,timeout=60):
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--connect-timeout','12','--max-time',str(timeout),
+                   '-A',ua,'-e',f'https://www.fxbaogao.com/detail/{docid}',
+                   '-H','Accept: image/avif,image/webp,image/png,image/*,*/*;q=0.8','-H','Accept-Encoding: identity',
+                   url,'-o',str(out),'-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              b=out.read_bytes() if out.exists() else b''
+              ok=p.returncode==0 and len(b)>5000 and (b[:8]==b'\x89PNG\r\n\x1a\n' or b[:3]==b'\xff\xd8\xff' or (b[:4]==b'RIFF' and b[8:12]==b'WEBP'))
+              return {'ok':ok,'size':len(b),'magic':b[:16].hex(),'meta':p.stdout,'err':p.stderr[-300:]}
+
+          probes=[];winning_date=None
+          for date in dates:
+              variants=[
+                  f'https://public.fxbaogao.com/report-image/{date}/{docid}-1.png?x-oss-process=image/quality,q_100',
+                  f'https://public.fxbaogao.com/report-image/{date}/{docid}-1.png',
+                  f'https://public.fxbaogao.com/report-image/{date}/{docid}-1.png?x-oss-process=image/format,png',
+                  f'https://public.fxbaogao.com/report-image/{date}/{docid}-1.png?x-oss-process=image/format,webp',
+              ]
+              for vi,url in enumerate(variants,1):
+                  out=Path('diagnostic')/f'probe_{date.replace("/","")}_{vi}.bin'
+                  r=fetch(url,out,90);r.update({'date':date,'variant':vi,'url':url});probes.append(r)
+                  print('PROBE',json.dumps(r,ensure_ascii=False))
+                  if r['ok']:
+                      winning_date=date
+                      out.unlink(missing_ok=True)
+                      break
+                  out.unlink(missing_ok=True)
+              if winning_date:break
+          Path('diagnostic/probes.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2),encoding='utf-8')
+          if not winning_date:
+              raise RuntimeError('No public page-image date worked')
+
+          def download_page(page):
+              urls=[
+                  f'https://public.fxbaogao.com/report-image/{winning_date}/{docid}-{page}.png?x-oss-process=image/quality,q_100',
+                  f'https://public.fxbaogao.com/report-image/{winning_date}/{docid}-{page}.png',
+              ]
+              dest=Path('pages')/f'{page:03d}.img'
+              for url in urls:
+                  r=fetch(url,dest,120)
+                  if r['ok']:
+                      b=dest.read_bytes()
+                      ext='.png' if b[:8]==b'\x89PNG\r\n\x1a\n' else '.jpg' if b[:3]==b'\xff\xd8\xff' else '.webp'
+                      final=dest.with_suffix(ext);dest.rename(final)
+                      return {'page':page,'ok':True,'file':str(final),'url':url,'size':len(b),'sha256':hashlib.sha256(b).hexdigest()}
+                  dest.unlink(missing_ok=True)
+              return {'page':page,'ok':False}
+
+          with ThreadPoolExecutor(max_workers=12) as ex:
+              results=list(ex.map(download_page,range(1,21)))
+          results.sort(key=lambda x:x['page'])
+          good=[r for r in results if r['ok']]
+          contiguous=0
+          for p in range(1,21):
+              if any(r['page']==p for r in good):contiguous=p
+              else:break
+          for r in good:
+              if r['page']>contiguous:Path(r['file']).unlink(missing_ok=True)
+          selected=[r for r in good if r['page']<=contiguous]
+          print('WINNING_DATE',winning_date,'CONTIGUOUS',contiguous,'PAGES',[r['page'] for r in selected])
+          Path('diagnostic/page_manifest.json').write_text(json.dumps({'date':winning_date,'contiguous':contiguous,'pages':selected,'all':results},ensure_ascii=False,indent=2),encoding='utf-8')
+          if contiguous!=11:
+              raise RuntimeError(f'Expected 11 pages, recovered {contiguous}')
+          PY
+
+          img2pdf $(find pages -type f | sort) -o output/Shenzhen_International_Southwest_20250417_11p_Public_Page_Copy.pdf
+          pdfinfo output/Shenzhen_International_Southwest_20250417_11p_Public_Page_Copy.pdf
+          pages=$(pdfinfo output/Shenzhen_International_Southwest_20250417_11p_Public_Page_Copy.pdf | awk '/^Pages:/ {print $2}')
+          test "$pages" -eq 11
+          sha256sum output/*.pdf > diagnostic/SHA256SUMS.txt
+
+      - name: Upload recovered page-image report
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-southwest-public-pages
+          path: |
+            output/*.pdf
+            pages/
+            diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
