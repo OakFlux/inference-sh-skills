@@ -1,0 +1,18 @@
+name: List Shenzhen International broker reports
+
+on:
+  push:
+    branches:
+      - tmp/shenzhen-international-broker-reports-20260831
+
+permissions:
+  contents: read
+
+jobs:
+  list:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python .github/scripts/list_shenzhen_international_reports.py
