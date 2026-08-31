@@ -1,0 +1,186 @@
+name: Temporary recover Shenwan Shenzhen International deep report
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-book118-recovery.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install image/PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq img2pdf poppler-utils python3-pil
+
+      - name: Resolve preview token, download all pages, build PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages output diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import hashlib,json,re,subprocess,time
+          from PIL import Image
+
+          original='https://max.book118.com/html/2025/0701/5104021001012234.shtm'
+          book_id='5104021001012234'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          def curl(url,out,referer=original,max_time=240):
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','5','--retry-all-errors',
+                   '--retry-delay','1','--connect-timeout','20','--max-time',str(max_time),'-A',ua,
+                   '-e',referer,'-H','Accept-Encoding: identity',url,'-o',str(out),
+                   '-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              return p
+
+          sources=[
+              original,
+              f'https://max.book118.com/index.php?g=Home&m=NewView&a=index&aid={book_id}',
+              f'https://max.book118.com/index.php?g=Home&m=NewView&a=index&aid={book_id}&v=1',
+          ]
+          source_texts=[]
+          for i,url in enumerate(sources,1):
+              out=Path('diagnostic')/f'source_{i}.html'
+              p=curl(url,out)
+              print('SOURCE',i,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'META',p.stdout,'ERR',p.stderr[-300:])
+              if p.returncode==0 and out.exists():
+                  body=out.read_bytes();text=None
+                  for enc in ['utf-8','gb18030','gbk','latin1']:
+                      try:text=body.decode(enc);break
+                      except Exception:pass
+                  if text is not None:
+                      out.write_text(text,encoding='utf-8');source_texts.append((url,text))
+
+          patterns=[
+              r'''["']?aid["']?\s*[:=]\s*["']?([^,"'\s}\]]+)''',
+              r'''["']?view_token["']?\s*[:=]\s*["']([^"']+)''',
+          ]
+          aid=None;token=None
+          for url,text in source_texts:
+              # Common compact object: aid:'...', view_token:'...'
+              aid_matches=re.findall(patterns[0],text,re.I)
+              token_matches=re.findall(patterns[1],text,re.I)
+              print('TOKEN_MATCHES',url,'AID',aid_matches[:20],'TOKEN',token_matches[:20])
+              if aid_matches and not aid:
+                  candidates=[x.strip('"\' ') for x in aid_matches]
+                  aid=next((x for x in candidates if x and x not in ['true','false','null']),None)
+              if token_matches and not token:
+                  token=token_matches[0]
+              # Broader JSON/string regexes
+              if not token:
+                  for pat in [r'view_token.{0,40}?["\']([^"\']{8,})["\']',r'viewToken.{0,40}?["\']([^"\']{8,})["\']']:
+                      m=re.search(pat,text,re.I|re.S)
+                      if m:token=m.group(1);break
+              if not aid:
+                  m=re.search(r'\baid\b.{0,30}?["\']?([0-9]{6,})["\']?',text,re.I|re.S)
+                  if m:aid=m.group(1)
+          aid=aid or book_id
+          print('RESOLVED',aid,token)
+          if not token:
+              raise RuntimeError('view_token not found')
+
+          def parse_jsonp(text):
+              s=text.strip()
+              if s.startswith('{') or s.startswith('['):return json.loads(s)
+              start=s.find('(');end=s.rfind(')')
+              if start>=0 and end>start:
+                  return json.loads(s[start+1:end])
+              start=s.find('{');end=s.rfind('}')
+              if start>=0 and end>start:return json.loads(s[start:end+1])
+              raise ValueError('Cannot parse JSONP')
+
+          api_base='https://openapi.book118.com/getPreview.html'
+          all_data={};responses=[];max_page=None
+          # Legacy API returns six pages per request, starting at 1,7,13...
+          starts=[1]+list(range(7,121,6))
+          for start_page in starts:
+              url=f'{api_base}?project_id=1&aid={aid}&view_token={token}&page={start_page}'
+              out=Path('diagnostic')/f'api_{start_page:03d}.txt'
+              p=curl(url,out,original,180)
+              size=out.stat().st_size if out.exists() else 0
+              print('API',start_page,'RC',p.returncode,'SIZE',size,'META',p.stdout,'ERR',p.stderr[-300:])
+              if p.returncode or not out.exists():
+                  if start_page==1:raise RuntimeError('Initial preview API request failed')
+                  break
+              text=out.read_text(encoding='utf-8',errors='replace')
+              obj=parse_jsonp(text)
+              responses.append({'page':start_page,'url':url,'object':obj})
+              data=obj.get('data') or {}
+              for k,v in data.items():all_data[str(k)]=v
+              pages_obj=obj.get('pages') or {}
+              if max_page is None:
+                  try:max_page=int(pages_obj.get('preview') or pages_obj.get('total') or pages_obj.get('page') or 0)
+                  except Exception:max_page=0
+              print('API_DATA',start_page,'KEYS',sorted(data.keys(),key=lambda x:int(x) if str(x).isdigit() else 999999),'MAX',max_page)
+              if max_page and max(all([int(k) for k in all_data if str(k).isdigit()] or [0]))>=max_page:
+                  break
+              time.sleep(0.4)
+
+          Path('diagnostic/api_manifest.json').write_text(json.dumps({'aid':aid,'token':token,'max_page':max_page,'data':all_data,'responses':responses},ensure_ascii=False,indent=2),encoding='utf-8')
+          numeric=sorted((int(k),v) for k,v in all_data.items() if str(k).isdigit())
+          print('NUMERIC_PAGES',len(numeric),numeric[:3],numeric[-3:] if numeric else [])
+          if not max_page:
+              max_page=max([p for p,_ in numeric],default=0)
+          # Book118 may report 32 as end sentinel for a 31-page document; use available consecutive pages.
+          consecutive=0
+          for p in range(1,max_page+2):
+              if str(p) in all_data:consecutive=p
+              else:break
+          print('MAX_PAGE',max_page,'CONSECUTIVE',consecutive)
+          if consecutive<30:
+              raise RuntimeError(f'Only {consecutive} consecutive preview pages found')
+
+          page_manifest=[]
+          for p in range(1,consecutive+1):
+              raw=str(all_data[str(p)]).strip()
+              if raw.startswith('//'):url='https:'+raw
+              elif raw.startswith('http://') or raw.startswith('https://'):url=raw
+              else:url=urljoin('https://openapi.book118.com/',raw)
+              tmp=Path('pages')/f'{p:03d}.bin'
+              cp=curl(url,tmp,original,240)
+              b=tmp.read_bytes() if tmp.exists() else b''
+              kind=None
+              if b[:8]==b'\x89PNG\r\n\x1a\n':kind='png'
+              elif b[:3]==b'\xff\xd8\xff':kind='jpg'
+              elif b[:4]==b'RIFF' and b[8:12]==b'WEBP':kind='webp'
+              print('IMAGE',p,'RC',cp.returncode,'SIZE',len(b),'KIND',kind,'URL',url,'ERR',cp.stderr[-200:])
+              if cp.returncode or len(b)<5000 or kind is None:
+                  raise RuntimeError(f'Page {p} image download failed')
+              src=tmp.with_suffix('.'+kind);tmp.rename(src)
+              # Convert every source page to RGB JPEG for predictable img2pdf handling.
+              with Image.open(src) as im:
+                  im=im.convert('RGB')
+                  jpg=Path('pages')/f'{p:03d}.jpg'
+                  im.save(jpg,quality=95,subsampling=0)
+                  width,height=im.size
+              if src!=jpg:src.unlink(missing_ok=True)
+              page_manifest.append({'page':p,'source_url':url,'file':jpg.name,'width':width,'height':height,'size':jpg.stat().st_size,'sha256':hashlib.sha256(jpg.read_bytes()).hexdigest()})
+          Path('diagnostic/page_manifest.json').write_text(json.dumps(page_manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          if len(page_manifest) not in [31,32]:
+              raise RuntimeError(f'Unexpected page count: {len(page_manifest)}')
+          PY
+
+          img2pdf $(find pages -name '*.jpg' | sort) -o output/Shenzhen_International_Shenwan_20250624_Deep_Report_Public_Preview_Copy.pdf
+          pdfinfo output/Shenzhen_International_Shenwan_20250624_Deep_Report_Public_Preview_Copy.pdf
+          sha256sum output/*.pdf > diagnostic/SHA256SUMS.txt
+
+      - name: Upload recovered report pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-shenwan-public-preview
+          path: |
+            output/*.pdf
+            pages/*.jpg
+            diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
