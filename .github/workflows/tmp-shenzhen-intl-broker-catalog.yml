@@ -1,0 +1,106 @@
+name: Temporary Shenzhen International broker report catalog
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-broker-catalog.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Query Eastmoney and Fxbaogao public catalogs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import json, os, subprocess, tempfile, urllib.parse, urllib.request
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          out=Path('diagnostic')
+
+          # Eastmoney company research catalog: try HK stock-code variants.
+          api='https://reportapi.eastmoney.com/report/list'
+          em=[]
+          for code in ['00152','0152','152']:
+              for page in range(1,8):
+                  params={
+                      'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                      'beginTime':'2014-01-01','endTime':'2030-12-31','pageNo':str(page),'fields':'',
+                      'qType':'0','orgCode':'','code':code,'rcode':'','p':str(page),
+                      'pageNum':str(page),'pageNumber':str(page),
+                  }
+                  url=api+'?'+urllib.parse.urlencode(params)
+                  fd,name=tempfile.mkstemp(prefix='szintl_',suffix='.json');os.close(fd);tmp=Path(name)
+                  try:
+                      cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors',
+                           '--connect-timeout','20','--max-time','180','-A',UA,'-e','https://data.eastmoney.com/report/',
+                           '-H','Accept-Encoding: identity',url,'-o',str(tmp)]
+                      p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                      if p.returncode:
+                          print('EM_ERR',code,page,p.stderr[-300:]);break
+                      raw=tmp.read_text(encoding='utf-8',errors='ignore').strip()
+                      if raw.startswith('datatable(') and raw.endswith(')'):raw=raw[len('datatable('):-1]
+                      elif raw and raw[0] not in '[{' and '(' in raw and raw.endswith(')'):raw=raw[raw.find('(')+1:raw.rfind(')')]
+                      obj=json.loads(raw); rows=obj.get('data') or []
+                      print('EM_PAGE',code,page,'HITS',obj.get('hits'),'ROWS',len(rows))
+                      for r in rows:
+                          rr=dict(r);rr['_code_query']=code;em.append(rr)
+                      if len(rows)<100:break
+                  finally:
+                      tmp.unlink(missing_ok=True)
+          seen={}
+          for r in em:
+              key=str(r.get('infoCode') or json.dumps(r,ensure_ascii=False,sort_keys=True))
+              seen[key]=r
+          em=list(seen.values())
+          em.sort(key=lambda r:str(r.get('publishDate') or ''),reverse=True)
+          out.joinpath('eastmoney.json').write_text(json.dumps(em,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('EM_COUNT',len(em))
+          for r in em:
+              print('EM',json.dumps({k:r.get(k) for k in ['publishDate','orgSName','stockCode','stockName','title','attachPages','reportType','ratingName','infoCode']},ensure_ascii=False))
+
+          # Fxbaogao public metadata search.
+          fx_api='https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth'
+          fx=[]
+          for kw in ['深圳国际','00152','0152.HK','深圳國際']:
+              for page in range(1,8):
+                  body=json.dumps({'keywords':kw,'pageIndex':page,'pageSize':100,'order':2,'nop':-1},ensure_ascii=False).encode('utf-8')
+                  req=urllib.request.Request(fx_api,data=body,headers={'User-Agent':UA,'Content-Type':'application/json'},method='POST')
+                  try:raw=urllib.request.urlopen(req,timeout=120).read().decode('utf-8','replace')
+                  except Exception as e:
+                      print('FX_ERR',kw,page,repr(e));break
+                  obj=json.loads(raw);rows=(obj.get('data') or {}).get('dataList') or []
+                  print('FX_PAGE',kw,page,'ROWS',len(rows))
+                  for r in rows:
+                      rr=dict(r);rr['_keyword']=kw;fx.append(rr)
+                  if len(rows)<100:break
+          seen={}
+          for r in fx:
+              key=str(r.get('docId') or r.get('id') or json.dumps(r,ensure_ascii=False,sort_keys=True))
+              seen[key]=r
+          fx=list(seen.values())
+          fx.sort(key=lambda r:(r.get('pubTime') or 0,r.get('pageNum') or 0),reverse=True)
+          out.joinpath('fxbaogao.json').write_text(json.dumps(fx,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FX_COUNT',len(fx))
+          for r in fx:
+              title=str(r.get('title') or '')
+              if '深圳国际' in title or '深圳國際' in title or '00152' in title or '0152' in title:
+                  print('FX',json.dumps({k:r.get(k) for k in ['docId','title','orgName','pageNum','pubTime','fileSize','categoryName','fileName','fileUrl','downloadUrl']},ensure_ascii=False))
+          PY
+
+      - name: Upload catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-broker-catalog
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
