@@ -1,0 +1,47 @@
+name: Temporary Shenzhen International report source grep
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-source-grep.yml
+
+jobs:
+  grep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch and grep source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          urls=(
+            'https://www.sdyanbao.com/detail/886501'
+            'https://www.fxbaogao.com/detail/4788440'
+            'https://max.book118.com/html/2025/0701/5104021001012234.shtm'
+          )
+          i=0
+          for url in "${urls[@]}"; do
+            i=$((i+1))
+            curl --http1.1 -L --fail --retry 5 --retry-all-errors --connect-timeout 20 --max-time 180 \
+              -A "$UA" -e "$url" -H 'Accept-Encoding: identity' "$url" -o "pages/$i.html" || true
+            echo "===== PAGE $i $url SIZE $(stat -c%s pages/$i.html 2>/dev/null || echo 0) ====="
+            grep -Eino '.{0,500}(886501|4788440|5104021001012234|download|pdfUrl|fileUrl|previewUrl|docId|reportId|pageCount|pageNum|attachment|\.pdf|report-image|api/).{0,1200}' "pages/$i.html" | head -300 || true
+            echo '----- ABSOLUTE URLS -----'
+            grep -Eo 'https?://[^"'"'"' <>]+' "pages/$i.html" | sed 's/&amp;/\&/g' | sort -u | grep -Ei 'pdf|download|file|preview|report|886501|4788440|5104021001012234|api' | head -300 || true
+            echo '----- SCRIPT URLS -----'
+            grep -Eio '<script[^>]+src=["'"'"'][^"'"'"']+' "pages/$i.html" | sed -E 's/.*src=["'"'"']//I' | head -200 || true
+          done
+
+      - name: Upload source pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-report-source-pages
+          path: pages/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
