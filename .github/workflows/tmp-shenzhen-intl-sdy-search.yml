@@ -1,0 +1,74 @@
+name: Temporary search Sdyanbao for Shenzhen International reports
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-sdy-search.yml
+
+jobs:
+  search:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Search public report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess
+          api='https://api.sdyanbao.com/api/file/search'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          keywords=['深圳国际','深圳國際','掌握湾区优质资产','国企优质资源禀赋','华南物流园增值添利']
+          all_rows=[]
+          for ki,keyword in enumerate(keywords,1):
+              for page in range(1,11):
+                  payload={
+                    'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':page,'pageSize':50,
+                    'keyword':keyword,'pageCount':0,'dateRange':0,'startTime':'','endTime':'',
+                    'typeIds':'','industryIds':''
+                  }
+                  out=Path('diagnostic')/f'{ki}_{page}.json'
+                  cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors',
+                       '--connect-timeout','20','--max-time','180','-A',ua,'-e','https://www.sdyanbao.com/report?keyword='+keyword,
+                       '-H','Content-Type: application/json','-H','Accept: application/json','-H','Accept-Encoding: identity',
+                       '-X','POST','--data-binary',json.dumps(payload,ensure_ascii=False),api,'-o',str(out)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  print('FETCH',keyword,page,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'ERR',p.stderr[-300:])
+                  if p.returncode or not out.exists():break
+                  obj=json.loads(out.read_text(encoding='utf-8',errors='replace'))
+                  if int(obj.get('status') or 0)!=1:
+                      print('API_ERROR',obj);break
+                  data=obj.get('data') or {};rows=data.get('files') or []
+                  print('PAGE',keyword,page,'ROWS',len(rows),'TOTAL',data.get('total'),'TOTAL_FILE',data.get('totalFile'))
+                  for r in rows:
+                      rr=dict(r);rr['_keyword']=keyword;all_rows.append(rr)
+                      title=str(r.get('name') or '')
+                      if any(k in title for k in ['深圳国际','深圳國際','掌握湾区','国企优质资源','华南物流园']):
+                          print('MATCH',json.dumps({k:r.get(k) for k in ['id','name','page_count','file_size','time_text','original_id','online_url','share_url','page_url','organization','stock','type']},ensure_ascii=False))
+                  if len(rows)<50:break
+          seen={}
+          for r in all_rows:
+              seen[str(r.get('id'))]=r
+          rows=list(seen.values())
+          rows.sort(key=lambda r:(str(r.get('time_text') or ''),int(r.get('page_count') or 0)),reverse=True)
+          Path('diagnostic/all_matches.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('UNIQUE',len(rows))
+          for r in rows:
+              title=str(r.get('name') or '')
+              if '深圳国际' in title or '深圳國際' in title:
+                  print('FINAL_MATCH',json.dumps({k:r.get(k) for k in ['id','name','page_count','file_size','time_text','original_id','online_url','share_url','page_url','organization','stock','type']},ensure_ascii=False))
+          PY
+
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-sdy-search
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
