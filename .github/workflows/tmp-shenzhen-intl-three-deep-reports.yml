@@ -1,0 +1,267 @@
+name: Temporary package three Shenzhen International deep reports
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-three-deep-reports.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF and image utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq img2pdf poppler-utils python3-pil zip
+
+      - name: Download all public preview pages, create PDFs, verify and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work output package previews diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import datetime as dt
+          import hashlib
+          import json
+          import shutil
+          import subprocess
+          import time
+
+          from PIL import Image
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          WORK = Path('work')
+          OUTPUT = Path('output')
+          PACKAGE = Path('package')
+          PREVIEWS = Path('previews')
+          DIAG = Path('diagnostic')
+
+          reports = [
+              {
+                  'index': 1,
+                  'broker': '财通证券',
+                  'date': '2026-01-20',
+                  'mirror_date': '2026-02-03',
+                  'title': '华南物流园兑现业绩，低估值高股息凸显价值',
+                  'page_count': 26,
+                  'report_id': 943201,
+                  'original_id': 1286435,
+                  'page_url': 'https://oss.sdyanbao.com/page/2026/2/3/1286435',
+                  'filename': '01_Shenzhen_International_Caitong_2026_26p_Public_Preview_Copy.pdf',
+              },
+              {
+                  'index': 2,
+                  'broker': '申万宏源',
+                  'date': '2025-06-24',
+                  'mirror_date': '2025-06-30',
+                  'title': '国企优质资源禀赋，物流园转型升级带来业绩弹性',
+                  'page_count': 37,
+                  'report_id': 898048,
+                  'original_id': 1208912,
+                  'page_url': 'https://oss.sdyanbao.com/page/2025/6/30/1208912',
+                  'filename': '02_Shenzhen_International_Shenwan_Hongyuan_2025_37p_Public_Preview_Copy.pdf',
+              },
+              {
+                  'index': 3,
+                  'broker': '国海证券',
+                  'date': '2024-02-29',
+                  'mirror_date': '2024-02-29',
+                  'title': '深度报告：低估值高股息深圳国企，华南物流园进入业绩兑现期',
+                  'page_count': 36,
+                  'report_id': 710902,
+                  'original_id': 940017,
+                  'page_url': 'https://oss.sdyanbao.com/page/2024/2/29/940017',
+                  'filename': '03_Shenzhen_International_Guohai_2024_36p_Public_Preview_Copy.pdf',
+              },
+          ]
+
+          def curl_download(url: str, destination: Path, referer: str, max_time: int = 180) -> tuple[bool, str, str]:
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              cmd = [
+                  'curl', '--http1.1', '-L', '--silent', '--show-error',
+                  '--retry', '8', '--retry-all-errors', '--retry-delay', '1',
+                  '--connect-timeout', '25', '--max-time', str(max_time),
+                  '-A', UA, '-e', referer,
+                  '-H', 'Accept: image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8',
+                  '-H', 'Accept-Encoding: identity',
+                  url, '-o', str(destination),
+                  '-w', '%{url_effective}\t%{http_code}\t%{content_type}',
+              ]
+              proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+              return proc.returncode == 0, proc.stdout, proc.stderr[-500:]
+
+          def detect_image(data: bytes) -> str | None:
+              if data[:8] == b'\x89PNG\r\n\x1a\n':
+                  return 'png'
+              if data[:3] == b'\xff\xd8\xff':
+                  return 'jpg'
+              if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+                  return 'webp'
+              return None
+
+          def download_page(report: dict, zero_index: int) -> dict:
+              page_no = zero_index + 1
+              page_dir = WORK / f"report_{report['index']:02d}"
+              referer = f"https://www.sdyanbao.com/detail/{report['report_id']}"
+              candidates = [
+                  f"{report['page_url']}/{zero_index}.png",
+                  f"{report['page_url']}/{zero_index}.jpg",
+                  f"{report['page_url']}/{zero_index}.jpeg",
+                  f"{report['page_url']}/{zero_index}.webp",
+              ]
+              errors = []
+              for candidate_index, url in enumerate(candidates, start=1):
+                  temp = page_dir / f'{page_no:03d}_{candidate_index}.bin'
+                  ok, meta, err = curl_download(url, temp, referer)
+                  data = temp.read_bytes() if temp.exists() else b''
+                  kind = detect_image(data)
+                  print('PAGE_TRY', report['index'], page_no, candidate_index, 'OK', ok, 'SIZE', len(data), 'KIND', kind, 'META', meta, 'URL', url, 'ERR', err)
+                  if ok and len(data) > 5000 and kind:
+                      try:
+                          with Image.open(temp) as image:
+                              image = image.convert('RGB')
+                              final = page_dir / f'{page_no:03d}.jpg'
+                              image.save(final, quality=96, subsampling=0)
+                              width, height = image.size
+                          temp.unlink(missing_ok=True)
+                          return {
+                              'page': page_no,
+                              'source_index': zero_index,
+                              'source_url': url,
+                              'file': str(final),
+                              'width': width,
+                              'height': height,
+                              'size_bytes': final.stat().st_size,
+                              'sha256': hashlib.sha256(final.read_bytes()).hexdigest(),
+                          }
+                      except Exception as exc:
+                          errors.append(f'{url}: PIL {exc!r}')
+                  else:
+                      errors.append(f'{url}: ok={ok}, size={len(data)}, kind={kind}, meta={meta}, err={err}')
+                  temp.unlink(missing_ok=True)
+              return {'page': page_no, 'error': errors}
+
+          verified_reports = []
+          for report in reports:
+              page_dir = WORK / f"report_{report['index']:02d}"
+              if page_dir.exists():
+                  shutil.rmtree(page_dir)
+              page_dir.mkdir(parents=True)
+
+              with ThreadPoolExecutor(max_workers=12) as executor:
+                  futures = {
+                      executor.submit(download_page, report, zero_index): zero_index
+                      for zero_index in range(report['page_count'])
+                  }
+                  page_results = [future.result() for future in as_completed(futures)]
+              page_results.sort(key=lambda item: item['page'])
+              failed = [item for item in page_results if 'error' in item]
+              if failed:
+                  raise RuntimeError(f"{report['broker']} page downloads failed: {failed}")
+              if len(page_results) != report['page_count']:
+                  raise RuntimeError(f"{report['broker']}: downloaded {len(page_results)} pages, expected {report['page_count']}")
+
+              manifest_path = DIAG / f"report_{report['index']:02d}_pages.json"
+              manifest_path.write_text(json.dumps(page_results, ensure_ascii=False, indent=2), encoding='utf-8')
+
+              pdf_path = OUTPUT / report['filename']
+              ordered_images = [item['file'] for item in page_results]
+              subprocess.run(['img2pdf', *ordered_images, '-o', str(pdf_path)], check=True)
+
+              info = subprocess.check_output(['pdfinfo', str(pdf_path)], text=True, errors='replace')
+              actual_pages = 0
+              for line in info.splitlines():
+                  if line.startswith('Pages:'):
+                      actual_pages = int(line.split(':', 1)[1].strip())
+                      break
+              if actual_pages != report['page_count']:
+                  raise RuntimeError(f"{pdf_path.name}: actual pages {actual_pages}, expected {report['page_count']}")
+
+              for page_no, tag in [(1, 'first'), (actual_pages, 'last')]:
+                  target = PREVIEWS / f"{report['index']:02d}_{tag}"
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '110', str(pdf_path), str(target)],
+                      check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  )
+                  preview = Path(str(target) + '.png')
+                  if not preview.exists() or preview.stat().st_size < 8000:
+                      raise RuntimeError(f'{pdf_path.name}: {tag} page render failed')
+
+              verified = dict(report)
+              verified.update({
+                  'actual_pages': actual_pages,
+                  'size_bytes': pdf_path.stat().st_size,
+                  'sha256': hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+                  'format_note': '由公开逐页预览图片按原页序合并；不是券商原始二进制PDF；通常不可全文检索。',
+              })
+              verified_reports.append(verified)
+              print('VERIFIED_REPORT', json.dumps(verified, ensure_ascii=False))
+
+          manifest = {
+              'company': '深圳国际控股有限公司',
+              'stock_code': '00152.HK / 0152.HK',
+              'generated_at_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'count': len(verified_reports),
+              'delivery_format': 'public_preview_page_image_pdf',
+              'reports': verified_reports,
+          }
+          (PACKAGE / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          lines = [
+              '深圳国际（00152.HK）券商深度研究报告，共3份',
+              '',
+              '版本说明：',
+              '公开来源未提供无需登录即可获取的券商原始二进制PDF。',
+              '本资料包依据公开逐页预览，按原页序完整合并为PDF；并非重新撰写摘要，也没有删减公开预览中的页面。',
+              '合并版为图片型PDF，通常无法直接全文检索或复制文字。',
+              '',
+          ]
+          for number, report in enumerate(verified_reports, start=1):
+              lines += [
+                  f'{number}. {report["broker"]}，{report["date"]}，{report["actual_pages"]}页',
+                  f'   《{report["title"]}》',
+                  f'   公开镜像收录日期：{report["mirror_date"]}',
+                  f'   文件名：{report["filename"]}',
+                  '',
+              ]
+          lines += [
+              '核验说明：已逐页下载并核对连续页码，检查PDF实际页数，完成每份首页和末页渲染，',
+              '并对PDF及全部页面图像生成SHA-256校验值。',
+              '仅供研究资料整理，不构成投资建议。',
+          ]
+          (PACKAGE / '报告清单与版本说明.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          (PACKAGE / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{report["sha256"]}  {report["filename"]}' for report in verified_reports) + '\n',
+              encoding='utf-8',
+          )
+          for report in verified_reports:
+              shutil.copy2(OUTPUT / report['filename'], PACKAGE / report['filename'])
+          PY
+
+          (cd package && zip -q -9 ../Shenzhen_International_Broker_Deep_Reports_3_Public_Preview_Verified.zip ./*)
+          unzip -t Shenzhen_International_Broker_Deep_Reports_3_Public_Preview_Verified.zip
+          ls -lh output package previews diagnostic Shenzhen_International_Broker_Deep_Reports_3_Public_Preview_Verified.zip
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-three-deep-reports
+          path: |
+            Shenzhen_International_Broker_Deep_Reports_3_Public_Preview_Verified.zip
+            output/*.pdf
+            package/manifest.json
+            package/报告清单与版本说明.txt
+            package/SHA256SUMS.txt
+            previews/*.png
+            diagnostic/*.json
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
