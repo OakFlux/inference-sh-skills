@@ -1,0 +1,148 @@
+name: Temporary scan Eastmoney for Shenzhen International reports
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-eastmoney-date-scan.yml
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Scan all report types on exact publication dates and recover PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output diagnostic previews
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import hashlib, json, os, re, subprocess, tempfile, time, urllib.parse
+
+          API='https://reportapi.eastmoney.com/report/list'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          dates=[
+              '2022-07-18','2022-07-19','2022-07-20',
+              '2024-02-28','2024-02-29','2024-03-01',
+              '2025-04-16','2025-04-17','2025-04-18',
+              '2025-06-20','2025-06-21','2025-06-22','2025-06-23','2025-06-24','2025-06-25','2025-06-30','2025-07-01','2025-07-02',
+              '2026-01-19','2026-01-20','2026-01-21','2026-01-22','2026-02-03',
+          ]
+          qtypes=list(range(0,8))
+          out=Path('output');diag=Path('diagnostic');pre=Path('previews')
+
+          def fetch(day,qtype,page):
+              params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':day,'endTime':day,'pageNo':str(page),'fields':'','qType':str(qtype),
+                  'orgCode':'','code':'*','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page),
+              }
+              url=API+'?'+urllib.parse.urlencode(params)
+              fd,name=tempfile.mkstemp(prefix='szintl_',suffix='.json');os.close(fd);tmp=Path(name)
+              try:
+                  cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','5','--retry-all-errors',
+                       '--retry-delay','1','--connect-timeout','20','--max-time','120','-A',UA,
+                       '-e','https://data.eastmoney.com/report/','-H','Accept-Encoding: identity',url,'-o',str(tmp)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if p.returncode:raise RuntimeError(p.stderr[-500:])
+                  raw=tmp.read_text(encoding='utf-8',errors='ignore').strip()
+                  if raw.startswith('datatable(') and raw.endswith(')'):raw=raw[len('datatable('):-1]
+                  elif raw and raw[0] not in '[{' and '(' in raw and raw.endswith(')'):raw=raw[raw.find('(')+1:raw.rfind(')')]
+                  return json.loads(raw),url
+              finally:tmp.unlink(missing_ok=True)
+
+          first={};tasks=[]
+          for day in dates:
+              for qtype in qtypes:
+                  try:obj,url=fetch(day,qtype,1)
+                  except Exception as e:
+                      print('FIRST_ERR',day,qtype,repr(e));continue
+                  first[(day,qtype)]=(obj,url)
+                  data=obj.get('data') or []
+                  pages=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+                  hits=obj.get('hits')
+                  if data or hits:print('FIRST',day,'Q',qtype,'HITS',hits,'ROWS',len(data),'PAGES',pages)
+                  tasks.extend((day,qtype,p) for p in range(2,pages+1))
+
+          objs={(d,q,1):(o,u) for (d,q),(o,u) in first.items()}
+          with ThreadPoolExecutor(max_workers=30) as ex:
+              fm={ex.submit(fetch,*task):task for task in tasks}
+              for f in as_completed(fm):
+                  task=fm[f]
+                  try:objs[task]=f.result()
+                  except Exception as e:print('PAGE_ERR',*task,repr(e))
+
+          matches=[];seen=set()
+          needles=['深圳国际','深圳國際','00152','0152.hk','00152.hk','华南物流园','華南物流園']
+          for (day,qtype,page),(obj,url) in sorted(objs.items()):
+              for r in obj.get('data') or []:
+                  hay=(str(r.get('title') or '')+' '+str(r.get('stockName') or '')+' '+str(r.get('stockCode') or '')+' '+json.dumps(r,ensure_ascii=False)).lower()
+                  if any(n.lower() in hay for n in needles):
+                      key=str(r.get('infoCode') or json.dumps(r,ensure_ascii=False,sort_keys=True))
+                      if key in seen:continue
+                      seen.add(key);rr=dict(r);rr.update({'_day':day,'_qtype':qtype,'_page':page,'_api_url':url});matches.append(rr)
+          matches.sort(key=lambda r:str(r.get('publishDate') or ''),reverse=True)
+          diag.joinpath('matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCH_COUNT',len(matches))
+          for r in matches:
+              print('MATCH',json.dumps({k:r.get(k) for k in ['publishDate','orgSName','stockCode','stockName','title','attachPages','reportType','ratingName','infoCode','_qtype']},ensure_ascii=False))
+
+          recovered=[]
+          for i,r in enumerate(matches,1):
+              info=str(r.get('infoCode') or '')
+              if not info:continue
+              urls=[
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/{info}.pdf',
+              ]
+              for url in urls:
+                  tmp=out/f'tmp_{i:02d}.pdf'
+                  cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','8','--retry-all-errors',
+                       '--retry-delay','2','--connect-timeout','25','--max-time','900','--compressed','-A',UA,
+                       '-e','https://data.eastmoney.com/report/','-H','Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',url,'-o',str(tmp)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  size=tmp.stat().st_size if tmp.exists() else 0;magic=tmp.read_bytes()[:8] if tmp.exists() else b''
+                  print('TRY',info,'RC',p.returncode,'SIZE',size,'MAGIC',magic,'URL',url,'ERR',p.stderr[-250:])
+                  if p.returncode==0 and size>25000 and magic[:4]==b'%PDF':
+                      info_text=subprocess.check_output(['pdfinfo',str(tmp)],text=True,errors='replace')
+                      m=re.search(r'^Pages:\s*(\d+)',info_text,re.M);pages=int(m.group(1)) if m else 0
+                      txt=diag/f'{info}.txt';subprocess.run(['pdftotext','-f','1','-l',str(min(15,pages)),str(tmp),str(txt)],check=False)
+                      text=txt.read_text(encoding='utf-8',errors='replace') if txt.exists() else ''
+                      compact=''.join(text.split()).lower()
+                      if not any(n.lower().replace(' ','') in compact for n in ['深圳国际','深圳國際','shenzheninternational','00152','0152']):
+                          print('TEXT_MISMATCH',info,pages,text[:800]);tmp.unlink(missing_ok=True);continue
+                      broker=re.sub(r'[^A-Za-z0-9_-]+','_',str(r.get('orgSName') or 'Broker'))
+                      date=str(r.get('publishDate') or r.get('_day') or '')[:10].replace('-','')
+                      final=out/f'{i:02d}_Shenzhen_International_{broker}_{date}_{pages}p.pdf';tmp.replace(final)
+                      for page_no,tag in [(1,'first'),(pages,'last')]:
+                          subprocess.run(['pdftoppm','-f',str(page_no),'-singlefile','-png','-r','90',str(final),str(pre/f'{i:02d}_{tag}')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                      rec=dict(r);rec.update({'pages_actual':pages,'filename':final.name,'source_url':url,'size_bytes':final.stat().st_size,'sha256':hashlib.sha256(final.read_bytes()).hexdigest()})
+                      recovered.append(rec);print('RECOVERED',json.dumps({k:rec.get(k) for k in ['publishDate','orgSName','title','infoCode','pages_actual','filename','source_url']},ensure_ascii=False));break
+                  tmp.unlink(missing_ok=True)
+          diag.joinpath('recovered.json').write_text(json.dumps(recovered,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('RECOVERED_COUNT',len(recovered))
+          PY
+          find output diagnostic previews -type f -printf '%p\t%s\n' | sort | tail -150
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-eastmoney-date-scan
+          path: |
+            output/
+            diagnostic/
+            previews/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
