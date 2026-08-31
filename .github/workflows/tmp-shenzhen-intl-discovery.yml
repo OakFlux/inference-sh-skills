@@ -1,0 +1,110 @@
+name: Temporary Shenzhen International report discovery
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-discovery.yml
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect official financial-report and disclosure pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import html, json, re, subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          urls=[
+            ('cn_reports','https://www.szihl.com/relations/report/index.html'),
+            ('cn_reports_2','https://www.szihl.com/relations/report/index_2.html'),
+            ('cn_reports_page2','https://www.szihl.com/relations/report/index.html?page=2'),
+            ('en_annual','https://en.szihl.com/investor/annual/'),
+            ('en_interim','https://en.szihl.com/investor/interim/'),
+            ('cn_home','https://www.szihl.com/'),
+            ('cn_disclosures','https://www.szihl.com/relations/supervision/index.html'),
+            ('cn_disclosures_alt','https://www.szihl.com/relations/disclosure/index.html'),
+            ('hk_home','https://hk.szihl.com/'),
+            ('robots','https://www.szihl.com/robots.txt'),
+            ('sitemap','https://www.szihl.com/sitemap.xml'),
+          ]
+          manifest=[]
+          for name,url in urls:
+              out=Path('diagnostic')/f'{name}.bin'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','6','--retry-all-errors',
+                   '--retry-delay','1','--connect-timeout','25','--max-time','240','--compressed',
+                   '-A',UA,'-e','https://www.szihl.com/','-H','Accept-Encoding: identity',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('FETCH',name,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'URL',url,'ERR',p.stderr[-300:])
+              if p.returncode or not out.exists():
+                  manifest.append({'name':name,'url':url,'error':p.stderr[-1000:]}); continue
+              body=out.read_bytes()
+              text=None; enc=None
+              for e in ['utf-8','gb18030','gbk','big5','latin1']:
+                  try: text=body.decode(e); enc=e; break
+                  except Exception: pass
+              if text is None:
+                  manifest.append({'name':name,'url':url,'size':len(body),'binary':True}); continue
+              text=html.unescape(text).replace('\\/','/')
+              html_path=out.with_suffix('.html')
+              out.unlink(); html_path.write_text(text,encoding='utf-8')
+              title=''
+              m=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              if m: title=' '.join(re.sub(r'<[^>]+>',' ',m.group(1)).split())
+              print('TITLE',name,title)
+              anchors=[]
+              for m in re.finditer(r'<a\b([^>]*)>(.*?)</a>',text,re.I|re.S):
+                  attrs=m.group(1); inner=m.group(2)
+                  hm=re.search(r'href\s*=\s*["\']([^"\']+)["\']',attrs,re.I)
+                  if not hm: continue
+                  href=urljoin(url,hm.group(1).strip())
+                  label=' '.join(re.sub(r'<[^>]+>',' ',inner).split())
+                  anchors.append({'label':label,'href':href})
+              for a in anchors:
+                  hay=(a['label']+' '+a['href']).lower()
+                  if any(k in hay for k in ['2020','2021','2022','2023','2024','2025','2026','年报','中报','annual','interim','.pdf','irasia']):
+                      print('ANCHOR',name,json.dumps(a,ensure_ascii=False))
+              # All literal PDF/doc URLs, including JS data objects.
+              found=[]
+              patterns=[r'https?://[^\s"\'<>]+',r'//[^\s"\'<>]+',r'[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?']
+              for pat in patterns:
+                  for v in re.findall(pat,text,re.I):
+                      v=v.strip().replace('&amp;','&')
+                      try: full=urljoin(url,v)
+                      except Exception: continue
+                      if full not in found: found.append(full)
+              for u in found:
+                  if any(k in u.lower() for k in ['.pdf','irasia','hkexnews']):
+                      print('RESOURCE',name,u[:2500])
+              # Relevant source lines around report years and PDF/AJAX APIs.
+              for i,line in enumerate(text.splitlines(),1):
+                  plain=' '.join(re.sub(r'<[^>]+>',' ',line).split())
+                  low=line.lower()
+                  if any(k in low for k in ['2020年报','2020 annual','2026年度中期','2026 interim','2025中报','2025 interim','uploads/','irasia.com','ajax','api/','report/index']):
+                      print('LINE',name,i,plain[:3500],line[:3500])
+              scripts=[]
+              for s in re.findall(r'<script[^>]+src\s*=\s*["\']([^"\']+)["\']',text,re.I):
+                  full=urljoin(url,s)
+                  if full not in scripts:scripts.append(full)
+              manifest.append({'name':name,'url':url,'encoding':enc,'title':title,'size':len(body),'anchors':anchors,'resources':found,'scripts':scripts})
+          Path('diagnostic/manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload discovery files
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-report-discovery
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 9
