@@ -1,0 +1,117 @@
+name: Identify Guofu Electronics listed issuer
+
+on:
+  push:
+    paths:
+      - '.github/workflows/identify-guofu-electronics-20260831.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  identify:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Query public securities master and suggestion APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, requests
+          from difflib import SequenceMatcher
+
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/150 Safari/537.36','Accept':'application/json,text/plain,*/*'}
+          target='国富电子'
+          output={'target':target,'api_results':{},'security_candidates':[],'cninfo_candidates':[]}
+
+          urls={
+            'eastmoney_suggest': 'https://searchapi.eastmoney.com/api/suggest/get?input=%E5%9B%BD%E5%AF%8C%E7%94%B5%E5%AD%90&type=14&token=D43BF722C8E33BDC906FB84D85E326E8',
+            'sina_suggest': 'https://suggest3.sinajs.cn/suggest/type=11,12,13,14,15&key=%E5%9B%BD%E5%AF%8C%E7%94%B5%E5%AD%90',
+            'tencent_smartbox': 'https://smartbox.gtimg.cn/s3/?q=%E5%9B%BD%E5%AF%8C%E7%94%B5%E5%AD%90&t=all',
+          }
+          for key,url in urls.items():
+            try:
+              r=s.get(url,headers=h,timeout=(10,40))
+              print('API',key,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              text=r.content.decode('utf-8','ignore')
+              output['api_results'][key]={'status':r.status_code,'url':r.url,'text':text[:10000]}
+              print(text[:3000],flush=True)
+            except Exception as e:
+              output['api_results'][key]={'error':repr(e)}
+              print('API_ERROR',key,repr(e),flush=True)
+
+          # Eastmoney A/B/Beijing/NEEQ-like public security lists.
+          fs_values=[
+            'm:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23',
+            'm:0+t:81+s:2048',
+            'm:0+t:81+s:2048+f:!50',
+            'm:0+t:81',
+            'm:1+t:3,m:0+t:7,m:2',
+          ]
+          all_items=[]
+          for fs in fs_values:
+            params={
+              'pn':1,'pz':10000,'po':1,'np':1,'fltt':2,'invt':2,'fid':'f3',
+              'fs':fs,'fields':'f12,f13,f14,f100,f102,f103,f104'
+            }
+            try:
+              r=s.get('https://push2.eastmoney.com/api/qt/clist/get',params=params,headers={**h,'Referer':'https://quote.eastmoney.com/'},timeout=(20,120))
+              print('CLIST',fs,r.status_code,len(r.content),flush=True)
+              obj=r.json() if r.status_code==200 else {}
+              diff=((obj.get('data') or {}).get('diff') or []) if isinstance(obj,dict) else []
+              for x in diff:
+                if isinstance(x,dict): all_items.append(x)
+            except Exception as e:
+              print('CLIST_ERROR',fs,repr(e),flush=True)
+
+          seen=set()
+          candidates=[]
+          for x in all_items:
+            code=str(x.get('f12') or '')
+            name=str(x.get('f14') or '')
+            key=(code,name)
+            if key in seen: continue
+            seen.add(key)
+            score=SequenceMatcher(None,target,name).ratio()
+            if ('国富' in name or '国光' in name or ('电子' in name and score>=0.35) or score>=0.55):
+              rec={'code':code,'name':name,'market':x.get('f13'),'industry':x.get('f100'),'similarity':round(score,4)}
+              candidates.append(rec)
+          candidates.sort(key=lambda x:(x['similarity'], '国富' in x['name'], '电子' in x['name']),reverse=True)
+          output['security_candidates']=candidates[:100]
+          print('SECURITY_CANDIDATES',json.dumps(candidates[:100],ensure_ascii=False,indent=2),flush=True)
+
+          # CNINFO official master lists, when endpoints are reachable.
+          for market in ('szse','sse','bse'):
+            for scheme in ('https','http'):
+              url=f'{scheme}://www.cninfo.com.cn/new/data/{market}_stock.json'
+              try:
+                r=s.get(url,headers={**h,'Referer':'https://www.cninfo.com.cn/'},timeout=(15,60))
+                print('CNINFO',url,r.status_code,len(r.content),flush=True)
+                if r.status_code!=200 or not r.content: continue
+                obj=r.json()
+                rows=obj.get('stockList') or obj.get('data') or obj if isinstance(obj,list) else []
+                if isinstance(rows,list):
+                  for row in rows:
+                    if not isinstance(row,dict): continue
+                    blob=json.dumps(row,ensure_ascii=False)
+                    if '国富' in blob or '国光' in blob or '国富电子' in blob:
+                      output['cninfo_candidates'].append({'market':market,'row':row})
+                break
+              except Exception as e:
+                print('CNINFO_ERROR',url,repr(e),flush=True)
+
+          print('CNINFO_CANDIDATES',json.dumps(output['cninfo_candidates'],ensure_ascii=False,indent=2),flush=True)
+          with open('guofu_identification.json','w',encoding='utf-8') as f:
+            json.dump(output,f,ensure_ascii=False,indent=2)
+          PY
+
+      - name: Upload identification result
+        uses: actions/upload-artifact@v4
+        with:
+          name: guofu-electronics-identification
+          path: guofu_identification.json
+          if-no-files-found: error
+          retention-days: 3
