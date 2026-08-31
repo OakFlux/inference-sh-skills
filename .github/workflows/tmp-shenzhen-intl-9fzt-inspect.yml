@@ -1,0 +1,119 @@
+name: Temporary inspect 9fzt Shenzhen International report
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-9fzt-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Inspect page source, scripts and APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p page scripts diagnostic assets
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import hashlib, html, json, re, subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          page_url='https://gmg.9fzt.com/report/HKSE/00152/762510958745.html'
+
+          def fetch(url,out,referer=page_url):
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','6','--retry-all-errors',
+                   '--connect-timeout','20','--max-time','240','--compressed','-A',UA,'-e',referer,
+                   '-H','Accept-Encoding: identity',url,'-o',str(out),
+                   '-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              return subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+
+          page=Path('page/report.html');p=fetch(page_url,page)
+          print('PAGE','RC',p.returncode,'SIZE',page.stat().st_size if page.exists() else 0,'META',p.stdout,'ERR',p.stderr[-300:])
+          if p.returncode or not page.exists():raise RuntimeError('page fetch failed')
+          text=page.read_text(encoding='utf-8',errors='replace')
+          text=html.unescape(text).replace('\\/','/').replace('\\u002F','/').replace('\\u0026','&')
+          page.write_text(text,encoding='utf-8')
+
+          scripts=[];candidates=[]
+          for src in re.findall(r'<script[^>]+src\s*=\s*["\']([^"\']+)["\']',text,re.I):
+              full=urljoin(page_url,src)
+              if full not in scripts:scripts.append(full)
+          for pat in [
+              r'''(?:href|src|data-url|data-file|data-pdf|url|file|fileurl|pdfurl|downloadurl|reporturl)\s*[:=]\s*["']([^"']+)["']''',
+              r'''https?://[^\s"'<>]+''',r'''//[^\s"'<>]+''',r'''[^\s"'<>]+\.pdf(?:\?[^\s"'<>]*)?''']:
+              for v in re.findall(pat,text,re.I):
+                  if isinstance(v,tuple):v=v[0]
+                  try:full=urljoin(page_url,v)
+                  except Exception:continue
+                  if full not in candidates:candidates.append(full)
+          for n,line in enumerate(text.splitlines(),1):
+              low=line.lower()
+              if any(k in low for k in ['762510958745','pdf','download','fileurl','reporturl','api/','__next_data__','window.__','gmgapi']):
+                  print('PAGE_LINE',n,' '.join(re.sub(r'<[^>]+>',' ',line).split())[:5000],line[:5000])
+          for u in candidates:
+              if any(k in u.lower() for k in ['762510958745','pdf','download','report','file','api']):print('PAGE_URL',u[:3000])
+
+          script_rows=[]
+          for i,u in enumerate(scripts,1):
+              out=Path('scripts')/f'{i:03d}.js';sp=fetch(u,out,page_url)
+              print('SCRIPT',i,'RC',sp.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'URL',u,'ERR',sp.stderr[-300:])
+              if sp.returncode or not out.exists():continue
+              s=out.read_text(encoding='utf-8',errors='replace').replace('\\/','/').replace('\\u002F','/').replace('\\u0026','&')
+              hits=[]
+              for pat in [r'''https?://[^\s"'<>]+''',r'''//[^\s"'<>]+''',r'''/[A-Za-z0-9_./?=&%{}:-]*(?:report|pdf|download|file|api)[A-Za-z0-9_./?=&%{}:-]*''']:
+                  for v in re.findall(pat,s,re.I):
+                      if isinstance(v,tuple):v=v[0]
+                      try:full=urljoin(u,v)
+                      except Exception:continue
+                      if any(k in full.lower() for k in ['report','pdf','download','file','api','762510958745']):
+                          if full not in hits:hits.append(full)
+                          if full not in candidates:candidates.append(full)
+              for keyword in ['762510958745','pdfUrl','fileUrl','downloadUrl','reportUrl','getReport','report/detail','api/report']:
+                  pos=0;count=0
+                  while True:
+                      pos=s.lower().find(keyword.lower(),pos)
+                      if pos<0 or count>=30:break
+                      print('CONTEXT',i,keyword,s[max(0,pos-800):min(len(s),pos+2000)].replace('\n',' ')[:3000])
+                      pos+=len(keyword);count+=1
+              for h in hits[:500]:print('SCRIPT_URL',i,h[:3000])
+              script_rows.append({'url':u,'size':out.stat().st_size,'hits':hits})
+          Path('diagnostic/scripts.json').write_text(json.dumps(script_rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/candidates.txt').write_text('\n'.join(candidates)+'\n',encoding='utf-8')
+
+          probes=[]
+          for i,u in enumerate(candidates[:3000],1):
+              if not any(k in u.lower() for k in ['762510958745','.pdf','download','report','file','api']):continue
+              out=Path('assets')/f'{i:04d}.bin';pp=fetch(u,out,page_url)
+              if pp.returncode or not out.exists():out.unlink(missing_ok=True);continue
+              b=out.read_bytes();kind='other';ext='.bin'
+              if b[:4]==b'%PDF':kind='pdf';ext='.pdf'
+              elif b[:1] in [b'{',b'[']:kind='json';ext='.json'
+              elif b[:8]==b'\x89PNG\r\n\x1a\n':kind='png';ext='.png'
+              elif b[:3]==b'\xff\xd8\xff':kind='jpg';ext='.jpg'
+              if kind in ['pdf','json','png','jpg'] and len(b)>200:
+                  final=out.with_suffix(ext);out.rename(final)
+                  row={'url':u,'kind':kind,'size':len(b),'file':str(final),'meta':pp.stdout,'sha256':hashlib.sha256(b).hexdigest()}
+                  print('ASSET',json.dumps(row,ensure_ascii=False));probes.append(row)
+              else:out.unlink(missing_ok=True)
+          Path('diagnostic/probes.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-9fzt-inspection
+          path: |
+            page/
+            scripts/
+            assets/
+            diagnostic/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
