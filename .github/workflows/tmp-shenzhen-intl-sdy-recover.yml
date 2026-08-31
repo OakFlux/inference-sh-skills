@@ -1,0 +1,145 @@
+name: Temporary recover Southwest Shenzhen International report
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-sdy-recover.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF/image utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq img2pdf poppler-utils python3-pil
+
+      - name: Query public metadata and recover all report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output pages diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import hashlib, json, subprocess
+          from PIL import Image
+
+          report_id=886501
+          detail_url=f'https://api.sdyanbao.com/api/file/detail?id={report_id}'
+          page_ref=f'https://www.sdyanbao.com/detail/{report_id}'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          def curl(url,out,referer=page_ref,max_time=300):
+              cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','8','--retry-all-errors',
+                   '--retry-delay','1','--connect-timeout','25','--max-time',str(max_time),'-A',ua,
+                   '-e',referer,'-H','Accept-Encoding: identity',url,'-o',str(out),
+                   '-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              return subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+
+          detail_path=Path('diagnostic/detail.json')
+          p=curl(detail_url,detail_path,max_time=180)
+          print('DETAIL_FETCH','RC',p.returncode,'SIZE',detail_path.stat().st_size if detail_path.exists() else 0,'META',p.stdout,'ERR',p.stderr[-500:])
+          if p.returncode or not detail_path.exists():
+              raise RuntimeError('Sdyanbao detail API request failed')
+          obj=json.loads(detail_path.read_text(encoding='utf-8',errors='replace'))
+          if int(obj.get('status') or 0)!=1:
+              raise RuntimeError(f'Detail API error: {obj}')
+          data=obj.get('data') or {}
+          print('DETAIL',json.dumps({k:data.get(k) for k in ['id','name','online_url','share_url','page_url','file_size','page_count','original_id','time_text','organization','stock','content']},ensure_ascii=False)[:12000])
+          title=str(data.get('name') or '')
+          page_count=int(data.get('page_count') or 0)
+          if '深圳国际' not in title and '深圳國際' not in title:
+              raise RuntimeError(f'Unexpected report title: {title}')
+          if page_count!=11:
+              raise RuntimeError(f'Expected 11 pages, metadata says {page_count}')
+
+          # Use an original public PDF if the API exposes one and it is valid.
+          online_url=str(data.get('online_url') or '').strip().replace('\\/','/')
+          if online_url:
+              original=Path('output/Shenzhen_International_Southwest_20250417_11p_Original.pdf')
+              op=curl(online_url,original,max_time=600)
+              magic=original.read_bytes()[:4] if original.exists() else b''
+              print('ONLINE_URL','RC',op.returncode,'SIZE',original.stat().st_size if original.exists() else 0,'MAGIC',magic,'META',op.stdout,'ERR',op.stderr[-300:])
+              if op.returncode==0 and original.exists() and original.stat().st_size>100000 and magic==b'%PDF':
+                  info=subprocess.check_output(['pdfinfo',str(original)],text=True,errors='replace')
+                  print(info)
+                  Path('diagnostic/mode.json').write_text(json.dumps({'mode':'original_pdf','url':online_url},ensure_ascii=False,indent=2),encoding='utf-8')
+                  raise SystemExit(0)
+              original.unlink(missing_ok=True)
+
+          page_url=str(data.get('page_url') or '').strip().replace('\\/','/').rstrip('/')
+          share_url=str(data.get('share_url') or '').strip().replace('\\/','/')
+          if not page_url:
+              raise RuntimeError('page_url missing')
+
+          manifest=[]
+          for index in range(page_count):
+              candidates=[]
+              if index==0 and share_url:
+                  candidates.append(share_url)
+              candidates += [
+                  f'{page_url}/{index}.png',f'{page_url}/{index}.jpg',f'{page_url}/{index}.jpeg',f'{page_url}/{index}.webp',
+                  f'{page_url}/{index+1}.png',f'{page_url}/{index+1}.jpg',
+              ]
+              seen=[]; chosen=None
+              for u in candidates:
+                  if u in seen:continue
+                  seen.append(u)
+                  temp=Path('pages')/f'{index:03d}.bin'
+                  cp=curl(u,temp,max_time=300)
+                  b=temp.read_bytes() if temp.exists() else b''
+                  kind=None
+                  if b[:8]==b'\x89PNG\r\n\x1a\n':kind='png'
+                  elif b[:3]==b'\xff\xd8\xff':kind='jpg'
+                  elif b[:4]==b'RIFF' and b[8:12]==b'WEBP':kind='webp'
+                  print('PAGE_TRY',index,u,'RC',cp.returncode,'SIZE',len(b),'KIND',kind,'META',cp.stdout,'ERR',cp.stderr[-250:])
+                  if cp.returncode==0 and len(b)>5000 and kind:
+                      chosen=(u,temp,kind,b);break
+                  temp.unlink(missing_ok=True)
+              if chosen is None:
+                  raise RuntimeError(f'Unable to recover page {index}')
+              u,temp,kind,b=chosen
+              with Image.open(temp) as im:
+                  im=im.convert('RGB')
+                  jpg=Path('pages')/f'{index+1:03d}.jpg'
+                  im.save(jpg,quality=96,subsampling=0)
+                  width,height=im.size
+              temp.unlink(missing_ok=True)
+              manifest.append({'page':index+1,'source_index':index,'source_url':u,'file':jpg.name,'width':width,'height':height,'size':jpg.stat().st_size,'sha256':hashlib.sha256(jpg.read_bytes()).hexdigest()})
+
+          Path('diagnostic/page_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/mode.json').write_text(json.dumps({'mode':'public_page_images','page_url':page_url,'page_count':page_count,'title':title},ensure_ascii=False,indent=2),encoding='utf-8')
+          if len(manifest)!=11:
+              raise RuntimeError(f'Unexpected recovered page count: {len(manifest)}')
+          PY
+
+          if [ ! -f output/Shenzhen_International_Southwest_20250417_11p_Original.pdf ]; then
+            img2pdf $(find pages -name '*.jpg' | sort) -o output/Shenzhen_International_Southwest_20250417_11p_Public_Page_Copy.pdf
+          fi
+          pdf=$(find output -name '*.pdf' -type f | head -1)
+          pdfinfo "$pdf"
+          pages=$(pdfinfo "$pdf" | awk '/^Pages:/ {print $2}')
+          test "$pages" -eq 11
+          pdftoppm -f 1 -singlefile -png -r 90 "$pdf" diagnostic/first >/dev/null 2>&1
+          pdftoppm -f 11 -singlefile -png -r 90 "$pdf" diagnostic/last >/dev/null 2>&1
+          test -s diagnostic/first.png
+          test -s diagnostic/last.png
+          sha256sum "$pdf" > diagnostic/SHA256SUMS.txt
+          ls -lh output pages diagnostic
+
+      - name: Upload recovered report
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-southwest-report
+          path: |
+            output/*.pdf
+            pages/*.jpg
+            diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
