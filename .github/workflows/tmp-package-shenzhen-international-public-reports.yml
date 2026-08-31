@@ -11,7 +11,7 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install browser, HTML and PDF tools
@@ -19,7 +19,7 @@ jobs:
           python -m pip install --quiet requests beautifulsoup4 playwright pypdf pymupdf
           python -m playwright install --with-deps chromium
       - name: Build, verify and package reports
-        run: python .github/scripts/run_shenzhen_international_static_public_reports_v2.py
+        run: python .github/scripts/run_shenzhen_international_static_public_reports_v3.py
       - uses: actions/upload-artifact@v4
         with:
           name: shenzhen-international-public-reports
