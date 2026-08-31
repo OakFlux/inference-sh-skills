@@ -1,0 +1,101 @@
+name: Temporary fast Shenzhen International 2020 annual probe
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-2020-fast.yml
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils parallel
+
+      - name: Probe likely original PDF paths concurrently
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probes output diagnostic
+          cat > diagnostic/urls.txt <<'EOF'
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/ar.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/arc.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/car.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/ar2020.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/car2020.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/cannual.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/annual.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/annualreport.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/cannualreport.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/2020ar.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/2020arc.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/c_annual.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/ar20.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/car20.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/cannual2020.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/annual2020.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/annual_report.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/annual_report_2020.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/2020_annual_report.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/2020annualreport.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/c2020.pdf
+          https://doc.irasia.com/listco/hk/szihl/annual/2020/c_ar.pdf
+          https://www.irasia.com/listco/hk/szihl/annual/2020/ar.pdf
+          https://www.irasia.com/listco/hk/szihl/annual/2020/arc.pdf
+          https://www.irasia.com/listco/hk/szihl/annual/2020/car.pdf
+          https://www.irasia.com/listco/hk/szihl/annual/2020/ar2020.pdf
+          https://www.irasia.com/listco/hk/szihl/annual/2020/car2020.pdf
+          EOF
+          sed -i 's/^          //' diagnostic/urls.txt
+          python3 - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from pathlib import Path
+          import hashlib, json, re, subprocess
+          urls=[x.strip() for x in Path('diagnostic/urls.txt').read_text().splitlines() if x.strip()]
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          def probe(i,u):
+              p=Path('probes')/f'{i:03d}.bin'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--connect-timeout','5','--max-time','20','-A',ua,'-e','https://www.irasia.com/listco/hk/szihl/','-H','Accept-Encoding: identity',u,'-o',str(p),'-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              b=p.read_bytes() if p.exists() else b''
+              result={'i':i,'url':u,'meta':r.stdout,'rc':r.returncode,'size':len(b),'magic':b[:8].hex(),'err':r.stderr[-200:]}
+              if r.returncode==0 and len(b)>100000 and b[:4]==b'%PDF':
+                  info=subprocess.check_output(['pdfinfo',str(p)],text=True,errors='replace')
+                  m=re.search(r'^Pages:\s*(\d+)',info,re.M); pages=int(m.group(1)) if m else 0
+                  txt=Path('diagnostic')/f'{i:03d}.txt'; subprocess.run(['pdftotext','-f','1','-l',str(min(15,pages)),str(p),str(txt)],check=False)
+                  text=txt.read_text(errors='replace') if txt.exists() else ''; compact=''.join(text.split()).lower()
+                  ok=('深圳國際' in text or '深圳国际' in text or 'shenzheninternational' in compact) and '2020' in compact and pages==195
+                  result.update({'pages':pages,'text_ok':ok})
+                  if ok:
+                      dest=Path('output/Shenzhen_International_2020_Annual_Report.pdf')
+                      dest.write_bytes(b)
+                      result['sha256']=hashlib.sha256(b).hexdigest()
+              p.unlink(missing_ok=True)
+              return result
+          results=[]
+          with ThreadPoolExecutor(max_workers=16) as ex:
+              fm={ex.submit(probe,i,u):(i,u) for i,u in enumerate(urls,1)}
+              for f in as_completed(fm):
+                  x=f.result();results.append(x);print('RESULT',json.dumps(x,ensure_ascii=False))
+          results.sort(key=lambda x:x['i'])
+          Path('diagnostic/results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          if not Path('output/Shenzhen_International_2020_Annual_Report.pdf').exists():
+              raise RuntimeError('Fast probe did not recover report')
+          PY
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-2020-fast
+          path: |
+            output/Shenzhen_International_2020_Annual_Report.pdf
+            diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
