@@ -1,0 +1,147 @@
+name: Temporary Shenzhen International 2020 annual report probe
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-2020-probe.yml
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Probe IRAsia, HKEX and archived official paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output diagnostic pages
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import hashlib, json, re, subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          pages=[
+              'https://www.irasia.com/listco/hk/szihl/annual/2020/',
+              'https://www.irasia.com/listco/hk/szihl/annual/20index.htm',
+              'https://www.irasia.com/listco/hk/szihl/annual/index.htm',
+              'https://www.irasia.com/listco/hk/szihl/annual.htm',
+              'https://www.irasia.com/listco/hk/szihl/financial.htm',
+              'https://www.irasia.com/listco/hk/szihl/index.htm',
+              'https://www.irasia.com/listco/hk/szihl/',
+              'https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=zh',
+          ]
+          discovered=[]
+          for i,url in enumerate(pages,1):
+              out=Path('pages')/f'{i:02d}.html'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','5','--retry-all-errors',
+                   '--retry-delay','1','--connect-timeout','20','--max-time','180','--compressed',
+                   '-A',UA,'-e','https://www.irasia.com/','-H','Accept-Encoding: identity',url,'-o',str(out)]
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              print('PAGE',i,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'URL',url,'ERR',p.stderr[-300:])
+              if p.returncode or not out.exists(): continue
+              body=out.read_bytes(); text=None
+              for enc in ['utf-8','big5','gb18030','latin1']:
+                  try: text=body.decode(enc); break
+                  except Exception: pass
+              if text is None: continue
+              out.write_text(text,encoding='utf-8')
+              for href in re.findall(r'''(?:href|src)\s*=\s*["']([^"']+)["']''',text,re.I):
+                  full=urljoin(url,href.replace('&amp;','&').replace('\\/','/'))
+                  hay=full.lower()
+                  if any(k in hay for k in ['annual','2020','.pdf','szihl']):
+                      if full not in discovered: discovered.append(full)
+                      print('DISCOVERED',full)
+              for line_no,line in enumerate(text.splitlines(),1):
+                  low=line.lower()
+                  if any(k in low for k in ['annual report 2020','2020年報','2020年报','2020 annual','financial report']):
+                      plain=' '.join(re.sub(r'<[^>]+>',' ',line).split())
+                      print('LINE',i,line_no,plain[:3000],line[:3000])
+
+          roots=[
+              'https://doc.irasia.com/listco/hk/szihl/annual/2020/',
+              'https://www.irasia.com/listco/hk/szihl/annual/2020/',
+          ]
+          names=[
+              'ar.pdf','arc.pdf','car.pdf','ar2020.pdf','car2020.pdf','2020ar.pdf','2020arc.pdf',
+              'annual.pdf','cannual.pdf','annualreport.pdf','cannualreport.pdf','annual2020.pdf',
+              'annual_report_2020.pdf','annual-report-2020.pdf','2020annualreport.pdf','2020_annual_report.pdf',
+              'c_annual.pdf','cannual2020.pdf','ar20.pdf','car20.pdf','report.pdf','cr.pdf','c_ar.pdf',
+              'AR2020.pdf','CAR2020.pdf','AR.pdf','CAR.pdf','AnnualReport2020.pdf','CAnnualReport2020.pdf',
+          ]
+          candidates=[]
+          for root in roots:
+              candidates.extend(root+n for n in names)
+          candidates.extend(u for u in discovered if '.pdf' in u.lower())
+          # Known public report mirror page assets may expose the exact source URL in redirects.
+          candidates += [
+              'https://www.sgpjbg.com/baogao/483119.html',
+              'https://www.sgpjbg.com/baogao/483117.html',
+              'https://www.sgpjbg.com/baogao/457710.html',
+          ]
+          seen=[]
+          for u in candidates:
+              if u not in seen: seen.append(u)
+          candidates=seen
+
+          results=[]; winner=None
+          for i,url in enumerate(candidates,1):
+              temp=Path('output')/f'probe_{i:03d}.bin'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','2','--retry-all-errors',
+                   '--connect-timeout','12','--max-time','90','--compressed','-A',UA,
+                   '-e','https://www.irasia.com/listco/hk/szihl/','-H','Accept: application/pdf,text/html,*/*;q=0.8',
+                   url,'-o',str(temp),'-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              size=temp.stat().st_size if temp.exists() else 0
+              magic=temp.read_bytes()[:8] if temp.exists() else b''
+              rec={'url':url,'curl_meta':p.stdout,'rc':p.returncode,'size':size,'magic':magic.hex(),'err':p.stderr[-300:]}
+              if p.returncode==0 and size>100000 and magic[:4]==b'%PDF':
+                  info=subprocess.check_output(['pdfinfo',str(temp)],text=True,errors='replace')
+                  m=re.search(r'^Pages:\s*(\d+)',info,re.M); page_count=int(m.group(1)) if m else 0
+                  text_path=Path('diagnostic')/f'probe_{i:03d}.txt'
+                  subprocess.run(['pdftotext','-f','1','-l',str(min(20,page_count)),str(temp),str(text_path)],check=False)
+                  text=text_path.read_text(encoding='utf-8',errors='replace') if text_path.exists() else ''
+                  compact=''.join(text.split()).lower()
+                  rec['pages']=page_count
+                  rec['text_ok']=('深圳國際' in text or '深圳国际' in text or 'shenzheninternational' in compact) and ('2020' in compact)
+                  print('PDF',i,page_count,rec['text_ok'],size,url,p.stdout)
+                  if rec['text_ok'] and 180 <= page_count <= 220 and winner is None:
+                      final=Path('output/Shenzhen_International_2020_Annual_Report.pdf')
+                      temp.replace(final)
+                      rec['winner']=True
+                      rec['sha256']=hashlib.sha256(final.read_bytes()).hexdigest()
+                      winner={'url':url,'effective':p.stdout,'pages':page_count,'filename':final.name,'sha256':rec['sha256'],'size':final.stat().st_size}
+                  else:
+                      temp.unlink(missing_ok=True)
+              else:
+                  temp.unlink(missing_ok=True)
+              results.append(rec)
+              if winner:
+                  break
+          Path('diagnostic/probe_results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('diagnostic/winner.json').write_text(json.dumps(winner,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('WINNER',json.dumps(winner,ensure_ascii=False))
+          if winner is None:
+              raise RuntimeError('Official/public original 2020 annual report PDF not recovered')
+          PY
+
+      - name: Upload recovered report
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-2020-annual-report
+          path: |
+            output/Shenzhen_International_2020_Annual_Report.pdf
+            diagnostic/
+            pages/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
