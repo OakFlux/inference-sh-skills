@@ -1,0 +1,172 @@
+name: Temporary verified Shenzhen International broker deep reports
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-final-broker-reports.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Download, verify and package original broker PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output package previews diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          OUT=Path('output'); PKG=Path('package'); PRE=Path('previews'); DIAG=Path('diagnostic')
+
+          reports=[
+              {
+                  'broker':'财通证券',
+                  'date':'2026-01-20',
+                  'title':'华南物流园兑现业绩，低估值高股息凸显价值',
+                  'type':'公司深度研究、首次覆盖',
+                  'pages':26,
+                  'url':'https://rdfile.gw.com.cn/new/caihui/rsr/FBTD/2026/2026-01/2026-01-21/9ECAD645C9586CD939DA9416EBE509C0.pdf',
+                  'filename':'01_Shenzhen_International_Caitong_Initiation_20260120_26p.pdf',
+                  'needles':['深圳国际','华南物流园兑现业绩','低估值高股息'],
+              },
+              {
+                  'broker':'申万宏源',
+                  'date':'2025-06-21',
+                  'title':'国企优质资源禀赋，物流园转型升级带来业绩弹性',
+                  'type':'公司深度研究、首次覆盖',
+                  'pages':37,
+                  'url':'https://rdfile.gw.com.cn/new/caihui/rsr/FBTD/2025/2025-06/2025-06-21/047D3B87F14C590B97A50BACBEED12F6.pdf',
+                  'filename':'02_Shenzhen_International_Shenwan_Hongyuan_Deep_Report_20250621_37p.pdf',
+                  'needles':['深圳国际','国企优质资源禀赋','物流园转型升级'],
+              },
+              {
+                  'broker':'华源证券',
+                  'date':'2024-07-03',
+                  'title':'转型升级释放盈利弹性，高股息价值突显',
+                  'type':'公司深度研究、首次覆盖',
+                  'pages':18,
+                  'url':'https://rdfile.gw.com.cn/new/caihui/rsr/FBTD/2024/2024-07/2024-07-04/3C7B2DA61CDE141D77DC7BB5F02C22C0.pdf',
+                  'filename':'03_Shenzhen_International_Huayuan_Initiation_20240703_18p.pdf',
+                  'needles':['深圳国际','转型升级释放盈利弹性','高股息价值'],
+              },
+          ]
+
+          verified=[]
+          for index,report in enumerate(reports,1):
+              temp=OUT/f'temp_{index:02d}.pdf'
+              cmd=[
+                  'curl','--http1.1','-L','--fail','--silent','--show-error',
+                  '--retry','10','--retry-all-errors','--retry-delay','2',
+                  '--connect-timeout','30','--max-time','900','--compressed',
+                  '-A',UA,'-e','https://webf10.gw.com.cn/HK/B11/HK00152_B11.html',
+                  '-H','Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  report['url'],'-o',str(temp),
+              ]
+              proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              size=temp.stat().st_size if temp.exists() else 0
+              magic=temp.read_bytes()[:8] if temp.exists() else b''
+              print('DOWNLOAD',index,'RC',proc.returncode,'SIZE',size,'MAGIC',magic,'ERR',proc.stderr[-300:])
+              if proc.returncode or size<25000 or magic[:4]!=b'%PDF':
+                  raise RuntimeError(f'Invalid download: {report["title"]}')
+
+              info=subprocess.check_output(['pdfinfo',str(temp)],text=True,errors='replace')
+              m=re.search(r'^Pages:\s*(\d+)',info,re.M)
+              pages=int(m.group(1)) if m else 0
+              if pages!=report['pages']:
+                  raise RuntimeError(f'{report["title"]}: actual {pages}, expected {report["pages"]}')
+
+              text_path=DIAG/f'{index:02d}.txt'
+              subprocess.run(['pdftotext','-f','1','-l',str(min(15,pages)),str(temp),str(text_path)],check=True)
+              text=text_path.read_text(encoding='utf-8',errors='replace')
+              compact=''.join(text.split())
+              if '深圳国际' not in compact and '深圳國際' not in compact and '00152' not in compact and '0152' not in compact:
+                  raise RuntimeError(f'{report["title"]}: company name/code not found')
+              if not any(''.join(n.split()) in compact for n in report['needles'][1:]):
+                  raise RuntimeError(f'{report["title"]}: title keywords not found')
+
+              final=OUT/report['filename']
+              temp.replace(final)
+              for page_no,tag in [(1,'first'),(pages,'last')]:
+                  target=PRE/f'{index:02d}_{tag}'
+                  subprocess.run(
+                      ['pdftoppm','-f',str(page_no),'-singlefile','-png','-r','110',str(final),str(target)],
+                      check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                  )
+                  png=Path(str(target)+'.png')
+                  if not png.exists() or png.stat().st_size<8000:
+                      raise RuntimeError(f'{final.name}: {tag} page render failed')
+
+              item=dict(report)
+              item.update({
+                  'size_bytes':final.stat().st_size,
+                  'sha256':hashlib.sha256(final.read_bytes()).hexdigest(),
+              })
+              verified.append(item)
+              print('VERIFIED',json.dumps(item,ensure_ascii=False))
+
+          manifest={
+              'company':'深圳国际控股有限公司',
+              'stock_code':'00152.HK',
+              'generated_at_utc':dt.datetime.now(dt.timezone.utc).isoformat(),
+              'count':len(verified),
+              'reports':verified,
+          }
+          (PKG/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          lines=['深圳国际控股有限公司（00152.HK）券商深度研究报告，共3份','']
+          for i,r in enumerate(verified,1):
+              lines += [
+                  f'{i}. {r["broker"]}，{r["date"]}，{r["pages"]}页',
+                  f'   《{r["title"]}》',
+                  f'   类型：{r["type"]}。',
+                  f'   文件名：{r["filename"]}',
+                  '',
+              ]
+          lines += [
+              '三份均为公开索引中的原始PDF，不是网页摘要、截图拼接或预览页重制文件。',
+              '已检查PDF文件头、实际页数、公司名称/股票代码、标题关键词，并完成首页与末页渲染。',
+              '压缩包附SHA-256校验值。仅供研究资料整理，不构成投资建议。',
+          ]
+          (PKG/'报告清单与核验说明.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          (PKG/'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{r["sha256"]}  {r["filename"]}' for r in verified)+'\n',encoding='utf-8'
+          )
+          for r in verified:
+              (PKG/r['filename']).write_bytes((OUT/r['filename']).read_bytes())
+          PY
+
+          (cd package && zip -q -9 ../Shenzhen_International_Broker_Deep_Reports_3_Verified.zip ./*)
+          unzip -t Shenzhen_International_Broker_Deep_Reports_3_Verified.zip
+          ls -lh output package previews Shenzhen_International_Broker_Deep_Reports_3_Verified.zip
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-broker-deep-reports-final
+          path: |
+            Shenzhen_International_Broker_Deep_Reports_3_Verified.zip
+            output/*.pdf
+            package/manifest.json
+            package/报告清单与核验说明.txt
+            package/SHA256SUMS.txt
+            previews/*.png
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
