@@ -1,0 +1,146 @@
+name: Temporary recover complete Shenwan Shenzhen International preview
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-book118-recovery-v2.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install image/PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq img2pdf poppler-utils python3-pil
+
+      - name: Resolve current full-preview token and recover 31 pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pages output diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import hashlib, json, re, subprocess, time
+          from PIL import Image
+
+          original='https://max.book118.com/html/2025/0701/5104021001012234.shtm'
+          public_book_id='5104021001012234'
+          newview=f'https://max.book118.com/index.php?g=Home&m=NewView&a=index&aid={public_book_id}'
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          def curl(url,out,referer=original,max_time=240):
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','7','--retry-all-errors',
+                   '--retry-delay','1','--connect-timeout','20','--max-time',str(max_time),'-A',ua,
+                   '-e',referer,'-H','Accept-Encoding: identity',url,'-o',str(out),
+                   '-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              return subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+
+          fetched=[]
+          for name,url in [('original',original),('newview',newview)]:
+              out=Path('diagnostic')/f'{name}.html'
+              p=curl(url,out,original,300)
+              print('SOURCE',name,'RC',p.returncode,'SIZE',out.stat().st_size if out.exists() else 0,'META',p.stdout,'ERR',p.stderr[-300:])
+              if p.returncode or not out.exists():raise RuntimeError(f'{name} fetch failed')
+              text=out.read_text(encoding='utf-8',errors='replace')
+              fetched.append((name,text))
+
+          original_text=dict(fetched)['original']
+          newview_text=dict(fetched)['newview']
+          # The HTML filename is a public document ID. The preview service uses its internal numeric aid.
+          aid_candidates=[]
+          for pat in [r'''["']?aid["']?\s*[:=]\s*["']?([0-9]{6,15})''',r'''\baid\b.{0,60}?([0-9]{6,15})''']:
+              aid_candidates += re.findall(pat,original_text,re.I|re.S)
+          aid_candidates=[x for x in dict.fromkeys(aid_candidates) if x!=public_book_id]
+          internal_aid=next((x for x in aid_candidates if 6<=len(x)<=12),None)
+          token_matches=re.findall(r'''["']?view_token["']?\s*[:=]\s*["']([^"']+)["']''',newview_text,re.I)
+          if not token_matches:
+              token_matches=re.findall(r'''view_token.{0,80}?["']([^"']{12,})["']''',newview_text,re.I|re.S)
+          token=token_matches[0] if token_matches else None
+          print('RESOLVED','AID_CANDIDATES',aid_candidates,'AID',internal_aid,'TOKEN',token)
+          if not internal_aid or not token:raise RuntimeError('Internal aid or full-preview token not resolved')
+
+          def parse_jsonp(text):
+              s=text.strip()
+              start=s.find('(');end=s.rfind(')')
+              if start>=0 and end>start:return json.loads(s[start+1:end])
+              start=s.find('{');end=s.rfind('}')
+              if start>=0 and end>start:return json.loads(s[start:end+1])
+              raise ValueError('JSONP parse failed')
+
+          all_data={};api_responses=[];preview_pages=actual_pages=0
+          for start_page in [1,7,13,19,25,31]:
+              url=(f'https://openapi.book118.com/getPreview.html?project_id=1&aid={internal_aid}'
+                   f'&view_token={token}&page={start_page}')
+              out=Path('diagnostic')/f'api_{start_page:02d}.txt'
+              p=curl(url,out,original,180)
+              body=out.read_text(encoding='utf-8',errors='replace') if out.exists() else ''
+              print('API',start_page,'RC',p.returncode,'SIZE',len(body),'META',p.stdout,'BODY',body[:500],'ERR',p.stderr[-200:])
+              if p.returncode or not body:raise RuntimeError(f'Preview API failed at {start_page}')
+              obj=parse_jsonp(body);api_responses.append(obj)
+              if int(obj.get('status') or 0)!=200:raise RuntimeError(f'Preview API status: {obj}')
+              for k,v in (obj.get('data') or {}).items():
+                  if v:all_data[str(k)]=v
+              page_meta=obj.get('pages') or {}
+              preview_pages=int(page_meta.get('preview') or preview_pages or 0)
+              actual_pages=int(page_meta.get('actual') or actual_pages or 0)
+              if all(str(p) in all_data for p in range(1,actual_pages+1)):break
+              time.sleep(.5)
+
+          Path('diagnostic/api_manifest.json').write_text(json.dumps({'internal_aid':internal_aid,'token':token,'preview_pages':preview_pages,'actual_pages':actual_pages,'data':all_data,'responses':api_responses},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('PAGE_META',preview_pages,actual_pages,'RECOVERED_KEYS',sorted(int(k) for k in all_data))
+          if preview_pages!=31 or actual_pages!=31:
+              raise RuntimeError(f'Expected 31/31 preview, got {preview_pages}/{actual_pages}')
+          missing=[p for p in range(1,32) if str(p) not in all_data]
+          if missing:raise RuntimeError(f'Missing page URLs: {missing}')
+
+          manifest=[]
+          for p in range(1,32):
+              raw=str(all_data[str(p)]).replace('\\/','/').strip()
+              url='https:'+raw if raw.startswith('//') else raw if raw.startswith(('http://','https://')) else urljoin('https://openapi.book118.com/',raw)
+              temp=Path('pages')/f'{p:03d}.bin'
+              cp=curl(url,temp,original,300)
+              b=temp.read_bytes() if temp.exists() else b''
+              kind=None
+              if b[:8]==b'\x89PNG\r\n\x1a\n':kind='png'
+              elif b[:3]==b'\xff\xd8\xff':kind='jpg'
+              elif b[:4]==b'RIFF' and b[8:12]==b'WEBP':kind='webp'
+              print('PAGE',p,'RC',cp.returncode,'SIZE',len(b),'KIND',kind,'URL',url,'ERR',cp.stderr[-160:])
+              if cp.returncode or len(b)<5000 or not kind:raise RuntimeError(f'Page {p} failed')
+              with Image.open(temp) as im:
+                  im=im.convert('RGB')
+                  jpg=Path('pages')/f'{p:03d}.jpg'
+                  im.save(jpg,quality=96,subsampling=0)
+                  width,height=im.size
+              temp.unlink(missing_ok=True)
+              manifest.append({'page':p,'source_url':url,'file':jpg.name,'width':width,'height':height,'size':jpg.stat().st_size,'sha256':hashlib.sha256(jpg.read_bytes()).hexdigest()})
+          Path('diagnostic/page_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+          img2pdf $(find pages -name '*.jpg' | sort) -o output/Shenzhen_International_Shenwan_20250624_Deep_Report_31p_Public_Preview_Copy.pdf
+          pages=$(pdfinfo output/*.pdf | awk '/^Pages:/ {print $2}')
+          test "$pages" -eq 31
+          pdftoppm -f 1 -singlefile -png -r 90 output/*.pdf diagnostic/first >/dev/null 2>&1
+          pdftoppm -f 31 -singlefile -png -r 90 output/*.pdf diagnostic/last >/dev/null 2>&1
+          test -s diagnostic/first.png
+          test -s diagnostic/last.png
+          sha256sum output/*.pdf > diagnostic/SHA256SUMS.txt
+          ls -lh output pages diagnostic
+
+      - name: Upload recovered report
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-shenwan-report
+          path: |
+            output/*.pdf
+            pages/*.jpg
+            diagnostic/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
