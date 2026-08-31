@@ -1,0 +1,61 @@
+name: Temporary inspect Chinese Shenzhen International annual index
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-cindex-inspect.yml
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Fetch and parse Chinese annual index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from pathlib import Path
+          from urllib.parse import urljoin, unquote
+          import html, json, re, subprocess
+          url='https://www.irasia.com/listco/hk/szihl/annual/cindex.htm'
+          out=Path('diagnostic/cindex.bin')
+          cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors','--connect-timeout','20','--max-time','180','-A','Mozilla/5.0','-H','Accept-Encoding: identity',url,'-o',str(out)]
+          p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+          print('FETCH',p.returncode,out.stat().st_size if out.exists() else 0,p.stderr[-500:])
+          if p.returncode: raise RuntimeError(p.stderr)
+          body=out.read_bytes(); text=None; enc=None
+          for e in ['big5','cp950','utf-8','gb18030','latin1']:
+              try: text=body.decode(e); enc=e; break
+              except Exception: pass
+          if text is None: raise RuntimeError('decode failed')
+          text=html.unescape(text).replace('\\/','/')
+          Path('diagnostic/cindex.html').write_text(text,encoding='utf-8')
+          print('ENC',enc)
+          rows=[]
+          for m in re.finditer(r'<a\b([^>]*)>(.*?)</a>',text,re.I|re.S):
+              attrs=m.group(1); inner=m.group(2)
+              hm=re.search(r'href\s*=\s*["\']([^"\']+)["\']',attrs,re.I)
+              if not hm: continue
+              href=urljoin(url,hm.group(1))
+              label=' '.join(re.sub(r'<[^>]+>',' ',inner).split())
+              rows.append({'label':label,'href':href})
+          Path('diagnostic/anchors.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          for r in rows:
+              hay=(r['label']+' '+r['href']).lower()
+              if any(k in hay for k in ['2020','2021','2022','2023','2024','2025','年報','年报','.pdf']):
+                  print('ANCHOR',json.dumps(r,ensure_ascii=False))
+          PY
+
+      - name: Upload index data
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-cindex
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
