@@ -1,0 +1,56 @@
+name: Temporary test Book118 aid token combinations
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-book118-token-test.yml
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Test preview API combinations
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic
+          python3 - <<'PY'
+          from pathlib import Path
+          import itertools,json,subprocess
+          aids=['5104021001012234','769012911']
+          tokens=['GCLpa4YZuS4ELzXchXsoMd9OuMu1BV_z','GCLpa4YZuS50zg_OUeSh5JaNRbmqrm9A']
+          project_ids=['1','2','3']
+          referers=[
+            'https://max.book118.com/html/2025/0701/5104021001012234.shtm',
+            'https://max.book118.com/index.php?g=Home&m=NewView&a=index&aid=5104021001012234',
+          ]
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          results=[]
+          i=0
+          for aid,token,project,referer in itertools.product(aids,tokens,project_ids,referers):
+              i+=1
+              url=f'https://openapi.book118.com/getPreview.html?project_id={project}&aid={aid}&view_token={token}&page=1'
+              out=Path('diagnostic')/f'{i:02d}.txt'
+              cmd=['curl','--http1.1','-L','--silent','--show-error','--connect-timeout','15','--max-time','60',
+                   '-A',ua,'-e',referer,'-H','Accept-Encoding: identity',url,'-o',str(out),
+                   '-w','%{url_effective}\t%{http_code}\t%{content_type}']
+              p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+              text=out.read_text(encoding='utf-8',errors='replace') if out.exists() else ''
+              rec={'aid':aid,'token':token,'project':project,'referer':referer,'rc':p.returncode,'meta':p.stdout,'err':p.stderr[-200:],'body':text}
+              results.append(rec)
+              print('COMBO',json.dumps(rec,ensure_ascii=False))
+          Path('diagnostic/results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: book118-token-test
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
