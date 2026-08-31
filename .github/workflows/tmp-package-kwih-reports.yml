@@ -1,0 +1,32 @@
+name: Package verified KWIH reports
+
+on:
+  push:
+    branches:
+      - tmp/kwih-reports-20260831
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Check out packaging branch
+        uses: actions/checkout@v4
+
+      - name: Install PDF tools
+        run: python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download, verify, and package reports
+        run: python .github/scripts/package_kwih_reports.py
+
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kwih-reports
+          path: 嘉华国际_2020-2025年报及2025年最新完整中期报告_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
