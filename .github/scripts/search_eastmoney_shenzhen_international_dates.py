@@ -31,10 +31,10 @@ def value(row: dict, *names: str) -> str:
 
 all_matches: dict[str, dict] = {}
 for center, keywords in TARGETS:
-    begin = center - timedelta(days=5)
-    end = center + timedelta(days=6)
+    begin = center - timedelta(days=1)
+    end = center + timedelta(days=2)
     print("\n=== WINDOW", begin, end, "KEYWORDS", keywords, "===")
-    for page in range(1, 31):
+    for page in range(1, 13):
         params = {
             "industryCode": "*", "pageSize": "100", "industry": "*",
             "rating": "*", "ratingChange": "*",
@@ -47,7 +47,7 @@ for center, keywords in TARGETS:
         response = session.get(API, params=params, timeout=(20, 120))
         print("PAGE", page, "STATUS", response.status_code)
         response.raise_for_status()
-        rows = (response.json().get("data") or [])
+        rows = response.json().get("data") or []
         print("ROWS", len(rows))
         if not rows:
             break
@@ -64,7 +64,7 @@ for center, keywords in TARGETS:
                 print("MATCH", json.dumps(row, ensure_ascii=False))
         if len(rows) < 100:
             break
-        time.sleep(0.3)
+        time.sleep(0.15)
 
 print("\n=== ALL MATCHES", len(all_matches), "===")
 for key, row in all_matches.items():
