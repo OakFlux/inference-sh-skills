@@ -1,0 +1,145 @@
+name: Temporary Shenzhen International date-index recovery
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-date-index.yml
+
+jobs:
+  recover:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Scan date slices and download matching original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output diagnostic previews
+          python3 - <<'PY'
+          from __future__ import annotations
+          from pathlib import Path
+          import hashlib, json, os, re, subprocess, tempfile, urllib.parse
+
+          API='https://reportapi.eastmoney.com/report/list'
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          dates=[
+              '2024-07-03','2024-07-04','2024-07-05',
+              '2025-04-16','2025-04-17','2025-04-18',
+              '2025-05-06','2025-05-07','2025-05-08',
+              '2025-06-23','2025-06-24','2025-06-25',
+              '2025-07-01','2025-07-02',
+          ]
+          terms=['深圳国际','深圳國際','0152','00152','华南物流园增值添利','国企优质资源禀赋','转型升级释放盈利弹性']
+          brokers=['西南证券','申万宏源','华源证券','华源']
+          OUT=Path('output');DIAG=Path('diagnostic');PRE=Path('previews')
+
+          def fetch(day,page,qtype):
+              params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':day,'endTime':day,'pageNo':str(page),'fields':'',
+                  'qType':str(qtype),'orgCode':'','code':'*','rcode':'',
+                  'p':str(page),'pageNum':str(page),'pageNumber':str(page),
+              }
+              url=API+'?'+urllib.parse.urlencode(params)
+              fd,name=tempfile.mkstemp(prefix='szintl_date_',suffix='.json');os.close(fd);p=Path(name)
+              try:
+                  cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','6','--retry-all-errors',
+                       '--retry-delay','1','--connect-timeout','20','--max-time','180','-A',UA,
+                       '-e','https://data.eastmoney.com/report/','-H','Accept-Encoding: identity',url,'-o',str(p)]
+                  r=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if r.returncode: raise RuntimeError(r.stderr[-500:])
+                  raw=p.read_text(encoding='utf-8',errors='ignore').strip()
+                  if raw.startswith('datatable(') and raw.endswith(')'): raw=raw[len('datatable('):-1]
+                  elif raw and raw[0] not in '[{' and '(' in raw and raw.endswith(')'): raw=raw[raw.find('(')+1:raw.rfind(')')]
+                  return json.loads(raw)
+              finally:
+                  p.unlink(missing_ok=True)
+
+          matches=[];seen=set()
+          for day in dates:
+              for qtype in [0,1,2,3]:
+                  try:obj=fetch(day,1,qtype)
+                  except Exception as e:
+                      print('FIRST_ERR',day,qtype,repr(e));continue
+                  pages=int(obj.get('TotalPage') or obj.get('totalPage') or 1)
+                  print('FIRST',day,'QTYPE',qtype,'HITS',obj.get('hits'),'PAGES',pages,'ROWS',len(obj.get('data') or []))
+                  for page in range(1,min(pages,60)+1):
+                      if page==1:cur=obj
+                      else:
+                          try:cur=fetch(day,page,qtype)
+                          except Exception as e:
+                              print('PAGE_ERR',day,qtype,page,repr(e));continue
+                      rows=cur.get('data') or []
+                      for row in rows:
+                          hay=json.dumps(row,ensure_ascii=False).lower()
+                          title=str(row.get('title') or '')
+                          stock=str(row.get('stockName') or '')
+                          broker=str(row.get('orgSName') or '')
+                          if not (any(t.lower() in hay for t in terms) or (broker in brokers and any(k in title for k in ['物流园','高股息','深圳']))):
+                              continue
+                          key=str(row.get('infoCode') or json.dumps(row,ensure_ascii=False,sort_keys=True))
+                          if key in seen:continue
+                          seen.add(key);rr=dict(row);rr['_day']=day;rr['_qtype']=qtype;matches.append(rr)
+                          print('MATCH',json.dumps({k:rr.get(k) for k in ['publishDate','orgSName','stockCode','stockName','title','attachPages','reportType','ratingName','infoCode']},ensure_ascii=False))
+                      if len(rows)<100:break
+
+          DIAG.joinpath('matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          recovered=[]
+          for i,row in enumerate(matches,1):
+              code=str(row.get('infoCode') or '')
+              if not code:continue
+              urls=[
+                  f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/{code}.pdf',
+              ]
+              tmp=OUT/f'tmp_{i:02d}.pdf';source=None
+              for url in urls:
+                  tmp.unlink(missing_ok=True)
+                  cmd=['curl','--http1.1','-L','--fail','--silent','--show-error','--retry','8','--retry-all-errors',
+                       '--retry-delay','2','--connect-timeout','25','--max-time','900','--compressed','-A',UA,
+                       '-e','https://data.eastmoney.com/report/','-H','Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                       url,'-o',str(tmp)]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  size=tmp.stat().st_size if tmp.exists() else 0;magic=tmp.read_bytes()[:8] if tmp.exists() else b''
+                  print('TRY',code,'RC',p.returncode,'SIZE',size,'MAGIC',magic,'URL',url,'ERR',p.stderr[-200:])
+                  if p.returncode==0 and size>25000 and magic[:4]==b'%PDF':source=url;break
+              if not source:continue
+              info=subprocess.check_output(['pdfinfo',str(tmp)],text=True,errors='replace')
+              m=re.search(r'^Pages:\s*(\d+)',info,re.M);pages=int(m.group(1)) if m else 0
+              txt=DIAG/f'{code}.txt';subprocess.run(['pdftotext','-f','1','-l',str(min(15,pages)),str(tmp),str(txt)],check=False)
+              text=txt.read_text(encoding='utf-8',errors='replace') if txt.exists() else ''
+              compact=''.join(text.split()).lower()
+              if not ('深圳国际' in text or '深圳國際' in text or '0152' in compact or '00152' in compact):
+                  print('TEXT_MISMATCH',code,pages,text[:800]);tmp.unlink(missing_ok=True);continue
+              broker=re.sub(r'[^A-Za-z0-9_-]+','_',str(row.get('orgSName') or 'Broker')) or 'Broker'
+              date=str(row.get('publishDate') or row.get('_day') or '')[:10].replace('-','')
+              final=OUT/f'{len(recovered)+1:02d}_Shenzhen_International_{broker}_{date}_{pages}p.pdf';tmp.replace(final)
+              for pn,tag in [(1,'first'),(pages,'last')]:
+                  subprocess.run(['pdftoppm','-f',str(pn),'-singlefile','-png','-r','90',str(final),str(PRE/f'{len(recovered)+1:02d}_{tag}')],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+              rec=dict(row);rec.update({'pages_actual':pages,'filename':final.name,'source_url':source,'size_bytes':final.stat().st_size,'sha256':hashlib.sha256(final.read_bytes()).hexdigest()})
+              recovered.append(rec);print('RECOVERED',json.dumps({k:rec.get(k) for k in ['publishDate','orgSName','title','infoCode','pages_actual','filename']},ensure_ascii=False))
+          DIAG.joinpath('recovered.json').write_text(json.dumps(recovered,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCH_COUNT',len(matches),'RECOVERED_COUNT',len(recovered))
+          PY
+          find output diagnostic previews -type f -printf '%p\t%s\n' | sort
+
+      - name: Upload date-index results
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-date-index-results
+          path: |
+            output/
+            diagnostic/
+            previews/
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
