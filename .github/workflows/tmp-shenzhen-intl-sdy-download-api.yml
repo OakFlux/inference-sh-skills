@@ -1,0 +1,56 @@
+name: Temporary verify Shenzhen International report download API
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-sdy-download-api.yml
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Test unauthenticated public download endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostic downloads
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, subprocess
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          ids=[943201,898048,710902,260253,886501]
+          variants=[]
+          for rid in ids:
+              for method,payload in [
+                ('POST',{'id':rid,'cid':0,'beike':0,'opFrom':1}),
+                ('POST',{'id':rid,'cid':0,'beike':1,'opFrom':1}),
+                ('POST',{'id':rid,'opFrom':1}),
+                ('GET',None),
+              ]:
+                  url='https://api.sdyanbao.com/api/file/download'
+                  if method=='GET':url+=f'?id={rid}&cid=0&beike=0&opFrom=1'
+                  out=Path('diagnostic')/f'{rid}_{len(variants):02d}.txt'
+                  cmd=['curl','--http1.1','-L','--silent','--show-error','--retry','3','--retry-all-errors','--connect-timeout','20','--max-time','120','-A',ua,'-e',f'https://www.sdyanbao.com/detail/{rid}','-H','Device: 1','-H','Accept: application/json','-H','Accept-Encoding: identity']
+                  if method=='POST':
+                      cmd += ['-H','Content-Type: application/json','-X','POST','--data-binary',json.dumps(payload,ensure_ascii=False)]
+                  cmd += [url,'-o',str(out),'-w','%{url_effective}\t%{http_code}\t%{content_type}']
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  body=out.read_text(encoding='utf-8',errors='replace') if out.exists() else ''
+                  rec={'id':rid,'method':method,'payload':payload,'rc':p.returncode,'meta':p.stdout,'error':p.stderr[-300:],'body':body}
+                  variants.append(rec)
+                  print('RESULT',json.dumps(rec,ensure_ascii=False))
+          Path('diagnostic/results.json').write_text(json.dumps(variants,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-download-api-results
+          path: diagnostic/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 9
