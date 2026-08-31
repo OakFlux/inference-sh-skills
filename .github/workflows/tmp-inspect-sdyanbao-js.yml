@@ -1,0 +1,18 @@
+name: Inspect Sdyanbao JS
+
+on:
+  push:
+    branches:
+      - tmp/shenzhen-international-broker-reports-20260831
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python .github/scripts/inspect_sdyanbao_js.py
