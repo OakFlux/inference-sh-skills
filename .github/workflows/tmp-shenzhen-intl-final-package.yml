@@ -1,0 +1,226 @@
+name: Temporary verified Shenzhen International report package
+
+on:
+  push:
+    branches:
+      - tmp/download-shenzhen-international-reports-20260831
+    paths:
+      - .github/workflows/tmp-shenzhen-intl-final-package.yml
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Install PDF utilities
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+
+      - name: Download, verify and package original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output package previews diagnostic
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          from pathlib import Path
+          import datetime as dt
+          import hashlib
+          import json
+          import re
+          import subprocess
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          OUTPUT=Path('output'); PACKAGE=Path('package'); PRE=Path('previews'); DIAG=Path('diagnostic')
+
+          reports=[
+              {
+                  'category':'年度報告', 'year':2020,
+                  'title':'深圳國際2020年報',
+                  'url':'https://doc.irasia.com/listco/hk/szihl/annual/ar245874-c20210415_1.pdf',
+                  'filename':'01_Shenzhen_International_2020_Annual_Report.pdf',
+                  'min_pages':150,
+              },
+              {
+                  'category':'年度報告', 'year':2021,
+                  'title':'深圳國際2021年報',
+                  'url':'https://doc.irasia.com/listco/hk/szihl/annual/ar263076-c20220419_1.pdf',
+                  'filename':'02_Shenzhen_International_2021_Annual_Report.pdf',
+                  'min_pages':150,
+              },
+              {
+                  'category':'年度報告', 'year':2022,
+                  'title':'深圳國際2022年報',
+                  'url':'https://doc.irasia.com/listco/hk/szihl/annual/ar280823-cw_00152ar_28032023.pdf',
+                  'filename':'03_Shenzhen_International_2022_Annual_Report.pdf',
+                  'min_pages':150,
+              },
+              {
+                  'category':'年度報告', 'year':2023,
+                  'title':'深圳國際2023年報',
+                  'url':'https://doc.irasia.com/listco/hk/szihl/annual/ar295909-c_00152_2023ar_20240419.pdf',
+                  'filename':'04_Shenzhen_International_2023_Annual_Report.pdf',
+                  'min_pages':150,
+              },
+              {
+                  'category':'年度報告', 'year':2024,
+                  'title':'深圳國際2024年報',
+                  'url':'https://doc.irasia.com/listco/hk/szihl/annual/2024/car2024.pdf',
+                  'filename':'05_Shenzhen_International_2024_Annual_Report.pdf',
+                  'min_pages':150,
+              },
+              {
+                  'category':'年度報告', 'year':2025,
+                  'title':'深圳國際2025年報',
+                  'url':'https://doc.irasia.com/listco/hk/szihl/annual/2025/car2025.pdf',
+                  'filename':'06_Shenzhen_International_2025_Annual_Report.pdf',
+                  'min_pages':150,
+              },
+              {
+                  'category':'最新定期財務披露', 'year':2026,
+                  'title':'深圳國際2026年度中期業績公告',
+                  'url':'https://doc.irasia.com/listco/hk/szihl/interim/2026/intc.pdf',
+                  'filename':'07_Shenzhen_International_2026_Interim_Results_Announcement.pdf',
+                  'min_pages':25,
+              },
+              {
+                  'category':'最近一期完整中期報告（備用）', 'year':2025,
+                  'title':'深圳國際2025中期報告',
+                  'url':'https://www.szihl.com/uploads/20250916050113_976485.pdf',
+                  'filename':'08_Shenzhen_International_2025_Interim_Report_Full.pdf',
+                  'min_pages':80,
+              },
+          ]
+
+          def download(record: dict, index: int) -> Path:
+              temp=OUTPUT/f'temp_{index:02d}.pdf'
+              urls=[record['url']]
+              # Official IRAsia redirect can improve compatibility for some legacy files.
+              if 'doc.irasia.com' in record['url']:
+                  urls.append('https://www.irwebcast.com/cgi-local/report/redirect.cgi?url='+record['url'])
+              for url in urls:
+                  temp.unlink(missing_ok=True)
+                  cmd=[
+                      'curl','--http1.1','-L','--fail','--silent','--show-error',
+                      '--retry','10','--retry-all-errors','--retry-delay','2',
+                      '--connect-timeout','30','--max-time','1800','--compressed',
+                      '-A',UA,'-e','https://www.szihl.com/relations/report/index.html',
+                      '-H','Accept: application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                      url,'-o',str(temp),
+                  ]
+                  p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  size=temp.stat().st_size if temp.exists() else 0
+                  magic=temp.read_bytes()[:8] if temp.exists() else b''
+                  print('TRY',index,'RC',p.returncode,'SIZE',size,'MAGIC',magic,'URL',url,'ERR',p.stderr[-400:])
+                  if p.returncode==0 and size>100000 and magic[:4]==b'%PDF':
+                      record['download_url']=url
+                      return temp
+              raise RuntimeError(f'Unable to download valid PDF: {record["title"]}')
+
+          verified=[]
+          for index,record in enumerate(reports,1):
+              temp=download(record,index)
+              info=subprocess.check_output(['pdfinfo',str(temp)],text=True,errors='replace')
+              m=re.search(r'^Pages:\s*(\d+)',info,re.M)
+              pages=int(m.group(1)) if m else 0
+              if pages<record['min_pages']:
+                  raise RuntimeError(f'{record["title"]}: only {pages} pages, expected >= {record["min_pages"]}')
+
+              text_path=DIAG/f'{index:02d}.txt'
+              subprocess.run(['pdftotext','-f','1','-l',str(min(35,pages)),str(temp),str(text_path)],check=True)
+              text=text_path.read_text(encoding='utf-8',errors='replace')
+              compact=''.join(text.split()).lower()
+              company_ok=(
+                  '深圳國際' in text or '深圳国际' in text or
+                  'shenzheninternational' in compact or '00152' in compact
+              )
+              if not company_ok:
+                  raise RuntimeError(f'{record["title"]}: company name/code not found')
+              if str(record['year']) not in compact[:60000]:
+                  raise RuntimeError(f'{record["title"]}: report year not found in opening pages')
+
+              final=OUTPUT/record['filename']
+              temp.replace(final)
+              for page_no,tag in [(1,'first'),(pages,'last')]:
+                  target=PRE/f'{index:02d}_{tag}'
+                  subprocess.run(
+                      ['pdftoppm','-f',str(page_no),'-singlefile','-png','-r','90',str(final),str(target)],
+                      check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+                  )
+                  png=Path(str(target)+'.png')
+                  if not png.exists() or png.stat().st_size<8000:
+                      raise RuntimeError(f'{final.name}: {tag}-page render failed')
+
+              item=dict(record)
+              item.update({
+                  'pages':pages,
+                  'size_bytes':final.stat().st_size,
+                  'sha256':hashlib.sha256(final.read_bytes()).hexdigest(),
+              })
+              verified.append(item)
+              print('VERIFIED',json.dumps(item,ensure_ascii=False))
+
+          manifest={
+              'company':'深圳國際控股有限公司',
+              'stock_code':'00152.HK',
+              'generated_at_utc':dt.datetime.now(dt.timezone.utc).isoformat(),
+              'note':'港股公司不按A股口徑披露第一、第三季度報告；以最新中期業績公告替代最新季報，並附最近完整中期報告。',
+              'files':verified,
+          }
+          (PACKAGE/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          lines=[
+              '深圳國際控股有限公司（00152.HK）2020—2025年報及最新定期財務披露',
+              '',
+              '資料包包含2020—2025年度報告、2026年度中期業績公告，並附2025完整中期報告作為備用。',
+              '說明：深圳國際為港股公司，不按A股口徑披露第一、第三季度報告；截至2026-08-31，',
+              '最新定期財務披露為2026年度中期業績公告。2026完整中期報告尚未在公司業績報告頁刊載。',
+              '',
+          ]
+          for i,r in enumerate(verified,1):
+              lines += [
+                  f'{i}. {r["title"]}',
+                  f'   類別：{r["category"]}',
+                  f'   實際頁數：{r["pages"]}',
+                  f'   文件名：{r["filename"]}',
+                  f'   官方來源：{r["url"]}',
+                  '',
+              ]
+          lines += [
+              '核驗說明：所有PDF均已檢查文件頭、實際頁數、公司名稱/股份代號與報告年份，',
+              '並完成首頁及末頁渲染；壓縮包附SHA-256校驗值。',
+              '僅供公開信息整理和研究使用。',
+          ]
+          (PACKAGE/'報告清單與核驗說明.txt').write_text('\n'.join(lines)+'\n',encoding='utf-8')
+          (PACKAGE/'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{r["sha256"]}  {r["filename"]}' for r in verified)+'\n',encoding='utf-8'
+          )
+          for r in verified:
+              (PACKAGE/r['filename']).write_bytes((OUTPUT/r['filename']).read_bytes())
+
+          print('FINAL_COUNT',len(verified))
+          for r in verified:
+              print('FINAL',r['category'],r['year'],r['pages'],r['filename'],r['size_bytes'])
+          PY
+
+          (cd package && zip -q -9 ../Shenzhen_International_2020_2025_Annual_Reports_Latest_Interim_Verified.zip ./*)
+          unzip -t Shenzhen_International_2020_2025_Annual_Reports_Latest_Interim_Verified.zip
+          ls -lh output package previews Shenzhen_International_2020_2025_Annual_Reports_Latest_Interim_Verified.zip
+
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shenzhen-international-annual-and-interim-reports
+          path: |
+            Shenzhen_International_2020_2025_Annual_Reports_Latest_Interim_Verified.zip
+            output/*.pdf
+            package/manifest.json
+            package/報告清單與核驗說明.txt
+            package/SHA256SUMS.txt
+            previews/*.png
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
