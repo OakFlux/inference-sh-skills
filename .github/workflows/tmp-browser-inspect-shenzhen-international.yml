@@ -1,0 +1,27 @@
+name: Browser inspect Shenzhen International reports
+
+on:
+  push:
+    branches:
+      - tmp/shenzhen-international-browser-package-20260831
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet playwright
+      - run: python -m playwright install --with-deps chromium
+      - run: python .github/scripts/browser_inspect_shenzhen_international.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shenzhen-international-browser-inspection
+          path: report_*_full.png
+          if-no-files-found: ignore
+          retention-days: 1
+          compression-level: 0
