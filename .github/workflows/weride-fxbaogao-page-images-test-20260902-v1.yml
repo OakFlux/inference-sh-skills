@@ -1,0 +1,49 @@
+name: Test FxBaogao page images for WeRide report
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-fxbaogao-page-images-test-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Probe page image sequence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pillow
+          python - <<'PY'
+          from io import BytesIO
+          import requests
+          from PIL import Image
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          pages=[1,2,3,10,20,40,60,70,77,78,79,80,81,82]
+          bases=[
+              'https://public.fxbaogao.com/report-image/2025/08/22/5095181-{n}.png',
+              'https://public.fxbaogao.com/report-image/2025/08/22/5095181-{n}.jpg',
+              'https://public.fxbaogao.com/report-image/2025/08/22/5095181-{n}.webp',
+              'https://public.fxbaogao.com/report-image/2025/08/25/5095181-{n}.png',
+          ]
+          for n in pages:
+              for base in bases:
+                  u=base.format(n=n)
+                  try:
+                      r=s.get(u,headers={'User-Agent':ua,'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8','Referer':'https://www.fxbaogao.com/detail/5095181'},timeout=(15,60),allow_redirects=True)
+                      ok=False; size=None; fmt=None
+                      if r.status_code==200 and len(r.content)>1000:
+                          try:
+                              im=Image.open(BytesIO(r.content)); size=im.size; fmt=im.format; ok=True
+                          except Exception: pass
+                      print('IMG',n,u,r.status_code,r.headers.get('content-type'),len(r.content),r.url,'OK',ok,'FMT',fmt,'SIZE',size,r.content[:12],flush=True)
+                      if ok: break
+                  except Exception as e: print('ERR',n,u,repr(e),flush=True)
+          PY
