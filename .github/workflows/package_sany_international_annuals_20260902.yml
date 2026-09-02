@@ -1,0 +1,453 @@
+name: package-sany-international-annuals-20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_sany_international_annuals_20260902.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Download validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY_CN = '三一国际'
+          COMPANY_LEGAL_CN = '三一重裝國際控股有限公司'
+          COMPANY_EN = 'SANY HEAVY EQUIPMENT INTERNATIONAL HOLDINGS COMPANY LIMITED'
+          STOCK_CODE = '00631'
+          PACKAGE = '三一国际_2020-2025年报及最新季报'
+          BASE = 'https://www1.hkexnews.hk'
+          SEARCH_URL = BASE + '/search/titlesearch.xhtml'
+          SERVLET_URL = BASE + '/search/titleSearchServlet.do'
+
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_sany_international_reports_work')
+          work.mkdir(exist_ok=True)
+          previews = work / 'previews'
+          previews.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          session.headers.update({
+              'User-Agent': ua,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': SEARCH_URL + '?lang=zh',
+          })
+
+          def retry_get(url: str, *, params=None, headers=None, timeout=(30, 180), attempts=6):
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = session.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
+                      print('GET', attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      print('GET_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'GET failed for {url}: {last}')
+
+          def retry_post(url: str, *, data=None, headers=None, timeout=(30, 180), attempts=6):
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = session.post(url, data=data, headers=headers, timeout=timeout, allow_redirects=True)
+                      print('POST', attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      print('POST_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def get_stock_id() -> str:
+              ts = str(int(time.time() * 1000))
+              urls = [
+                  BASE + '/ncms/script/eds/activestock_sehk_e.json?_=' + ts,
+                  BASE + '/ncms/script/eds/activestock_sehk_c.json?_=' + ts,
+                  BASE + '/ncms/script/eds/tierone_e.json?_=' + ts,
+                  BASE + '/ncms/script/eds/tierone_c.json?_=' + ts,
+              ]
+              for url in urls:
+                  try:
+                      r = retry_get(url, headers={'Accept':'application/json,text/plain,*/*'}, timeout=(30, 90), attempts=3)
+                      obj = r.json()
+                      if isinstance(obj, list):
+                          for item in obj:
+                              if not isinstance(item, dict):
+                                  continue
+                              code = str(item.get('c') or item.get('code') or '').zfill(5)
+                              name = str(item.get('n') or item.get('name') or '')
+                              if code == STOCK_CODE or 'SANY HEAVY EQUIPMENT' in name.upper() or COMPANY_LEGAL_CN[:4] in name:
+                                  stock_id = str(item.get('i') or item.get('id') or '')
+                                  if stock_id:
+                                      print('STOCK_MATCH', json.dumps(item, ensure_ascii=False), flush=True)
+                                      return stock_id
+                  except Exception as exc:
+                      print('STOCK_LIST_WARNING', url, repr(exc), flush=True)
+              raise RuntimeError('Unable to resolve HKEX internal stockId for 00631')
+
+          stock_id = get_stock_id()
+          print('STOCK_ID', stock_id, flush=True)
+
+          def clean_text(value: str) -> str:
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', ' ', value)
+              return re.sub(r'\s+', ' ', value).strip()
+
+          def query_period(start_date: str, end_date: str, lang: str, document_type: str = '-1') -> list[dict]:
+              payload = {
+                  'lang': lang,
+                  'category': '0',
+                  'market': 'SEHK',
+                  'searchType': '0',
+                  'documentType': document_type,
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'stockId': stock_id,
+                  'from': start_date,
+                  'to': end_date,
+                  'MB-Daterange': '0',
+                  'title': '',
+              }
+              retry_post(SEARCH_URL, data=payload, timeout=(30, 90), attempts=4)
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': stock_id,
+                  'documentType': document_type,
+                  'fromDate': start_date,
+                  'toDate': end_date,
+                  'title': '',
+                  'searchType': '0',
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'rowRange': '9999',
+                  'lang': lang,
+              }
+              r = retry_get(SERVLET_URL, params=params, headers={'Accept':'application/json,text/plain,*/*','Referer':SEARCH_URL+'?lang=zh'}, timeout=(30, 120), attempts=5)
+              outer = r.json()
+              result = outer.get('result', '[]') if isinstance(outer, dict) else outer
+              rows = json.loads(result) if isinstance(result, str) else result
+              if not isinstance(rows, list):
+                  rows = []
+              parsed = []
+              for item in rows:
+                  if not isinstance(item, dict):
+                      continue
+                  code = clean_text(str(item.get('STOCK_CODE') or ''))
+                  if STOCK_CODE not in code.replace(' ', '') and '00631' not in code.replace(' ', ''):
+                      continue
+                  link = str(item.get('FILE_LINK') or '').strip()
+                  if not link:
+                      continue
+                  parsed.append({
+                      'lang': lang,
+                      'title': clean_text(str(item.get('TITLE') or '')),
+                      'long_text': clean_text(str(item.get('LONG_TEXT') or '')),
+                      'date_time': clean_text(str(item.get('DATE_TIME') or '')),
+                      'file_link': link,
+                      'pdf_url': urljoin(BASE + '/', link),
+                      'file_type': clean_text(str(item.get('FILE_TYPE') or '')),
+                      'file_size': clean_text(str(item.get('FILE_SIZE') or '')),
+                      'stock_name': clean_text(str(item.get('STOCK_NAME') or '')),
+                      'raw': item,
+                  })
+              print('QUERY', start_date, end_date, lang, document_type, 'COUNT', len(parsed), flush=True)
+              return parsed
+
+          all_rows = []
+          # Query by publication year to avoid HKEX row caps and retain all title variants.
+          for publication_year in range(2021, 2027):
+              for lang in ('ZH', 'EN'):
+                  start = f'{publication_year}0101'
+                  end = '20260902' if publication_year == 2026 else f'{publication_year}1231'
+                  for doc_type in ('001', '002', '003', '-1'):
+                      try:
+                          all_rows.extend(query_period(start, end, lang, doc_type))
+                      except Exception as exc:
+                          print('QUERY_WARNING', publication_year, lang, doc_type, repr(exc), flush=True)
+
+          deduped = []
+          seen_links = set()
+          for row in all_rows:
+              key = row['pdf_url'].split('?')[0]
+              if key in seen_links:
+                  continue
+              seen_links.add(key)
+              deduped.append(row)
+          all_rows = deduped
+          (work / 'all_hkex_rows.json').write_text(json.dumps(all_rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('ALL_ROWS', len(all_rows), flush=True)
+          for row in all_rows:
+              print('ROW', row['date_time'], row['lang'], row['title'], row['pdf_url'], row['file_size'], flush=True)
+
+          def title_norm(row: dict) -> str:
+              return clean_text((row.get('title') or '') + ' ' + (row.get('long_text') or '')).lower()
+
+          def is_excluded_annual(text: str) -> bool:
+              terms = (
+                  'annual results', 'final results', '年度業績', '年度业绩', '全年業績', '全年业绩',
+                  'summary financial', 'financial summary', '摘要', 'sustainability', 'esg',
+                  'environmental, social', '環境、社會', '环境、社会', 'reminder letter', 'notification letter',
+                  '通知信函', '提示信函', 'circular', '通函', 'proxy', '委任表格', 'board meeting', '董事會會議',
+                  'announcement', '公告', 'monthly return', '月報表',
+              )
+              return any(term in text for term in terms)
+
+          def annual_candidates(year: int) -> list[dict]:
+              ys = str(year)
+              items = []
+              for row in all_rows:
+                  text = title_norm(row)
+                  if ys not in text:
+                      continue
+                  has_annual = ('annual report' in text or '年報' in text or '年报' in text or '年度報告' in text or '年度报告' in text)
+                  if not has_annual or is_excluded_annual(text):
+                      continue
+                  score = 0
+                  if 'annual report' in text: score += 100
+                  if '年報' in text or '年报' in text: score += 130
+                  if re.search(rf'\b{year}\b', text): score += 30
+                  if row['lang'] == 'ZH': score += 20
+                  try:
+                      size_num = float(re.search(r'[0-9.]+', row.get('file_size') or '0').group())
+                      score += min(size_num, 50)
+                  except Exception:
+                      pass
+                  items.append({**row, 'score': score})
+              items.sort(key=lambda x: (x['score'], x['date_time']), reverse=True)
+              return items
+
+          def interim_candidates(year: int) -> list[dict]:
+              items = []
+              for row in all_rows:
+                  text = title_norm(row)
+                  if str(year) not in text:
+                      continue
+                  if not ('interim report' in text or '中期報告' in text or '中期报告' in text):
+                      continue
+                  if any(x in text for x in ('interim results', '中期業績', '中期业绩', 'announcement', '公告', 'notification', '通知')):
+                      continue
+                  score = 200 + (30 if row['lang'] == 'ZH' else 0)
+                  items.append({**row, 'score': score})
+              items.sort(key=lambda x: (x['score'], x['date_time']), reverse=True)
+              return items
+
+          def q1_candidates(year: int) -> list[dict]:
+              items = []
+              for row in all_rows:
+                  text = title_norm(row)
+                  if str(year) not in text:
+                      continue
+                  cond_period = (
+                      ('three months ended 31 march' in text) or
+                      ('截至' in text and ('3月31日' in text or '3月 31日' in text or 'march 31' in text) and ('三個月' in text or '三个月' in text))
+                  cond_fin = ('unaudited consolidated financial data' in text or '未經審核綜合財務數據' in text or '未经审核综合财务数据' in text)
+                  if cond_period and cond_fin:
+                      score = 200 + (20 if row['lang'] == 'ZH' else 0)
+                      items.append({**row, 'score': score})
+              items.sort(key=lambda x: (x['score'], x['date_time']), reverse=True)
+              return items
+
+          def download_bytes(url: str) -> bytes:
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      r = session.get(url, headers={
+                          'User-Agent': ua,
+                          'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                          'Referer': SEARCH_URL + '?lang=zh',
+                      }, timeout=(30, 480), allow_redirects=True)
+                      print('PDF_GET', attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50_000:
+                          return r.content
+                      last = RuntimeError(f'HTTP {r.status_code}, {len(r.content)} bytes')
+                  except Exception as exc:
+                      last = exc
+                      print('PDF_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'Unable to download PDF {url}: {last}')
+
+          def compact_text(reader: PdfReader, max_pages: int = 12) -> str:
+              texts = []
+              for page in reader.pages[:min(len(reader.pages), max_pages)]:
+                  try:
+                      texts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(texts)).lower()
+
+          def validate_and_store(candidates: list[dict], filename: str, kind: str, expected_year: int, min_pages: int) -> dict:
+              failures = []
+              for idx, candidate in enumerate(candidates, 1):
+                  temp = work / f'candidate_{kind}_{expected_year}_{idx}.pdf'
+                  try:
+                      data = download_bytes(candidate['pdf_url'])
+                      temp.write_bytes(data)
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < min_pages:
+                          raise RuntimeError(f'too short: {pages} pages, min {min_pages}')
+                      compact = compact_text(reader)
+                      identity_ok = (
+                          'sanyheavyequipmentinternational' in compact or
+                          '三一重裝國際' in compact or
+                          '三一重装国际' in compact or
+                          STOCK_CODE in compact
+                      )
+                      if not identity_ok:
+                          raise RuntimeError('company identity validation failed')
+                      if str(expected_year) not in compact and str(expected_year) not in title_norm(candidate):
+                          raise RuntimeError('expected reporting year not found')
+                      if kind == 'annual' and not ('annualreport' in compact or '年報' in compact or '年报' in compact):
+                          # Some Chinese PDFs have non-extractable glyphs; title and page count remain acceptable.
+                          if not ('annual report' in title_norm(candidate) or '年報' in title_norm(candidate) or '年报' in title_norm(candidate)):
+                              raise RuntimeError('annual-report identity not confirmed')
+                      if kind == 'interim' and not ('interimreport' in compact or '中期報告' in compact or '中期报告' in compact):
+                          if not ('interim report' in title_norm(candidate) or '中期報告' in title_norm(candidate) or '中期报告' in title_norm(candidate)):
+                              raise RuntimeError('interim-report identity not confirmed')
+
+                      check = subprocess.run(['qpdf', '--check', str(temp)], capture_output=True, text=True)
+                      if check.returncode not in (0, 3):
+                          raise RuntimeError(f'qpdf failed: {check.stderr[-1000:]}')
+                      dest = out / filename
+                      dest.write_bytes(data)
+                      first_prefix = previews / f'{dest.stem}_first'
+                      last_prefix = previews / f'{dest.stem}_last'
+                      subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(dest), str(first_prefix)], check=True, capture_output=True)
+                      subprocess.run(['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90', str(dest), str(last_prefix)], check=True, capture_output=True)
+                      if not Path(str(first_prefix)+'.png').exists() or not Path(str(last_prefix)+'.png').exists():
+                          raise RuntimeError('render verification failed')
+                      digest = hashlib.sha256(data).hexdigest()
+                      record = {
+                          'kind': kind,
+                          'report_year': expected_year,
+                          'filename': filename,
+                          'title': candidate['title'],
+                          'date_time': candidate['date_time'],
+                          'language_query': candidate['lang'],
+                          'pages': pages,
+                          'bytes': len(data),
+                          'sha256': digest,
+                          'source_url': candidate['pdf_url'],
+                          'source': '香港交易所披露易（HKEXnews）原始PDF',
+                      }
+                      print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+                      return record
+                  except Exception as exc:
+                      failures.append({'title':candidate.get('title'),'url':candidate.get('pdf_url'),'error':repr(exc)})
+                      print('CANDIDATE_FAILURE', kind, expected_year, candidate.get('title'), repr(exc), flush=True)
+              raise RuntimeError(f'No valid {kind} report for {expected_year}; failures={failures}')
+
+          records = []
+          for year in range(2020, 2026):
+              candidates = annual_candidates(year)
+              print('ANNUAL_CANDIDATES', year, json.dumps(candidates, ensure_ascii=False, indent=2), flush=True)
+              if not candidates:
+                  raise RuntimeError(f'No annual report candidates found for {year}')
+              records.append(validate_and_store(candidates, f'{year}年年度报告.pdf', 'annual', year, 80))
+
+          q1 = q1_candidates(2026)
+          print('Q1_CANDIDATES', json.dumps(q1, ensure_ascii=False, indent=2), flush=True)
+          if not q1:
+              raise RuntimeError('No 2026 Q1 unaudited financial-data announcement found')
+          records.append(validate_and_store(q1, '2026年第一季度未经审核综合财务数据.pdf', 'q1', 2026, 3))
+
+          interim = interim_candidates(2026)
+          print('INTERIM_CANDIDATES', json.dumps(interim, ensure_ascii=False, indent=2), flush=True)
+          if interim:
+              records.append(validate_and_store(interim, '2026年中期报告.pdf', 'interim', 2026, 40))
+          else:
+              print('INTERIM_REPORT_NOT_FOUND', flush=True)
+
+          expected_annuals = {2020,2021,2022,2023,2024,2025}
+          actual_annuals = {r['report_year'] for r in records if r['kind']=='annual'}
+          if actual_annuals != expected_annuals:
+              raise RuntimeError(f'Annual report coverage mismatch: {actual_annuals}')
+
+          lines = [
+              '三一国际（00631.HK）2020-2025年报及最新期内报告',
+              '',
+              '所有年度报告均为港交所披露易公开的完整原始PDF，不是年度业绩公告、摘要或媒体转载。',
+              '“最新季报”按公司实际披露口径收入2026年第一季度未经审核综合财务数据；如港交所已发布2026年中期报告，也一并收入。',
+              '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines.extend([
+                  f"{i}. {r['filename']}",
+                  f"   港交所标题：{r['title']}",
+                  f"   披露时间：{r['date_time']}；实际页数：{r['pages']}页；文件大小：{r['bytes']/1024/1024:.2f} MB",
+                  f"   来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、公司名称/证券代码、报告年度、实际页数、qpdf结构检查、首页与末页渲染、SHA-256、ZIP CRC。',
+              '年度报告按其覆盖的财政年度命名，而不是按PDF披露年份命名。',
+          ])
+          (out/'报告清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdfs = [n for n in archive.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(records):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)} vs {len(records)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sany-international-2020-2025-annuals-latest-final
+          path: |
+            三一国际_2020-2025年报及最新季报/
+            三一国际_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
