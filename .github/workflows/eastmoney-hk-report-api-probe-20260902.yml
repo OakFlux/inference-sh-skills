@@ -1,0 +1,49 @@
+name: Probe Eastmoney HK company report APIs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/eastmoney-hk-report-api-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Probe known HK tickers and WeRide
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json
+          import requests
+
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 Chrome/151','Referer':'https://data.eastmoney.com/report/stock.jshtml','Accept':'application/json,text/plain,*/*'}
+          endpoints=['https://reportapi.eastmoney.com/report/list','https://reportapi.eastmoney.com/report/list2']
+          codes=['00700','0700','116.00700','116.0700','HK00700','00700.HK','00165','0165','116.00165','00800','0800','116.00800','116.0800','WRD','WRD.O','105.WRD']
+          for endpoint in endpoints:
+            for code in codes:
+              for qtype in [0,1,2,3]:
+                params={'pageNo':1,'pageSize':20,'code':code,'qType':qtype,'beginTime':'2025-01-01','endTime':'2026-09-02','industryCode':'*','rating':'*','ratingChange':'*'}
+                try:
+                  if endpoint.endswith('list2'):
+                    r=s.post(endpoint,json=params,headers={**h,'Content-Type':'application/json'},timeout=(15,60))
+                  else:
+                    r=s.get(endpoint,params=params,headers=h,timeout=(15,60))
+                  try: p=r.json()
+                  except Exception: p={}
+                  rows=(p.get('data') or p.get('Data') or []) if isinstance(p,dict) else []
+                  hits=p.get('hits') if isinstance(p,dict) else None
+                  if rows or hits:
+                    print('RESULT',endpoint,code,qtype,r.status_code,len(r.content),'hits',hits,'rows',len(rows),flush=True)
+                    for row in rows[:3]:
+                      print('ROW',json.dumps({k:row.get(k) for k in ('infoCode','title','publishDate','orgSName','stockName','stockCode','attachPages','reportType')},ensure_ascii=False),flush=True)
+                except Exception as exc:
+                  print('ERR',endpoint,code,qtype,repr(exc),flush=True)
+          PY
