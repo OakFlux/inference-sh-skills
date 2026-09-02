@@ -1,0 +1,79 @@
+name: discover-skyworth-reports-20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/discover_skyworth_reports_20260902.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Discover HKEX records
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import html, json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+
+          BASE='https://www1.hkexnews.hk'
+          SEARCH=BASE+'/search/titlesearch.xhtml'
+          SERVLET=BASE+'/search/titleSearchServlet.do'
+          CODE='00751'
+          out=Path('skyworth_discovery'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Referer':SEARCH+'?lang=zh'})
+
+          ts=str(int(time.time()*1000))
+          r=s.get(BASE+'/ncms/script/eds/activestock_sehk_e.json?_='+ts,timeout=90)
+          print('DICT',r.status_code,len(r.content),flush=True); r.raise_for_status()
+          stock_id=''
+          for item in r.json():
+            if str(item.get('c','')).zfill(5)==CODE:
+              stock_id=str(item.get('i','')); print('STOCK',json.dumps(item,ensure_ascii=False),flush=True); break
+          if not stock_id: raise RuntimeError('stock id not found')
+
+          def clean(x):
+            return re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',html.unescape(str(x or '')))).strip()
+
+          def query(start,end,lang,search_type,t1,t2):
+            payload={'lang':lang,'category':'0','market':'SEHK','searchType':search_type,'documentType':'-1','t1code':t1,'t2Gcode':'-2','t2code':t2,'stockId':stock_id,'from':start,'to':end,'MB-Daterange':'0','title':''}
+            p=s.post(SEARCH,data=payload,timeout=90); print('POST',start,end,lang,search_type,t1,t2,p.status_code,len(p.content),flush=True); p.raise_for_status()
+            params={'sortDir':'0','sortByOptions':'DateTime','category':'0','market':'SEHK','stockId':stock_id,'documentType':'-1','fromDate':start,'toDate':end,'title':'','searchType':search_type,'t1code':t1,'t2Gcode':'-2','t2code':t2,'rowRange':'9999','lang':lang}
+            g=s.get(SERVLET,params=params,headers={'Accept':'application/json,text/plain,*/*','Referer':SEARCH+'?lang=zh'},timeout=120); print('GET',g.status_code,len(g.content),g.url,flush=True); g.raise_for_status()
+            outer=g.json(); result=outer.get('result','[]')
+            rows=json.loads(result) if isinstance(result,str) and result not in ('','null') else (result if isinstance(result,list) else [])
+            parsed=[]
+            for x in rows:
+              code=clean(x.get('STOCK_CODE'))
+              if CODE not in code.replace(' ',''): continue
+              parsed.append({'title':clean(x.get('TITLE')),'long_text':clean(x.get('LONG_TEXT')),'date_time':clean(x.get('DATE_TIME')),'file_info':clean(x.get('FILE_INFO')),'url':urljoin(BASE+'/',str(x.get('FILE_LINK') or '')),'lang':lang,'search_type':search_type,'t1':t1,'t2':t2})
+            print('ROWS',len(parsed),flush=True)
+            for row in parsed: print('ROW',json.dumps(row,ensure_ascii=False),flush=True)
+            return parsed
+
+          rows=[]
+          for lang in ('zh','EN'):
+            rows += query('20200101','20260902',lang,'1','40000','40100')
+            rows += query('20200101','20260902',lang,'1','40000','40200')
+            rows += query('20260101','20260902',lang,'0','-2','-2')
+          dedup=[]; seen=set()
+          for row in rows:
+            if row['url'] in seen: continue
+            seen.add(row['url']); dedup.append(row)
+          (out/'records.json').write_text(json.dumps(dedup,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',stock_id,len(dedup),flush=True)
+          PY
+
+      - name: Upload discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-hkex-discovery
+          path: skyworth_discovery/
+          if-no-files-found: error
+          retention-days: 7
