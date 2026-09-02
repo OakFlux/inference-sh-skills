@@ -1,0 +1,39 @@
+name: Probe public PDF paths for China Conch Venture reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-pdf-url-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Test likely public PDF paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import requests
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          items=[('4894193','2025/06/11'),('4871262','2025/05/28')]
+          hosts=['https://public.fxbaogao.com/','https://report.fxbaogao.com/','https://dr.fxbaogao.com/']
+          folders=['report','report-cn','report-en','pdf','report-pdf','report-file']
+          names=['{id}.pdf','{id}_1.pdf','{id}-1.pdf']
+          for rid,date in items:
+              for host in hosts:
+                  for folder in folders:
+                      for name in names:
+                          url=f'{host}{folder}/{date}/{name.format(id=rid)}'
+                          try:
+                              r=requests.get(url,headers={'User-Agent':ua,'Referer':f'https://www.fxbaogao.com/view?id={rid}','Range':'bytes=0-4095'},timeout=(15,60),allow_redirects=True)
+                              print('TEST',url,r.status_code,r.headers.get('content-type'),r.headers.get('content-length'),len(r.content),r.url,r.content[:8],flush=True)
+                          except Exception as e:
+                              print('ERROR',url,repr(e),flush=True)
+          PY
