@@ -1,0 +1,208 @@
+name: Resolve REPT BATTERO report sources
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-targeted-source-resolution-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Resolve Eastmoney and Sina records
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import io, json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          out = Path('rept_resolution')
+          out.mkdir(exist_ok=True)
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s = requests.Session()
+          api_headers = {'User-Agent': ua, 'Referer': 'https://data.eastmoney.com/', 'Accept': 'application/json,text/plain,*/*'}
+
+          dates = [
+              '2024-05-30','2024-05-31','2024-06-01','2024-06-02',
+              '2025-03-27','2025-03-28','2025-03-29',
+              '2025-08-12','2025-08-13','2025-08-14',
+              '2025-09-15','2025-09-16','2025-09-17','2025-09-18',
+              '2026-02-03','2026-02-04',
+              '2026-08-31','2026-09-01',
+          ]
+          eastmoney = []
+          relevant = []
+          all_target_org = []
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          known_phrases = [
+              '规模效应下毛利率提升', '1H25毛利率稳步提升', '出货量高增，看好盈利改善趋势',
+              '青山集团旗下锂电池公司', '海外营收快速增长', '瑞浦兰钧', '瑞浦蘭鈞', 'REPT BATTERO',
+          ]
+          for ds in dates:
+              for qtype in (0, 1, 2):
+                  for page in range(1, 5):
+                      try:
+                          r = s.get(endpoint, params={
+                              'pageNo': page, 'pageSize': 100, 'qType': qtype,
+                              'beginTime': ds, 'endTime': ds,
+                          }, headers=api_headers, timeout=(15, 90))
+                          j = r.json()
+                          rows = j.get('data') if isinstance(j, dict) else []
+                          rec = {'date': ds, 'qType': qtype, 'page': page, 'http_status': r.status_code,
+                                 'hits': j.get('hits') if isinstance(j, dict) else None,
+                                 'row_count': len(rows) if isinstance(rows, list) else None}
+                          eastmoney.append(rec)
+                          print('EM_QUERY', ds, qtype, page, rec['row_count'], rec['hits'], flush=True)
+                          if not isinstance(rows, list) or not rows:
+                              break
+                          for row in rows:
+                              if not isinstance(row, dict):
+                                  continue
+                              blob = json.dumps(row, ensure_ascii=False)
+                              title = str(row.get('title') or '')
+                              stock_name = str(row.get('stockName') or '')
+                              stock_code = str(row.get('stockCode') or '')
+                              org = str(row.get('orgSName') or row.get('orgName') or '')
+                              author = str(row.get('researcher') or '')
+                              exact = (
+                                  stock_name in ('瑞浦兰钧','瑞浦蘭鈞','瑞浦兰均') or
+                                  stock_code in ('00666','0666','00666.HK','0666.HK') or
+                                  any(x in title for x in known_phrases)
+                              )
+                              target_org = any(x in org for x in ('交银国际','兴证国际','兴业证券','海通国际'))
+                              target_author = any(x in author for x in ('李柳晓','陈庆','余小丽','张忠业','梅斌'))
+                              if exact:
+                                  relevant.append({'query': rec, 'row': row})
+                                  print('EM_EXACT', json.dumps(row, ensure_ascii=False), flush=True)
+                              if target_org or target_author:
+                                  all_target_org.append({'query': rec, 'row': row})
+                                  print('EM_TARGET_ORG', json.dumps({k: row.get(k) for k in ['title','stockName','stockCode','orgSName','orgName','publishDate','infoCode','attachPages','attachSize','researcher','emRatingName','indvAimPriceT','indvAimPriceL']}, ensure_ascii=False), flush=True)
+                          hits = j.get('hits') if isinstance(j, dict) else None
+                          if len(rows) < 100 or (isinstance(hits, int) and page * 100 >= hits):
+                              break
+                          time.sleep(.3)
+                      except Exception as exc:
+                          eastmoney.append({'date': ds, 'qType': qtype, 'page': page, 'error': repr(exc)})
+                          print('EM_ERROR', ds, qtype, page, repr(exc), flush=True)
+                          break
+
+          # Probe direct PDF for all AP records selected above.
+          ap_records = {}
+          for item in relevant + all_target_org:
+              row = item['row']
+              ap = str(row.get('infoCode') or '')
+              if ap.startswith('AP'):
+                  ap_records[ap] = row
+          pdf_probes = []
+          for ap, row in ap_records.items():
+              for prefix in ('H3','H2'):
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{ap}_1.pdf'
+                  try:
+                      rr = s.get(url, headers={'User-Agent': ua, 'Referer': 'https://data.eastmoney.com/', 'Accept': 'application/pdf,*/*;q=0.8'}, timeout=(20, 120), allow_redirects=True)
+                      p = {'ap': ap, 'prefix': prefix, 'url': url, 'final_url': rr.url, 'status': rr.status_code,
+                           'bytes': len(rr.content), 'type': rr.headers.get('content-type'), 'pdf': rr.content.startswith(b'%PDF-'),
+                           'source_row': row}
+                      if p['pdf']:
+                          try:
+                              reader = PdfReader(io.BytesIO(rr.content))
+                              p['pages'] = len(reader.pages)
+                              text = '\n'.join((pg.extract_text() or '') for pg in reader.pages[:min(8, len(reader.pages))])
+                              p['head_text'] = text[:20000]
+                              norm = re.sub(r'\s+', '', text).upper()
+                              p['identity_match'] = any(re.sub(r'\s+', '', x).upper() in norm for x in ('瑞浦兰钧','瑞浦蘭鈞','瑞浦兰均','REPT BATTERO'))
+                              p['title_head'] = re.sub(r'\s+', ' ', text).strip()[:500]
+                              if p['identity_match']:
+                                  (out / f'{ap}_{prefix}.pdf').write_bytes(rr.content)
+                          except Exception as exc:
+                              p['parse_error'] = repr(exc)
+                      pdf_probes.append(p)
+                      print('PDF_PROBE', json.dumps({k:p.get(k) for k in ['ap','prefix','status','bytes','pdf','pages','identity_match','title_head']}, ensure_ascii=False), flush=True)
+                  except Exception as exc:
+                      pdf_probes.append({'ap': ap, 'prefix': prefix, 'url': url, 'error': repr(exc), 'source_row': row})
+
+          # Parse Sina HK quote/rating pages and follow report links.
+          sina_result = []
+          sina_urls = [
+              'https://stock.finance.sina.com.cn/hkstock/quotes/0666.html',
+              'https://stock.finance.sina.com.cn/hkstock/quotes/00666.html',
+              'https://stock.finance.sina.com.cn/hkstock/quotes/000666.html',
+          ]
+          followed = set()
+          for url in sina_urls:
+              try:
+                  r = s.get(url, headers={'User-Agent': ua, 'Accept': 'text/html,*/*'}, timeout=(20,90), allow_redirects=True)
+                  enc = r.apparent_encoding or 'utf-8'
+                  text = r.content.decode(enc, errors='replace')
+                  soup = BeautifulSoup(text, 'html.parser')
+                  anchors = []
+                  for a in soup.find_all('a'):
+                      href = a.get('href')
+                      label = a.get_text(' ', strip=True)
+                      if href:
+                          full = urljoin(r.url, href)
+                          if ('vReport' in full or 'report' in full.lower() or label == '查看'):
+                              anchors.append({'text': label, 'href': full})
+                              followed.add(full)
+                  rows = []
+                  for tr in soup.find_all('tr'):
+                      tx = tr.get_text(' ', strip=True)
+                      if any(x in tx for x in ('交银国际','瑞浦兰钧','15.460','14.250')):
+                          rows.append({'text': tx, 'links': [{'text':a.get_text(' ',strip=True),'href':urljoin(r.url,a.get('href'))} for a in tr.find_all('a') if a.get('href')]})
+                  sina_result.append({'requested': url, 'status': r.status_code, 'final_url': r.url, 'bytes': len(r.content), 'encoding': enc, 'anchors': anchors, 'rows': rows})
+                  (out / ('sina_' + re.sub(r'\D','',url.split('/')[-1]) + '.html')).write_text(text, encoding='utf-8')
+                  print('SINA_PAGE', url, r.status_code, len(r.content), enc, 'anchors', len(anchors), 'rows', len(rows), flush=True)
+                  for row in rows:
+                      print('SINA_ROW', json.dumps(row, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  sina_result.append({'requested': url, 'error': repr(exc)})
+
+          followed_pages = []
+          for url in sorted(followed):
+              try:
+                  r = s.get(url, headers={'User-Agent': ua, 'Referer': 'https://stock.finance.sina.com.cn/'}, timeout=(15,60), allow_redirects=True)
+                  text = r.content.decode(r.apparent_encoding or 'utf-8', errors='replace')
+                  soup = BeautifulSoup(text, 'html.parser')
+                  links = []
+                  for a in soup.find_all('a'):
+                      href = a.get('href')
+                      if href:
+                          full = urljoin(r.url, href)
+                          if '.pdf' in full.lower() or 'download' in full.lower() or 'report' in full.lower():
+                              links.append({'text': a.get_text(' ',strip=True), 'href': full})
+                  followed_pages.append({'requested':url,'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'links':links,'text':soup.get_text('\n',strip=True)[:20000]})
+                  print('SINA_FOLLOW', r.status_code, len(r.content), url, 'title', followed_pages[-1]['title'], 'links', len(links), flush=True)
+              except Exception as exc:
+                  followed_pages.append({'requested':url,'error':repr(exc)})
+
+          payload = {
+              'eastmoney_queries': eastmoney,
+              'eastmoney_relevant': relevant,
+              'eastmoney_target_org': all_target_org,
+              'pdf_probes': pdf_probes,
+              'sina_pages': sina_result,
+              'sina_followed_pages': followed_pages,
+          }
+          (out / 'result.json').write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Upload resolution output
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-targeted-source-resolution
+          path: rept_resolution/
+          if-no-files-found: error
+          retention-days: 7
