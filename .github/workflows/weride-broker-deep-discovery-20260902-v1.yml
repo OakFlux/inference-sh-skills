@@ -1,0 +1,163 @@
+name: Discover WeRide broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-broker-deep-discovery-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Scan Eastmoney report index and validate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import time
+          from io import BytesIO
+
+          import requests
+          from pypdf import PdfReader
+
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Cache-Control': 'no-cache',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+          session = requests.Session()
+          session.trust_env = False
+
+          windows = [
+              ('2025-01-19', '2025-01-24'),
+              ('2025-08-20', '2025-08-26'),
+              ('2025-10-25', '2025-11-15'),
+              ('2025-12-23', '2026-01-08'),
+              ('2026-03-20', '2026-04-05'),
+              ('2026-05-10', '2026-06-05'),
+              ('2026-08-10', '2026-08-25'),
+          ]
+          needles = [
+              '文远知行', '文遠知行', 'weride', 'wrd.o', '00800.hk', '0800.hk',
+              '全球l4级自动驾驶产品及解决方案先行者',
+              'l4智驾先行者', 'robotaxi全球布局',
+          ]
+
+          found: dict[str, dict] = {}
+
+          def get_page(begin: str, end: str, qtype: int, page: int) -> tuple[list[dict], int]:
+              params = {
+                  'pageNo': page,
+                  'pageSize': 100,
+                  'code': '',
+                  'qType': qtype,
+                  'beginTime': begin,
+                  'endTime': end,
+                  '_': int(time.time() * 1000) + page + qtype * 1000,
+              }
+              last = None
+              for attempt in range(4):
+                  try:
+                      r = session.get(endpoint, params=params, headers=headers, timeout=(20, 120))
+                      r.raise_for_status()
+                      obj = r.json()
+                      rows = obj.get('data') or []
+                      if not isinstance(rows, list):
+                          rows = []
+                      pages = int(obj.get('TotalPage') or 0)
+                      return rows, pages
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(f'API failed {begin} {end} qtype={qtype} page={page}: {last!r}')
+
+          for begin, end in windows:
+              print('\n=== WINDOW', begin, end, '===', flush=True)
+              for qtype in (0, 1, 2):
+                  page = 1
+                  total_pages = 1
+                  while page <= total_pages and page <= 500:
+                      rows, total_pages = get_page(begin, end, qtype, page)
+                      print('PAGE', qtype, page, '/', total_pages, 'ROWS', len(rows), flush=True)
+                      for row in rows:
+                          raw = json.dumps(row, ensure_ascii=False)
+                          low = re.sub(r'\s+', '', raw).lower()
+                          if any(n.lower() in low for n in needles):
+                              info = str(row.get('infoCode') or row.get('infocode') or '')
+                              if info:
+                                  found[info] = row
+                      if not rows:
+                          break
+                      page += 1
+
+          print('\nFOUND_COUNT', len(found), flush=True)
+          working = []
+          for info, row in sorted(found.items(), key=lambda kv: str(kv[1].get('publishDate') or '')):
+              meta = {
+                  'infoCode': info,
+                  'title': row.get('title'),
+                  'publishDate': row.get('publishDate'),
+                  'orgSName': row.get('orgSName'),
+                  'orgName': row.get('orgName'),
+                  'researcher': row.get('researcher'),
+                  'stockName': row.get('stockName'),
+                  'stockCode': row.get('stockCode'),
+                  'attachPages': row.get('attachPages'),
+                  'attachSize': row.get('attachSize'),
+                  'rating': row.get('emRatingName'),
+                  'reportType': row.get('reportType'),
+              }
+              print('MATCH', json.dumps(meta, ensure_ascii=False), flush=True)
+              if not info.startswith('AP'):
+                  continue
+              for prefix in ('H3', 'H2'):
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  try:
+                      r = session.get(url, headers=pdf_headers, timeout=(20, 180), allow_redirects=True)
+                      print('PDF_TRY', info, prefix, r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 100_000:
+                          reader = PdfReader(BytesIO(r.content), strict=False)
+                          pages = len(reader.pages)
+                          sample = []
+                          for i in list(range(min(6, pages))) + ([pages - 1] if pages else []):
+                              if i < 0 or i >= pages:
+                                  continue
+                              try:
+                                  sample.append(reader.pages[i].extract_text() or '')
+                              except Exception:
+                                  pass
+                          sample_text = re.sub(r'\s+', ' ', '\n'.join(sample))
+                          rec = {
+                              **meta,
+                              'actualPages': pages,
+                              'bytes': len(r.content),
+                              'pdfUrl': r.url,
+                              'identityFound': any(x.lower() in sample_text.lower() for x in ['文远知行', '文遠知行', 'WeRide']),
+                              'sample': sample_text[:3000],
+                          }
+                          working.append(rec)
+                          print('WORKING', json.dumps(rec, ensure_ascii=False), flush=True)
+                          break
+                  except Exception as exc:
+                      print('PDF_ERROR', info, prefix, repr(exc), flush=True)
+
+          print('\nWORKING_ALL', json.dumps(working, ensure_ascii=False, indent=2), flush=True)
+          PY
