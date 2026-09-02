@@ -1,0 +1,50 @@
+name: Probe China Conch Venture report page count
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-pagecount-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Extract page counts and test image tail
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 pillow
+          python - <<'PY'
+          import io,re
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          for doc,date in [('4871262','2025/05/28'),('4894193','2025/06/11')]:
+              detail=f'https://www.fxbaogao.com/detail/{doc}'
+              r=requests.get(detail,headers={'User-Agent':ua},timeout=60)
+              visible=BeautifulSoup(r.text,'html.parser').get_text(' ',strip=True)
+              print('DOC',doc,'DETAIL',r.status_code,len(r.content),flush=True)
+              for pattern in [r'(?<!\d)1\s*/\s*(\d{1,3})(?!\d)',r'(?<!\d)1\s*／\s*(\d{1,3})(?!\d)',r'研究所\s*1\s*/\s*(\d{1,3})']:
+                  print('PATTERN',pattern,re.findall(pattern,visible),flush=True)
+              print('CONTEXTS',flush=True)
+              for m in re.finditer(r'(?<!\d)1\s*[/／]\s*\d{1,3}(?!\d)',visible):
+                  print(repr(visible[max(0,m.start()-150):m.end()+150]),flush=True)
+              template=f'https://public.fxbaogao.com/report-image/{date}/{doc}-{{}}.png'
+              for page in list(range(1,10))+list(range(10,81,5)):
+                  u=template.format(page)
+                  x=requests.get(u,headers={'User-Agent':ua,'Referer':detail},timeout=60)
+                  dims=''
+                  digest=''
+                  try:
+                      im=Image.open(io.BytesIO(x.content)); dims=str(im.size)
+                      import hashlib; digest=hashlib.sha256(x.content).hexdigest()[:16]
+                  except Exception as e:
+                      dims=repr(e)
+                  print('IMG',doc,page,x.status_code,x.headers.get('content-type'),len(x.content),dims,digest,flush=True)
+          PY
