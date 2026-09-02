@@ -1,0 +1,357 @@
+name: Package United Energy Group broker research reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ueg-broker-reports-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF validation dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet pypdf requests
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY_CN = "联合能源集团"
+          COMPANY_EN = "United Energy Group"
+          CODE = "00467.HK"
+          PACKAGE = "联合能源集团_00467HK_券商研究报告_3份_公开原始PDF"
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          previews = Path("_ueg_report_previews")
+          previews.mkdir(exist_ok=True)
+
+          sources = [
+              {
+                  "order": 1,
+                  "institution": "招银国际",
+                  "date": "2021-09-14",
+                  "report_type": "首次覆盖深度报告",
+                  "title_en": "A fast-growing medium-sized IOC",
+                  "title_cn": "快速成长的中型国际油气公司",
+                  "source_page": "https://data.eastmoney.com/report/zw_stock.jshtml?infocode=AP202109141516183306",
+                  "pdf_urls": [
+                      "https://pdf.dfcfw.com/pdf/H3_AP202109141516183306_1.pdf",
+                      "https://pdf.dfcfw.com/pdf/H2_AP202109141516183306_1.pdf",
+                  ],
+                  "referer": "https://data.eastmoney.com/",
+                  "min_pages": 20,
+                  "identity_terms": ["United Energy", "467 HK"],
+                  "title_terms": ["A fast-growing medium-sized IOC"],
+                  "date_terms": ["14 Sep 2021", "14 September 2021"],
+              },
+              {
+                  "order": 2,
+                  "institution": "招银国际",
+                  "date": "2024-05-06",
+                  "report_type": "公司更新报告",
+                  "title_en": "Expect volume growth to accelerate in 2024E",
+                  "title_cn": "预计2024年产量增长加速",
+                  "source_page": "https://www.cmbi.com.hk/article/9819.html?lang=en",
+                  "pdf_urls": [
+                      "https://hk-official.cmbi.info/upload/9de5b129-3a53-4c91-a551-b946c1b08d52.pdf",
+                  ],
+                  "referer": "https://www.cmbi.com.hk/article/9819.html?lang=en",
+                  "min_pages": 5,
+                  "identity_terms": ["United Energy", "467 HK"],
+                  "title_terms": ["Expect volume growth to accelerate"],
+                  "date_terms": ["6 May 2024", "06 May 2024", "7 May 2024"],
+              },
+              {
+                  "order": 3,
+                  "institution": "招银国际",
+                  "date": "2024-06-28",
+                  "report_type": "公司跟踪报告",
+                  "title_en": "Overhang on share price due to uncertain financial condition of controlling shareholder",
+                  "title_cn": "控股股东财务状况不确定性压制股价",
+                  "source_page": "https://www.cmbi.com.hk/article/10054.html?lang=en",
+                  "pdf_urls": [
+                      "https://hk-official.cmbi.info/upload/44073c6a-01c4-4c5a-b1ca-f246c05209c5.pdf",
+                  ],
+                  "referer": "https://www.cmbi.com.hk/article/10054.html?lang=en",
+                  "min_pages": 7,
+                  "identity_terms": ["United Energy", "467 HK"],
+                  "title_terms": ["Overhang on share price", "uncertain financial condition"],
+                  "date_terms": ["28 Jun 2024", "28 June 2024"],
+              },
+          ]
+
+          ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0 Safari/537.36"
+
+          def safe(value: str) -> str:
+              return re.sub(r'[\\/:*?"<>|\s]+', "_", value).strip("_")[:110]
+
+          def fetch_pdf(item: dict) -> tuple[bytes, str]:
+              last_error = None
+              for pdf_url in item["pdf_urls"]:
+                  for attempt in range(6):
+                      session = requests.Session()
+                      try:
+                          if "cmbi.com.hk" in item["source_page"]:
+                              try:
+                                  landing = session.get(
+                                      item["source_page"],
+                                      headers={
+                                          "User-Agent": ua,
+                                          "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                                          "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+                                      },
+                                      timeout=(20, 60),
+                                      allow_redirects=True,
+                                  )
+                                  print("LANDING", item["order"], landing.status_code, len(landing.content), landing.url, flush=True)
+                              except Exception as exc:
+                                  print("LANDING_WARN", item["order"], repr(exc), flush=True)
+
+                          response = session.get(
+                              pdf_url,
+                              headers={
+                                  "User-Agent": ua,
+                                  "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                                  "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8",
+                                  "Referer": item["referer"],
+                                  "Cache-Control": "no-cache",
+                                  "Pragma": "no-cache",
+                              },
+                              timeout=(30, 300),
+                              allow_redirects=True,
+                          )
+                          content_type = response.headers.get("content-type", "")
+                          print(
+                              "PDF_GET",
+                              item["order"],
+                              pdf_url,
+                              response.status_code,
+                              content_type,
+                              len(response.content),
+                              response.url,
+                              flush=True,
+                          )
+                          if (
+                              response.status_code == 200
+                              and response.content.startswith(b"%PDF-")
+                              and len(response.content) > 100_000
+                          ):
+                              return response.content, response.url
+                          snippet = response.content[:300].decode("utf-8", errors="replace")
+                          last_error = RuntimeError(
+                              f"HTTP {response.status_code}; type={content_type}; bytes={len(response.content)}; body={snippet!r}"
+                          )
+                      except Exception as exc:
+                          last_error = exc
+                      time.sleep(2 * (attempt + 1))
+              raise RuntimeError(f"Failed to download report {item['order']}: {last_error}")
+
+          records = []
+          seen_hashes = set()
+
+          for item in sources:
+              pdf_bytes, final_source_url = fetch_pdf(item)
+              temp_path = out / f"_temp_{item['order']:02d}.pdf"
+              temp_path.write_bytes(pdf_bytes)
+
+              reader = PdfReader(str(temp_path), strict=False)
+              pages = len(reader.pages)
+              if pages < item["min_pages"]:
+                  raise RuntimeError(
+                      f"Report {item['order']} is too short: {pages} pages, expected at least {item['min_pages']}"
+                  )
+
+              first_n = min(pages, 10)
+              text = "\n".join((reader.pages[i].extract_text() or "") for i in range(first_n))
+              compact = re.sub(r"\s+", " ", text).lower()
+
+              if not all(term.lower() in compact for term in item["identity_terms"]):
+                  raise RuntimeError(f"Company/ticker identity validation failed for report {item['order']}")
+              if not any(term.lower() in compact for term in item["title_terms"]):
+                  raise RuntimeError(f"Title validation failed for report {item['order']}")
+              if not any(term.lower() in compact for term in item["date_terms"]):
+                  raise RuntimeError(f"Date validation failed for report {item['order']}")
+
+              filename = (
+                  f"{item['order']:02d}_{item['institution']}_{COMPANY_CN}_"
+                  f"{safe(item['title_cn'])}_{item['date']}_{pages}页.pdf"
+              )
+              path = out / filename
+              temp_path.replace(path)
+
+              subprocess.run(
+                  ["qpdf", "--check", str(path)],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+
+              first_prefix = previews / f"{item['order']:02d}_first"
+              last_prefix = previews / f"{item['order']:02d}_last"
+              subprocess.run(
+                  ["pdftoppm", "-f", "1", "-singlefile", "-png", "-r", "90", str(path), str(first_prefix)],
+                  check=True,
+                  capture_output=True,
+              )
+              subprocess.run(
+                  ["pdftoppm", "-f", str(pages), "-singlefile", "-png", "-r", "90", str(path), str(last_prefix)],
+                  check=True,
+                  capture_output=True,
+              )
+              if not Path(str(first_prefix) + ".png").exists():
+                  raise RuntimeError(f"First-page render failed for report {item['order']}")
+              if not Path(str(last_prefix) + ".png").exists():
+                  raise RuntimeError(f"Last-page render failed for report {item['order']}")
+
+              digest = hashlib.sha256(pdf_bytes).hexdigest()
+              if digest in seen_hashes:
+                  raise RuntimeError("Duplicate PDF detected")
+              seen_hashes.add(digest)
+
+              record = {
+                  "order": item["order"],
+                  "company": COMPANY_CN,
+                  "ticker": CODE,
+                  "institution": item["institution"],
+                  "date": item["date"],
+                  "report_type": item["report_type"],
+                  "title_en": item["title_en"],
+                  "title_cn": item["title_cn"],
+                  "filename": filename,
+                  "pages": pages,
+                  "bytes": len(pdf_bytes),
+                  "sha256": digest,
+                  "source_page": item["source_page"],
+                  "source_pdf": final_source_url,
+                  "source_format": "公开原始PDF",
+                  "validation": [
+                      "PDF文件头",
+                      "qpdf结构检查",
+                      "实际页数",
+                      "公司名称与证券代码",
+                      "报告题目与日期",
+                      "首页与末页渲染",
+                      "SHA-256",
+                  ],
+              }
+              records.append(record)
+              print(
+                  "VERIFIED",
+                  json.dumps(
+                      {
+                          "order": record["order"],
+                          "title": record["title_en"],
+                          "date": record["date"],
+                          "pages": record["pages"],
+                          "bytes": record["bytes"],
+                          "sha256": record["sha256"],
+                      },
+                      ensure_ascii=False,
+                  ),
+                  flush=True,
+              )
+
+          lines = [
+              f"{COMPANY_CN}（{CODE}）券商研究报告包",
+              "",
+              "共收录3份公开原始PDF：1份首次覆盖深度报告、2份较新的公司跟踪/更新报告。",
+              "由于联合能源集团公开可下载的完整券商覆盖较少，未用网页摘要、二次整理稿或伪造PDF补足数量。",
+              "",
+          ]
+          for record in records:
+              lines.extend(
+                  [
+                      f"{record['order']}. {record['institution']}：《{record['title_en']}》",
+                      f"   中文题名：{record['title_cn']}",
+                      f"   日期：{record['date']}；类型：{record['report_type']}；实际页数：{record['pages']}页",
+                      f"   文件：{record['filename']}",
+                      f"   原始页面：{record['source_page']}",
+                      f"   原始PDF：{record['source_pdf']}",
+                      f"   SHA-256：{record['sha256']}",
+                      "",
+                  ]
+              )
+          lines.extend(
+              [
+                  "核验项目：PDF文件头、qpdf结构、实际页数、公司名称与证券代码、报告题目与日期、首页与末页渲染、重复文件、SHA-256及ZIP CRC。",
+                  "资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。",
+              ]
+          )
+
+          (out / "报告清单与核验说明.txt").write_text("\n".join(lines), encoding="utf-8")
+          (out / "manifest.json").write_text(
+              json.dumps(records, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          (out / "SHA256SUMS.txt").write_text(
+              "".join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding="utf-8",
+          )
+
+          zip_path = Path(f"{PACKAGE}.zip")
+          with zipfile.ZipFile(
+              zip_path,
+              "w",
+              zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+              allowZip64=True,
+          ) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f"{PACKAGE}/{path.name}")
+
+          with zipfile.ZipFile(zip_path, "r") as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f"ZIP CRC failure: {bad}")
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith(".pdf")]
+              if len(pdf_names) != 3:
+                  raise RuntimeError(f"ZIP contains {len(pdf_names)} PDF files instead of 3")
+              if not any(name.endswith("报告清单与核验说明.txt") for name in archive.namelist()):
+                  raise RuntimeError("ZIP is missing the report inventory")
+
+          bundle_digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          Path("FINAL_ZIP_SHA256.txt").write_text(
+              f"{bundle_digest}  {zip_path.name}\n",
+              encoding="utf-8",
+          )
+          print(
+              "FINAL_ZIP",
+              zip_path.name,
+              zip_path.stat().st_size,
+              bundle_digest,
+              flush=True,
+          )
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ueg-broker-reports-20260902-final
+          path: |
+            联合能源集团_00467HK_券商研究报告_3份_公开原始PDF/
+            联合能源集团_00467HK_券商研究报告_3份_公开原始PDF.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
