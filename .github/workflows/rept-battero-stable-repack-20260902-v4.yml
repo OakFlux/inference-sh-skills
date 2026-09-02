@@ -1,0 +1,165 @@
+name: Build stable REPT BATTERO research report download package v4
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-stable-repack-20260902-v4.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package original PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, json, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE='REPT_BATTERO_00666HK_Broker_Research_Reports_Stable'
+          OUT=Path(PACKAGE)
+          OUT.mkdir(exist_ok=True)
+          session=requests.Session()
+          headers={
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer':'https://data.eastmoney.com/report/',
+          }
+          reports=[
+              {
+                  'filename':'01_Haitong_International_REPT_BATTERO_Initiation_2024-05-30_22p.pdf',
+                  'url':'https://pdf.dfcfw.com/pdf/H3_AP202405311635020328_1.pdf',
+                  'pages':22,
+                  'institution':'海通国际',
+                  'date':'2024-05-30',
+                  'type':'公司首次覆盖深度报告',
+                  'title':'青山集团旗下锂电池公司，海外营收快速增长',
+              },
+              {
+                  'filename':'02_Minsheng_Securities_REPT_BATTERO_New_Products_2025-10-26_21p.pdf',
+                  'url':'https://pdf.dfcfw.com/pdf/H3_AP202510261769511409_1.pdf',
+                  'pages':21,
+                  'institution':'民生证券',
+                  'date':'2025-10-26',
+                  'type':'电力设备与新能源行业专题周报',
+                  'title':'9月逆变器出口同比维持上涨，瑞浦兰钧发布多款战略新品',
+              },
+              {
+                  'filename':'03_Haitong_Securities_REPT_BATTERO_HK_Listing_2023-12-28_9p.pdf',
+                  'url':'https://pdf.dfcfw.com/pdf/H3_AP202312291615475036_1.pdf',
+                  'pages':9,
+                  'institution':'海通证券',
+                  'date':'2023-12-28',
+                  'type':'储能行业专题周报',
+                  'title':'特斯拉储能工厂落地，瑞浦兰钧港交所上市',
+              },
+          ]
+
+          def sha256(path):
+              h=hashlib.sha256()
+              with open(path,'rb') as f:
+                  for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
+              return h.hexdigest()
+
+          def fetch(spec,dest):
+              errors=[]
+              for attempt in range(1,5):
+                  try:
+                      r=session.get(spec['url'],headers=headers,timeout=(20,180),allow_redirects=True)
+                      print('GET',spec['url'],r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+                      if r.status_code==200 and r.content.startswith(b'%PDF-'):
+                          dest.write_bytes(r.content)
+                          return r.url
+                      errors.append(f'{r.status_code}/{len(r.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(attempt)
+              raise RuntimeError(f"download failed {spec['filename']}: {errors}")
+
+          records=[]
+          for i,spec in enumerate(reports,1):
+              dest=OUT/spec['filename']
+              final_url=fetch(spec,dest)
+              reader=PdfReader(str(dest),strict=False)
+              pages=len(reader.pages)
+              if pages!=spec['pages']:
+                  raise RuntimeError(f"page mismatch {dest.name}: {pages} != {spec['pages']}")
+              text='\n'.join((p.extract_text() or '') for p in reader.pages[:3])
+              compact=''.join(text.split()).upper()
+              if '瑞浦兰钧' not in compact and 'REPTBATTERO' not in compact:
+                  raise RuntimeError(f'company marker missing: {dest.name}')
+              q=subprocess.run(['qpdf','--check',str(dest)],capture_output=True,text=True)
+              if q.returncode not in (0,3):
+                  raise RuntimeError(f'qpdf failed {dest.name}: {q.stderr[-500:]}')
+              for label,pageno in [('first',1),('last',pages)]:
+                  prefix=Path('_render')/f'{i}_{label}'
+                  prefix.parent.mkdir(exist_ok=True)
+                  subprocess.run(['pdftoppm','-f',str(pageno),'-singlefile','-png','-r','72',str(dest),str(prefix)],check=True,capture_output=True)
+                  png=Path(str(prefix)+'.png')
+                  if not png.exists() or png.stat().st_size<1000:
+                      raise RuntimeError(f'render failed {dest.name} {label}')
+              rec={**spec,'final_url':final_url,'bytes':dest.stat().st_size,'sha256':sha256(dest)}
+              records.append(rec)
+              print('VERIFIED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          if len({r['sha256'] for r in records})!=3:
+              raise RuntimeError('duplicate PDF detected')
+          if sum(r['pages'] for r in records)!=52:
+              raise RuntimeError('combined page count mismatch')
+
+          readme=[
+              '瑞浦兰钧（REPT BATTERO，00666.HK）券商研究报告备用下载包',
+              '重新打包日期：2026-09-02',
+              '',
+              '说明：本包包含1份公司首次覆盖深度报告，以及2份直接以瑞浦兰钧为标题重点的券商行业专题报告。全部为券商原始PDF。',
+              '',
+          ]
+          for i,r in enumerate(records,1):
+              readme += [f"{i}. {r['institution']}｜{r['date']}｜{r['type']}｜{r['pages']}页",f"   {r['title']}",f"   文件：{r['filename']}",f"   SHA-256：{r['sha256']}",'']
+          readme += ['已核验PDF文件头、实际页数、公司名称、qpdf结构、首页及末页渲染、文件去重和ZIP CRC。','资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。']
+          (OUT/'00_README_中文说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+          with (OUT/'report_list.csv').open('w',encoding='utf-8-sig',newline='') as f:
+              fields=['序号','机构','日期','报告类型','标题','页数','文件大小_字节','SHA256','来源','文件名']
+              w=csv.DictWriter(f,fieldnames=fields);w.writeheader()
+              for i,r in enumerate(records,1):
+                  w.writerow({'序号':i,'机构':r['institution'],'日期':r['date'],'报告类型':r['type'],'标题':r['title'],'页数':r['pages'],'文件大小_字节':r['bytes'],'SHA256':r['sha256'],'来源':r['final_url'],'文件名':r['filename']})
+
+          zip_path=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+              for p in sorted(OUT.iterdir()): z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError(f'ZIP CRC failed: {bad}')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=3:
+                  raise RuntimeError('ZIP PDF count mismatch')
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{sha256(zip_path)}  {zip_path.name}\n',encoding='utf-8')
+          print('FINAL_ZIP',zip_path.name,zip_path.stat().st_size,sha256(zip_path),flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-stable-repack-v4
+          path: |
+            REPT_BATTERO_00666HK_Broker_Research_Reports_Stable.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
