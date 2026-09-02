@@ -1,0 +1,55 @@
+name: Scan open report indexes for China Conch Venture
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-open-index-scan-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Fetch and search open indexes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re
+          from urllib.parse import urljoin,unquote
+          import requests
+          from bs4 import BeautifulSoup
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          indexes=[
+              'https://aigc.idigital.com.cn/djyanbao/',
+          ]
+          needles=['海螺创业','后手致胜','扬帆掘金新能源','资金&效率双强','现金流回正大增','联营公司业绩见底','利润及现金流迎来拐点','底部反转双重奏','分红提升可期']
+          for base in indexes:
+              try:
+                  r=requests.get(base,headers={'User-Agent':ua,'Accept':'text/html,*/*'},timeout=(20,180),allow_redirects=True)
+                  print('\nINDEX',base,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                  print('HEAD',r.text[:1000],flush=True)
+                  text=unquote(r.text)
+                  for needle in needles:
+                      positions=[m.start() for m in re.finditer(re.escape(needle),text,re.I)]
+                      print('NEEDLE',needle,'COUNT',len(positions),flush=True)
+                      for pos in positions[:20]:
+                          print('CTX',repr(text[max(0,pos-500):pos+1200]),flush=True)
+                  soup=BeautifulSoup(r.text,'html.parser')
+                  matches=[]
+                  for a in soup.find_all('a',href=True):
+                      label=' '.join(a.get_text(' ',strip=True).split())
+                      href=urljoin(r.url,a['href'])
+                      hay=unquote(label+' '+href)
+                      if any(n.lower() in hay.lower() for n in needles):
+                          matches.append({'label':label,'url':href})
+                  print('MATCHES',json.dumps(matches,ensure_ascii=False,indent=2),flush=True)
+              except Exception as exc:
+                  print('INDEX_ERROR',base,repr(exc),flush=True)
+          PY
