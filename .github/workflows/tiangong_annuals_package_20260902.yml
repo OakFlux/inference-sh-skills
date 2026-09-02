@@ -1,0 +1,244 @@
+name: Package Tiangong annual reports 20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tiangong_annuals_package_20260902.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf
+      - name: Download, verify, render, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import fitz
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          root = Path('tiangong-annuals-work')
+          pdf_dir = root / 'pdfs'
+          render_dir = root / 'renders'
+          pdf_dir.mkdir(parents=True, exist_ok=True)
+          render_dir.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          records: list[dict] = []
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', ' ', text or '').strip()
+
+          def sha256(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def download_pdf(url: str, filename: str, expected_year: int | None, source_title: str, category: str) -> dict:
+              r = session.get(
+                  url,
+                  headers={**headers, 'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'},
+                  timeout=(25, 240),
+                  allow_redirects=True,
+              )
+              print('DOWNLOAD', r.status_code, len(r.content), url, '->', r.url, flush=True)
+              if r.status_code != 200 or not r.content.startswith(b'%PDF-') or len(r.content) < 50_000:
+                  raise RuntimeError(f'Invalid PDF response: {url} status={r.status_code} bytes={len(r.content)} type={r.headers.get("content-type")}')
+
+              path = pdf_dir / filename
+              path.write_bytes(r.content)
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'PDF has too few pages: {path} pages={pages}')
+
+              text_parts = []
+              for page in reader.pages[: min(8, pages)]:
+                  try:
+                      text_parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              head = compact('\n'.join(text_parts))[:20000]
+              ident = compact(head).lower()
+              identity_ok = any(token in ident for token in ('天工國際', '天工国际', 'tiangong international', 'tiangong int'))
+              year_ok = True if expected_year is None else str(expected_year) in head
+
+              # Render the first page to verify that the PDF opens and has visible dimensions.
+              doc = fitz.open(str(path))
+              page = doc.load_page(0)
+              pix = page.get_pixmap(matrix=fitz.Matrix(1.25, 1.25), alpha=False)
+              render_path = render_dir / (path.stem + '_page1.png')
+              pix.save(str(render_path))
+              render_ok = render_path.exists() and render_path.stat().st_size > 10_000 and pix.width > 500 and pix.height > 500
+              doc.close()
+              if not render_ok:
+                  raise RuntimeError(f'First-page render failed: {path}')
+
+              rec = {
+                  'filename': filename,
+                  'category': category,
+                  'source_title': source_title,
+                  'source_url': url,
+                  'final_url': r.url,
+                  'pages': pages,
+                  'bytes': len(r.content),
+                  'sha256': sha256(r.content),
+                  'identity_text_check': identity_ok,
+                  'year_text_check': year_ok,
+                  'render_verified': render_ok,
+                  'text_head': head[:1500],
+              }
+              records.append(rec)
+              print('VERIFIED', json.dumps({k: rec[k] for k in ('filename','pages','bytes','identity_text_check','year_text_check','render_verified')}, ensure_ascii=False), flush=True)
+              return rec
+
+          # Official investor-relations archive used by Tiangong International's website.
+          iframe_base = 'https://iframesolution.website.wisdomir.com/main/page2.php'
+          for year in range(2020, 2026):
+              params = {
+                  'id': '763',
+                  'lang': 'tc',
+                  'default_section': '4,14',
+                  'section': '4',
+                  'year': str(year),
+              }
+              r = session.get(iframe_base, params=params, headers=headers, timeout=(25, 150), allow_redirects=True)
+              print('ARCHIVE', year, r.status_code, len(r.content), r.url, flush=True)
+              if r.status_code != 200:
+                  raise RuntimeError(f'Archive page failed for {year}: {r.status_code}')
+              (root / f'archive_{year}.html').write_bytes(r.content)
+              soup = BeautifulSoup(r.text, 'lxml')
+              candidates = []
+              for a in soup.find_all('a', href=True):
+                  href = urljoin(r.url, a['href'])
+                  if '.pdf' not in href.lower():
+                      continue
+                  parent = a.find_parent(['li', 'ul', 'div'])
+                  context = compact(parent.get_text(' ', strip=True) if parent else a.get_text(' ', strip=True))
+                  if not context:
+                      context = compact(a.get_text(' ', strip=True))
+                  candidates.append({'url': href, 'context': context})
+                  print('ARCHIVE_PDF', year, json.dumps({'url': href, 'context': context[:500]}, ensure_ascii=False), flush=True)
+
+              annuals = [
+                  c for c in candidates
+                  if ('年報' in c['context'] or '年报' in c['context'] or re.search(r'annual\s+report', c['context'], re.I))
+                  and not ('中期' in c['context'] or re.search(r'interim', c['context'], re.I))
+              ]
+              if not annuals:
+                  raise RuntimeError(f'No annual-report PDF found for {year}: {candidates}')
+
+              # Prefer a title explicitly containing the requested fiscal year.
+              selected = next((c for c in annuals if str(year) in c['context']), annuals[0])
+              download_pdf(
+                  selected['url'],
+                  f'天工国际_{year}年报.pdf',
+                  year,
+                  selected['context'] or f'{year} 年報',
+                  'annual_report',
+              )
+
+          # HKEX title-search page for issuer 00826 / stockId 16633.
+          hkex_search = 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=16633'
+          r = session.get(hkex_search, headers=headers, timeout=(25, 150), allow_redirects=True)
+          print('HKEX_SEARCH', r.status_code, len(r.content), r.url, flush=True)
+          (root / 'hkex_latest.html').write_bytes(r.content)
+          soup = BeautifulSoup(r.text, 'lxml') if r.status_code == 200 else BeautifulSoup('', 'lxml')
+
+          hkex_links = []
+          for a in soup.find_all('a', href=True):
+              title = compact(a.get_text(' ', strip=True))
+              href = urljoin(r.url, a['href'])
+              if title and ('.pdf' in href.lower() or 'listedco/listconews' in href.lower()):
+                  hkex_links.append({'title': title, 'url': href})
+
+          interim_match = next((x for x in hkex_links if 'INTERIM RESULTS' in x['title'].upper() and '2026' in x['title']), None)
+          if not interim_match:
+              interim_match = {
+                  'title': 'ANNOUNCEMENT OF THE INTERIM RESULTS FOR THE SIX MONTHS ENDED 30 JUNE 2026',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0828/2026082802690.pdf',
+              }
+          download_pdf(
+              interim_match['url'],
+              '天工国际_2026年中期业绩公告_最新公司级定期报告.pdf',
+              2026,
+              interim_match['title'],
+              'latest_parent_periodic_report',
+          )
+
+          # Optional appendix: the issuer's HKEX disclosures include its listed subsidiary's latest Q1 highlight.
+          q1_match = next((x for x in hkex_links if 'FIRST QUARTERLY REPORT 2026' in x['title'].upper()), None)
+          if q1_match:
+              download_pdf(
+                  q1_match['url'],
+                  '附录_天工股份_2026年第一季度报告摘要.pdf',
+                  2026,
+                  q1_match['title'],
+                  'subsidiary_quarterly_appendix',
+              )
+          else:
+              print('Q1_APPENDIX_NOT_FOUND', flush=True)
+
+          # Human-readable manifest.
+          lines = [
+              '天工国际（00826.HK）2020-2025年报及最新定期报告',
+              '',
+              '说明：港股母公司天工国际截至2026-09-02尚未披露完整2026中期报告，',
+              '本包纳入其最新公司级定期披露——截至2026-06-30的中期业绩公告。',
+              '如港交所检索页可取得，另附天工股份2026年第一季度报告摘要，文件名已明确标注为子公司附录。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(records, 1):
+              lines.extend([
+                  f'{i}. {rec["filename"]}',
+                  f'   类别：{rec["category"]}',
+                  f'   原始标题：{rec["source_title"]}',
+                  f'   页数：{rec["pages"]}；大小：{rec["bytes"]} bytes',
+                  f'   来源：{rec["source_url"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  '',
+              ])
+          manifest_txt = root / '文件清单.txt'
+          manifest_txt.write_text('\n'.join(lines), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          final_zip = Path('天工国际_2020-2025年报及最新定期报告.zip')
+          with zipfile.ZipFile(final_zip, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(pdf_dir.glob('*.pdf')):
+                  zf.write(path, arcname=path.name)
+              zf.write(manifest_txt, arcname='文件清单.txt')
+              zf.write(root / 'manifest.json', arcname='manifest.json')
+
+          if not final_zip.exists() or final_zip.stat().st_size < 1_000_000:
+              raise RuntimeError('Final ZIP was not created correctly')
+          print('FINAL_ZIP', final_zip, final_zip.stat().st_size, 'files', len(records), flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiangong-annuals-and-latest-20260902
+          path: 天工国际_2020-2025年报及最新定期报告.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
