@@ -1,0 +1,94 @@
+name: Probe fxbaogao viewer for Tiangong reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fxbaogao-viewer-probe-tiangong-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+
+      - name: Inspect viewer HTML scripts and endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('fxbaogao-viewer-probe'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          ids=['5349100','5136394']
+          results=[]
+          script_urls=[]
+          for rid in ids:
+              for kind,url in [('detail',f'https://www.fxbaogao.com/detail/{rid}'),('view',f'https://www.fxbaogao.com/view?id={rid}'),('viewslash',f'https://www.fxbaogao.com/view/{rid}')]:
+                  rec={'id':rid,'kind':kind,'url':url}
+                  try:
+                      r=s.get(url,headers=h,timeout=(20,90),allow_redirects=True)
+                      rec.update({'status':r.status_code,'bytes':len(r.content),'final_url':r.url,'type':r.headers.get('content-type')})
+                      (out/f'{rid}_{kind}.html').write_bytes(r.content)
+                      text=r.text
+                      soup=BeautifulSoup(text,'lxml')
+                      rec['title']=soup.title.get_text(' ',strip=True) if soup.title else ''
+                      scripts=[]
+                      for tag in soup.find_all('script',src=True):
+                          u=urljoin(r.url,tag['src']); scripts.append(u)
+                          if u not in script_urls: script_urls.append(u)
+                      rec['scripts']=scripts
+                      rec['interesting']=[line.strip()[:3000] for line in text.splitlines() if any(k in line.lower() for k in ('report-image','reportimage','report_id','reportid','pagecount','page_count','view?id','pdf','oss','viewer','imageurl','pages'))][:300]
+                      urls=re.findall(r'https?://[^"\'<>\s]+',text)
+                      rec['urls']=[html.unescape(u)[:2000] for u in urls if any(k in u.lower() for k in ('report','pdf','image','api','oss'))][:300]
+                      print('PAGE',json.dumps(rec,ensure_ascii=False)[:50000],flush=True)
+                  except Exception as exc:
+                      rec['error']=repr(exc); print('PAGE_ERR',rid,kind,repr(exc),flush=True)
+                  results.append(rec)
+
+          scripts_out=[]
+          for index,u in enumerate(script_urls[:80],1):
+              rec={'url':u}
+              try:
+                  r=s.get(u,headers={**h,'Referer':'https://www.fxbaogao.com/'},timeout=(20,90),allow_redirects=True)
+                  rec.update({'status':r.status_code,'bytes':len(r.content),'final_url':r.url,'type':r.headers.get('content-type')})
+                  if r.status_code==200 and len(r.content)<15_000_000:
+                      text=r.text
+                      (out/f'script_{index:03d}.js').write_text(text,encoding='utf-8',errors='ignore')
+                      # Snippets around useful tokens.
+                      snippets=[]
+                      for pat in ('report-image','reportImage','pageCount','page_count','reportId','report_id','/api/','viewReport','preview','pdfUrl','imageUrl','oss'):
+                          for m in re.finditer(re.escape(pat),text,re.I):
+                              snippets.append(text[max(0,m.start()-500):min(len(text),m.end()+1000)])
+                              if len(snippets)>=120: break
+                          if len(snippets)>=120: break
+                      rec['snippets']=snippets
+                      rec['urls']=list(dict.fromkeys(re.findall(r'https?://[^"\'<>\s\\]+',text)))[:500]
+                  print('SCRIPT',json.dumps(rec,ensure_ascii=False)[:60000],flush=True)
+              except Exception as exc:
+                  rec['error']=repr(exc); print('SCRIPT_ERR',u,repr(exc),flush=True)
+              scripts_out.append(rec)
+              time.sleep(.1)
+
+          (out/'pages.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'scripts.json').write_text(json.dumps(scripts_out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-viewer-probe-tiangong
+          path: fxbaogao-viewer-probe/
+          retention-days: 7
