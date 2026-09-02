@@ -1,0 +1,129 @@
+name: Inspect WeRide report sites for original PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-report-site-inspection-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Inspect pages, scripts, and APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          session=requests.Session(); session.trust_env=False
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Accept':'text/html,application/json,text/plain,*/*'}
+          pages=[
+              'https://www.sdyanbao.com/detail/940420',
+              'https://www.51pdf.cn/report/view_5781611.html',
+              'https://www.nxny.com/report/view_6191969.html',
+              'https://www.baogaobox.com/insights/260112000024754.html',
+              'https://max.book118.com/html/2026/0211/8047123005010046.shtm',
+          ]
+          assets=[]
+          api_candidates=[]
+          keywords=('pdf','download','fileurl','file_url','sourceurl','source_url','original','origin','oss','reportid','report_id','documentid','document_id','attachment','preview','viewurl','api/')
+
+          def emit_context(label,text,keyword,limit=8):
+              positions=[m.start() for m in re.finditer(re.escape(keyword),text,flags=re.I)]
+              if positions: print('KEY',label,keyword,'COUNT',len(positions),flush=True)
+              for pos in positions[:limit]:
+                  snippet=re.sub(r'\s+',' ',text[max(0,pos-600):pos+1800])
+                  print('CTX',label,keyword,snippet[:2400],flush=True)
+
+          def inspect_text(label,base_url,text):
+              decoded=html.unescape(text).replace('\\/','/').replace('\\u0026','&')
+              for raw in re.findall(r'https?://[^"\'<>\\\s]+',decoded,flags=re.I):
+                  candidate=raw.rstrip('),;]}')
+                  low=candidate.lower()
+                  if any(k in low for k in ('.pdf','download','file','report','api','oss','attachment','source','origin','viewer','preview')):
+                      print('URL',label,candidate[:2000],flush=True)
+                      if any(k in low for k in ('.pdf','download','api','file')): api_candidates.append(candidate)
+              soup=BeautifulSoup(decoded,'lxml')
+              for tag in soup.find_all(['script','a','iframe','embed','source','object'],src=True):
+                  url=urljoin(base_url,tag.get('src'))
+                  print('SRC',label,url,flush=True)
+                  if url.endswith('.js') or '/_next/static/' in url or '/assets/' in url: assets.append(url)
+              for tag in soup.find_all(['script','a','iframe','embed','source'],href=True):
+                  url=urljoin(base_url,tag.get('href'))
+                  if any(x in url.lower() for x in ('.js','.pdf','download','api','file','report','view')):
+                      print('HREF',label,url,flush=True)
+                  if url.endswith('.js') or '/_next/static/' in url or '/assets/' in url: assets.append(url)
+                  if any(x in url.lower() for x in ('.pdf','download','api','file')): api_candidates.append(url)
+              for tag in soup.find_all('object',data=True):
+                  url=urljoin(base_url,tag.get('data'))
+                  print('OBJECT',label,url,flush=True); api_candidates.append(url)
+              next_data=soup.find('script',id='__NEXT_DATA__')
+              if next_data and next_data.string:
+                  print('NEXT_DATA',label,len(next_data.string),next_data.string[:12000],flush=True)
+              for keyword in keywords:
+                  emit_context(label,decoded,keyword)
+
+          for url in pages:
+              print('\n===== PAGE',url,'=====',flush=True)
+              try:
+                  r=session.get(url,headers=headers,timeout=(30,180),allow_redirects=True)
+                  print('STATUS',r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+                  print('HEAD',re.sub(r'\s+',' ',r.text[:1000]),flush=True)
+                  inspect_text('PAGE:'+url,r.url,r.text)
+              except Exception as exc:
+                  print('PAGE_ERROR',url,repr(exc),flush=True)
+
+          unique_assets=[]
+          for url in assets:
+              if url not in unique_assets: unique_assets.append(url)
+          print('\n===== ASSETS',len(unique_assets),'=====',flush=True)
+          for url in unique_assets[:100]:
+              try:
+                  r=session.get(url,headers=headers,timeout=(30,180),allow_redirects=True)
+                  print('\nASSET',r.status_code,len(r.content),url,r.url,flush=True)
+                  if r.status_code!=200 or len(r.content)>5_000_000: continue
+                  inspect_text('ASSET:'+url,r.url,r.text)
+              except Exception as exc:
+                  print('ASSET_ERROR',url,repr(exc),flush=True)
+
+          # Probe likely API/file URLs and common endpoint patterns.
+          extras=[
+              'https://www.sdyanbao.com/api/report/detail/940420',
+              'https://www.sdyanbao.com/api/detail/940420',
+              'https://www.sdyanbao.com/api/report/940420',
+              'https://www.sdyanbao.com/api/report/download/940420',
+              'https://www.sdyanbao.com/download/940420',
+              'https://www.51pdf.cn/report/download_5781611.html',
+              'https://www.51pdf.cn/report/download/5781611',
+              'https://www.nxny.com/report/download_6191969.html',
+              'https://www.nxny.com/report/download/6191969',
+          ]
+          candidates=[]
+          for url in api_candidates+extras:
+              if url not in candidates: candidates.append(url)
+          print('\n===== PROBES',len(candidates),'=====',flush=True)
+          for url in candidates[:250]:
+              try:
+                  r=session.get(url,headers={**headers,'Accept':'application/json,application/pdf,*/*','Referer':pages[0]},timeout=(20,90),allow_redirects=True,stream=True)
+                  first=next(r.iter_content(32),b'')
+                  print('PROBE',r.status_code,r.headers.get('content-type'),r.headers.get('content-length'),first[:12],url,'=>',r.url,flush=True)
+                  r.close()
+              except Exception as exc:
+                  print('PROBE_ERROR',url,repr(exc),flush=True)
+          PY
