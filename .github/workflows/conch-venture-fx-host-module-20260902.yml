@@ -1,0 +1,43 @@
+name: Extract FX report host URL module
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-fx-host-module-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Extract URL helper module from public JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import re, requests
+          url='https://www.fxbaogao.com/_fxbg/2609011655/js/app-pages-fxbg-main-js.fc73e06a3b851d5deafc.chunk.js'
+          text=requests.get(url,headers={'User-Agent':'Mozilla/5.0 Chrome/151'},timeout=120).text
+          key='ca1f3b6f05410ce35d4a'
+          pos=text.find(key+':function')
+          print('SIZE',len(text),'POS',pos,flush=True)
+          if pos<0: raise SystemExit('module not found')
+          next_match=re.search(r'},[0-9a-f]{20}:function',text[pos+1:])
+          end=(pos+1+next_match.start()+1) if next_match else min(len(text),pos+20000)
+          module=text[pos:end]
+          print('MODULE_LENGTH',len(module),flush=True)
+          print(module[:40000],flush=True)
+          for needle in ['HOST_OSSBUY','HOST_DOWNLOAD_OSSBUY','urlPdf','urlPdfByDownload','public.fxbaogao','report.fxbaogao','dr.fxbaogao']:
+              print('\nNEEDLE',needle,flush=True)
+              low=module.lower(); start=0
+              while True:
+                  p=low.find(needle.lower(),start)
+                  if p<0: break
+                  print(module[max(0,p-600):min(len(module),p+1200)],flush=True)
+                  start=p+len(needle)
+          PY
