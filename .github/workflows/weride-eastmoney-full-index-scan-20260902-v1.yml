@@ -1,0 +1,92 @@
+name: Scan full Eastmoney report index for WeRide
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-eastmoney-full-index-scan-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Scan all stock report pages and validate matching PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from io import BytesIO
+          import requests
+          from pypdf import PdfReader
+
+          ENDPOINT='https://reportapi.eastmoney.com/report/list2'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          HEADERS={'User-Agent':UA,'Accept':'application/json,text/plain,*/*','Referer':'https://data.eastmoney.com/report/stock.jshtml','Content-Type':'application/json'}
+          NEEDLES=['文远知行','文遠知行','weride','105.wrd','116.00800','robotaxi全球布局','知行全球，行于文远','l4智驾先行者','全球l4级自动驾驶产品及解决方案先行者','全球l4自动驾驶领导者','l4和l2+双轮驱动','重视国内市场、深厚布局海外']
+
+          def fetch_page(page:int):
+              sess=requests.Session(); sess.trust_env=False
+              payload={'pageSize':100,'pageNo':page,'p':page,'pageNum':page,'pageNumber':page,'beginTime':'2024-01-01','endTime':'2026-09-02','code':'*','industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''}
+              err=None
+              for attempt in range(5):
+                  try:
+                      r=sess.post(ENDPOINT,json=payload,headers=HEADERS,timeout=(20,120))
+                      r.raise_for_status(); o=r.json(); rows=o.get('data') or []
+                      if not isinstance(rows,list): rows=[]
+                      return page,rows,int(o.get('TotalPage') or 0),None
+                  except Exception as e:
+                      err=repr(e); time.sleep((attempt+1)*0.7)
+              return page,[],0,err
+
+          p,rows,total,err=fetch_page(1)
+          print('FIRST',p,len(rows),'TOTAL_PAGES',total,'ERR',err,flush=True)
+          found={}
+          def inspect(rs):
+              for row in rs:
+                  raw=json.dumps(row,ensure_ascii=False)
+                  low=re.sub(r'\s+','',raw).lower()
+                  if any(n.lower().replace(' ','') in low for n in NEEDLES):
+                      key=str(row.get('infoCode') or raw)
+                      found[key]=row
+                      print('MATCH_ROW',json.dumps(row,ensure_ascii=False),flush=True)
+          inspect(rows)
+
+          with ThreadPoolExecutor(max_workers=24) as ex:
+              futures=[ex.submit(fetch_page,i) for i in range(2,total+1)]
+              done=1
+              for fut in as_completed(futures):
+                  page,rs,_,e=fut.result(); done+=1
+                  inspect(rs)
+                  if e: print('PAGE_ERROR',page,e,flush=True)
+                  if done%25==0 or found: print('PROGRESS',done,'/',total,'FOUND',len(found),flush=True)
+
+          print('FOUND_COUNT',len(found),flush=True)
+          sess=requests.Session(); sess.trust_env=False
+          for info,row in sorted(found.items(), key=lambda kv:str(kv[1].get('publishDate') or '')):
+              meta={k:row.get(k) for k in ('infoCode','title','publishDate','orgSName','orgName','researcher','stockName','stockCode','attachPages','attachSize','emRatingName','reportType')}
+              print('MATCH_META',json.dumps(meta,ensure_ascii=False),flush=True)
+              if not str(info).startswith('AP'): continue
+              for prefix in ('H3','H2','H1'):
+                  url=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  try:
+                      r=sess.get(url,headers={'User-Agent':UA,'Accept':'application/pdf,*/*','Referer':'https://data.eastmoney.com/'},timeout=(20,180),allow_redirects=True)
+                      print('PDF_TRY',info,prefix,r.status_code,r.headers.get('content-type'),len(r.content),r.url,r.content[:8],flush=True)
+                      if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>100000:
+                          reader=PdfReader(BytesIO(r.content),strict=False)
+                          text=''
+                          for i in range(min(6,len(reader.pages))):
+                              try:text+=(reader.pages[i].extract_text() or '')+'\n'
+                              except Exception:pass
+                          rec={**meta,'actualPages':len(reader.pages),'bytes':len(r.content),'url':r.url,'identity':any(x.lower() in text.lower() for x in ('文远知行','文遠知行','weride'))}
+                          print('WORKING_PDF',json.dumps(rec,ensure_ascii=False),flush=True)
+                          break
+                  except Exception as e: print('PDF_ERROR',info,prefix,repr(e),flush=True)
+          PY
