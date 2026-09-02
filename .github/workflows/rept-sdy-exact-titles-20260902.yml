@@ -1,0 +1,77 @@
+name: Find exact REPT BATTERO broker report titles
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-exact-titles-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - run: python -m pip install --quiet requests pypdf
+      - name: Query exact report titles and probe PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json,re,time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          out=Path('rept_exact_titles'); out.mkdir()
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','Device':'1','X-Token':''}
+          queries=[
+            '规模效应下毛利率提升',
+            '动力电池业务增速强劲',
+            '1H25毛利率稳步提升',
+            '预计全年亏损大幅收窄',
+            '出货量高增，看好盈利改善趋势',
+            '2026上半年业绩大超预期',
+            '上调盈利预测及目标价',
+            '青山集团旗下锂电池公司',
+          ]
+          results=[]; codes=set()
+          for q in queries:
+            for only in (1,0):
+              body={'device':1,'hideTrader':0,'onlyTitle':only,'order':1,'page':1,'pageSize':100,'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+              try:
+                r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=body,timeout=(8,30)); obj=r.json(); data=obj.get('data',{}) if isinstance(obj,dict) else {}; rows=data.get('files',[]) if isinstance(data,dict) else []
+                rec={'query':q,'onlyTitle':only,'status':r.status_code,'bytes':len(r.content),'total':data.get('total') if isinstance(data,dict) else None,'rows':rows}
+                for row in rows if isinstance(rows,list) else []:
+                  if isinstance(row,dict):
+                    c=str(row.get('data_source_uuid') or '')
+                    if c.startswith('AP'): codes.add(c)
+              except Exception as e: rec={'query':q,'onlyTitle':only,'error':repr(e),'rows':[]}
+              results.append(rec); print('QUERY',q,only,rec.get('total'),len(rec.get('rows',[])),rec.get('error'),flush=True)
+              time.sleep(.1)
+          # known original Eastmoney code for Haitong first coverage
+          codes.add('AP202405311635020328')
+          probes=[]
+          ph={'User-Agent':h['User-Agent'],'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Referer':'https://data.eastmoney.com/'}
+          for code in sorted(codes):
+            for pre in ('H3','H2'):
+              u=f'https://pdf.dfcfw.com/pdf/{pre}_{code}_1.pdf'
+              try:
+                r=s.get(u,headers=ph,timeout=(8,60),allow_redirects=True)
+                z={'code':code,'prefix':pre,'url':u,'final_url':r.url,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type',''),'is_pdf':r.content.startswith(b'%PDF-')}
+                if z['is_pdf']:
+                  p=out/f'{pre}_{code}.pdf'; p.write_bytes(r.content); reader=PdfReader(str(p)); z['pages']=len(reader.pages); z['text_head']='\n'.join((pg.extract_text() or '') for pg in reader.pages[:4])[:12000]
+              except Exception as e: z={'code':code,'prefix':pre,'url':u,'error':repr(e)}
+              probes.append(z); print('PDF',code,pre,z.get('status'),z.get('bytes'),z.get('pages'),z.get('error'),flush=True)
+          (out/'result.json').write_text(json.dumps({'queries':results,'codes':sorted(codes),'probes':probes},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-exact-titles
+          path: rept_exact_titles/
+          retention-days: 7
+          if-no-files-found: error
