@@ -1,0 +1,80 @@
+name: Diagnose HKEX queries for Sihuan
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sihuan-hkex-query-diagnostics-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Query HKEX variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import html, json, re
+          import requests
+          from bs4 import BeautifulSoup
+
+          session = requests.Session()
+          session.trust_env = False
+          endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/json,text/html,*/*',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+          base = {
+              'sortDir': '0', 'sortByOptions': 'DateTime', 'category': '0',
+              'market': 'SEHK', 'documentType': '-1', 'fromDate': '20260826',
+              'toDate': '20260826', 'title': '', 'searchType': '1',
+              't2Gcode': '-2', 't2code': '-2', 'rowRange': '500', 'lang': 'zh',
+          }
+          variants = [
+              ('stock_financial', {'stockId': '54111', 't1code': '40000'}),
+              ('stock_all', {'stockId': '54111', 't1code': '-2'}),
+              ('stock_blank_t1', {'stockId': '54111', 't1code': ''}),
+              ('global_financial', {'stockId': '-1', 't1code': '40000'}),
+              ('global_all', {'stockId': '-1', 't1code': '-2'}),
+              ('global_title_trad', {'stockId': '-1', 't1code': '-2', 'title': '中期業績'}),
+              ('global_title_simp', {'stockId': '-1', 't1code': '-2', 'title': '中期业绩'}),
+              ('global_title_code', {'stockId': '-1', 't1code': '-2', 'title': '00460'}),
+          ]
+          markers = ('00460', '四環醫藥', '四环医药', 'SIHUAN', '中期業績', '中期业绩', 'INTERIM RESULTS')
+          for name, changes in variants:
+              params = dict(base)
+              params.update(changes)
+              response = session.get(endpoint, params=params, headers=headers, timeout=(30, 180))
+              print('\n===', name, response.status_code, len(response.content), response.url, flush=True)
+              print('RAW_HEAD', response.text[:800], flush=True)
+              try:
+                  obj = response.json()
+              except Exception as exc:
+                  print('JSON_ERROR', repr(exc), flush=True)
+                  continue
+              print('OUTER_TYPE', type(obj).__name__, flush=True)
+              if isinstance(obj, dict):
+                  print('KEYS', list(obj.keys()), flush=True)
+                  for key, value in obj.items():
+                      if not isinstance(value, (dict, list)):
+                          print('SCALAR', key, repr(str(value)[:300]), flush=True)
+              raw = html.unescape(json.dumps(obj, ensure_ascii=False)).replace('\\/', '/')
+              print('RAW_LEN', len(raw), flush=True)
+              for marker in markers:
+                  positions = [m.start() for m in re.finditer(re.escape(marker), raw, flags=re.I)]
+                  if positions:
+                      print('MARKER', marker, positions[:10], 'COUNT', len(positions), flush=True)
+                      for pos in positions[:2]:
+                          snippet = raw[max(0, pos-700):min(len(raw), pos+1800)]
+                          print('SNIPPET', marker, snippet, flush=True)
+              soup = BeautifulSoup(raw, 'html.parser')
+              print('ANCHORS', len(soup.find_all('a')), 'ROWS', len(soup.find_all('tr')), flush=True)
+          PY
