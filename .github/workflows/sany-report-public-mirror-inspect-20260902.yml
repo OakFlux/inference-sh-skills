@@ -1,0 +1,79 @@
+name: Inspect public mirrors for Sany International reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sany-report-public-mirror-inspect-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet curl_cffi beautifulsoup4 requests
+
+      - name: Fetch and inspect mirror pages
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup
+          from curl_cffi import requests
+
+          out=Path('mirror_inspect'); out.mkdir(exist_ok=True)
+          urls=[
+            'https://www.vzkoo.com/document/202508280c2006aa4fa5f668d5458161.html',
+            'https://www.vzkoo.com/read/20250814282a0651a9f49d0f5512c7a2.html',
+            'https://www.ifxh.com/2726.html',
+            'https://www.baogaobox.com/insights/250813000017272.html',
+            'https://www.baogaobox.com/insights/250829000019466.html',
+          ]
+          all_records=[]
+          for idx,url in enumerate(urls,1):
+            try:
+              r=requests.get(url,impersonate='chrome',timeout=90,allow_redirects=True,headers={'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+              print('PAGE',idx,r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+              text=r.text
+              (out/f'page_{idx}.html').write_text(text,encoding='utf-8')
+              soup=BeautifulSoup(text,'html.parser')
+              rec={'url':r.url,'status':r.status_code,'length':len(r.content),'links':[],'images':[],'scripts':[],'hits':[]}
+              for a in soup.find_all('a',href=True):
+                href=urljoin(r.url,html.unescape(a['href']))
+                txt=' '.join(a.get_text(' ',strip=True).split())
+                if any(k in (href+' '+txt).lower() for k in ('download','pdf','pan.baidu','quark','aliyundrive','123pan','lanzou','file','document','三一国际')):
+                  rec['links'].append({'text':txt,'href':href})
+              for im in soup.find_all('img'):
+                for attr in ('src','data-src','data-original','data-lazy-src'):
+                  v=im.get(attr)
+                  if v:
+                    rec['images'].append(urljoin(r.url,html.unescape(v)))
+              for sc in soup.find_all('script',src=True):
+                rec['scripts'].append(urljoin(r.url,html.unescape(sc['src'])))
+              for pat in [
+                r'https?://[^\"\'<>\s\\]+',
+                r'["\']([^"\']*(?:download|pdf|pan\.baidu|quark|aliyundrive|123pan|lanzou|file|document|image|oss)[^"\']*)["\']',
+              ]:
+                for m in re.findall(pat,text,flags=re.I):
+                  val=m if isinstance(m,str) else m[0]
+                  if val not in rec['hits']: rec['hits'].append(val)
+              all_records.append(rec)
+              print('RECORD',idx,json.dumps(rec,ensure_ascii=False,indent=2)[:60000])
+            except Exception as e:
+              print('ERROR',idx,url,repr(e))
+              all_records.append({'url':url,'error':repr(e)})
+          (out/'summary.json').write_text(json.dumps(all_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: sany-report-public-mirror-inspection
+          path: mirror_inspect/
+          if-no-files-found: error
+          retention-days: 7
