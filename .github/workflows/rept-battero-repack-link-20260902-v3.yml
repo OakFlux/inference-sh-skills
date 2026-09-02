@@ -1,0 +1,336 @@
+name: Repack REPT BATTERO broker reports for direct download v3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-repack-link-20260902-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 reportlab pypdf pillow
+
+      - name: Download, build, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html as html_lib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+          from reportlab.lib import colors
+          from reportlab.lib.enums import TA_CENTER, TA_LEFT
+          from reportlab.lib.pagesizes import A4
+          from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+          from reportlab.lib.units import mm
+          from reportlab.pdfbase import pdfmetrics
+          from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+          from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+          PACKAGE = '瑞浦兰钧_00666HK_券商研究报告_备用下载包_2份'
+          OUT = Path(PACKAGE)
+          WORK = Path('_rept_repack_work')
+          RENDERS = WORK / 'renders'
+          OUT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          SESSION = requests.Session()
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def get(url: str, referer: str, accept: str, attempts: int = 5) -> requests.Response:
+              errors = []
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = SESSION.get(
+                          url,
+                          headers={
+                              'User-Agent': UA,
+                              'Accept': accept,
+                              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                              'Referer': referer,
+                              'Cache-Control': 'no-cache',
+                          },
+                          timeout=(25, 240),
+                          allow_redirects=True,
+                      )
+                      print('GET', url, r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+                      if r.status_code == 200 and r.content:
+                          return r
+                      errors.append(f'{r.status_code}/{len(r.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(attempt)
+              raise RuntimeError(f'GET failed {url}: {errors}')
+
+          def validate_pdf(path: Path, expected_pages: int | None = None, min_pages: int = 1) -> dict:
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError(f'PDF signature missing: {path}')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if expected_pages is not None and pages != expected_pages:
+                  raise RuntimeError(f'{path.name}: {pages} pages, expected {expected_pages}')
+              if pages < min_pages:
+                  raise RuntimeError(f'{path.name}: only {pages} pages')
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed: {q.stderr[-1000:]}')
+              render_checks = []
+              for label, pageno in [('first', 1), ('last', pages)]:
+                  prefix = RENDERS / f'{path.stem}_{label}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(pageno), '-singlefile', '-png', '-r', '110', str(path), str(prefix)],
+                      check=True,
+                      capture_output=True,
+                  )
+                  png = Path(str(prefix) + '.png')
+                  if not png.exists() or png.stat().st_size < 5000:
+                      raise RuntimeError(f'render failed: {path.name} {label}')
+                  with Image.open(png) as im:
+                      dims = [im.width, im.height]
+                  render_checks.append({'page': pageno, 'label': label, 'bytes': png.stat().st_size, 'dimensions': dims})
+              return {'pages': pages, 'bytes': path.stat().st_size, 'sha256': sha256(path), 'render_checks': render_checks}
+
+          # Report 1: original broker PDF.
+          report1 = OUT / '01_海通国际_瑞浦兰钧首次覆盖_青山集团旗下锂电池公司海外营收快速增长_2024-05-31_22页_原始PDF.pdf'
+          r = get(
+              'https://pdf.dfcfw.com/pdf/H3_AP202405311635020328_1.pdf',
+              'https://data.eastmoney.com/report/',
+              'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+          )
+          if not r.content.startswith(b'%PDF-'):
+              raise RuntimeError('Original report download is not a PDF')
+          report1.write_bytes(r.content)
+          meta1 = validate_pdf(report1, expected_pages=22)
+
+          # Report 2: public full-text archival edition generated from the broker report page.
+          source_url = 'https://www.fxbaogao.com/detail/4994227'
+          page = get(source_url, 'https://www.fxbaogao.com/', 'text/html,application/xhtml+xml,*/*;q=0.8')
+          raw_html = page.content.decode(page.encoding or 'utf-8', errors='replace')
+          soup = BeautifulSoup(raw_html, 'html.parser')
+
+          pieces = []
+          visible = soup.get_text('\n', strip=True)
+          if visible:
+              pieces.append(visible)
+          for tag in soup.find_all(True):
+              for attr in ('alt', 'title', 'aria-label'):
+                  value = tag.get(attr)
+                  if isinstance(value, str) and len(value.strip()) > 30:
+                      pieces.append(value.strip())
+          for script in soup.find_all('script'):
+              text = script.string or script.get_text(' ', strip=True)
+              if text and any(x in text for x in ('瑞浦兰钧', '1H25毛利率', '666 HK')):
+                  pieces.append(text)
+
+          combined = '\n'.join(pieces)
+          combined = html_lib.unescape(combined)
+          combined = re.sub(r'<[^>]+>', ' ', combined)
+          combined = combined.replace('\\n', '\n').replace('\\t', ' ')
+          combined = re.sub(r'[ \t]+', ' ', combined)
+          combined = re.sub(r'\n{3,}', '\n\n', combined)
+
+          markers = ['瑞浦兰钧', '1H25毛利率稳步提升', '预计全年亏损大幅收窄', '交银国际']
+          if not all(marker in combined for marker in markers):
+              raise RuntimeError('Expected report text markers not found in public source page')
+
+          # Prefer the report body and stop before recommendation/site boilerplate.
+          start_candidates = [combined.find('瑞浦兰钧 (666 HK)'), combined.find('瑞浦兰钧(666HK)'), combined.find('交银国际研究')]
+          start_candidates = [x for x in start_candidates if x >= 0]
+          start = min(start_candidates) if start_candidates else 0
+          end_candidates = []
+          for marker in ('你可能感兴趣', '公司简介', '发现报告（www.fxbaogao.com）'):
+              idx = combined.find(marker, start + 1000)
+              if idx >= 0:
+                  end_candidates.append(idx)
+          end = min(end_candidates) if end_candidates else len(combined)
+          body = combined[start:end].strip()
+          if len(body) < 7000:
+              # The page sometimes stores the body in an image alt attribute; retain the full combined text in that case.
+              body = combined.strip()
+          if len(body) < 7000:
+              raise RuntimeError(f'Public report text too short: {len(body)} chars')
+
+          # De-duplicate consecutive repeated blocks while preserving order.
+          paragraphs = []
+          seen_recent = []
+          for line in body.splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              line = re.sub(r'\s+', ' ', line)
+              if len(line) < 2:
+                  continue
+              fingerprint = line[:240]
+              if fingerprint in seen_recent:
+                  continue
+              paragraphs.append(line)
+              seen_recent.append(fingerprint)
+              if len(seen_recent) > 80:
+                  seen_recent.pop(0)
+
+          pdfmetrics.registerFont(UnicodeCIDFont('STSong-Light'))
+          styles = getSampleStyleSheet()
+          title_style = ParagraphStyle(
+              'TitleCN', parent=styles['Title'], fontName='STSong-Light', fontSize=17,
+              leading=24, alignment=TA_CENTER, spaceAfter=12,
+          )
+          subtitle_style = ParagraphStyle(
+              'SubtitleCN', parent=styles['Normal'], fontName='STSong-Light', fontSize=10.5,
+              leading=16, alignment=TA_CENTER, textColor=colors.HexColor('#444444'), spaceAfter=8,
+          )
+          body_style = ParagraphStyle(
+              'BodyCN', parent=styles['BodyText'], fontName='STSong-Light', fontSize=9.5,
+              leading=15, alignment=TA_LEFT, firstLineIndent=18, spaceAfter=5,
+          )
+          heading_style = ParagraphStyle(
+              'HeadingCN', parent=styles['Heading2'], fontName='STSong-Light', fontSize=12,
+              leading=18, spaceBefore=8, spaceAfter=5,
+          )
+          note_style = ParagraphStyle(
+              'NoteCN', parent=styles['Normal'], fontName='STSong-Light', fontSize=8.5,
+              leading=13, textColor=colors.HexColor('#555555'), spaceAfter=6,
+          )
+
+          report2 = OUT / '02_交银国际_瑞浦兰钧_1H25毛利率稳步提升预计全年亏损大幅收窄_2025-08-12_公开全文存档版.pdf'
+          doc = SimpleDocTemplate(
+              str(report2), pagesize=A4,
+              rightMargin=18*mm, leftMargin=18*mm, topMargin=17*mm, bottomMargin=17*mm,
+              title='瑞浦兰钧：1H25毛利率稳步提升，预计全年亏损大幅收窄',
+              author='交银国际（公开网页全文存档）',
+          )
+          story = [
+              Paragraph('瑞浦兰钧（666 HK）', title_style),
+              Paragraph('1H25毛利率稳步提升，预计全年亏损大幅收窄；上调盈利预测及目标价', title_style),
+              Paragraph('交银国际｜2025年8月12日｜李柳晓、陈庆', subtitle_style),
+              Spacer(1, 4*mm),
+              Table(
+                  [[Paragraph('文件说明', heading_style)],
+                   [Paragraph('本文件依据公开报告页面披露的全文内容制作，便于离线研究与归档。它不是券商原始排版PDF；观点、数据及版权归原研究机构和作者所有。', note_style)]],
+                  colWidths=[170*mm],
+                  style=TableStyle([
+                      ('BOX',(0,0),(-1,-1),0.6,colors.HexColor('#888888')),
+                      ('BACKGROUND',(0,0),(0,0),colors.HexColor('#EEEEEE')),
+                      ('LEFTPADDING',(0,0),(-1,-1),8),('RIGHTPADDING',(0,0),(-1,-1),8),
+                      ('TOPPADDING',(0,0),(-1,-1),6),('BOTTOMPADDING',(0,0),(-1,-1),6),
+                  ]),
+              ),
+              Spacer(1, 5*mm),
+              PageBreak(),
+          ]
+
+          heading_keywords = ('投资要点', '核心观点', '财务数据', '盈利预测', '风险提示', '研究结论', '图表', '损益表', '现金流量表', '资产负债')
+          for paragraph in paragraphs:
+              safe = html_lib.escape(paragraph)
+              if any(paragraph.startswith(key) or paragraph == key for key in heading_keywords) and len(paragraph) < 80:
+                  story.append(Paragraph(safe, heading_style))
+              else:
+                  story.append(Paragraph(safe, body_style))
+          story.extend([
+              Spacer(1, 6*mm),
+              Paragraph('公开来源页面：' + html_lib.escape(source_url), note_style),
+              Paragraph('资料仅供研究参考，不构成投资建议。', note_style),
+          ])
+          doc.build(story)
+          meta2 = validate_pdf(report2, min_pages=3)
+
+          records = [
+              {
+                  'order': 1, 'institution': '海通国际', 'date': '2024-05-31',
+                  'title': '瑞浦兰钧首次覆盖：青山集团旗下锂电池公司，海外营收快速增长',
+                  'version': '券商原始PDF', 'source': r.url, 'filename': report1.name, **meta1,
+              },
+              {
+                  'order': 2, 'institution': '交银国际', 'date': '2025-08-12',
+                  'title': '1H25毛利率稳步提升，预计全年亏损大幅收窄；上调盈利预测及目标价',
+                  'version': '公开网页全文存档版（非券商原始排版）', 'source': source_url,
+                  'source_text_chars': len(body), 'filename': report2.name, **meta2,
+              },
+          ]
+
+          readme = [
+              '瑞浦兰钧能源股份有限公司（REPT BATTERO，00666.HK）券商研究报告备用下载包',
+              '重新打包日期：2026-09-02',
+              '',
+              '1. 海通国际｜2024-05-31｜22页｜首次覆盖｜券商原始PDF',
+              '   青山集团旗下锂电池公司，海外营收快速增长',
+              '',
+              f"2. 交银国际｜2025-08-12｜{meta2['pages']}页｜公司更新｜公开网页全文存档版",
+              '   1H25毛利率稳步提升，预计全年亏损大幅收窄；上调盈利预测及目标价',
+              '   注：该文件依据公开报告页面全文重新排版，不是券商原始PDF。',
+              '',
+              '两份文件均已检查PDF结构、实际页数、首页和末页渲染；压缩包已执行CRC校验。',
+          ]
+          (OUT / '00_文件说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['filename']}\n" for item in records), encoding='utf-8'
+          )
+          with (OUT / '报告清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','机构','日期','标题','版本','页数','文件大小_字节','SHA256','来源','文件名']
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              for item in records:
+                  w.writerow({
+                      '序号': item['order'], '机构': item['institution'], '日期': item['date'],
+                      '标题': item['title'], '版本': item['version'], '页数': item['pages'],
+                      '文件大小_字节': item['bytes'], 'SHA256': item['sha256'],
+                      '来源': item['source'], '文件名': item['filename'],
+                  })
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for path in sorted(OUT.iterdir()):
+                  z.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')]) != 2:
+                  raise RuntimeError('ZIP PDF count is not 2')
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{sha256(zip_path)}  {zip_path.name}\n', encoding='utf-8')
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, sha256(zip_path), flush=True)
+          print('RECORDS', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-repacked-download-v3
+          path: |
+            瑞浦兰钧_00666HK_券商研究报告_备用下载包_2份/
+            瑞浦兰钧_00666HK_券商研究报告_备用下载包_2份.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
