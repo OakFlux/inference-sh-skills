@@ -1,0 +1,152 @@
+name: Search Sdyanbao metadata and probe public REPT PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-search-ap-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests pypdf
+
+      - name: Search metadata and probe public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          out = Path('rept_sdy_search_probe')
+          out.mkdir(exist_ok=True)
+          s = requests.Session()
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/json, text/plain, */*',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/report?keyword=%E7%91%9E%E6%B5%A6%E5%85%B0%E9%92%A7',
+              'Device': '1',
+              'X-Token': '',
+          }
+
+          variants = []
+          for keyword in ['瑞浦兰钧', 'REPT BATTERO', '瑞浦兰钧能源', '00666']:
+              for only_title in [1, 0]:
+                  body = {
+                      'device': 1, 'hideTrader': 0, 'onlyTitle': only_title,
+                      'order': 1, 'page': 1, 'pageSize': 100,
+                      'keyword': keyword, 'pageCount': 0, 'dateRange': 0,
+                      'startTime': '', 'endTime': '', 'typeIds': '',
+                      'industryIds': '', 'opFrom': 1,
+                  }
+                  try:
+                      r = s.post('https://api.sdyanbao.com/api/file/search', headers=headers, json=body, timeout=(20, 90))
+                      rec = {'keyword': keyword, 'onlyTitle': only_title, 'status': r.status_code, 'bytes': len(r.content), 'url': r.url, 'type': r.headers.get('content-type','')}
+                      try: rec['json'] = r.json()
+                      except Exception: rec['text'] = r.text[:5000]
+                  except Exception as e:
+                      rec = {'keyword': keyword, 'onlyTitle': only_title, 'error': repr(e)}
+                  variants.append(rec)
+                  print('SEARCH', keyword, only_title, rec.get('status'), rec.get('bytes'), flush=True)
+
+          files = []
+          seen_ids = set()
+          for rec in variants:
+              obj = rec.get('json')
+              if not isinstance(obj, dict): continue
+              data = obj.get('data')
+              if isinstance(data, dict):
+                  rows = data.get('files') or data.get('data') or []
+              elif isinstance(data, list):
+                  rows = data
+              else:
+                  rows = []
+              if not isinstance(rows, list): continue
+              for row in rows:
+                  if not isinstance(row, dict): continue
+                  rid = row.get('id')
+                  if rid in seen_ids: continue
+                  hay = json.dumps(row, ensure_ascii=False).upper()
+                  if any(x.upper() in hay for x in ['瑞浦兰钧','REPT BATTERO','00666']):
+                      seen_ids.add(rid)
+                      files.append(row)
+
+          details = []
+          for row in files:
+              rid = row.get('id')
+              body = {'id': rid, 'opFrom': 1}
+              try:
+                  r = s.post('https://api.sdyanbao.com/api/file/detail', headers=headers, json=body, timeout=(20, 90))
+                  rec = {'id': rid, 'status': r.status_code, 'bytes': len(r.content)}
+                  try: rec['json'] = r.json()
+                  except Exception: rec['text'] = r.text[:5000]
+              except Exception as e:
+                  rec = {'id': rid, 'error': repr(e)}
+              details.append(rec)
+              print('DETAIL', rid, rec.get('status'), rec.get('bytes'), flush=True)
+
+          # Include a known metadata item discovered from SSR.
+          known_codes = {'AP202604011820964558'}
+          for row in files:
+              val = str(row.get('data_source_uuid') or '')
+              if val.startswith('AP'): known_codes.add(val)
+          for det in details:
+              obj = det.get('json')
+              if isinstance(obj, dict):
+                  payload = obj.get('data')
+                  if isinstance(payload, dict):
+                      val = str(payload.get('data_source_uuid') or '')
+                      if val.startswith('AP'): known_codes.add(val)
+
+          pdf_probes = []
+          pdf_headers = {
+              'User-Agent': headers['User-Agent'],
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+          for code in sorted(known_codes):
+              for prefix in ['H3','H2']:
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{code}_1.pdf'
+                  try:
+                      r = s.get(url, headers=pdf_headers, timeout=(20, 180), allow_redirects=True)
+                      rec = {'code': code, 'prefix': prefix, 'url': url, 'final_url': r.url, 'status': r.status_code, 'bytes': len(r.content), 'type': r.headers.get('content-type',''), 'is_pdf': r.content.startswith(b'%PDF-')}
+                      if rec['is_pdf']:
+                          p = out / f'{prefix}_{code}.pdf'
+                          p.write_bytes(r.content)
+                          try:
+                              reader = PdfReader(str(p))
+                              rec['pages'] = len(reader.pages)
+                              rec['text_head'] = '\n'.join((pg.extract_text() or '') for pg in reader.pages[:3])[:5000]
+                          except Exception as e:
+                              rec['pdf_error'] = repr(e)
+                  except Exception as e:
+                      rec = {'code': code, 'prefix': prefix, 'url': url, 'error': repr(e)}
+                  pdf_probes.append(rec)
+                  print('PDF', code, prefix, rec.get('status'), rec.get('bytes'), rec.get('pages'), flush=True)
+
+          result = {'searches': variants, 'matched_files': files, 'details': details, 'known_codes': sorted(known_codes), 'pdf_probes': pdf_probes}
+          (out / 'result.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('MATCHED', json.dumps(files, ensure_ascii=False, indent=2), flush=True)
+          print('CODES', sorted(known_codes), flush=True)
+          PY
+
+      - name: Upload probe output
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-search-ap-probe
+          path: rept_sdy_search_probe/
+          if-no-files-found: error
+          retention-days: 7
