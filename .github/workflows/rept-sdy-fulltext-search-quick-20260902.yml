@@ -1,0 +1,42 @@
+name: Quick full text search Sdyanbao for REPT BATTERO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-fulltext-search-quick-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Search API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,requests
+          from pathlib import Path
+          s=requests.Session(); h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report?keyword=%E7%91%9E%E6%B5%A6%E5%85%B0%E9%92%A7','X-Token':'','Device':'1'}
+          all=[]
+          for kw in ['瑞浦兰钧','瑞浦蘭鈞','REPT BATTERO']:
+            p={'device':1,'hideTrader':0,'onlyTitle':0,'order':1,'page':1,'pageSize':200,'keyword':kw,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+            r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=p,timeout=(15,60)); j=r.json(); files=(j.get('data') or {}).get('files') or []
+            print('SEARCH',kw,'status',j.get('status'),'total',(j.get('data') or {}).get('total'),'files',len(files),flush=True)
+            concise=[]
+            for f in files:
+              x={k:f.get(k) for k in ['id','name','time_text','page_count','size','file_size','data_source','data_source_uuid','original_id','online_url','page_url','share_url','organization','researcher','stock','type','industry','keyword','summary']}
+              concise.append(x); print('FILE',json.dumps(x,ensure_ascii=False),flush=True)
+            all.append({'keyword':kw,'raw':j,'concise':concise})
+          Path('rept_sdy_fulltext.json').write_text(json.dumps(all,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-fulltext-search
+          path: rept_sdy_fulltext.json
+          retention-days: 7
