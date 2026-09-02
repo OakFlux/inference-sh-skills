@@ -1,0 +1,39 @@
+name: Build verified REPT BATTERO broker report package
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-package-script-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Build and validate package
+        run: python .github/scripts/package_rept_battero_reports.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-broker-reports-final
+          path: |
+            瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版/
+            瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
