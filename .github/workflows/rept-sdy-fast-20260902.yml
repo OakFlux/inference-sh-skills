@@ -1,0 +1,72 @@
+name: Fast query Sdyanbao for REPT BATTERO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-fast-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: python -m pip install --quiet requests pypdf
+      - shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          o=Path('fast'); o.mkdir()
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report?keyword=%E7%91%9E%E6%B5%A6%E5%85%B0%E9%92%A7','Device':'1','X-Token':''}
+          s=requests.Session()
+          bodies=[]
+          for only in (1,0):
+              bodies.append({'device':1,'hideTrader':0,'onlyTitle':only,'order':1,'page':1,'pageSize':100,'keyword':'瑞浦兰钧','pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1})
+          res=[]
+          for b in bodies:
+              try:
+                  r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=b,timeout=(5,12))
+                  x={'body':b,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type','')}
+                  try:x['json']=r.json()
+                  except Exception:x['text']=r.text[:10000]
+              except Exception as e:x={'body':b,'error':repr(e)}
+              res.append(x); print('SEARCH',x.get('status'),x.get('bytes'),x.get('error'),flush=True)
+          try:
+              r=s.post('https://api.sdyanbao.com/api/file/detail',headers=h,json={'id':950829,'opFrom':1},timeout=(5,12))
+              x={'id':950829,'status':r.status_code,'bytes':len(r.content)}
+              try:x['json']=r.json()
+              except Exception:x['text']=r.text[:10000]
+          except Exception as e:x={'id':950829,'error':repr(e)}
+          res.append({'detail':x}); print('DETAIL',x.get('status'),x.get('bytes'),x.get('error'),flush=True)
+          codes={'AP202604011820964558'}
+          for rec in res:
+              raw=json.dumps(rec,ensure_ascii=False)
+              import re
+              codes.update(re.findall(r'AP\d{18}',raw))
+          probs=[]
+          for code in sorted(codes):
+              for pre in ('H3','H2'):
+                  u=f'https://pdf.dfcfw.com/pdf/{pre}_{code}_1.pdf'
+                  try:
+                      r=s.get(u,headers={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*'},timeout=(5,20))
+                      z={'code':code,'pre':pre,'url':u,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type',''),'pdf':r.content.startswith(b'%PDF-')}
+                      if z['pdf']:
+                          p=o/f'{pre}_{code}.pdf'; p.write_bytes(r.content); z['pages']=len(PdfReader(str(p)).pages)
+                  except Exception as e:z={'code':code,'pre':pre,'url':u,'error':repr(e)}
+                  probs.append(z); print('PDF',code,pre,z.get('status'),z.get('bytes'),z.get('pages'),z.get('error'),flush=True)
+          (o/'result.json').write_text(json.dumps({'responses':res,'codes':sorted(codes),'pdf_probes':probs},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-fast
+          path: fast/
+          retention-days: 7
+          if-no-files-found: error
