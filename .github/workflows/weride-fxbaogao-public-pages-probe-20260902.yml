@@ -1,0 +1,111 @@
+name: Probe public full-page images for WeRide research reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-fxbaogao-public-pages-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Probe public report viewer pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pillow
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          from pathlib import Path
+
+          import requests
+          from PIL import Image
+
+          reports = [
+              {
+                  'id': 5095181,
+                  'date_path': '2025/08/22',
+                  'label': '国信证券_文远知行_全球L4级自动驾驶产品及解决方案先行者',
+                  'probe_pages': [1, 2, 7, 50, 77, 78, 79, 80],
+              },
+              {
+                  'id': 5222906,
+                  'date_path': '2026/01/12',
+                  'label': '国盛证券_文远知行_L4和L2双轮驱动',
+                  'probe_pages': [1, 2, 5, 20, 39, 40, 41, 42, 43, 44],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              'Referer': 'https://www.fxbaogao.com/',
+          }
+
+          results = []
+          for report in reports:
+              print('\n=== REPORT', report['id'], report['label'], '===', flush=True)
+              for page in report['probe_pages']:
+                  variants = [
+                      f"https://public.fxbaogao.com/report-image/{report['date_path']}/{report['id']}-{page}.png",
+                      f"https://public.fxbaogao.com/report-image/{report['date_path']}/{report['id']}-{page}.png?x-oss-process=image%2Fformat%2Cwebp",
+                      f"https://public.fxbaogao.com/report-image/{report['date_path']}/{report['id']}-{page}.png?x-oss-process=image%2Fresize%2Cp_100",
+                  ]
+                  page_result = {'report_id': report['id'], 'page': page, 'attempts': []}
+                  for url in variants:
+                      try:
+                          response = session.get(url, headers=headers, timeout=(20, 120), allow_redirects=True)
+                          attempt = {
+                              'url': url,
+                              'status': response.status_code,
+                              'content_type': response.headers.get('content-type'),
+                              'bytes': len(response.content),
+                              'final_url': response.url,
+                              'head': response.content[:12].hex(),
+                          }
+                          if response.status_code == 200 and response.content:
+                              try:
+                                  with Image.open(io.BytesIO(response.content)) as image:
+                                      attempt.update({
+                                          'image_format': image.format,
+                                          'width': image.width,
+                                          'height': image.height,
+                                          'mode': image.mode,
+                                          'sha256': hashlib.sha256(response.content).hexdigest(),
+                                      })
+                              except Exception as exc:
+                                  attempt['image_error'] = repr(exc)
+                          page_result['attempts'].append(attempt)
+                          print('PROBE', json.dumps(attempt, ensure_ascii=False), flush=True)
+                          if attempt.get('width', 0) >= 800 and attempt.get('height', 0) >= 1000:
+                              break
+                      except Exception as exc:
+                          attempt = {'url': url, 'error': repr(exc)}
+                          page_result['attempts'].append(attempt)
+                          print('ERROR', json.dumps(attempt, ensure_ascii=False), flush=True)
+                  results.append(page_result)
+
+          Path('weride_fxbaogao_probe.json').write_text(
+              json.dumps(results, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          PY
+
+      - name: Upload probe metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: weride-fxbaogao-public-pages-probe-20260902
+          path: weride_fxbaogao_probe.json
+          if-no-files-found: error
+          retention-days: 3
