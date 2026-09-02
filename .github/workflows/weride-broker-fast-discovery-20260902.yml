@@ -1,0 +1,68 @@
+name: Fast discover WeRide broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-broker-fast-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query Eastmoney codes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          import json, re
+          from io import BytesIO
+          import requests
+          from pypdf import PdfReader
+
+          session=requests.Session(); session.trust_env=False
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':ua,'Referer':'https://data.eastmoney.com/report/stock.jshtml','Accept':'application/json,text/plain,*/*'}
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          found={}
+          for code in ('00800','0800','800','116.00800','116.0800','HK00800','00800.HK','WRD'):
+              for qtype in (0,1):
+                  params={'pageNo':1,'pageSize':500,'code':code,'qType':qtype,'beginTime':'2024-01-01','endTime':'2026-09-02','industryCode':'*','rating':'*','ratingChange':'*'}
+                  try:
+                      r=session.get(endpoint,params=params,headers=headers,timeout=(20,90))
+                      print('QUERY',code,qtype,r.status_code,len(r.content),r.url,flush=True)
+                      r.raise_for_status(); payload=r.json(); rows=payload.get('data') or []
+                      print('META',len(rows),{k:payload.get(k) for k in ('hits','size','TotalPage','pageNo')},flush=True)
+                      for row in rows:
+                          raw=json.dumps(row,ensure_ascii=False)
+                          low=re.sub(r'\s+','',raw).lower()
+                          if any(x in low for x in ('文远知行','weride','00800','0800.hk','wrd.us')):
+                              key=str(row.get('infoCode') or raw)
+                              found[key]=row
+                  except Exception as exc:
+                      print('ERROR',code,qtype,repr(exc),flush=True)
+          print('FOUND_COUNT',len(found),flush=True)
+          working=[]
+          for key,row in found.items():
+              keep={k:row.get(k) for k in ('infoCode','title','publishDate','orgSName','orgName','researcher','stockName','stockCode','attachPages','attachSize','emRatingName','reportType','encodeUrl')}
+              print('MATCH',json.dumps(keep,ensure_ascii=False),flush=True)
+              info=str(row.get('infoCode') or '')
+              if not info.startswith('AP'): continue
+              for prefix in ('H3','H2'):
+                  url=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  try:
+                      pdf=session.get(url,headers={'User-Agent':ua,'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*'},timeout=(20,180))
+                      print('PDF',info,prefix,pdf.status_code,len(pdf.content),pdf.headers.get('content-type'),flush=True)
+                      if pdf.status_code==200 and pdf.content.startswith(b'%PDF-') and len(pdf.content)>100000:
+                          reader=PdfReader(BytesIO(pdf.content),strict=False)
+                          rec={'infoCode':info,'title':row.get('title'),'publishDate':row.get('publishDate'),'orgSName':row.get('orgSName'),'researcher':row.get('researcher'),'pages':len(reader.pages),'bytes':len(pdf.content),'url':pdf.url}
+                          working.append(rec); print('WORKING',json.dumps(rec,ensure_ascii=False),flush=True); break
+                  except Exception as exc:
+                      print('PDF_ERROR',info,prefix,repr(exc),flush=True)
+          print('WORKING_ALL',json.dumps(working,ensure_ascii=False,indent=2),flush=True)
+          PY
