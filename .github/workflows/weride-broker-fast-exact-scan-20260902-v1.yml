@@ -1,0 +1,91 @@
+name: Fast exact scan WeRide deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-broker-fast-exact-scan-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Find exact report metadata and public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          import json, re, time
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from io import BytesIO
+          import requests
+          from pypdf import PdfReader
+
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':ua,'Accept':'application/json,text/plain,*/*','Referer':'https://data.eastmoney.com/report/'}
+          windows=[
+              ('2025-01-20','2025-01-23'),
+              ('2025-08-21','2025-08-26'),
+              ('2025-12-24','2026-01-06'),
+          ]
+          exact_needles=[
+              '文远知行','文遠知行','weride','全球l4级自动驾驶产品及解决方案先行者',
+              'l4智驾先行者','robotaxi全球布局'
+          ]
+
+          def call(begin,end,qtype,page):
+              s=requests.Session(); s.trust_env=False
+              params={'pageNo':page,'pageSize':100,'code':'','qType':qtype,'beginTime':begin,'endTime':end,'_':int(time.time()*1000)+page}
+              for attempt in range(4):
+                  try:
+                      r=s.get(endpoint,params=params,headers=headers,timeout=(20,90)); r.raise_for_status(); o=r.json()
+                      rows=o.get('data') or []
+                      return page, rows if isinstance(rows,list) else [], int(o.get('TotalPage') or 0)
+                  except Exception as e:
+                      if attempt==3: raise
+                      time.sleep(attempt+1)
+
+          found={}
+          for begin,end in windows:
+              for qtype in (0,1,2):
+                  page1,rows,total=call(begin,end,qtype,1)
+                  print('META',begin,end,'q',qtype,'pages',total,'rows1',len(rows),flush=True)
+                  allrows=list(rows)
+                  if total>1:
+                      with ThreadPoolExecutor(max_workers=12) as ex:
+                          futs=[ex.submit(call,begin,end,qtype,p) for p in range(2,total+1)]
+                          for fut in as_completed(futs):
+                              p,rs,_=fut.result(); allrows.extend(rs); print('PAGE',begin,end,qtype,p,len(rs),flush=True)
+                  for row in allrows:
+                      raw=json.dumps(row,ensure_ascii=False)
+                      low=re.sub(r'\s+','',raw).lower()
+                      if any(n.lower() in low for n in exact_needles):
+                          info=str(row.get('infoCode') or '')
+                          if info: found[info]=row
+
+          print('FOUND',len(found),flush=True)
+          for info,row in found.items():
+              meta={k:row.get(k) for k in ['infoCode','title','publishDate','orgSName','orgName','researcher','stockName','stockCode','attachPages','attachSize','emRatingName','reportType']}
+              print('MATCH',json.dumps(meta,ensure_ascii=False),flush=True)
+              for prefix in ('H3','H2'):
+                  u=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  try:
+                      r=requests.get(u,headers={'User-Agent':ua,'Accept':'application/pdf,*/*','Referer':'https://data.eastmoney.com/'},timeout=(20,180))
+                      print('PDFTRY',info,prefix,r.status_code,len(r.content),r.headers.get('content-type'),flush=True)
+                      if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>100000:
+                          rd=PdfReader(BytesIO(r.content),strict=False)
+                          txt=''
+                          for i in range(min(4,len(rd.pages))):
+                              try: txt+=(rd.pages[i].extract_text() or '')+'\n'
+                              except Exception: pass
+                          print('WORKING',json.dumps({'infoCode':info,'title':row.get('title'),'date':row.get('publishDate'),'org':row.get('orgSName') or row.get('orgName'),'pages':len(rd.pages),'bytes':len(r.content),'url':r.url,'identity':('文远知行' in txt or 'WeRide' in txt)},ensure_ascii=False),flush=True)
+                          break
+                  except Exception as e:
+                      print('PDFERR',info,prefix,repr(e),flush=True)
+          PY
