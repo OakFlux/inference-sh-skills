@@ -1,0 +1,187 @@
+name: discover-sany-international-reports-20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/discover_sany_international_reports_20260902.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet 'httpx[http2]' requests beautifulsoup4 lxml
+
+      - name: Discover official HKEX filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import httpx, requests
+          from bs4 import BeautifulSoup
+
+          out = Path('sany_hkex_discovery')
+          out.mkdir(exist_ok=True)
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=en',
+          }
+          code = '00631'
+          stock_ids = set()
+          discovery = {'stock_dictionary': [], 'prefix': [], 'servlet': [], 'post_html': []}
+
+          dict_urls = [
+              'https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json',
+              'https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_c.json',
+              'https://www1.hkexnews.hk/ncms/json/eds/activestock_sehk_e.json',
+              'https://www1.hkexnews.hk/ncms/json/eds/activestock_sehk_c.json',
+          ]
+          with httpx.Client(http2=True, headers=headers, timeout=60.0, follow_redirects=True) as client:
+              for idx, url in enumerate(dict_urls, 1):
+                  try:
+                      r = client.get(url)
+                      print('DICT', idx, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      rec = {'url': str(r.url), 'status': r.status_code, 'length': len(r.content), 'content_type': r.headers.get('content-type')}
+                      if r.status_code == 200:
+                          (out / f'dict_{idx}.txt').write_bytes(r.content)
+                          try:
+                              obj = r.json()
+                              rec['json_type'] = type(obj).__name__
+                              rec['top_preview'] = str(obj)[:1000]
+                              def walk(x):
+                                  if isinstance(x, dict):
+                                      c = str(x.get('c') or x.get('code') or x.get('stockCode') or x.get('STOCK_CODE') or '')
+                                      n = str(x.get('n') or x.get('name') or x.get('stockName') or x.get('STOCK_NAME') or '')
+                                      i = str(x.get('i') or x.get('id') or x.get('stockId') or x.get('STOCK_ID') or '')
+                                      if c.replace('.','').zfill(5) == code or 'SANY HEAVY EQUIPMENT' in n.upper() or '三一' in n:
+                                          rec.setdefault('matches', []).append(x)
+                                          if i and i not in ('-1','None'):
+                                              stock_ids.add(i)
+                                      for v in x.values(): walk(v)
+                                  elif isinstance(x, list):
+                                      for v in x: walk(v)
+                              walk(obj)
+                          except Exception as exc:
+                              rec['json_error'] = repr(exc)
+                      discovery['stock_dictionary'].append(rec)
+                  except Exception as exc:
+                      discovery['stock_dictionary'].append({'url': url, 'error': repr(exc)})
+                      print('DICT_ERROR', url, repr(exc), flush=True)
+
+              prefix_urls = [
+                  'https://www1.hkexnews.hk/search/prefix.do',
+                  'https://www1.hkexnews.hk/search/prefix.do?type=A&market=SEHK&name=00631&lang=EN',
+              ]
+              for url in prefix_urls:
+                  try:
+                      if '?' in url:
+                          r = client.get(url)
+                      else:
+                          r = client.get(url, params={'type':'A','market':'SEHK','name':code,'lang':'EN'})
+                      print('PREFIX', r.status_code, len(r.content), r.url, r.text[:500], flush=True)
+                      rec = {'url': str(r.url), 'status': r.status_code, 'length': len(r.content), 'text': r.text[:5000]}
+                      for m in re.findall(r'(?i)(?:stockId|id)[^0-9]{0,10}([0-9]{4,})', r.text): stock_ids.add(m)
+                      try:
+                          obj = r.json(); rec['json'] = obj
+                          def walk2(x):
+                              if isinstance(x, dict):
+                                  c = str(x.get('c') or x.get('code') or x.get('stockCode') or x.get('STOCK_CODE') or '')
+                                  n = str(x.get('n') or x.get('name') or x.get('stockName') or x.get('STOCK_NAME') or '')
+                                  i = str(x.get('i') or x.get('id') or x.get('stockId') or x.get('STOCK_ID') or '')
+                                  if c.replace('.','').zfill(5) == code or 'SANY HEAVY EQUIPMENT' in n.upper() or '三一' in n:
+                                      rec.setdefault('matches', []).append(x)
+                                      if i and i not in ('-1','None'): stock_ids.add(i)
+                                  for v in x.values(): walk2(v)
+                              elif isinstance(x, list):
+                                  for v in x: walk2(v)
+                          walk2(obj)
+                      except Exception as exc: rec['json_error'] = repr(exc)
+                      discovery['prefix'].append(rec)
+                  except Exception as exc:
+                      discovery['prefix'].append({'url': url, 'error': repr(exc)})
+
+              print('STOCK_IDS', sorted(stock_ids), flush=True)
+              ids_to_try = sorted(stock_ids) + ['-1']
+              servlet_url = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              for stock_id in ids_to_try:
+                  for lang in ('EN','zh'):
+                      for t2code in ('40200','40300','40400','40100'):
+                          params = {
+                              'sortDir':'0','sortByOptions':'DateTime','category':'0','market':'SEHK',
+                              'stockId':stock_id,'documentType':'-1','fromDate':'20200101','toDate':'20260902',
+                              'title':'','searchType':'1','t1code':'40000','t2Gcode':'-2','t2code':t2code,
+                              'rowRange':'2000','lang':lang,
+                          }
+                          try:
+                              r = client.get(servlet_url, params=params, headers={**headers,'Accept':'application/json,text/plain,*/*'})
+                              print('SERVLET', stock_id, lang, t2code, r.status_code, len(r.content), r.url, r.text[:180], flush=True)
+                              rec = {'stock_id':stock_id,'lang':lang,'t2code':t2code,'url':str(r.url),'status':r.status_code,'length':len(r.content)}
+                              if r.status_code == 200:
+                                  try:
+                                      outer = r.json(); rec['outer_type'] = type(outer).__name__
+                                      inner = outer
+                                      if isinstance(outer, dict) and isinstance(outer.get('result'), str):
+                                          inner = json.loads(outer['result'])
+                                      elif isinstance(outer, dict) and 'result' in outer:
+                                          inner = outer['result']
+                                      rec['data'] = inner
+                                      rows = inner if isinstance(inner, list) else (inner.get('data') if isinstance(inner, dict) else [])
+                                      if not isinstance(rows, list): rows=[]
+                                      filtered=[]
+                                      for row in rows:
+                                          text=' '.join(str(row.get(k) or '') for k in ('STOCK_CODE','STOCK_NAME','TITLE','FILE_LINK','DATE_TIME','stockCode','stockName','title','fileLink'))
+                                          if code in text.replace(' ','') or 'SANY HEAVY EQUIPMENT' in text.upper() or '三一' in text:
+                                              filtered.append(row)
+                                      rec['filtered'] = filtered
+                                  except Exception as exc:
+                                      rec['parse_error'] = repr(exc); rec['text'] = r.text[:10000]
+                              discovery['servlet'].append(rec)
+                          except Exception as exc:
+                              discovery['servlet'].append({'stock_id':stock_id,'lang':lang,'t2code':t2code,'error':repr(exc)})
+
+              post_url='https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=en'
+              for stock_id in ids_to_try:
+                  form={'lang':'EN','category':'0','market':'SEHK','searchType':'0','documentType':'','t1code':'','t2Gcode':'','t2code':'','stockId':stock_id,'from':'20200101','to':'20260902','MB-Daterange':'0','title':''}
+                  try:
+                      r=client.post(post_url,data=form,headers={**headers,'Accept':'text/html,application/xhtml+xml,*/*'})
+                      print('POST_HTML',stock_id,r.status_code,len(r.content),r.url,flush=True)
+                      filename=f'post_{re.sub(r"[^0-9A-Za-z_-]","_",stock_id)}.html'
+                      (out/filename).write_bytes(r.content)
+                      soup=BeautifulSoup(r.text,'lxml')
+                      links=[]
+                      for a in soup.find_all('a',href=True):
+                          href=urljoin(str(r.url),a['href'])
+                          title=' '.join(a.get_text(' ',strip=True).split())
+                          if '.pdf' in href.lower() or 'annual report' in title.lower() or 'interim report' in title.lower() or 'quarterly' in title.lower() or '年報' in title or '中期報告' in title or '季度報告' in title:
+                              links.append({'title':title,'href':href})
+                      discovery['post_html'].append({'stock_id':stock_id,'status':r.status_code,'length':len(r.content),'links':links})
+                  except Exception as exc:
+                      discovery['post_html'].append({'stock_id':stock_id,'error':repr(exc)})
+
+          (out/'discovery.json').write_text(json.dumps(discovery,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_STOCK_IDS', sorted(stock_ids), flush=True)
+          all_hits=[]
+          for rec in discovery['servlet']:
+              for row in rec.get('filtered',[]):
+                  all_hits.append(row)
+          for rec in discovery['post_html']:
+              all_hits.extend(rec.get('links',[]))
+          (out/'hits.json').write_text(json.dumps(all_hits,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('HITS', json.dumps(all_hits,ensure_ascii=False,indent=2)[:50000], flush=True)
+          PY
+
+      - name: Upload discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: sany-international-hkex-discovery
+          path: sany_hkex_discovery/
+          if-no-files-found: error
+          retention-days: 7
