@@ -1,0 +1,115 @@
+name: Inspect Vzkoo Sany International document endpoints
+
+on:
+  push:
+    paths:
+      - '.github/workflows/vzkoo-sany-international-inspect-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+
+      - name: Fetch pages and inspect public assets
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, html
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          out = Path('vzkoo_inspect')
+          out.mkdir(exist_ok=True)
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+          urls = [
+              'https://www.vzkoo.com/document/202508280c2006aa4fa5f668d5458161.html',
+              'https://www.vzkoo.com/read/20250814282a0651a9f49d0f5512c7a2.html',
+          ]
+          summary = []
+          assets = set()
+          for idx, url in enumerate(urls, 1):
+              r = session.get(url, headers=headers, timeout=(30,180), allow_redirects=True)
+              print('PAGE', idx, r.status_code, len(r.content), r.url, r.headers.get('content-type'))
+              r.raise_for_status()
+              text = r.text
+              (out / f'page_{idx}.html').write_text(text, encoding='utf-8')
+              soup = BeautifulSoup(text, 'html.parser')
+              record = {'url': r.url, 'status': r.status_code, 'length': len(r.content), 'images': [], 'scripts': [], 'links': [], 'interesting': []}
+              for tag in soup.find_all(True):
+                  for attr in ('src','href','data-src','data-original','data-url','data-pdf','data-file','content'):
+                      value = tag.get(attr)
+                      if not value or not isinstance(value, str):
+                          continue
+                      full = urljoin(r.url, html.unescape(value))
+                      low = full.lower()
+                      if tag.name == 'img' or any(x in low for x in ('.png','.jpg','.jpeg','.webp')):
+                          record['images'].append(full)
+                      if tag.name == 'script' and attr == 'src':
+                          record['scripts'].append(full)
+                          assets.add(full)
+                      if tag.name == 'a' and attr == 'href':
+                          record['links'].append(full)
+                      if any(k in low for k in ('pdf','download','document','preview','image','file','api')):
+                          record['interesting'].append({'tag': tag.name, 'attr': attr, 'value': full})
+              patterns = [
+                  r'https?://[^\"\'<>\s\\]+',
+                  r'[/A-Za-z0-9_.-]+\.(?:pdf|png|jpe?g|webp)(?:\?[^\"\'<>\s]*)?',
+                  r'["\']([^"\']*(?:download|preview|document|file|pdf|image|api)[^"\']*)["\']',
+              ]
+              found = []
+              for pattern in patterns:
+                  for m in re.findall(pattern, text, flags=re.I):
+                      value = m if isinstance(m, str) else m[0]
+                      if value and value not in found:
+                          found.append(value)
+              record['regex_found'] = found[:1000]
+              summary.append(record)
+              print('IMAGES', idx, json.dumps(record['images'][:100], ensure_ascii=False, indent=2))
+              print('SCRIPTS', idx, json.dumps(record['scripts'], ensure_ascii=False, indent=2))
+              print('INTERESTING', idx, json.dumps(record['interesting'][:200], ensure_ascii=False, indent=2))
+
+          for asset_idx, asset_url in enumerate(sorted(assets), 1):
+              try:
+                  r = session.get(asset_url, headers={**headers, 'Referer': urls[0]}, timeout=(30,180), allow_redirects=True)
+                  print('ASSET', asset_idx, r.status_code, len(r.content), r.url, r.headers.get('content-type'))
+                  if r.status_code != 200 or len(r.content) > 5_000_000:
+                      continue
+                  suffix = '.js' if 'javascript' in (r.headers.get('content-type') or '') or asset_url.lower().endswith('.js') else '.txt'
+                  name = f'asset_{asset_idx:03d}{suffix}'
+                  (out / name).write_bytes(r.content)
+                  try:
+                      txt = r.text
+                  except Exception:
+                      continue
+                  interesting_lines = []
+                  for line in txt.splitlines():
+                      if any(k in line.lower() for k in ('download','pdf','document','preview','image','pagecount','fileurl','oss','api')):
+                          interesting_lines.append(line[:2000])
+                  if interesting_lines:
+                      (out / f'asset_{asset_idx:03d}_interesting.txt').write_text('\n'.join(interesting_lines[:500]), encoding='utf-8')
+              except Exception as exc:
+                  print('ASSET_ERROR', asset_url, repr(exc))
+          (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: vzkoo-sany-inspection
+          path: vzkoo_inspect/
+          if-no-files-found: error
+          retention-days: 7
