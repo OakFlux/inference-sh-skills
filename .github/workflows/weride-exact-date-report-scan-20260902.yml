@@ -1,0 +1,100 @@
+name: Scan exact dates for WeRide broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-exact-date-report-scan-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Scan Eastmoney exact dates and alternative APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json, re, time
+          import requests
+
+          session=requests.Session(); session.trust_env=False
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':ua,'Referer':'https://data.eastmoney.com/report/stock.jshtml','Accept':'application/json,text/plain,*/*'}
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          targets=[
+              ('2025-12-26','2025-12-26',['文远知行','L4智驾先行者','ROBOTAXI全球布局']),
+              ('2026-01-08','2026-01-09',['文远知行','知行全球','行于文远']),
+              ('2026-01-12','2026-01-13',['文远知行','立足国内发力海外','ROBOX商业化']),
+              ('2026-02-11','2026-02-12',['文远知行','重视国内市场','L4平台型公司']),
+              ('2025-01-20','2025-01-23',['文远知行','WERIDE','多元产品布局']),
+          ]
+          found={}
+          for begin,end,markers in targets:
+              for page in range(1,31):
+                  params={'pageNo':page,'pageSize':100,'qType':0,'beginTime':begin,'endTime':end,'industryCode':'*','rating':'*','ratingChange':'*'}
+                  try:
+                      r=session.get(endpoint,params=params,headers=headers,timeout=(20,120))
+                      print('LIST',begin,end,page,r.status_code,len(r.content),flush=True)
+                      r.raise_for_status(); payload=r.json(); rows=payload.get('data') or []
+                      total_page=int(payload.get('TotalPage') or 0)
+                      print('META',len(rows),total_page,payload.get('hits'),flush=True)
+                      for row in rows:
+                          raw=json.dumps(row,ensure_ascii=False)
+                          compact=re.sub(r'\s+','',raw).upper()
+                          if any(re.sub(r'\s+','',m).upper() in compact for m in markers):
+                              key=str(row.get('infoCode') or raw); found[key]=row
+                              print('MATCH',begin,end,page,json.dumps(row,ensure_ascii=False),flush=True)
+                      if not rows or (total_page and page>=total_page): break
+                  except Exception as exc:
+                      print('LIST_ERROR',begin,end,page,repr(exc),flush=True); time.sleep(1)
+
+          # Probe optional keyword parameter names against the same endpoint.
+          for param_name in ('title','keyword','searchText','stockName','searchkey','name'):
+              for word in ('文远知行','WeRide','知行全球，行于文远','L4智驾先行者'):
+                  params={'pageNo':1,'pageSize':500,'qType':0,'beginTime':'2024-01-01','endTime':'2026-09-02','industryCode':'*','rating':'*','ratingChange':'*',param_name:word}
+                  try:
+                      r=session.get(endpoint,params=params,headers=headers,timeout=(20,120))
+                      print('KEYWORD',param_name,word,r.status_code,len(r.content),r.url,flush=True)
+                      r.raise_for_status(); payload=r.json(); rows=payload.get('data') or []
+                      print('KEY_META',len(rows),payload.get('hits'),payload.get('TotalPage'),flush=True)
+                      for row in rows:
+                          raw=json.dumps(row,ensure_ascii=False)
+                          if '文远知行' in raw or 'WeRide' in raw:
+                              key=str(row.get('infoCode') or raw); found[key]=row
+                              print('KEY_MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+                  except Exception as exc:
+                      print('KEY_ERROR',param_name,word,repr(exc),flush=True)
+
+          # Try list2 GET and POST with keyword and code variants.
+          endpoint2='https://reportapi.eastmoney.com/report/list2'
+          bodies=[]
+          for code in ('','00800','0800','WRD'):
+              for key in ('title','keyword','stockName','searchText'):
+                  body={'pageSize':500,'pageNo':1,'p':1,'pageNum':1,'pageNumber':1,'beginTime':'2024-01-01','endTime':'2026-09-02','code':code,'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':'',key:'文远知行'}
+                  bodies.append(body)
+          for body in bodies:
+              for mode in ('json','form'):
+                  try:
+                      r=session.post(endpoint2,json=body if mode=='json' else None,data=body if mode=='form' else None,headers={**headers,'Content-Type':'application/json'} if mode=='json' else headers,timeout=(20,120))
+                      print('LIST2',mode,body.get('code'),[(k,v) for k,v in body.items() if k in ('title','keyword','stockName','searchText')],r.status_code,len(r.content),flush=True)
+                      r.raise_for_status(); payload=r.json(); rows=payload.get('data') or payload.get('Data') or []
+                      print('LIST2_META',len(rows),payload.get('hits'),payload.get('TotalPage'),flush=True)
+                      for row in rows:
+                          raw=json.dumps(row,ensure_ascii=False)
+                          if '文远知行' in raw or 'WeRide' in raw:
+                              key=str(row.get('infoCode') or raw); found[key]=row
+                              print('LIST2_MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+                  except Exception as exc:
+                      print('LIST2_ERROR',mode,repr(exc),flush=True)
+
+          print('FINAL_FOUND_COUNT',len(found),flush=True)
+          for row in found.values():
+              keep={k:row.get(k) for k in ('infoCode','title','publishDate','orgSName','orgName','researcher','stockName','stockCode','attachPages','attachSize','reportType','encodeUrl')}
+              print('FINAL_MATCH',json.dumps(keep,ensure_ascii=False),flush=True)
+          PY
