@@ -1,0 +1,65 @@
+name: Probe FX report viewer JavaScript
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-viewer-js-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Inspect viewer JavaScript for APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import re,json
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          s=requests.Session(); ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          view='https://www.fxbaogao.com/view?id=4894193'
+          r=s.get(view,headers={'User-Agent':ua},timeout=90)
+          print('VIEW',r.status_code,len(r.content),r.url,flush=True)
+          soup=BeautifulSoup(r.text,'html.parser')
+          scripts=[]
+          for tag in soup.find_all('script',src=True):
+              u=urljoin(r.url,tag['src'].strip())
+              if u not in scripts: scripts.append(u)
+          print('SCRIPTS',json.dumps(scripts,ensure_ascii=False,indent=2),flush=True)
+          keys=['api.fxbaogao','mofoun','docId','reportId','pdfUrl','pdfurl','fileUrl','fileurl','download','preview','pageCount','pageNum','report-image','/pdf','/view','document','oss','filePath','file_path','imageUrl','sourceUrl','reader']
+          for u in scripts:
+              try:
+                  x=s.get(u,headers={'User-Agent':ua,'Referer':view},timeout=120)
+                  print('\n=== SCRIPT',u,x.status_code,len(x.content),x.headers.get('content-type'),'===',flush=True)
+                  text=x.text
+                  urls=sorted(set(re.findall(r'https?://[^"\'`<>\\\s]+',text)))
+                  for z in urls:
+                      if any(k.lower() in z.lower() for k in ['fxbaogao','hufangde','pdf','report','api']):
+                          print('URL',z[:2000],flush=True)
+                  strings=re.findall(r'["\'`]([^"\'`]{2,300})["\'`]',text)
+                  hits=[]
+                  for st in strings:
+                      low=st.lower()
+                      if any(k.lower() in low for k in keys):
+                          hits.append(st)
+                  for st in list(dict.fromkeys(hits))[:1000]:
+                      print('STR',repr(st[:2000]),flush=True)
+                  low=text.lower()
+                  for key in keys:
+                      start=0; shown=0
+                      while shown<12:
+                          pos=low.find(key.lower(),start)
+                          if pos<0: break
+                          print('CTX',key,repr(text[max(0,pos-300):pos+600]),flush=True)
+                          start=pos+len(key); shown+=1
+              except Exception as e:
+                  print('SCRIPT_ERROR',u,repr(e),flush=True)
+          PY
