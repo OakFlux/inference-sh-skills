@@ -1,0 +1,103 @@
+name: Focused web search for Skyworth broker PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-focused-web-search-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: gtjai1
+            q: 'site:gtjai.com/UploadFiles/gtja_Report "Skyworth Digital" 00751'
+          - id: gtjai2
+            q: 'site:gtjai.com/UploadFiles/gtja_Report "Skyworth Group" 00751'
+          - id: exact_en
+            q: '"Skyworth Digital (00751 HK)" filetype:pdf'
+          - id: holdings_en
+            q: '"Skyworth Digital Holdings" filetype:pdf analyst'
+          - id: firstshanghai
+            q: 'site:firstshanghai.com.hk Skyworth 00751 pdf'
+          - id: cmbi
+            q: 'site:cmbi.com.hk Skyworth 00751 report pdf'
+          - id: dfcfw_old
+            q: 'site:pdf.dfcfw.com "创维数码"'
+          - id: old_cn
+            q: '"创维数码" 券商 研报 PDF'
+          - id: tianfeng
+            q: '"创维集团" "2022年09月13日" 天风证券 PDF'
+          - id: exact_cn
+            q: '"家电行业领军者，分布式光伏开启第二成长曲线" PDF'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Search
+        shell: bash
+        env:
+          QUERY: ${{ matrix.q }}
+          ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, re, json, html, base64
+          from urllib.parse import quote_plus, urljoin, urlparse, parse_qs, unquote
+          import requests
+
+          q=os.environ['QUERY']; ident=os.environ['ID']
+          s=requests.Session(); s.trust_env=False
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          engines={
+            'brave':'https://search.brave.com/search?q='+quote_plus(q)+'&source=web',
+            'google':'https://www.google.com/search?q='+quote_plus(q)+'&num=30&hl=en',
+            'duck':'https://html.duckduckgo.com/html/?q='+quote_plus(q),
+            'yahoo':'https://search.yahoo.com/search?p='+quote_plus(q)+'&n=30',
+            'mojeek':'https://www.mojeek.com/search?q='+quote_plus(q),
+          }
+          out=[]
+          for engine,url in engines.items():
+            try:
+              r=s.get(url,headers=headers,timeout=(15,60),allow_redirects=True)
+              text=r.text
+              links=[]
+              # General href extraction plus surrounding anchor text.
+              for m in re.finditer(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+                href=html.unescape(m.group(1)); label=re.sub(r'<[^>]+>',' ',m.group(2)); label=html.unescape(re.sub(r'\s+',' ',label)).strip()
+                if engine=='duck' and 'uddg=' in href:
+                  href=parse_qs(urlparse(href).query).get('uddg',[href])[0]
+                if href.startswith('/url?'):
+                  href=parse_qs(urlparse(href).query).get('q',[href])[0]
+                if href.startswith('//'): href='https:'+href
+                if href.startswith('/') and engine in ('brave','google','yahoo','mojeek'): href=urljoin(r.url,href)
+                if href.startswith('http'):
+                  links.append({'url':href,'text':label[:500]})
+              # raw PDF URLs
+              pdfs=[]
+              for u in re.findall(r'https?://[^"\'<>\s\\]+?\.pdf(?:\?[^"\'<>\s\\]*)?',text,re.I):
+                u=html.unescape(u).replace('\\u0026','&').replace('\\/','/')
+                if u not in pdfs: pdfs.append(u)
+              rec={'engine':engine,'status':r.status_code,'bytes':len(r.content),'url':r.url,'links':links[:100],'pdfs':pdfs[:50]}
+              out.append(rec)
+              print('ENGINE',engine,'STATUS',r.status_code,'BYTES',len(r.content),'URL',r.url,flush=True)
+              for l in links[:40]:
+                hay=(l['text']+' '+l['url']).lower()
+                if any(k in hay for k in ('skyworth','创维','00751','0751','pdf','report','研报')):
+                  print('LINK',engine,json.dumps(l,ensure_ascii=False),flush=True)
+              for u in pdfs: print('PDF',engine,u,flush=True)
+            except Exception as e:
+              out.append({'engine':engine,'error':repr(e)})
+              print('ERROR',engine,repr(e),flush=True)
+          os.makedirs('results',exist_ok=True)
+          open(f'results/{ident}.json','w',encoding='utf-8').write(json.dumps({'query':q,'results':out},ensure_ascii=False,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-focused-${{ matrix.id }}
+          path: results/
+          retention-days: 7
