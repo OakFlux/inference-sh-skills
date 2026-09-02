@@ -1,0 +1,44 @@
+name: Quick probe REPT BATTERO report pages
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-fx-quick-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe image pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          s=requests.Session(); h={'User-Agent':'Mozilla/5.0','Referer':'https://www.fxbaogao.com/','Accept':'image/*,*/*;q=0.8'}
+          specs=[('4749230','2025/03/27'),('4994227','2025/08/12'),('5063388','2025/09/15'),('5658063','2026/08/31')]
+          out=[]
+          for rid,ds in specs:
+            item={'id':rid,'date':ds,'pages':[]}
+            for p in list(range(1,16))+[20,25,30,35,40,50]:
+              url=f'https://public.fxbaogao.com/report-image/{ds}/{rid}-{p}.png'
+              try:
+                r=s.get(url,headers=h,timeout=(5,10))
+                item['pages'].append({'page':p,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type')})
+                print(rid,p,r.status_code,len(r.content),r.headers.get('content-type'),flush=True)
+              except Exception as e:item['pages'].append({'page':p,'error':repr(e)})
+            out.append(item)
+          Path('rept_fx_quick_probe.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-fx-quick-probe
+          path: rept_fx_quick_probe.json
+          retention-days: 7
