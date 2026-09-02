@@ -1,0 +1,63 @@
+name: Inspect public FX report metadata
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-fxapi-metadata-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Read public report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json
+          import requests
+
+          base = 'https://api.fxbaogao.com'
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          ids = [4894193, 4871262]
+
+          for rid in ids:
+              headers = {
+                  'User-Agent': ua,
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Referer': f'https://www.fxbaogao.com/view?id={rid}',
+                  'Origin': 'https://www.fxbaogao.com',
+                  'x-fp': '',
+                  'x-bot': '',
+              }
+              calls = [
+                  ('GET', f'/mofoun/report/readReport/readReport?reportId={rid}', None),
+                  ('GET', f'/mofoun/report/report/getReportPreviewImages?reportId={rid}', None),
+                  ('GET', f'/mofoun/report/searchReport/detail/catalog?reportId={rid}', None),
+                  ('POST', '/mofoun/report/searchReport/detail', {'id': rid}),
+                  ('POST', '/mofoun/report/searchReport/detail', {'docId': rid}),
+                  ('POST', '/mofoun/report/searchReport/detail', {'reportId': rid}),
+              ]
+              for method, path, payload in calls:
+                  try:
+                      if method == 'GET':
+                          response = requests.get(base + path, headers=headers, timeout=(20, 120))
+                      else:
+                          response = requests.post(
+                              base + path,
+                              headers={**headers, 'Content-Type': 'application/json; charset=UTF-8'},
+                              json=payload,
+                              timeout=(20, 120),
+                          )
+                      print('\nCALL', rid, method, path, payload, flush=True)
+                      print('STATUS', response.status_code, response.headers.get('content-type'), len(response.content), response.url, flush=True)
+                      print(response.text[:60000], flush=True)
+                  except Exception as exc:
+                      print('ERROR', rid, method, path, repr(exc), flush=True)
+          PY
