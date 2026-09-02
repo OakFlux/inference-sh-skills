@@ -1,0 +1,82 @@
+name: Inspect Reportify WeRide report source files
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-reportify-inspect-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Inspect HTML scripts APIs and source URLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re
+          from urllib.parse import urljoin,unquote
+          import requests
+          from bs4 import BeautifulSoup
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,*/*','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          ids=['1156306286569197568','1218993723300515840']
+          scripts=[]
+          for rid in ids:
+              for u in [f'https://reportify.cn/reports/{rid}',f'https://www.reportify.cn/reports/{rid}',f'https://reportify.cn/reports/{rid}?source=search']:
+                  try:
+                      r=s.get(u,headers=h,timeout=(20,120),allow_redirects=True)
+                      print('\nPAGE',rid,u,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                      print('COOKIES',s.cookies.get_dict(),flush=True)
+                      print(r.text[:180000],flush=True)
+                      soup=BeautifulSoup(r.text,'html.parser')
+                      print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+                      for tag in soup.find_all('script',src=True):
+                          src=urljoin(r.url,tag['src']); scripts.append(src); print('SCRIPT',src,flush=True)
+                      for tag in soup.find_all(['a','iframe','embed','object','source','img']):
+                          for attr in ('href','src','data','onclick'):
+                              val=tag.get(attr)
+                              if val and any(k in unquote(val.lower()) for k in (rid.lower(),'pdf','download','file','source','report')):
+                                  print('RESOURCE',tag.name,attr,repr(val),flush=True)
+                      for key in [rid,'pdf','download','sourceUrl','fileUrl','documentUrl','oss','cos','cdn','originUrl','originalUrl','reportUrl','attachment']:
+                          for m in re.finditer(re.escape(key),r.text,re.I):
+                              print('HTMLMATCH',key,repr(r.text[max(0,m.start()-1000):m.start()+2500]),flush=True)
+                  except Exception as e: print('PAGEERR',rid,u,repr(e),flush=True)
+
+          for src in sorted(set(scripts)):
+              try:
+                  r=s.get(src,headers={**h,'Accept':'*/*','Referer':'https://reportify.cn/'},timeout=(20,120))
+                  text=r.text
+                  print('\nJS',src,r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+                  hits=[]
+                  for key in ['pdf','download','sourceUrl','fileUrl','documentUrl','originUrl','originalUrl','attachment','getReport','reports/','reportDetail','reportify-api','api.reportify']:
+                      for m in re.finditer(re.escape(key),text,re.I): hits.append((m.start(),key))
+                  for pos,key in sorted(hits)[:300]:
+                      print('JSMATCH',key,repr(text[max(0,pos-1000):pos+3000]),flush=True)
+              except Exception as e: print('JSERR',src,repr(e),flush=True)
+
+          bases=['https://reportify.cn','https://api.reportify.cn','https://server.reportify.cn','https://reportify.ai']
+          paths=[]
+          for rid in ids:
+              paths += [
+                  f'/api/reports/{rid}',f'/api/report/{rid}',f'/api/v1/reports/{rid}',f'/api/v1/report/{rid}',
+                  f'/api/reports/{rid}/detail',f'/api/report/detail?id={rid}',f'/api/reports/detail?id={rid}',
+                  f'/api/reports/{rid}/download',f'/api/report/download?id={rid}',f'/api/source/reports/{rid}',
+              ]
+          for base in bases:
+              for path in paths:
+                  u=base+path
+                  try:
+                      r=s.get(u,headers={'User-Agent':ua,'Accept':'application/json,text/plain,*/*','Referer':'https://reportify.cn/'},timeout=(10,30),allow_redirects=True)
+                      if r.status_code!=404 or len(r.content)>1000:
+                          print('API',u,r.status_code,r.headers.get('content-type'),len(r.content),r.url,repr(r.text[:5000]),flush=True)
+                  except Exception as e: pass
+          PY
