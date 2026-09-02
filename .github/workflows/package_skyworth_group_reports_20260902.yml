@@ -1,0 +1,424 @@
+name: package-skyworth-group-reports-20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_skyworth_group_reports_20260902.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY_CN = '创维集团'
+          COMPANY_TC = '創維集團'
+          COMPANY_EN = 'SKYWORTH GROUP'
+          STOCK_CODE = '00751'
+          STOCK_ID = '1819'
+          BASE = 'https://www1.hkexnews.hk'
+          SEARCH_URL = BASE + '/search/titlesearch.xhtml'
+          SERVLET_URL = BASE + '/search/titleSearchServlet.do'
+          PACKAGE = '创维集团_2020-2025年报及最新期报'
+
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_skyworth_group_work')
+          work.mkdir(exist_ok=True)
+          previews = work / 'previews'
+          previews.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          session.headers.update({
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': SEARCH_URL + '?lang=zh',
+          })
+
+          def get(url: str, *, params=None, headers=None, timeout=(30, 180), attempts=6):
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = session.get(url, params=params, headers=headers, timeout=timeout, allow_redirects=True)
+                      print('GET', attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      print('GET_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(2 * attempt, 10))
+              raise RuntimeError(f'GET failed for {url}: {last}')
+
+          def post(url: str, *, data=None, headers=None, timeout=(30, 180), attempts=5):
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = session.post(url, data=data, headers=headers, timeout=timeout, allow_redirects=True)
+                      print('POST', attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      print('POST_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(2 * attempt, 10))
+              raise RuntimeError(f'POST failed for {url}: {last}')
+
+          def clean(value: str) -> str:
+              value = html.unescape(value or '')
+              value = re.sub(r'<[^>]+>', ' ', value)
+              return re.sub(r'\s+', ' ', value).strip()
+
+          def query_financial_category(t2code: str, lang: str) -> list[dict]:
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': '20200101',
+                  'toDate': '20260902',
+                  'title': '',
+                  'searchType': '1',
+                  't1code': '40000',
+                  't2Gcode': '-2',
+                  't2code': t2code,
+                  'rowRange': '9999',
+                  'lang': lang,
+              }
+              r = get(SERVLET_URL, params=params, headers={
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Referer': SEARCH_URL + '?lang=' + ('zh' if lang.lower().startswith('z') else 'en'),
+              }, timeout=(30, 150))
+              outer = r.json()
+              result = outer.get('result', '[]') if isinstance(outer, dict) else outer
+              rows = json.loads(result) if isinstance(result, str) and result not in ('', 'null') else result
+              if not isinstance(rows, list):
+                  rows = []
+              parsed = []
+              for item in rows:
+                  if not isinstance(item, dict):
+                      continue
+                  code = clean(str(item.get('STOCK_CODE') or ''))
+                  if STOCK_CODE not in code.replace(' ', ''):
+                      continue
+                  link = str(item.get('FILE_LINK') or '').strip()
+                  if not link:
+                      continue
+                  parsed.append({
+                      'lang': lang,
+                      'title': clean(str(item.get('TITLE') or '')),
+                      'long_text': clean(str(item.get('LONG_TEXT') or '')),
+                      'date_time': clean(str(item.get('DATE_TIME') or '')),
+                      'file_info': clean(str(item.get('FILE_INFO') or item.get('FILE_SIZE') or '')),
+                      'pdf_url': urljoin(BASE + '/', link),
+                      'file_link': link,
+                      'stock_name': clean(str(item.get('STOCK_NAME') or '')),
+                  })
+              print('CATEGORY', t2code, lang, 'COUNT', len(parsed), flush=True)
+              for row in parsed:
+                  print('ROW', json.dumps(row, ensure_ascii=False), flush=True)
+              return parsed
+
+          annual_rows = query_financial_category('40100', 'zh') + query_financial_category('40100', 'EN')
+          interim_rows = query_financial_category('40200', 'zh') + query_financial_category('40200', 'EN')
+
+          # Latest issuer-level periodic disclosure. This is intentionally limited to 2026 and excludes subsidiary results.
+          payload = {
+              'lang': 'EN', 'category': '0', 'market': 'SEHK', 'searchType': '0',
+              'documentType': '-1', 't1code': '-2', 't2Gcode': '-2', 't2code': '-2',
+              'stockId': STOCK_ID, 'from': '20260101', 'to': '20260902',
+              'MB-Daterange': '0', 'title': '',
+          }
+          post(SEARCH_URL + '?lang=en', data=payload, headers={
+              'Accept': 'text/html,application/xhtml+xml,*/*',
+              'Referer': SEARCH_URL + '?lang=en',
+          })
+          params = {
+              'sortDir': '0', 'sortByOptions': 'DateTime', 'category': '0', 'market': 'SEHK',
+              'stockId': STOCK_ID, 'documentType': '-1', 'fromDate': '20260101', 'toDate': '20260902',
+              'title': '', 'searchType': '0', 't1code': '-2', 't2Gcode': '-2', 't2code': '-2',
+              'rowRange': '9999', 'lang': 'EN',
+          }
+          r = get(SERVLET_URL, params=params, headers={
+              'Accept': 'application/json,text/plain,*/*', 'Referer': SEARCH_URL + '?lang=en',
+          }, timeout=(30, 150))
+          outer = r.json()
+          result = outer.get('result', '[]') if isinstance(outer, dict) else outer
+          latest_rows_raw = json.loads(result) if isinstance(result, str) and result not in ('', 'null') else result
+          latest_rows = []
+          if isinstance(latest_rows_raw, list):
+              for item in latest_rows_raw:
+                  code = clean(str(item.get('STOCK_CODE') or ''))
+                  if STOCK_CODE not in code.replace(' ', ''):
+                      continue
+                  link = str(item.get('FILE_LINK') or '').strip()
+                  if not link:
+                      continue
+                  latest_rows.append({
+                      'lang': 'EN',
+                      'title': clean(str(item.get('TITLE') or '')),
+                      'long_text': clean(str(item.get('LONG_TEXT') or '')),
+                      'date_time': clean(str(item.get('DATE_TIME') or '')),
+                      'file_info': clean(str(item.get('FILE_INFO') or item.get('FILE_SIZE') or '')),
+                      'pdf_url': urljoin(BASE + '/', link),
+                      'file_link': link,
+                      'stock_name': clean(str(item.get('STOCK_NAME') or '')),
+                  })
+          print('LATEST_ROWS', len(latest_rows), flush=True)
+          for row in latest_rows:
+              print('LATEST_ROW', json.dumps(row, ensure_ascii=False), flush=True)
+
+          def norm(row: dict) -> str:
+              return clean((row.get('title') or '') + ' ' + (row.get('long_text') or '')).lower()
+
+          def parse_date(value: str):
+              for fmt in ('%d/%m/%Y %H:%M', '%d/%m/%Y', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+                  try:
+                      return datetime.strptime(value, fmt)
+                  except Exception:
+                      pass
+              return datetime.min
+
+          def annual_candidates(year: int) -> list[dict]:
+              items = []
+              for row in annual_rows:
+                  text = norm(row)
+                  if str(year) not in text:
+                      continue
+                  if not ('annual report' in text or '年報' in text or '年报' in text or '年度報告' in text or '年度报告' in text):
+                      continue
+                  if any(x in text for x in ('annual results', '年度業績', '年度业绩', 'announcement', '公告', 'summary', '摘要')):
+                      continue
+                  score = 0
+                  if row['lang'].lower().startswith('z'): score += 100
+                  if '年報' in text or '年报' in text: score += 80
+                  if 'annual report' in text: score += 60
+                  if row['pdf_url'].lower().endswith('_c.pdf'): score += 30
+                  score += min(len(row.get('file_info') or ''), 10)
+                  items.append({**row, 'score': score})
+              items.sort(key=lambda x: (x['score'], parse_date(x['date_time'])), reverse=True)
+              return items
+
+          def full_interim_2026_candidates() -> list[dict]:
+              items = []
+              for row in interim_rows:
+                  text = norm(row)
+                  if '2026' not in text:
+                      continue
+                  if not ('interim report' in text or '中期報告' in text or '中期报告' in text or 'half-year report' in text):
+                      continue
+                  score = 100 + (50 if row['lang'].lower().startswith('z') else 0) + (20 if row['pdf_url'].lower().endswith('_c.pdf') else 0)
+                  items.append({**row, 'score': score})
+              items.sort(key=lambda x: (x['score'], parse_date(x['date_time'])), reverse=True)
+              return items
+
+          def interim_results_2026_candidates() -> list[dict]:
+              items = []
+              for row in latest_rows:
+                  text = norm(row)
+                  if '2026' not in text:
+                      continue
+                  if ('interim results' in text or 'six months ended 30 june 2026' in text) and 'skyworth digital' not in text:
+                      score = 100
+                      if 'announcement of interim results' in text: score += 30
+                      items.append({**row, 'score': score})
+              items.sort(key=lambda x: (x['score'], parse_date(x['date_time'])), reverse=True)
+              return items
+
+          def download_pdf(url: str) -> bytes:
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      response = session.get(url, headers={
+                          'User-Agent': ua,
+                          'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                          'Referer': SEARCH_URL + '?lang=zh',
+                      }, timeout=(30, 480), allow_redirects=True)
+                      print('PDF_GET', attempt, response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50_000:
+                          return response.content
+                      last = RuntimeError(f'HTTP {response.status_code}, {len(response.content)} bytes')
+                  except Exception as exc:
+                      last = exc
+                      print('PDF_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(2 * attempt, 10))
+              raise RuntimeError(f'Unable to download {url}: {last}')
+
+          def compact_text(reader: PdfReader, limit: int = 18) -> str:
+              texts = []
+              for page in reader.pages[:min(len(reader.pages), limit)]:
+                  try:
+                      texts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(texts)).lower()
+
+          def verify_store(candidates: list[dict], filename: str, kind: str, year: int, min_pages: int) -> dict:
+              failures = []
+              for idx, candidate in enumerate(candidates, 1):
+                  try:
+                      data = download_pdf(candidate['pdf_url'])
+                      path = out / filename
+                      path.write_bytes(data)
+                      reader = PdfReader(str(path), strict=False)
+                      pages = len(reader.pages)
+                      if pages < min_pages:
+                          raise RuntimeError(f'too short: {pages} pages')
+                      compact = compact_text(reader)
+                      identity_ok = any(x in compact for x in (
+                          'skyworthgroup', '創維集團', '创维集团', '00751'
+                      ))
+                      if not identity_ok:
+                          raise RuntimeError('company identity validation failed')
+                      if str(year) not in compact and str(year) not in norm(candidate):
+                          raise RuntimeError('reporting year not confirmed')
+                      if kind == 'annual':
+                          if not any(x in compact for x in ('annualreport', '年報', '年报')) and not any(x in norm(candidate) for x in ('annual report', '年報', '年报')):
+                              raise RuntimeError('annual-report identity not confirmed')
+                      if kind in ('interim_report', 'interim_results'):
+                          if not any(x in compact for x in ('interim', '中期', 'sixmonthsended30june2026')) and not any(x in norm(candidate) for x in ('interim', '中期', 'six months ended 30 june 2026')):
+                              raise RuntimeError('interim-period identity not confirmed')
+
+                      q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+                      if q.returncode not in (0, 3):
+                          raise RuntimeError(f'qpdf failed: {q.stderr[-1000:]}')
+                      if q.returncode == 3:
+                          print('QPDF_WARNING', filename, q.stderr[-1000:], flush=True)
+
+                      first = previews / f'{path.stem}_first'
+                      last = previews / f'{path.stem}_last'
+                      subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(path), str(first)], check=True, capture_output=True)
+                      subprocess.run(['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90', str(path), str(last)], check=True, capture_output=True)
+                      if not Path(str(first) + '.png').exists() or not Path(str(last) + '.png').exists():
+                          raise RuntimeError('render validation failed')
+
+                      digest = hashlib.sha256(data).hexdigest()
+                      record = {
+                          'kind': kind,
+                          'report_year': year,
+                          'filename': filename,
+                          'hkex_title': candidate['title'],
+                          'disclosure_time': candidate['date_time'],
+                          'pages': pages,
+                          'bytes': len(data),
+                          'sha256': digest,
+                          'source_url': candidate['pdf_url'],
+                          'source': '香港交易所披露易（HKEXnews）原始PDF',
+                      }
+                      print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+                      return record
+                  except Exception as exc:
+                      failures.append({'title': candidate.get('title'), 'url': candidate.get('pdf_url'), 'error': repr(exc)})
+                      print('CANDIDATE_FAILURE', kind, year, candidate.get('title'), repr(exc), flush=True)
+              raise RuntimeError(f'No valid candidate for {filename}: {failures}')
+
+          records = []
+          for year in range(2020, 2026):
+              candidates = annual_candidates(year)
+              print('ANNUAL_CANDIDATES', year, json.dumps(candidates, ensure_ascii=False, indent=2), flush=True)
+              if not candidates:
+                  raise RuntimeError(f'No annual report candidate found for {year}')
+              records.append(verify_store(candidates, f'{year}年年度报告.pdf', 'annual', year, 90))
+
+          full_interim = full_interim_2026_candidates()
+          interim_results = interim_results_2026_candidates()
+          print('FULL_INTERIM_2026', json.dumps(full_interim, ensure_ascii=False, indent=2), flush=True)
+          print('INTERIM_RESULTS_2026', json.dumps(interim_results, ensure_ascii=False, indent=2), flush=True)
+          if full_interim:
+              records.append(verify_store(full_interim, '2026年中期报告.pdf', 'interim_report', 2026, 40))
+              latest_note = '2026年中期报告'
+          elif interim_results:
+              records.append(verify_store(interim_results, '2026年中期业绩公告.pdf', 'interim_results', 2026, 8))
+              latest_note = '2026年中期业绩公告（完整中期报告尚未在港交所披露）'
+          else:
+              raise RuntimeError('No 2026 issuer-level interim report or interim-results announcement found')
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 PDFs, got {len(records)}')
+          if {r['report_year'] for r in records if r['kind'] == 'annual'} != set(range(2020, 2026)):
+              raise RuntimeError('Annual coverage mismatch')
+          if len({r['sha256'] for r in records}) != len(records):
+              raise RuntimeError('Duplicate PDF detected')
+
+          lines = [
+              '创维集团（00751.HK）2020—2025年报及最新期内报告',
+              '',
+              '本包中的2020—2025年度文件均为香港交易所披露易发布的完整年度报告，不是年度业绩公告、摘要或媒体转载。',
+              f'截至2026年9月2日，创维集团最新的集团层面定期财务披露为：{latest_note}。',
+              '创维数字等上市子公司的季度结果不等同于创维集团本身的季度报告，因此未混入本包。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {record['filename']}",
+                  f"   港交所标题：{record['hkex_title']}",
+                  f"   披露时间：{record['disclosure_time']}；实际页数：{record['pages']}页；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、公司名称或证券代码、报告年度/期间、实际页数、qpdf结构、首页与末页渲染、SHA-256及ZIP CRC。',
+              '年度报告按其覆盖的财政年度命名，而不是按PDF披露年份命名。',
+          ])
+          (out / '报告清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 7')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'REPORTS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-group-2020-2025-annuals-latest-final
+          path: |
+            创维集团_2020-2025年报及最新期报/
+            创维集团_2020-2025年报及最新期报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
