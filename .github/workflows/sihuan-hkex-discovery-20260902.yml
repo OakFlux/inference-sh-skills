@@ -1,0 +1,101 @@
+name: Discover Sihuan 2026 interim results PDF
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sihuan-hkex-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Discover PDF URL
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import html
+          import json
+          import re
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          session = requests.Session()
+          session.trust_env = False
+          endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/json,text/html,*/*',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+
+          def compact(text):
+              return re.sub(r'\s+', '', text or '').upper()
+
+          def normalize_url(value):
+              value = html.unescape(unquote(value or '')).replace('\\/', '/')
+              if value.startswith('/'):
+                  return urljoin('https://www1.hkexnews.hk', value)
+              if value.startswith('listedco/'):
+                  return urljoin('https://www1.hkexnews.hk/', value)
+              return value
+
+          found = []
+          for lang in ('zh', 'en'):
+              params = {
+                  'sortDir': '0', 'sortByOptions': 'DateTime',
+                  'category': '0', 'market': 'SEHK', 'stockId': '-1',
+                  'documentType': '-1', 'fromDate': '20260820',
+                  'toDate': '20260902', 'title': '', 'searchType': '1',
+                  't1code': '40000', 't2Gcode': '-2', 't2code': '-2',
+                  'rowRange': '500', 'lang': lang,
+              }
+              response = session.get(endpoint, params=params, headers=headers, timeout=(30, 180))
+              print('FETCH', lang, response.status_code, len(response.content), response.url, flush=True)
+              response.raise_for_status()
+              outer = response.json()
+              inner = outer.get('result', outer) if isinstance(outer, dict) else outer
+              if not isinstance(inner, str):
+                  inner = json.dumps(inner, ensure_ascii=False)
+              inner = html.unescape(inner).replace('\\/', '/')
+              soup = BeautifulSoup(inner, 'html.parser')
+
+              for row in soup.find_all('tr'):
+                  row_text = ' '.join(row.stripped_strings)
+                  hay = compact(row_text)
+                  company_ok = any(x in hay for x in ('00460', '四環醫藥', '四环医药', 'SIHUANPHARMACEUTICAL'))
+                  type_ok = any(x in hay for x in ('中期業績', '中期业绩', 'INTERIMRESULTS'))
+                  exclude = any(x in hay for x in ('盈利預告', '盈利预告', 'PROFITALERT', '董事會會議', '董事会会议'))
+                  if company_ok:
+                      print('MATCHED_ROW', lang, row_text[:1800], flush=True)
+                      print('MATCHED_HTML', lang, str(row)[:4000], flush=True)
+                  if company_ok and type_ok and not exclude:
+                      for anchor in row.find_all('a', href=True):
+                          url = normalize_url(anchor['href'])
+                          if '.pdf' in url.lower() and url not in found:
+                              found.append(url)
+                              print('FOUND_PDF', url, flush=True)
+
+              for marker in ('00460', '四環醫藥', '四环医药', 'SIHUAN PHARMACEUTICAL'):
+                  for match in re.finditer(re.escape(marker), inner, flags=re.I):
+                      snippet = inner[max(0, match.start() - 2500): min(len(inner), match.end() + 5000)]
+                      hay = compact(BeautifulSoup(snippet, 'html.parser').get_text(' ', strip=True))
+                      if any(x in hay for x in ('中期業績', '中期业绩', 'INTERIMRESULTS')) and not any(x in hay for x in ('盈利預告', '盈利预告', 'PROFITALERT')):
+                          for value in re.findall(r'(?:https?://[^"<>\s]+?\.pdf|/listedco/listconews/[^"<>\s]+?\.pdf|listedco/listconews/[^"<>\s]+?\.pdf)', snippet, flags=re.I):
+                              url = normalize_url(value)
+                              if url not in found:
+                                  found.append(url)
+                                  print('FOUND_SNIPPET_PDF', url, flush=True)
+
+          print('FINAL_FOUND', json.dumps(found, ensure_ascii=False, indent=2), flush=True)
+          if not found:
+              raise SystemExit('No matching Sihuan interim-results PDF found')
+          PY
