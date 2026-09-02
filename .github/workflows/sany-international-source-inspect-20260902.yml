@@ -1,0 +1,65 @@
+name: Inspect Sany International report source metadata
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sany-international-source-inspect-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Query public index and save full metadata
+        run: |
+          python - <<'PY'
+          import json
+          import requests
+          from pathlib import Path
+
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/json,text/plain,*/*',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Origin': 'https://www.sdyanbao.com',
+              'Referer': 'https://www.sdyanbao.com/',
+              'Device': '1',
+              'X-Token': '',
+          }
+          response = requests.post(
+              'https://api.sdyanbao.com/api/file/search',
+              headers=headers,
+              json={'keyword': '三一国际', 'page': 1, 'pageSize': 100, 'opFrom': 1},
+              timeout=(30, 180),
+          )
+          print(response.status_code, len(response.content), response.text[:500])
+          response.raise_for_status()
+          obj = response.json()
+          Path('sany_international_api_full.json').write_text(
+              json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          data = obj.get('data') if isinstance(obj, dict) else None
+          files = data.get('files') if isinstance(data, dict) else []
+          selected = []
+          for item in files if isinstance(files, list) else []:
+              name = str(item.get('name') or '')
+              if '三一国际' in name:
+                  selected.append(item)
+                  print('ITEM', json.dumps(item, ensure_ascii=False, indent=2), flush=True)
+          Path('sany_international_items.json').write_text(
+              json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          PY
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: sany-international-source-metadata
+          path: |
+            sany_international_api_full.json
+            sany_international_items.json
+          if-no-files-found: error
+          retention-days: 7
