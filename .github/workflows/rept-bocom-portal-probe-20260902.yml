@@ -1,0 +1,72 @@
+name: Inspect BOCOM research portal
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-bocom-portal-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Install
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Inspect portal and JS
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re,urllib.parse,hashlib
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          out=Path('bocom_portal'); out.mkdir(exist_ok=True)
+          s=requests.Session(); ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          h={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,application/json,*/*','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          roots=['https://research.bocomgroup.com/portal/','https://research.bocomgroup.com/portal/index.html','https://research.bocomgroup.com/portal/login']
+          result={'pages':[],'assets':[],'probes':[]}; assets=[]
+          for u in roots:
+            try:
+              r=s.get(u,headers=h,timeout=(15,60),allow_redirects=True); text=r.text
+              soup=BeautifulSoup(text,'html.parser')
+              rec={'requested':u,'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'type':r.headers.get('content-type'),'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'links':[], 'scripts':[], 'matches':{}}
+              for a in soup.find_all('a'):
+                if a.get('href'): rec['links'].append(urllib.parse.urljoin(r.url,a.get('href')))
+              for tag,attr in [('script','src'),('link','href')]:
+                for x in soup.find_all(tag):
+                  if x.get(attr):
+                    full=urllib.parse.urljoin(r.url,x.get(attr)); rec['scripts'].append(full); assets.append(full)
+              for k,p in {'absolute_urls':r'https?://[^\"\'<>\\s]+','paths':r'[\"\'](/[^\"\']*(?:api|report|research|download|login|search|file)[^\"\']*)[\"\']','pdfs':r'https?://[^\"\'<>\\s]+?\.pdf(?:\?[^\"\'<>\\s]*)?'}.items(): rec['matches'][k]=list(dict.fromkeys(re.findall(p,text,flags=re.I)))[:500]
+              result['pages'].append(rec); (out/('page_'+hashlib.md5(u.encode()).hexdigest()+'.html')).write_text(text,encoding='utf-8',errors='ignore')
+              print('PAGE',r.status_code,len(r.content),r.url,'title',rec['title'],'assets',len(rec['scripts']),flush=True)
+            except Exception as e: result['pages'].append({'requested':u,'error':repr(e)})
+          for u in list(dict.fromkeys(assets))[:100]:
+            try:
+              r=s.get(u,headers={**h,'Referer':'https://research.bocomgroup.com/portal/'},timeout=(15,60)); text=r.text[:5000000]
+              rec={'url':u,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'matches':{}}
+              for k,p in {'api_paths':r'[\"\'`](/[^\"\'`]*(?:api|report|research|download|search|file|login)[^\"\'`]*)[\"\'`]','absolute_urls':r'https?://[^\"\'`<>\\s]+','keywords':r'.{0,120}(?:download|\.pdf|report|瑞浦兰钧|REPT).{0,180}'}.items():
+                rec['matches'][k]=list(dict.fromkeys(re.findall(p,text,flags=re.I)))[:1500]
+              result['assets'].append(rec); (out/('asset_'+hashlib.md5(u.encode()).hexdigest()+'.txt')).write_text(text,encoding='utf-8',errors='ignore')
+              print('ASSET',r.status_code,len(r.content),u,flush=True)
+            except Exception as e: result['assets'].append({'url':u,'error':repr(e)})
+          # Probe likely report hosts and public endpoints revealed by conventional portal setups.
+          probes=['/portal/api','/portal/api/search','/portal/api/report/search','/portal/report/search','/portal/search','/portal/report','/portal/download','/portal/assets/','/portal/static/']
+          for p in probes:
+            u=urllib.parse.urljoin('https://research.bocomgroup.com',p)
+            try:
+              r=s.get(u,headers=h,timeout=(10,45),allow_redirects=True); result['probes'].append({'url':u,'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'type':r.headers.get('content-type'),'text':r.text[:20000]})
+              print('PROBE',r.status_code,len(r.content),u,'->',r.url,flush=True)
+            except Exception as e: result['probes'].append({'url':u,'error':repr(e)})
+          (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-bocom-portal-probe
+          path: bocom_portal/
+          retention-days: 7
