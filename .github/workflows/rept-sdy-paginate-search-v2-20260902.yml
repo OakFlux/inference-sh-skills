@@ -1,0 +1,74 @@
+name: Paginate Sdyanbao search for REPT BATTERO reports v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-paginate-search-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - run: python -m pip install --quiet requests
+      - name: Paginate and filter report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, time
+          from pathlib import Path
+          import requests
+
+          out=Path('rept_sdy_paginated'); out.mkdir()
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report?keyword=%E7%91%9E%E6%B5%A6%E5%85%B0%E9%92%A7','Device':'1','X-Token':''}
+          matches=[]; audits=[]; seen=set(); total=None
+          for page in range(1,26):
+              body={'device':1,'hideTrader':0,'onlyTitle':0,'order':1,'page':page,'pageSize':100,'keyword':'瑞浦兰钧','pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+              try:
+                  r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=body,timeout=(8,25))
+                  obj=r.json(); data=obj.get('data') if isinstance(obj,dict) else None
+                  rows=data.get('files') if isinstance(data,dict) else []
+                  if total is None and isinstance(data,dict): total=data.get('total')
+                  audits.append({'page':page,'status':r.status_code,'bytes':len(r.content),'row_count':len(rows) if isinstance(rows,list) else None,'total':total})
+                  if not isinstance(rows,list): break
+                  print('PAGE',page,'rows',len(rows),'total',total,flush=True)
+                  for row in rows:
+                      if not isinstance(row,dict): continue
+                      stock=row.get('stock') or {}
+                      name=str(row.get('name') or '')
+                      code=str(stock.get('code') or '')
+                      sname=str(stock.get('name') or '')
+                      exact = code in {'00666','0666','666'} or sname=='瑞浦兰钧' or '瑞浦兰钧(' in name or name.startswith('瑞浦兰钧')
+                      if exact and row.get('id') not in seen:
+                          seen.add(row.get('id')); matches.append(row)
+                          print('MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+                  if not rows or (total and page*100>=int(total)): break
+              except Exception as e:
+                  audits.append({'page':page,'error':repr(e)})
+                  print('ERROR',page,repr(e),flush=True)
+                  break
+              time.sleep(.2)
+          body={'device':1,'hideTrader':0,'onlyTitle':1,'order':1,'page':1,'pageSize':100,'keyword':'瑞浦兰钧','pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+          try:
+              r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=body,timeout=(8,25)); obj=r.json(); data=obj.get('data',{}); rows=data.get('files',[])
+              for row in rows:
+                  if isinstance(row,dict) and row.get('id') not in seen:
+                      seen.add(row.get('id')); matches.append(row)
+          except Exception as e: audits.append({'title_only_error':repr(e)})
+          result={'total_fulltext':total,'matches':matches,'audits':audits}
+          (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_MATCH_COUNT',len(matches),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-paginated-search-v2
+          path: rept_sdy_paginated/
+          retention-days: 7
+          if-no-files-found: error
