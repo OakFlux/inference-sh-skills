@@ -1,0 +1,186 @@
+name: Package depth-focused SJM Holdings broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sjm-broker-package-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download validate and package selected reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf pymupdf
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          out = Path('output')
+          out.mkdir(exist_ok=True)
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+
+          reports = [
+              {
+                  'broker': '华泰证券',
+                  'date': '2024-10-10',
+                  'title': '上葡京爬坡见成效，业务有望重回正轨，上调目标价至4.7港元',
+                  'type': '公司专题/深度更新',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP202410111640256905_1.pdf',
+                  'expected_pages': 7,
+              },
+              {
+                  'broker': '广发证券',
+                  'date': '2020-05-27',
+                  'title': '公司治理改善有望带动盈利能力提升',
+                  'type': '公司专题研究',
+                  'url': 'https://img3.gelonghui.com/pdf/68d8e-6c5399c9-048a-45a6-90d3-c4e5df7e14d0.pdf',
+                  'expected_pages': 9,
+              },
+              {
+                  'broker': '广发证券',
+                  'date': '2019-07-01',
+                  'title': '公司治理改善减少估值折价，成本控制将继续提升利润率',
+                  'type': '公司深度研究',
+                  'url': 'https://img3.gelonghui.com/pdf/3b71c-7208c73c-618c-445d-9de5-6a9716bba7d7.pdf',
+                  'expected_pages': 23,
+              },
+          ]
+
+          records = []
+          pdf_paths = []
+          safe = re.compile(r'[\\/:*?"<>|]')
+
+          for i, report in enumerate(reports, 1):
+              r = session.get(report['url'], headers=headers, timeout=(25, 240), allow_redirects=True)
+              print('DOWNLOAD', i, r.status_code, len(r.content), r.headers.get('content-type'), r.url, flush=True)
+              data = r.content
+              if r.status_code != 200 or not data.startswith(b'%PDF-') or len(data) < 100_000:
+                  raise RuntimeError(f'Invalid PDF response for report {i}')
+
+              reader = PdfReader(BytesIO(data), strict=False)
+              pages = len(reader.pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(f'Unexpected page count for report {i}: {pages}')
+
+              chunks = []
+              for page in reader.pages[:min(8, pages)]:
+                  chunks.append(page.extract_text() or '')
+              text = '\n'.join(chunks)
+              compact = re.sub(r'\s+', '', text).lower()
+              if not any(x in compact for x in ('澳博控股', '澳門博彩控股', '澳门博彩控股', 'sjmholdings', '0880.hk', '00880.hk')):
+                  raise RuntimeError(f'Company verification failed for report {i}')
+              if not any(x in compact for x in ('证券研究报告', '證券研究報告', '公司研究', '研究报告')):
+                  raise RuntimeError(f'Research-report verification failed for report {i}')
+              broker_core = report['broker'].replace('证券', '')
+              if broker_core not in text and report['broker'] not in text:
+                  raise RuntimeError(f'Broker verification failed for report {i}')
+
+              filename = f'{i:02d}_{report["broker"]}_{report["date"]}_{report["title"]}.pdf'
+              filename = safe.sub('_', filename).replace(' ', '')
+              path = out / filename
+              path.write_bytes(data)
+              pdf_paths.append(path)
+
+              # Rasterization check and retained first-page preview for QA.
+              doc = pymupdf.open(path)
+              pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False)
+              cover = out / f'{path.stem}_封面.png'
+              pix.save(cover)
+              doc.close()
+
+              sha = hashlib.sha256(data).hexdigest()
+              records.append({
+                  '序号': i,
+                  '券商': report['broker'],
+                  '报告日期': report['date'],
+                  '报告名称': report['title'],
+                  '报告类型': report['type'],
+                  '页数': pages,
+                  '文件大小_MB': round(len(data) / 1024 / 1024, 2),
+                  'SHA256': sha,
+                  '公开来源': r.url,
+                  '文件名': filename,
+                  '文本核验摘录': re.sub(r'\s+', ' ', text)[:500],
+              })
+              print('VALIDATED', json.dumps({k:v for k,v in records[-1].items() if k != '文本核验摘录'}, ensure_ascii=False), flush=True)
+
+          readme = [
+              '# 澳博控股（00880.HK）券商深度研究报告',
+              '',
+              '- 整理日期：2026-09-02',
+              '- 共3份完整原始PDF；均已核验PDF文件头、页数、封面券商信息、公司名称及正文可解析性。',
+              '- 本包优先保留公司深度、治理专题及经营拐点专题；未纳入仅4页的常规季度点评。',
+              '- 仅供个人研究与学习，请遵守原发布机构的版权及使用条款。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for r in records:
+              readme += [
+                  f'### {r["序号"]}. {r["券商"]}｜{r["报告日期"]}',
+                  f'- {r["报告名称"]}',
+                  f'- 类型：{r["报告类型"]}',
+                  f'- 页数：{r["页数"]}页；大小：{r["文件大小_MB"]} MB',
+                  f'- 文件名：`{r["文件名"]}`',
+                  f'- SHA-256：`{r["SHA256"]}`',
+                  f'- 公开来源：{r["公开来源"]}',
+                  '',
+              ]
+          (out / 'README.md').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{r["SHA256"]}  {r["文件名"]}\n' for r in records), encoding='utf-8'
+          )
+
+          archive = out / '澳博控股_券商深度报告_3份_20260902.zip'
+          with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for p in pdf_paths + [out/'README.md', out/'manifest.json', out/'SHA256SUMS.txt']:
+                  zf.write(p, p.name)
+          archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+          print('ARCHIVE', archive.name, archive.stat().st_size, archive_sha, flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+          ls -lah output
+          find output -maxdepth 1 -type f -print0 | xargs -0 file
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sjm-holdings-depth-reports-20260902
+          path: |
+            output/澳博控股_券商深度报告_3份_20260902.zip
+            output/*.pdf
+            output/README.md
+            output/manifest.json
+            output/SHA256SUMS.txt
+            output/*_封面.png
+          if-no-files-found: error
+          retention-days: 7
