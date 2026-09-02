@@ -1,0 +1,67 @@
+name: Resolve REPT BATTERO known report titles
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-known-title-search-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Resolve titles and probe direct PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import io,json,re,requests
+          from pathlib import Path
+          try:
+            from pypdf import PdfReader
+          except Exception:
+            PdfReader=None
+          s=requests.Session(); ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          h={'User-Agent':ua,'Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','X-Token':'','Device':'1'}
+          kws=['规模效应下毛利率提升','1H25毛利率稳步提升','出货量高增，看好盈利改善趋势','储能业务驱动盈利加速修复','瑞浦兰钧首次覆盖']
+          all=[]; aps=set()
+          for kw in kws:
+            p={'device':1,'hideTrader':0,'onlyTitle':1,'order':1,'page':1,'pageSize':30,'keyword':kw,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+            try:
+              r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=p,timeout=(15,45)); j=r.json(); fs=(j.get('data') or {}).get('files') or []
+              print('SEARCH',kw,'total',(j.get('data') or {}).get('total'),'count',len(fs),flush=True)
+              concise=[]
+              for f in fs:
+                x={k:f.get(k) for k in ['id','name','time_text','page_count','size','file_size','data_source','data_source_uuid','original_id','online_url','page_url','share_url','organization','researcher','stock','type','industry']}
+                concise.append(x); print('FILE',json.dumps(x,ensure_ascii=False),flush=True)
+                if isinstance(x.get('data_source_uuid'),str) and x['data_source_uuid'].startswith('AP'): aps.add(x['data_source_uuid'])
+              all.append({'keyword':kw,'status':r.status_code,'api':j,'concise':concise})
+            except Exception as e: all.append({'keyword':kw,'error':repr(e)})
+          probes=[]
+          for ap in sorted(aps):
+            for prefix in ['H3','H2']:
+              u=f'https://pdf.dfcfw.com/pdf/{prefix}_{ap}_1.pdf'
+              try:
+                r=s.get(u,headers={'User-Agent':ua,'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*;q=0.8'},timeout=(15,90)); x={'ap':ap,'prefix':prefix,'url':u,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'pdf':r.content.startswith(b'%PDF-')}
+                if x['pdf'] and PdfReader:
+                  reader=PdfReader(io.BytesIO(r.content)); x['pages']=len(reader.pages); text='\n'.join((p.extract_text() or '') for p in reader.pages[:6]); x['head']=text[:5000]; x['rept']=any(k in text for k in ['瑞浦兰钧','瑞浦蘭鈞']) or 'REPT BATTERO' in text.upper()
+                  if x['rept']: Path(f'{ap}_{prefix}.pdf').write_bytes(r.content)
+                probes.append(x); print('PDF',json.dumps({k:x.get(k) for k in ['ap','prefix','status','bytes','pdf','pages','rept']},ensure_ascii=False),flush=True)
+              except Exception as e: probes.append({'ap':ap,'prefix':prefix,'url':u,'error':repr(e)})
+          Path('rept_known_titles.json').write_text(json.dumps({'searches':all,'aps':sorted(aps),'probes':probes},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Install parser and repeat PDF metadata if needed
+        run: true
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-known-title-resolution
+          path: |
+            rept_known_titles.json
+            AP*.pdf
+          if-no-files-found: error
+          retention-days: 7
