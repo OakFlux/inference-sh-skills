@@ -1,0 +1,215 @@
+name: Discover Skyworth Group broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-group-broker-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+
+      - name: Search public report sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, re, time
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          out = Path('skyworth-broker-discovery'); out.mkdir(exist_ok=True)
+          s = requests.Session(); s.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Accept':'text/html,application/xhtml+xml,application/json,text/plain,*/*'}
+          results = {'eastmoney':[], 'search_pages':[], 'crawled_pages':[], 'pdf_candidates':[]}
+
+          def clean_url(url, source=''):
+              if not url: return ''
+              url = html.unescape(unquote(str(url))).replace('\\/', '/').strip(' \"\'')
+              if url.startswith('//'): url = 'https:' + url
+              if url.startswith('/') and source.startswith('http'): url = urljoin(source, url)
+              return url
+
+          def add_pdf(url, source, context=''):
+              url = clean_url(url, source)
+              if not url.startswith('http'): return
+              low = url.lower()
+              if '.pdf' not in low and not any(x in low for x in ('download','attachment','file=')): return
+              if any(x['url'] == url for x in results['pdf_candidates']): return
+              results['pdf_candidates'].append({'url':url,'source':source,'context':context[:800]})
+
+          # Eastmoney research report API.
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          code_variants = ['00751','0751','HK00751','00751.HK','116.00751','100.00751']
+          params_list=[]
+          for code in code_variants:
+              for qtype in (0,1):
+                  params_list.append({'pageNo':1,'pageSize':500,'code':code,'qType':qtype,'beginTime':'2010-01-01','endTime':'2026-09-02'})
+          for key in ('title','keyword','searchText','stockName'):
+              params_list.append({'pageNo':1,'pageSize':500,'qType':0,key:'创维集团','beginTime':'2010-01-01','endTime':'2026-09-02'})
+          for params in params_list:
+              try:
+                  r=s.get(endpoint,params=params,headers={**headers,'Referer':'https://data.eastmoney.com/'},timeout=(15,90))
+                  rec={'params':params,'status':r.status_code,'url':r.url,'bytes':len(r.content),'body_head':r.text[:300]}
+                  try:
+                      payload=r.json(); rec['payload_type']=type(payload).__name__
+                      rows=[]
+                      if isinstance(payload,dict):
+                          for key in ('data','result','list'):
+                              value=payload.get(key)
+                              if isinstance(value,list): rows=value; break
+                              if isinstance(value,dict):
+                                  for key2 in ('data','list','items'):
+                                      if isinstance(value.get(key2),list): rows=value[key2]; break
+                      elif isinstance(payload,list): rows=payload
+                      rec['row_count']=len(rows)
+                      filtered=[]
+                      for row in rows:
+                          if not isinstance(row,dict): continue
+                          text=json.dumps(row,ensure_ascii=False)
+                          if any(term.lower() in text.lower() for term in ('创维集团','skyworth group','00751','751 hk')):
+                              filtered.append(row)
+                              info=str(row.get('infoCode') or row.get('infocode') or row.get('INFO_CODE') or '')
+                              if info:
+                                  for prefix in ('H3','H2'):
+                                      add_pdf(f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf',r.url,text)
+                      rec['filtered']=filtered
+                  except Exception as exc: rec['json_error']=repr(exc)
+                  results['eastmoney'].append(rec)
+                  print('EASTMONEY',json.dumps(rec,ensure_ascii=False)[:5000],flush=True)
+              except Exception as exc:
+                  results['eastmoney'].append({'params':params,'error':repr(exc)})
+              time.sleep(.3)
+
+          queries=[
+              '"创维集团" 券商 深度 报告 PDF',
+              '"创维集团" "首次覆盖报告" PDF',
+              '"创维集团" "公司深度报告" PDF',
+              '"创维集团深度" PDF',
+              '"家电行业领军者，分布式光伏开启第二成长曲线" PDF',
+              '"创维集团" "分布式光伏" 研报 PDF',
+              '"创维集团" 天风证券 PDF',
+              '"创维集团" 中金公司 研报 PDF',
+              '"SKYWORTH GROUP" equity research report PDF',
+              '"00751 HK" initiation report PDF',
+              'site:pdf.dfcfw.com "创维集团"',
+              'site:pdf.dfcfw.com "00751" "SKYWORTH"',
+              'site:sgpjbg.com "创维集团"',
+              'site:vzkoo.com "创维集团" 研报',
+              'site:sdyanbao.com "创维集团"',
+              'site:fhyanbao.com "创维集团"',
+              'site:baogaobox.com "创维集团"',
+          ]
+          engines=[
+              ('bing','https://www.bing.com/search?q={q}&count=50'),
+              ('duckduckgo','https://html.duckduckgo.com/html/?q={q}'),
+              ('brave','https://search.brave.com/search?q={q}&source=web'),
+              ('baidu','https://www.baidu.com/s?wd={q}&rn=50'),
+              ('sogou','https://www.sogou.com/web?query={q}&num=50'),
+          ]
+          pages=[]
+          for query in queries:
+              for engine,template in engines:
+                  url=template.format(q=quote_plus(query))
+                  try:
+                      r=s.get(url,headers=headers,timeout=(15,75),allow_redirects=True)
+                      rec={'engine':engine,'query':query,'url':r.url,'status':r.status_code,'bytes':len(r.content)}
+                      links=[]
+                      if r.status_code==200:
+                          soup=BeautifulSoup(r.text,'lxml')
+                          for a in soup.find_all('a',href=True):
+                              href=html.unescape(a['href']); label=' '.join(a.get_text(' ',strip=True).split())
+                              if engine=='duckduckgo' and 'uddg=' in href:
+                                  href=parse_qs(urlparse(href).query).get('uddg',[href])[0]
+                              if engine=='baidu' and href.startswith('/link?'): href=urljoin('https://www.baidu.com',href)
+                              if href.startswith('//'): href='https:'+href
+                              if href.startswith('http'):
+                                  links.append({'url':href,'text':label})
+                                  add_pdf(href,r.url,label)
+                                  if any(d in href for d in ('sgpjbg.com','vzkoo.com','sdyanbao.com','fhyanbao.com','baogaobox.com','eastmoney.com','dfcfw.com','pdf.dfcfw.com','sohu.com','sina.com.cn','xueqiu.com','stockstar.com','cmbi.com.hk')):
+                                      pages.append(href)
+                      rec['links']=links[:200]
+                      results['search_pages'].append(rec)
+                      print('SEARCH',engine,r.status_code,len(r.content),query,flush=True)
+                  except Exception as exc:
+                      results['search_pages'].append({'engine':engine,'query':query,'url':url,'error':repr(exc)})
+                  time.sleep(.3)
+
+          seeds=[
+              'https://www.sgpjbg.com/baogao/98867.html',
+              'https://www.sgpjbg.com/baogao/98867.html?from=search',
+              'https://www.vzkoo.com/search?keyword=%E5%88%9B%E7%BB%B4%E9%9B%86%E5%9B%A2',
+              'https://www.sdyanbao.com/search?keyword=%E5%88%9B%E7%BB%B4%E9%9B%86%E5%9B%A2',
+              'https://www.fhyanbao.com/search?keyword=%E5%88%9B%E7%BB%B4%E9%9B%86%E5%9B%A2',
+          ]
+          uniq=[]
+          for u in seeds+pages:
+              if u not in uniq: uniq.append(u)
+          for u in uniq[:180]:
+              try:
+                  r=s.get(u,headers=headers,timeout=(15,90),allow_redirects=True)
+                  rec={'requested':u,'url':r.url,'status':r.status_code,'bytes':len(r.content)}
+                  if r.status_code==200:
+                      text=r.text; soup=BeautifulSoup(text,'lxml')
+                      rec['title']=soup.title.get_text(' ',strip=True) if soup.title else ''
+                      for pat in (r'https?://[^\"\'<>\\s]+?\.pdf(?:\?[^\"\'<>\\s]*)?',r'(?i)(?:pdf|download|attachment|file|url)[\"\']?\s*[:=]\s*[\"\']([^\"\']+)'):
+                          try:
+                              for m in re.findall(pat,text,flags=re.I): add_pdf(m,r.url,'regex')
+                          except Exception: pass
+                      links=[]
+                      for tag in soup.find_all(True):
+                          for attr in ('href','src','data','data-src','data-url','data-file'):
+                              val=tag.get(attr)
+                              if isinstance(val,str) and val:
+                                  full=clean_url(val,r.url); context=' '.join(tag.get_text(' ',strip=True).split())
+                                  add_pdf(full,r.url,context or tag.name)
+                                  if full.startswith('http'): links.append({'url':full,'text':context[:200]})
+                      rec['links']=links[:300]
+                      rec['interesting']=[line.strip()[:1500] for line in text.splitlines() if any(k in line.lower() for k in ('pdf','downloadurl','attachment','infocode','reportid','fileurl'))][:150]
+                  results['crawled_pages'].append(rec)
+                  print('CRAWL',r.status_code,len(r.content),u,r.url,flush=True)
+              except Exception as exc:
+                  results['crawled_pages'].append({'requested':u,'error':repr(exc)})
+              time.sleep(.3)
+
+          # Probe all candidate links.
+          for candidate in results['pdf_candidates']:
+              try:
+                  r=s.get(candidate['url'],headers={**headers,'Accept':'application/pdf,*/*'},timeout=(15,90),allow_redirects=True,stream=True)
+                  first=next(r.iter_content(32),b'')
+                  candidate.update({'probe_status':r.status_code,'probe_final_url':r.url,'probe_type':r.headers.get('content-type',''),'probe_length':r.headers.get('content-length',''),'probe_pdf':first.startswith(b'%PDF-')})
+                  r.close()
+              except Exception as exc: candidate['probe_error']=repr(exc)
+              print('PROBE',json.dumps(candidate,ensure_ascii=False),flush=True)
+
+          (out/'discovery.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          summary={
+              'eastmoney_matches':sum(len(x.get('filtered',[])) for x in results['eastmoney']),
+              'search_pages':len(results['search_pages']),
+              'crawled_pages':len(results['crawled_pages']),
+              'pdf_candidates':len(results['pdf_candidates']),
+              'working_pdfs':[x for x in results['pdf_candidates'] if x.get('probe_pdf')],
+          }
+          (out/'summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY',json.dumps(summary,ensure_ascii=False,indent=2),flush=True)
+          PY
+
+      - name: Upload discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-group-broker-discovery
+          path: skyworth-broker-discovery/
+          if-no-files-found: error
+          retention-days: 7
