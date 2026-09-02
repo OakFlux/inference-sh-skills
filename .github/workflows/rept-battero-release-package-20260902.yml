@@ -1,0 +1,49 @@
+name: Publish verified REPT BATTERO broker report package
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-release-package-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Build and validate package
+        run: python .github/scripts/package_rept_battero_reports.py
+
+      - name: Publish release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: rept-battero-broker-reports-20260902
+        run: |
+          cp '瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版.zip' REPT_BATTERO_00666HK_Broker_Deep_Reports_2.zip
+          gh release delete "$TAG" --yes --cleanup-tag || true
+          gh release create "$TAG" REPT_BATTERO_00666HK_Broker_Deep_Reports_2.zip FINAL_ZIP_SHA256.txt \
+            --title 'REPT BATTERO (00666.HK) Broker Deep Reports' \
+            --notes 'Two complete broker deep reports, 46 pages in total. PDF structure, first/last page rendering, SHA-256 and ZIP CRC verified.'
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-broker-reports-release-copy
+          path: |
+            瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
