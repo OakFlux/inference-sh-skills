@@ -1,0 +1,235 @@
+name: Package Sihuan reports with font-safe validation
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sihuan-periodic-reports-final-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Build verified archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '四环医药_00460_2020-2025年报及最新半年报'
+          output_dir = Path(PACKAGE)
+          work_dir = Path('_work')
+          preview_dir = work_dir / 'previews'
+          output_dir.mkdir(exist_ok=True)
+          preview_dir.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              (1, 2020, '年度报告', '01_四环医药_2020年年度报告.pdf', 'https://ir.sihuanpharm.com/media/wn3js2eh/2020-ar.pdf', 200),
+              (2, 2021, '年度报告', '02_四环医药_2021年年度报告.pdf', 'https://ir.sihuanpharm.com/media/fjhlecue/2021-annual-report.pdf', 200),
+              (3, 2022, '年度报告', '03_四环医药_2022年年度报告.pdf', 'https://ir.sihuanpharm.com/media/pu1ncuyj/c22ar.pdf', 200),
+              (4, 2023, '年度报告', '04_四环医药_2023年年度报告.pdf', 'https://ir.sihuanpharm.com/media/okqbni3v/sihuan-23ar.pdf', 200),
+              (5, 2024, '年度报告', '05_四环医药_2024年年度报告.pdf', 'https://ir.sihuanpharm.com/media/m0ncd4i0/hkex-eps_20250428_11646350_0.pdf', 200),
+              (6, 2025, '年度报告', '06_四环医药_2025年年度报告.pdf', 'https://ir.sihuanpharm.com/media/4xghdcny/hkex-eps_20260427_12124140_0.pdf', 200),
+              (7, 2026, '中期业绩公告', '07_四环医药_2026年中期业绩公告_截至2026年6月30日.pdf', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082600208_c.pdf', 10),
+              (8, 2025, '中期报告', '08_四环医药_2025年中期报告_最新完整中报.pdf', 'https://ir.sihuanpharm.com/media/hk3jhyix/hkex-eps_20250915_11841229_0.pdf', 50),
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          base_headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
+          }
+
+          def compact(value):
+              return re.sub(r'\s+', '', value or '').upper()
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with open(path, 'rb') as handle:
+                  for block in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def download(url):
+              errors = []
+              for attempt in range(1, 6):
+                  for referer in ('https://ir.sihuanpharm.com/', 'https://www1.hkexnews.hk/', 'https://www.hkexnews.hk/'):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={**base_headers, 'Referer': referer},
+                              timeout=(30, 900),
+                              allow_redirects=True,
+                          )
+                          print('GET', attempt, response.status_code, len(response.content), response.url, flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 20000:
+                              return response
+                          errors.append(f'{response.status_code}/{len(response.content)}')
+                      except Exception as exc:
+                          errors.append(repr(exc))
+                  time.sleep(min(attempt * 2, 8))
+              raise RuntimeError('Download failed: ' + ' | '.join(errors[-12:]))
+
+          def text_sample(reader):
+              chunks = []
+              for page in reader.pages[:min(45, len(reader.pages))]:
+                  try:
+                      chunks.append(page.extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', repr(exc), flush=True)
+              return compact('\n'.join(chunks))
+
+          def validate(path, index, year, kind, minimum_pages):
+              with open(path, 'rb') as handle:
+                  if handle.read(5) != b'%PDF-':
+                      raise RuntimeError('PDF header missing')
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < minimum_pages:
+                  raise RuntimeError(f'Unexpected page count: {pages}')
+
+              sample = text_sample(reader)
+              company_ok = any(marker in sample for marker in (
+                  compact('四環醫藥'),
+                  compact('四环医药'),
+                  'SIHUANPHARMACEUTICAL',
+                  '00460',
+                  '0460',
+              ))
+              if not company_ok:
+                  raise RuntimeError('Company identity not found in extracted text')
+
+              chinese_years = {
+                  2020: '二零二零',
+                  2021: '二零二一',
+                  2022: '二零二二',
+                  2023: '二零二三',
+                  2024: '二零二四',
+                  2025: '二零二五',
+                  2026: '二零二六',
+              }
+              if str(year) not in sample and chinese_years[year] not in sample:
+                  raise RuntimeError(f'Year {year} not found in extracted text')
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError('qpdf failed: ' + qpdf.stderr[-1200:])
+              if qpdf.returncode == 3:
+                  print('QPDF_WARNING', qpdf.stderr[-1200:], flush=True)
+
+              for label, page_number in (('first', 1), ('last', pages)):
+                  prefix = preview_dir / f'{index:02d}_{label}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_number), '-singlefile', '-png', '-r', '72', str(path), str(prefix)],
+                      check=True,
+                      capture_output=True,
+                  )
+                  image = Path(str(prefix) + '.png')
+                  if not image.exists() or image.stat().st_size < 1000:
+                      raise RuntimeError(f'{label} page render failed')
+
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+              }
+
+          manifest = []
+          hashes = set()
+          for index, year, kind, filename, url, minimum_pages in reports:
+              response = download(url)
+              temporary = work_dir / f'{index:02d}.pdf'
+              temporary.write_bytes(response.content)
+              metadata = validate(temporary, index, year, kind, minimum_pages)
+              if metadata['sha256'] in hashes:
+                  raise RuntimeError(f'Duplicate PDF: {filename}')
+              hashes.add(metadata['sha256'])
+              shutil.copy2(temporary, output_dir / filename)
+              record = {
+                  'filename': filename,
+                  'year': year,
+                  'report_type': kind,
+                  'source_url': response.url,
+                  **metadata,
+              }
+              manifest.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(manifest) != 8:
+              raise RuntimeError(f'Expected 8 PDFs, got {len(manifest)}')
+
+          lines = [
+              '四环医药控股集团有限公司（00460.HK）定期报告资料包',
+              '',
+              '内容：2020—2025年完整年度报告；2026年8月26日港交所披露的截至2026年6月30日止六个月中期业绩公告；公司官网当前最新的2025年完整中期报告。',
+              '',
+          ]
+          for item in manifest:
+              lines.extend([
+                  f"- {item['filename']}",
+                  f"  类型：{item['report_type']}｜年份：{item['year']}｜页数：{item['pages']}｜大小：{item['bytes']} bytes",
+                  f"  官方来源：{item['source_url']}",
+                  f"  SHA-256：{item['sha256']}",
+              ])
+          lines.extend([
+              '',
+              '核验：PDF文件头、公司名称或证券代码、报告年份、实际页数、qpdf结构检查、首页与末页渲染、SHA-256、ZIP文件数及CRC。',
+              '注：2026年中期业绩公告的内嵌字体会影响部分中文标题的机器抽取，因此该文件通过港交所原始地址、公司与年份匹配、页数、结构及渲染联合核验。',
+          ])
+          (output_dir / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (output_dir / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (output_dir / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{item['sha256']}  {item['filename']}\n" for item in manifest),
+              encoding='utf-8',
+          )
+
+          archive = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as bundle:
+              for file in sorted(output_dir.rglob('*')):
+                  if file.is_file():
+                      bundle.write(file, arcname=f'{output_dir.name}/{file.relative_to(output_dir)}')
+
+          with zipfile.ZipFile(archive) as bundle:
+              bad = bundle.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in bundle.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'Archive PDF count is {len(pdfs)}, expected 8')
+              print('ZIP_MEMBERS', json.dumps(bundle.namelist(), ensure_ascii=False, indent=2), flush=True)
+
+          print('FINAL_ZIP', archive.name, archive.stat().st_size, sha256(archive), flush=True)
+          PY
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: sihuan-pharmaceutical-00460-reports-final-v2-20260902
+          path: 四环医药_00460_2020-2025年报及最新半年报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
