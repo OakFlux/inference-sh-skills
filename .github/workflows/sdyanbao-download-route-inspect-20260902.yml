@@ -1,0 +1,93 @@
+name: Inspect Sdyanbao public download routes
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sdyanbao-download-route-inspect-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+
+      - name: Fetch detail pages and scripts
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          out = Path('sdy_inspect'); out.mkdir(exist_ok=True)
+          s = requests.Session(); s.trust_env = False
+          hdr = {
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+          pages = [
+              'https://www.sdyanbao.com/detail/916241',
+              'https://www.sdyanbao.com/detail/906591',
+          ]
+          scripts = set()
+          report = []
+          for idx,url in enumerate(pages,1):
+              r=s.get(url,headers=hdr,timeout=(30,180)); print('PAGE',idx,r.status_code,len(r.content),r.url,r.headers.get('content-type'))
+              r.raise_for_status(); text=r.text
+              (out/f'page_{idx}.html').write_text(text,encoding='utf-8')
+              soup=BeautifulSoup(text,'html.parser')
+              rec={'url':r.url,'scripts':[],'links':[],'forms':[],'inline_hits':[]}
+              for sc in soup.find_all('script',src=True):
+                  u=urljoin(r.url,html.unescape(sc['src'])); scripts.add(u); rec['scripts'].append(u)
+              for a in soup.find_all('a',href=True):
+                  u=urljoin(r.url,html.unescape(a['href']));
+                  if any(k in u.lower() for k in ('download','file','pdf','api','detail')): rec['links'].append({'text':a.get_text(' ',strip=True),'url':u})
+              for form in soup.find_all('form'):
+                  rec['forms'].append({'action':urljoin(r.url,form.get('action') or ''),'method':form.get('method'),'html':str(form)[:3000]})
+              for m in re.finditer(r'.{0,180}(?:download|立即下载|file_url|fileurl|pdf|original_id|data_source_uuid|api/file).{0,300}',text,flags=re.I|re.S):
+                  rec['inline_hits'].append(m.group(0))
+              report.append(rec)
+              print('REC',idx,json.dumps(rec,ensure_ascii=False,indent=2)[:30000])
+
+          asset_meta=[]
+          for i,u in enumerate(sorted(scripts),1):
+              try:
+                  r=s.get(u,headers={**hdr,'Referer':pages[0]},timeout=(30,180)); print('SCRIPT',i,r.status_code,len(r.content),r.url)
+                  if r.status_code!=200 or len(r.content)>8_000_000: continue
+                  data=r.content; (out/f'script_{i:03d}.js').write_bytes(data)
+                  text=r.text
+                  hits=[]
+                  patterns=[
+                      r'.{0,250}(?:download|file/download|downloadFile|fileUrl|file_url|original_id|data_source_uuid|page_url|online_url|/api/file/).{0,500}',
+                      r'["\']([^"\']*(?:download|file|pdf|api)[^"\']*)["\']',
+                  ]
+                  for pat in patterns:
+                      for m in re.finditer(pat,text,flags=re.I|re.S):
+                          val=m.group(0)
+                          if val not in hits: hits.append(val)
+                          if len(hits)>=500: break
+                      if len(hits)>=500: break
+                  if hits:
+                      (out/f'script_{i:03d}_hits.txt').write_text('\n\n---\n\n'.join(hits),encoding='utf-8')
+                      print('HITS',i,'\n'.join(hits[:40])[:30000])
+                  asset_meta.append({'url':u,'status':r.status_code,'length':len(data),'hits':len(hits)})
+              except Exception as e:
+                  print('SCRIPT_ERROR',u,repr(e))
+          (out/'report.json').write_text(json.dumps({'pages':report,'assets':asset_meta},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdyanbao-download-route-inspection
+          path: sdy_inspect/
+          if-no-files-found: error
+          retention-days: 7
