@@ -1,0 +1,64 @@
+name: Inspect official broker research portals for WeRide PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-official-research-portals-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Inspect official research portal HTML JS and APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          sites=[
+            ('gs','https://research.gszq.com/'),
+            ('eb','https://research.ebscn.com/'),
+            ('ht','https://research.htsc.com.cn/'),
+            ('gx','https://www.guosen.com.cn/gs/research/'),
+            ('db','https://www.nesc.cn/'),
+            ('cms','https://www.cmschina.com/'),
+          ]
+          for tag,root in sites:
+            s=requests.Session(); s.trust_env=False
+            try:
+              r=s.get(root,headers={'User-Agent':UA,'Accept':'text/html,*/*','Accept-Language':'zh-CN,zh;q=0.9'},timeout=(20,90),allow_redirects=True)
+              print('\n===SITE',tag,root,r.status_code,r.headers.get('content-type'),len(r.content),r.url,'===',flush=True)
+              print(r.text[:30000],flush=True)
+              soup=BeautifulSoup(r.text,'html.parser')
+              scripts=[urljoin(r.url,x.get('src')) for x in soup.find_all('script',src=True)]
+              print('SCRIPTS',json.dumps(scripts,ensure_ascii=False),flush=True)
+              for src in scripts[:30]:
+                try:
+                  rr=s.get(src,headers={'User-Agent':UA,'Accept':'*/*','Referer':r.url},timeout=(20,90))
+                  text=rr.text
+                  hits=[]
+                  for key in ['api','report','research','download','attachment','fileUrl','pdf','search','graphql','axios','baseURL']:
+                    for m in re.finditer(key,text,re.I): hits.append((m.start(),key))
+                  if hits:
+                    print('\nJSFILE',tag,src,rr.status_code,len(rr.content),flush=True)
+                    seen=[]
+                    for pos,key in sorted(hits):
+                      snippet=text[max(0,pos-500):pos+1200]
+                      if snippet in seen: continue
+                      seen.append(snippet)
+                      print('JSHIT',key,repr(snippet[:1800]),flush=True)
+                      if len(seen)>=80: break
+                except Exception as e: print('JSERR',tag,src,repr(e),flush=True)
+            except Exception as e: print('SITEERR',tag,root,repr(e),flush=True)
+          PY
