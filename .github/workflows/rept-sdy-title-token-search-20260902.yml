@@ -1,0 +1,47 @@
+name: Search Sdyanbao title tokens for REPT BATTERO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-title-token-search-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Query title tokens
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import concurrent.futures,json,requests
+          from pathlib import Path
+          URL='https://api.sdyanbao.com/api/file/search'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          H={'User-Agent':UA,'Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','X-Token':'','Device':'1'}
+          kws=['规模效应','毛利率提升','动力电池业务','上调至买入','1H25','全年亏损大幅收窄','上调盈利预测及目标价','出货量高增','盈利改善趋势','储能业务驱动','首次覆盖','海外营收快速增长']
+          def q(kw):
+            p={'device':1,'hideTrader':0,'onlyTitle':1,'order':1,'page':1,'pageSize':100,'keyword':kw,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+            try:
+              r=requests.post(URL,headers=H,json=p,timeout=(10,45)); j=r.json(); d=j.get('data') if isinstance(j,dict) else None; fs=d.get('files') if isinstance(d,dict) else []
+              return {'keyword':kw,'http':r.status_code,'status':j.get('status') if isinstance(j,dict) else None,'total':d.get('total') if isinstance(d,dict) else None,'files':[{k:f.get(k) for k in ['id','name','time_text','page_count','file_size','data_source','data_source_uuid','original_id','page_url','share_url','organization','researcher','stock','type','industry','summary']} for f in fs] if isinstance(fs,list) else [],'raw':j}
+            except Exception as e:return {'keyword':kw,'error':repr(e)}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex: out=list(ex.map(q,kws))
+          for x in out:
+            print('QUERY',x['keyword'],'status',x.get('status'),'total',x.get('total'),'files',len(x.get('files',[])),'err',x.get('error'),flush=True)
+            for f in x.get('files',[]):
+              if any(k in json.dumps(f,ensure_ascii=False) for k in ['瑞浦兰钧','瑞浦蘭鈞','REPT BATTERO','666 HK','00666','0666.HK']) or x['keyword'] in ['规模效应','1H25','出货量高增','海外营收快速增长']:
+                print('FILE',x['keyword'],json.dumps(f,ensure_ascii=False),flush=True)
+          Path('rept_title_token_search.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-title-token-search
+          path: rept_title_token_search.json
+          retention-days: 7
