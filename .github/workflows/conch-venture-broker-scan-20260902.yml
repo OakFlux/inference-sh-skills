@@ -1,0 +1,69 @@
+name: Scan China Conch Venture broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-broker-scan-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Probe public report APIs and search pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re
+          from urllib.parse import quote
+          import requests
+          from bs4 import BeautifulSoup
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session()
+          headers={'User-Agent':ua,'Accept':'application/json,text/html,*/*','Referer':'https://data.eastmoney.com/'}
+
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          for code in ['00586','00586.HK','586','HK00586']:
+              for qtype in [0,1,2]:
+                  try:
+                      r=s.get(endpoint,params={'pageNo':1,'pageSize':200,'code':code,'qType':qtype,'beginTime':'2015-01-01','endTime':'2026-09-02'},headers=headers,timeout=(20,120))
+                      print('\n=== EASTMONEY',code,qtype,r.status_code,r.headers.get('content-type'),len(r.content),r.url,'===',flush=True)
+                      print(r.text[:30000],flush=True)
+                  except Exception as e:
+                      print('EASTMONEY_ERROR',code,qtype,repr(e),flush=True)
+
+          queries=[
+              '海螺创业 00586 研报 pdf',
+              '海螺创业 深度报告 pdf',
+              '海螺创业 首次覆盖 pdf',
+              'China Conch Venture 00586 research report pdf',
+              'site:pdf.dfcfw.com 海螺创业',
+              'site:reportify.cn 海螺创业 研报',
+              'site:hibor.com.cn 海螺创业 00586',
+              'site:nxny.com/report 海螺创业',
+          ]
+          for query in queries:
+              for engine in [
+                  'https://www.bing.com/search?q='+quote(query),
+                  'https://www.baidu.com/s?wd='+quote(query),
+              ]:
+                  try:
+                      r=s.get(engine,headers={'User-Agent':ua,'Accept':'text/html,*/*'},timeout=(20,120))
+                      print('\n=== SEARCH',query,engine.split('/')[2],r.status_code,len(r.content),r.url,'===',flush=True)
+                      soup=BeautifulSoup(r.text,'html.parser')
+                      for a in soup.find_all('a',href=True):
+                          text=' '.join(a.get_text(' ',strip=True).split())
+                          href=a.get('href','')
+                          hay=(text+' '+href).lower()
+                          if any(k in hay for k in ['海螺创业','conch venture','00586','pdf.dfcfw','reportify','hibor','nxny']):
+                              print('LINK',repr(text[:300]),repr(href[:1000]),flush=True)
+                  except Exception as e:
+                      print('SEARCH_ERROR',query,engine,repr(e),flush=True)
+          PY
