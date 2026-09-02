@@ -1,0 +1,154 @@
+name: Package complete REPT BATTERO broker deep reports v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-final-package-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Download page images, build PDFs, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, io, json, subprocess, time, zipfile
+          from pathlib import Path
+          import img2pdf, requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE='瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版'
+          OUT=Path(PACKAGE); WORK=Path('_work'); RENDERS=WORK/'renders'
+          OUT.mkdir(exist_ok=True); RENDERS.mkdir(parents=True,exist_ok=True)
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          session=requests.Session()
+          specs=[
+            {
+              'order':1,'institution':'海通国际','date':'2024-05-31','pages':22,
+              'type':'首次覆盖报告','rating':'优于大市','researchers':'陈兆庆、曾彪',
+              'title':'青山集团旗下锂电池公司，海外营收快速增长',
+              'detail':'https://www.sdyanbao.com/detail/768016',
+              'base':'https://oss.sdyanbao.com/page/2024/5/31/1017103',
+              'filename':'01_海通国际_瑞浦兰钧_首次覆盖_青山集团旗下锂电池公司海外营收快速增长_2024-05-31_22页.pdf',
+            },
+            {
+              'order':2,'institution':'华龙证券','date':'2024-07-26','pages':24,
+              'type':'公司深度报告','rating':'未标注','researchers':'未标注',
+              'title':'动力电池老兵焕发新活力，多元赛道助力全球布局',
+              'detail':'https://www.sdyanbao.com/detail/780251',
+              'base':'https://oss.sdyanbao.com/page/2024/7/26/1032354',
+              'filename':'02_华龙证券_瑞浦兰钧_动力电池老兵焕发新活力多元赛道助力全球布局_2024-07-26_24页.pdf',
+            },
+          ]
+
+          def digest(path:Path)->str:
+            h=hashlib.sha256()
+            with path.open('rb') as f:
+              for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+            return h.hexdigest()
+
+          def fetch_image(url:str,referer:str):
+            errors=[]
+            for attempt in range(1,5):
+              try:
+                r=session.get(url,headers={'User-Agent':UA,'Accept':'image/avif,image/webp,image/apng,image/png,image/jpeg,image/*,*/*;q=0.8','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Referer':referer},timeout=(20,180),allow_redirects=True)
+                print('GET',url,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                if r.status_code==200 and len(r.content)>5000: return r.content,r.url,r.headers.get('content-type','')
+                errors.append(f'{r.status_code}/{len(r.content)}')
+              except Exception as e: errors.append(repr(e))
+              time.sleep(attempt)
+            raise RuntimeError(f'fetch failed {url}: {errors}')
+
+          def build(spec):
+            page_dir=WORK/f"pages_{spec['order']:02d}"; page_dir.mkdir(parents=True,exist_ok=True)
+            images=[]; page_manifest=[]
+            for idx in range(spec['pages']):
+              url=f"{spec['base']}/{idx}.png"
+              body,final_url,ctype=fetch_image(url,spec['detail'])
+              with Image.open(io.BytesIO(body)) as im: im.verify()
+              with Image.open(io.BytesIO(body)) as im:
+                width,height=im.size; fmt=(im.format or '').upper()
+                if width<500 or height<700: raise RuntimeError(f'page {idx+1} too small: {width}x{height}')
+                dest=page_dir/f'{idx+1:03d}.png'
+                im.convert('RGB').save(dest,format='PNG',optimize=False)
+              images.append(dest)
+              page_manifest.append({'page':idx+1,'source_url':final_url,'source_content_type':ctype,'source_format':fmt,'width':width,'height':height,'source_bytes':len(body),'source_sha256':hashlib.sha256(body).hexdigest(),'normalized_sha256':digest(dest)})
+              print('PAGE_OK',spec['order'],idx+1,fmt,width,height,len(body),flush=True)
+            if len(images)!=spec['pages']: raise RuntimeError('incomplete page set')
+            if len({x['source_sha256'] for x in page_manifest})!=spec['pages']: raise RuntimeError('duplicate source page images')
+            pdf=OUT/spec['filename']; pdf.write_bytes(img2pdf.convert([str(p) for p in images]))
+            if not pdf.read_bytes().startswith(b'%PDF-'): raise RuntimeError('PDF signature missing')
+            reader=PdfReader(str(pdf),strict=False); actual=len(reader.pages)
+            if actual!=spec['pages']: raise RuntimeError(f'PDF pages {actual} != {spec["pages"]}')
+            q=subprocess.run(['qpdf','--check',str(pdf)],capture_output=True,text=True)
+            if q.returncode not in (0,3): raise RuntimeError(q.stderr[-1000:])
+            render_checks=[]
+            for label,pageno in [('first',1),('last',actual)]:
+              prefix=RENDERS/f'{pdf.stem}_{label}'
+              subprocess.run(['pdftoppm','-f',str(pageno),'-singlefile','-png','-r','120',str(pdf),str(prefix)],check=True,capture_output=True)
+              png=Path(str(prefix)+'.png')
+              if not png.exists() or png.stat().st_size<10000: raise RuntimeError(f'render failed {label}')
+              with Image.open(png) as im: rw,rh=im.size
+              if rw<700 or rh<900: raise RuntimeError(f'render too small {rw}x{rh}')
+              render_checks.append({'label':label,'page':pageno,'file':png.name,'bytes':png.stat().st_size,'width':rw,'height':rh})
+            return {
+              **spec,'company':'瑞浦兰钧','company_en':'REPT BATTERO Energy Co., Ltd.','ticker':'00666.HK',
+              'source_type':'公开逐页原版图像按原页序无损合成PDF','source_image_pattern':spec['base']+'/{page_index_0_based}.png',
+              'image_manifest':page_manifest,'pdf_bytes':pdf.stat().st_size,'pdf_sha256':digest(pdf),'render_checks':render_checks,
+            }
+
+          records=[build(s) for s in specs]
+          if len({r['pdf_sha256'] for r in records})!=2: raise RuntimeError('duplicate PDFs')
+          if sum(r['pages'] for r in records)!=46: raise RuntimeError('combined pages mismatch')
+
+          lines=['瑞浦兰钧能源股份有限公司（REPT BATTERO，00666.HK）券商深度报告合集','整理日期：2026-09-02','','一、收录报告']
+          for r in records:
+            lines += [f"{r['order']}. {r['institution']}｜{r['date']}｜{r['type']}｜{r['pages']}页",f"   标题：{r['title']}",f"   评级：{r['rating']}；分析师：{r['researchers']}",f"   文件：{r['filename']}",f"   SHA-256：{r['pdf_sha256']}",'']
+          lines += ['二、版本说明','两份报告均由公开详情页对应的逐页原版图像，按照报告原页序逐页无损合成为PDF；未改写、删页或重排。','公开渠道中另有2025年及2026年跟踪报告，但目前只开放前两页预览，因此未混入本包。','','三、核验项目','已核验逐页数量与顺序、图像格式与尺寸、重复页、PDF文件头、实际页数、qpdf结构、首页及末页渲染、SHA-256、PDF去重及ZIP CRC。','资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。']
+          (OUT/'00_报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          with (OUT/'报告清单.csv').open('w',encoding='utf-8-sig',newline='') as f:
+            fields=['序号','机构','报告日期','报告类型','标题','评级','分析师','页数','文件大小_字节','版本','SHA256','来源页面','文件名']
+            w=csv.DictWriter(f,fieldnames=fields); w.writeheader()
+            for r in records:
+              w.writerow({'序号':r['order'],'机构':r['institution'],'报告日期':r['date'],'报告类型':r['type'],'标题':r['title'],'评级':r['rating'],'分析师':r['researchers'],'页数':r['pages'],'文件大小_字节':r['pdf_bytes'],'版本':r['source_type'],'SHA256':r['pdf_sha256'],'来源页面':r['detail'],'文件名':r['filename']})
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f"{r['pdf_sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          zpath=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+            for p in sorted(OUT.iterdir()): z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zpath) as z:
+            bad=z.testzip()
+            if bad: raise RuntimeError(f'ZIP CRC failure: {bad}')
+            if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=2: raise RuntimeError('ZIP PDF count mismatch')
+          zh=digest(zpath); Path('FINAL_ZIP_SHA256.txt').write_text(f'{zh}  {zpath.name}\n',encoding='utf-8')
+          print('FINAL_ZIP',zpath,zpath.stat().st_size,zh,flush=True)
+          print('FINAL_RECORDS',json.dumps([{k:r[k] for k in ['order','institution','date','title','pages','pdf_bytes','pdf_sha256']} for r in records],ensure_ascii=False,indent=2),flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-broker-deep-reports-final-v2
+          path: |
+            瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版/
+            瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
