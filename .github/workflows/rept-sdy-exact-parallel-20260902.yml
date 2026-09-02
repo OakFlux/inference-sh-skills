@@ -1,0 +1,42 @@
+name: Parallel query exact REPT BATTERO report titles
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-exact-parallel-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    steps:
+      - run: python -m pip install --quiet requests
+      - name: Query titles concurrently
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import concurrent.futures,json
+          from pathlib import Path
+          import requests
+          qs=['规模效应下毛利率提升','1H25毛利率稳步提升','出货量高增，看好盈利改善趋势','2026上半年业绩大超预期']
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','Device':'1','X-Token':''}
+          def one(q):
+            b={'device':1,'hideTrader':0,'onlyTitle':1,'order':1,'page':1,'pageSize':30,'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+            try:
+              r=requests.post('https://api.sdyanbao.com/api/file/search',headers=h,json=b,timeout=(5,25)); obj=r.json(); data=obj.get('data',{}) if isinstance(obj,dict) else {}; return {'query':q,'status':r.status_code,'bytes':len(r.content),'total':data.get('total'),'rows':data.get('files',[])}
+            except Exception as e:return {'query':q,'error':repr(e),'rows':[]}
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex: res=list(ex.map(one,qs))
+          Path('parallel').mkdir(); Path('parallel/result.json').write_text(json.dumps(res,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(res,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-exact-parallel
+          path: parallel/
+          retention-days: 7
+          if-no-files-found: error
