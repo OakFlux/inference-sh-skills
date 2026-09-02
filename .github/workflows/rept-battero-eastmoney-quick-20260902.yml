@@ -1,0 +1,52 @@
+name: Query Eastmoney for REPT BATTERO reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-eastmoney-quick-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Query report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/json,text/plain,*/*'}
+          out=[]
+          for code in ['00666','666','HK00666','00666.HK','116.00666']:
+            for q in [0,1,2]:
+              try:
+                r=s.get('https://reportapi.eastmoney.com/report/list',params={'pageNo':1,'pageSize':200,'code':code,'qType':q,'beginTime':'2023-01-01','endTime':'2026-09-02'},headers=h,timeout=(10,30))
+                x={'code':code,'qType':q,'status':r.status_code,'url':r.url,'bytes':len(r.content)}
+                try:
+                  j=r.json(); x['json']=j
+                  rows=j.get('data') if isinstance(j,dict) else None
+                  print('QUERY',code,q,r.status_code,'rows',len(rows) if isinstance(rows,list) else None,flush=True)
+                  if isinstance(rows,list):
+                    for row in rows:
+                      if isinstance(row,dict):
+                        print('ROW',json.dumps({k:row.get(k) for k in ['title','orgSName','orgName','infoCode','publishDate','attachPages','stockName','stockCode']},ensure_ascii=False),flush=True)
+                except Exception:
+                  x['text']=r.text[:5000]
+                out.append(x)
+              except Exception as e:
+                out.append({'code':code,'qType':q,'error':repr(e)})
+          Path('rept_eastmoney.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-eastmoney-query
+          path: rept_eastmoney.json
+          retention-days: 7
