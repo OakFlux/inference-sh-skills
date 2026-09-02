@@ -1,0 +1,160 @@
+name: Discover Joyson report sources
+
+on:
+  push:
+    paths:
+      - '.github/workflows/joyson-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Discover source documents
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import html
+          import json
+          import re
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          html_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/html,application/xhtml+xml,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://money.finance.sina.com.cn/',
+          }
+
+          def fetch(url, *, params=None):
+              response = session.get(url, params=params, headers=html_headers, timeout=(30, 240), allow_redirects=True)
+              print('FETCH', response.status_code, len(response.content), response.url, flush=True)
+              response.raise_for_status()
+              return response
+
+          def decode(response):
+              for encoding in ('gb18030', 'gbk', 'utf-8'):
+                  try:
+                      text = response.content.decode(encoding)
+                      if any(marker in text for marker in ('均胜电子', '年度报告', '半年度报告', 'vCB_AllBulletinDetail')):
+                          return text
+                  except Exception:
+                      pass
+              response.encoding = response.apparent_encoding or 'utf-8'
+              return response.text
+
+          def parse_sina(page_type):
+              url = f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/600699/page_type/{page_type}.phtml'
+              response = fetch(url)
+              soup = BeautifulSoup(decode(response), 'html.parser')
+              rows = []
+              seen = set()
+              for anchor in soup.find_all('a', href=True):
+                  title = ' '.join(anchor.get_text(' ', strip=True).split())
+                  href = urljoin(response.url, html.unescape(anchor['href']))
+                  if 'vCB_AllBulletinDetail.php' not in href:
+                      continue
+                  if not any(marker in title for marker in ('均胜电子', '辽源得亨', '得亨股份')):
+                      continue
+                  key = (title, href)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  rows.append({'title': title, 'detail_url': href})
+              print('SINA_ROWS', page_type, json.dumps(rows, ensure_ascii=False, indent=2), flush=True)
+              return rows
+
+          def extract_pdf(detail_url):
+              response = fetch(detail_url)
+              text = decode(response).replace('\\/', '/')
+              candidates = []
+              for pattern in (
+                  r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+?\.PDF',
+                  r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+?\.pdf',
+              ):
+                  for match in re.findall(pattern, text, flags=re.I):
+                      value = html.unescape(match)
+                      if value not in candidates:
+                          candidates.append(value)
+              print('SINA_DETAIL', detail_url, json.dumps(candidates, ensure_ascii=False), flush=True)
+              return candidates
+
+          annuals = parse_sina('ndbg')
+          halfs = parse_sina('zqbg')
+
+          for year in range(2010, 2026):
+              matches = [
+                  row for row in annuals
+                  if f'{year}年年度报告' in row['title']
+                  and '摘要' not in row['title']
+                  and '英文版' not in row['title']
+                  and '取消' not in row['title']
+              ]
+              print('ANNUAL_MATCH', year, json.dumps(matches, ensure_ascii=False), flush=True)
+              for row in matches[:2]:
+                  extract_pdf(row['detail_url'])
+
+          half_matches = [
+              row for row in halfs
+              if '2026年半年度报告' in row['title']
+              and '摘要' not in row['title']
+              and '英文版' not in row['title']
+              and '取消' not in row['title']
+          ]
+          print('HALF_2026_MATCH', json.dumps(half_matches, ensure_ascii=False, indent=2), flush=True)
+          for row in half_matches:
+              extract_pdf(row['detail_url'])
+
+          # HKEX listing document discovery.
+          endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+          hkex_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/html,*/*',
+              'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+          for lang in ('zh', 'en'):
+              for t1code in ('-2', '50000', '40000'):
+                  params = {
+                      'sortDir': '0', 'sortByOptions': 'DateTime',
+                      'category': '0', 'market': 'SEHK',
+                      'stockId': '1000279756', 'documentType': '-1',
+                      'fromDate': '20250101', 'toDate': '20260131',
+                      'title': '', 'searchType': '1',
+                      't1code': t1code, 't2Gcode': '-2', 't2code': '-2',
+                      'rowRange': '500', 'lang': lang,
+                  }
+                  response = session.get(endpoint, params=params, headers=hkex_headers, timeout=(30, 240))
+                  print('HKEX_FETCH', lang, t1code, response.status_code, len(response.content), response.url, flush=True)
+                  response.raise_for_status()
+                  outer = response.json()
+                  result = outer.get('result', '[]') if isinstance(outer, dict) else '[]'
+                  if isinstance(result, str):
+                      try:
+                          rows = json.loads(result)
+                      except Exception:
+                          rows = []
+                  elif isinstance(result, list):
+                      rows = result
+                  else:
+                      rows = []
+                  print('HKEX_COUNT', lang, t1code, len(rows), flush=True)
+                  for row in rows:
+                      raw = json.dumps(row, ensure_ascii=False)
+                      hay = re.sub(r'\s+', '', raw).upper()
+                      if any(marker in hay for marker in ('招股章程', 'PROSPECTUS', '全球發售', 'GLOBALOFFERING', '上市文件', 'LISTINGDOCUMENT')):
+                          print('HKEX_MATCH', lang, t1code, raw, flush=True)
+          PY
