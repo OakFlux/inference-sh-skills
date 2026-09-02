@@ -1,0 +1,93 @@
+name: Query Eastmoney list2 for WeRide reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-eastmoney-list2-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query securities lookup and stock-report POST endpoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from io import BytesIO
+          import requests
+          from pypdf import PdfReader
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S=requests.Session(); S.trust_env=False
+          H={'User-Agent':UA,'Accept':'application/json,text/plain,*/*','Referer':'https://data.eastmoney.com/report/stock.jshtml'}
+
+          # Resolve Eastmoney's own security identifiers first.
+          lookup_urls=[
+              'https://searchapi.eastmoney.com/api/suggest/get?input=%E6%96%87%E8%BF%9C%E7%9F%A5%E8%A1%8C&type=14&count=50',
+              'https://searchapi.eastmoney.com/api/suggest/get?input=WeRide&type=14&count=50',
+              'https://searchapi.eastmoney.com/api/suggest/get?input=WRD&type=14&count=50',
+              'https://searchapi.eastmoney.com/api/suggest/get?input=0800&type=14&count=50',
+          ]
+          for u in lookup_urls:
+              try:
+                  r=S.get(u,headers=H,timeout=(15,60)); print('LOOKUP',u,r.status_code,len(r.content),repr(r.text[:10000]),flush=True)
+              except Exception as e: print('LOOKUP_ERR',u,repr(e),flush=True)
+
+          endpoint='https://reportapi.eastmoney.com/report/list2'
+          variants=[
+              'WRD','105.WRD','106.WRD','107.WRD','WRD.US','WRD.O','US.WRD',
+              '00800','0800','116.00800','116.0800','00800.HK','0800.HK','HK00800','HK.00800',
+              '文远知行','文遠知行','WeRide','*'
+          ]
+          found={}
+          for code in variants:
+              payload={
+                  'pageSize':500,'pageNo':1,'p':1,'pageNum':1,'pageNumber':1,
+                  'beginTime':'2024-01-01','endTime':'2026-09-02','code':code,
+                  'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''
+              }
+              try:
+                  r=S.post(endpoint,json=payload,headers={**H,'Content-Type':'application/json'},timeout=(20,120))
+                  print('\nQUERY',code,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                  print('HEAD',repr(r.text[:1000]),flush=True)
+                  r.raise_for_status(); obj=r.json(); rows=obj.get('data') or []
+                  print('META',code,{k:obj.get(k) for k in ('hits','size','TotalPage','pageNo')},'ROWS',len(rows),flush=True)
+                  for row in rows:
+                      raw=json.dumps(row,ensure_ascii=False)
+                      low=re.sub(r'\s+','',raw).lower()
+                      if code!='*' or any(x in low for x in ('文远知行','文遠知行','weride','wrd')):
+                          info=str(row.get('infoCode') or '')
+                          key=info or raw
+                          found[key]=row
+                          print('ROW',json.dumps(row,ensure_ascii=False),flush=True)
+              except Exception as e: print('QUERY_ERR',code,repr(e),flush=True)
+
+          print('\nFOUND_COUNT',len(found),flush=True)
+          for key,row in found.items():
+              info=str(row.get('infoCode') or '')
+              print('MATCH',json.dumps({k:row.get(k) for k in ('infoCode','title','publishDate','orgSName','orgName','researcher','stockName','stockCode','attachPages','attachSize','emRatingName','reportType')},ensure_ascii=False),flush=True)
+              if not info: continue
+              for prefix in ('H3','H2','H1'):
+                  u=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                  try:
+                      rr=S.get(u,headers={'User-Agent':UA,'Accept':'application/pdf,*/*','Referer':'https://data.eastmoney.com/'},timeout=(20,180),allow_redirects=True)
+                      print('PDFTRY',info,prefix,rr.status_code,rr.headers.get('content-type'),len(rr.content),rr.url,rr.content[:8],flush=True)
+                      if rr.status_code==200 and rr.content.startswith(b'%PDF-') and len(rr.content)>100000:
+                          rd=PdfReader(BytesIO(rr.content),strict=False)
+                          text=''
+                          for i in range(min(4,len(rd.pages))):
+                              try: text+=(rd.pages[i].extract_text() or '')+'\n'
+                              except Exception: pass
+                          print('WORKING',json.dumps({'infoCode':info,'title':row.get('title'),'date':row.get('publishDate'),'org':row.get('orgSName') or row.get('orgName'),'pages':len(rd.pages),'bytes':len(rr.content),'url':rr.url,'identity':any(x in text for x in ('文远知行','文遠知行','WeRide'))},ensure_ascii=False),flush=True)
+                          break
+                  except Exception as e: print('PDFERR',info,prefix,repr(e),flush=True)
+          PY
