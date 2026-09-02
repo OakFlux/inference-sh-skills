@@ -1,0 +1,199 @@
+name: Scan First Shanghai archive for Tiangong reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/firstshanghai-tiangong-archive-scan-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Scan public archive and inspect downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import html, io, json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          out=Path('firstshanghai-tiangong-scan'); out.mkdir(exist_ok=True)
+          pdfdir=out/'pdfs'; pdfdir.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          base='https://www.mystockhk.com/'
+          matches=[]; candidate_urls=[]
+
+          def add_candidate(url, source, context=''):
+              if not url: return
+              url=html.unescape(str(url)).replace('\\/','/').strip()
+              if url.startswith('//'): url='https:'+url
+              url=urljoin(source,url)
+              if not url.startswith('http'): return
+              low=url.lower()
+              if any(x in low for x in ('.pdf','download','getfile','attachment','upload/')):
+                  if not any(x['url']==url for x in candidate_urls):
+                      candidate_urls.append({'url':url,'source':source,'context':context[:2000]})
+
+          # Scan daily NewForce archive; 80 pages covers well before 2021.
+          for page in range(1,81):
+              url=f'https://www.mystockhk.com/category.aspx?NodeID=81&page={page}'
+              try:
+                  r=s.get(url,headers=h,timeout=(15,75),allow_redirects=True)
+                  print('PAGE',page,r.status_code,len(r.content),r.url,flush=True)
+                  if r.status_code!=200: continue
+                  text=r.text
+                  if not any(k in text for k in ('天工國際','天工国际','Tiangong')):
+                      continue
+                  soup=BeautifulSoup(text,'lxml')
+                  # Find every text node mentioning Tiangong and capture ancestor HTML/links.
+                  for node in soup.find_all(string=re.compile(r'天工[國国]際|Tiangong',re.I)):
+                      parent=node.parent
+                      anc=parent
+                      for _ in range(7):
+                          if anc is None: break
+                          anc_text=' '.join(anc.get_text(' ',strip=True).split())
+                          if 80 <= len(anc_text) <= 8000 and ('天工' in anc_text or 'Tiangong' in anc_text):
+                              break
+                          anc=anc.parent
+                      if anc is None: anc=parent
+                      snippet=str(anc)[:50000]
+                      rec={'archive_page':page,'archive_url':r.url,'text':' '.join(anc.get_text(' ',strip=True).split())[:10000],'html':snippet,'links':[]}
+                      for tag in anc.find_all(True):
+                          context=' '.join(tag.get_text(' ',strip=True).split())[:1000]
+                          for attr in ('href','src','onclick','data-url','data-file','data-src'):
+                              val=tag.get(attr)
+                              if isinstance(val,str):
+                                  rec['links'].append({'tag':tag.name,'attr':attr,'value':val,'context':context})
+                                  add_candidate(val,r.url,context)
+                                  # Extract URLs or file paths embedded in onclick.
+                                  for embedded in re.findall(r'["\']([^"\']+(?:\.pdf|download|upload/)[^"\']*)["\']',val,re.I):
+                                      add_candidate(embedded,r.url,context)
+                      if not any(m.get('archive_page')==page and m.get('text')==rec['text'] for m in matches):
+                          matches.append(rec)
+                          print('MATCH',json.dumps(rec,ensure_ascii=False)[:60000],flush=True)
+                  (out/f'page_{page:03d}.html').write_bytes(r.content)
+              except Exception as e:
+                  print('PAGE_ERR',page,repr(e),flush=True)
+              time.sleep(.12)
+
+          # Scan HK research pages too, but stop after 150 pages to cover several years.
+          for page in range(1,151):
+              url=f'https://www.mystockhk.com/category.aspx?NodeID=85&page={page}'
+              try:
+                  r=s.get(url,headers=h,timeout=(15,75),allow_redirects=True)
+                  if page%10==0: print('RESEARCH_PAGE',page,r.status_code,len(r.content),flush=True)
+                  if r.status_code!=200: continue
+                  text=r.text
+                  if not any(k in text for k in ('天工國際','天工国际','Tiangong')):
+                      continue
+                  soup=BeautifulSoup(text,'lxml')
+                  for node in soup.find_all(string=re.compile(r'天工[國国]際|Tiangong',re.I)):
+                      parent=node.parent; anc=parent
+                      for _ in range(7):
+                          if anc is None: break
+                          anc_text=' '.join(anc.get_text(' ',strip=True).split())
+                          if 60<=len(anc_text)<=8000 and ('天工' in anc_text or 'Tiangong' in anc_text): break
+                          anc=anc.parent
+                      if anc is None: anc=parent
+                      rec={'research_page':page,'archive_url':r.url,'text':' '.join(anc.get_text(' ',strip=True).split())[:10000],'html':str(anc)[:50000],'links':[]}
+                      for tag in anc.find_all(True):
+                          context=' '.join(tag.get_text(' ',strip=True).split())[:1000]
+                          for attr in ('href','src','onclick','data-url','data-file','data-src'):
+                              val=tag.get(attr)
+                              if isinstance(val,str):
+                                  rec['links'].append({'tag':tag.name,'attr':attr,'value':val,'context':context})
+                                  add_candidate(val,r.url,context)
+                                  for embedded in re.findall(r'["\']([^"\']+(?:\.pdf|download|upload/)[^"\']*)["\']',val,re.I):
+                                      add_candidate(embedded,r.url,context)
+                      matches.append(rec)
+                      print('RESEARCH_MATCH',json.dumps(rec,ensure_ascii=False)[:60000],flush=True)
+                  (out/f'research_{page:03d}.html').write_bytes(r.content)
+              except Exception as e:
+                  print('RESEARCH_ERR',page,repr(e),flush=True)
+              time.sleep(.08)
+
+          # Follow non-PDF candidate detail links and harvest PDF URLs from them.
+          follow_records=[]
+          for item in list(candidate_urls):
+              if '.pdf' in item['url'].lower(): continue
+              rec=dict(item)
+              try:
+                  r=s.get(item['url'],headers={**h,'Referer':item['source']},timeout=(15,90),allow_redirects=True)
+                  rec.update({'status':r.status_code,'bytes':len(r.content),'final_url':r.url})
+                  if r.status_code==200:
+                      soup=BeautifulSoup(r.text,'lxml')
+                      for tag in soup.find_all(True):
+                          context=' '.join(tag.get_text(' ',strip=True).split())[:1000]
+                          for attr in ('href','src','onclick','data-url','data-file','data-src'):
+                              val=tag.get(attr)
+                              if isinstance(val,str):
+                                  add_candidate(val,r.url,context)
+                                  for embedded in re.findall(r'["\']([^"\']+(?:\.pdf|download|upload/)[^"\']*)["\']',val,re.I):
+                                      add_candidate(embedded,r.url,context)
+                      rec['interesting']=[line.strip()[:4000] for line in r.text.splitlines() if any(k in line.lower() for k in ('pdf','download','upload/','getfile','attachment'))][:300]
+                  print('FOLLOW',r.status_code,len(r.content),item['url'],r.url,flush=True)
+              except Exception as e: rec['error']=repr(e)
+              follow_records.append(rec)
+
+          # Probe and inspect all PDF candidates.
+          pdf_records=[]
+          seen_final=set()
+          for i,item in enumerate(candidate_urls,1):
+              if '.pdf' not in item['url'].lower() and not any(x in item['url'].lower() for x in ('download','getfile','attachment')): continue
+              rec=dict(item)
+              try:
+                  r=s.get(item['url'],headers={**h,'Accept':'application/pdf,*/*','Referer':item['source']},timeout=(20,180),allow_redirects=True)
+                  rec.update({'status':r.status_code,'bytes':len(r.content),'final_url':r.url,'type':r.headers.get('content-type'),'pdf':r.content.startswith(b'%PDF-')})
+                  if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>30000:
+                      key=(r.url,len(r.content))
+                      if key in seen_final: continue
+                      seen_final.add(key)
+                      p=pdfdir/f'{i:04d}.pdf'; p.write_bytes(r.content)
+                      rd=PdfReader(str(p),strict=False); rec['pages']=len(rd.pages)
+                      txt=''
+                      for pg in rd.pages[:min(8,len(rd.pages))]:
+                          try:txt+='\n'+(pg.extract_text() or '')
+                          except:pass
+                      rec['text_head']=re.sub(r'\s+',' ',txt).strip()[:30000]
+                      compact=re.sub(r'\s+','',txt).lower()
+                      rec['tiangong']=any(x in compact for x in ('天工国际','天工國際','tiangonginternational','00826','826hk'))
+                      print('PDF_OK',json.dumps({'url':r.url,'pages':rec['pages'],'bytes':rec['bytes'],'tiangong':rec['tiangong'],'head':rec['text_head'][:2500]},ensure_ascii=False),flush=True)
+                  else:
+                      print('NOT_PDF',r.status_code,len(r.content),item['url'],r.url,r.headers.get('content-type'),flush=True)
+              except Exception as e:
+                  rec['error']=repr(e); print('PDF_ERR',item['url'],repr(e),flush=True)
+              pdf_records.append(rec)
+
+          good=[x for x in pdf_records if x.get('pdf') and x.get('tiangong')]
+          good.sort(key=lambda x:(x.get('pages',0),x.get('bytes',0)),reverse=True)
+          (out/'matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'candidates.json').write_text(json.dumps(candidate_urls,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'follow.json').write_text(json.dumps(follow_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'pdf_records.json').write_text(json.dumps(pdf_records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'good.json').write_text(json.dumps(good,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY',json.dumps({'matches':len(matches),'candidates':len(candidate_urls),'pdfs':len([x for x in pdf_records if x.get('pdf')]),'good':len(good)},ensure_ascii=False),flush=True)
+          print('GOOD')
+          for x in good: print(json.dumps(x,ensure_ascii=False)[:10000],flush=True)
+          PY
+
+      - name: Upload scan
+        uses: actions/upload-artifact@v4
+        with:
+          name: firstshanghai-tiangong-archive-scan
+          path: firstshanghai-tiangong-scan/
+          if-no-files-found: error
+          retention-days: 7
