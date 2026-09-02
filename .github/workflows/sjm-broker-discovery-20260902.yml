@@ -1,0 +1,241 @@
+name: Discover SJM Holdings broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sjm-broker-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Discover public report PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          import time
+          from io import BytesIO
+          from urllib.parse import quote_plus, urljoin, urlparse, parse_qs
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          session = requests.Session()
+          session.trust_env = False
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          H = {'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7'}
+
+          def norm(s):
+              return re.sub(r'\s+', '', str(s or '')).lower()
+
+          def get(url, **kw):
+              headers = dict(H)
+              headers.update(kw.pop('headers', {}))
+              return session.get(url, headers=headers, timeout=kw.pop('timeout', (20, 120)), allow_redirects=True, **kw)
+
+          def post(url, **kw):
+              headers = dict(H)
+              headers.update(kw.pop('headers', {}))
+              return session.post(url, headers=headers, timeout=kw.pop('timeout', (20, 120)), allow_redirects=True, **kw)
+
+          print('=== EASTMONEY REPORT API ===', flush=True)
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          matches = {}
+          codes = ['00880', '0880', '880', '116.00880', '116.0880', 'HK00880', '00880.HK', '0880.HK']
+          for code in codes:
+              for qtype in (0, 1):
+                  params = {
+                      'pageNo': 1, 'pageSize': 500, 'code': code, 'qType': qtype,
+                      'beginTime': '2018-01-01', 'endTime': '2026-09-02',
+                      'industryCode': '*', 'rating': '*', 'ratingChange': '*',
+                  }
+                  try:
+                      r = get(endpoint, params=params, headers={'Referer': 'https://data.eastmoney.com/report/stock.jshtml', 'Accept': 'application/json,text/plain,*/*'})
+                      print('EM_QUERY', code, qtype, r.status_code, len(r.content), r.url, flush=True)
+                      r.raise_for_status()
+                      p = r.json()
+                      rows = p.get('data') or []
+                      print('EM_META', code, qtype, len(rows), {k:p.get(k) for k in ('hits','size','TotalPage','pageNo')}, flush=True)
+                      for row in rows:
+                          raw = json.dumps(row, ensure_ascii=False)
+                          n = norm(raw)
+                          if any(x in n for x in ('澳博控股', '澳博', 'sjmholdings', '00880', '0880.hk')):
+                              key = str(row.get('infoCode') or row.get('id') or raw)
+                              matches[key] = row
+                  except Exception as e:
+                      print('EM_ERR', code, qtype, repr(e), flush=True)
+
+          print('EM_MATCH_COUNT', len(matches), flush=True)
+          for key, row in matches.items():
+              keep = {k: row.get(k) for k in ('infoCode','title','publishDate','orgSName','orgName','researcher','stockName','stockCode','attachPages','attachSize','emRatingName','reportType','encodeUrl')}
+              print('EM_MATCH', json.dumps(keep, ensure_ascii=False), flush=True)
+              info = str(row.get('infoCode') or '')
+              if info.startswith('AP'):
+                  for prefix in ('H3','H2'):
+                      u = f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+                      try:
+                          rr = get(u, headers={'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*'}, timeout=(20,180))
+                          print('EM_PDF_PROBE', info, prefix, rr.status_code, len(rr.content), rr.headers.get('content-type'), rr.url, flush=True)
+                          if rr.status_code == 200 and rr.content.startswith(b'%PDF-') and len(rr.content) > 100000:
+                              pdf = PdfReader(BytesIO(rr.content), strict=False)
+                              print('EM_PDF_OK', json.dumps({'infoCode':info,'pages':len(pdf.pages),'bytes':len(rr.content),'url':rr.url}, ensure_ascii=False), flush=True)
+                              break
+                      except Exception as e:
+                          print('EM_PDF_ERR', info, prefix, repr(e), flush=True)
+
+          print('\n=== SDYANBAO API ===', flush=True)
+          search_payloads = [
+              {'device':1,'hideTrader':0,'onlyTitle':0,'order':1,'page':1,'pageSize':100,'keyword':'澳博控股','pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':''},
+              {'device':1,'hideTrader':0,'onlyTitle':0,'order':1,'page':1,'pageSize':100,'keyword':'00880','pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':''},
+          ]
+          for payload in search_payloads:
+              try:
+                  r = post('https://www.sdyanbao.com/api/file/search', json=payload, headers={'Device':'1','Content-Type':'application/json','Accept':'application/json,text/plain,*/*'})
+                  print('SD_SEARCH', payload['keyword'], r.status_code, len(r.content), r.url, r.text[:300], flush=True)
+                  if r.status_code == 200:
+                      p = r.json()
+                      files = ((p.get('data') or {}).get('files') or []) if isinstance(p, dict) else []
+                      print('SD_FILES', payload['keyword'], len(files), flush=True)
+                      for f in files:
+                          raw=json.dumps(f,ensure_ascii=False)
+                          if any(x in norm(raw) for x in ('澳博控股','00880','sjm')):
+                              print('SD_MATCH', raw, flush=True)
+                              fid=f.get('id')
+                              if fid:
+                                  try:
+                                      d=post('https://www.sdyanbao.com/api/file/detail',json={'id':fid},headers={'Device':'1','Content-Type':'application/json','Accept':'application/json,text/plain,*/*'})
+                                      print('SD_DETAIL', fid, d.status_code, d.text[:3000], flush=True)
+                                  except Exception as e:
+                                      print('SD_DETAIL_ERR',fid,repr(e),flush=True)
+              except Exception as e:
+                  print('SD_ERR', payload['keyword'], repr(e), flush=True)
+
+          print('\n=== BAOGAOBOX KNOWN PAGE ===', flush=True)
+          for u in [
+              'https://www.baogaobox.com/reports/240311000009679.html',
+              'https://www.baogaobox.com/reports/240311000009680.html',
+          ]:
+              try:
+                  r=get(u)
+                  r.encoding = r.apparent_encoding or 'utf-8'
+                  print('BB_PAGE', r.status_code, len(r.content), r.url, flush=True)
+                  soup=BeautifulSoup(r.text,'lxml')
+                  print('BB_TITLE', soup.title.get_text(' ',strip=True) if soup.title else '', flush=True)
+                  txt=' '.join(soup.get_text(' ',strip=True).split())
+                  print('BB_TEXT', txt[:1500], flush=True)
+                  for a in soup.find_all('a', href=True):
+                      href=urljoin(r.url,a['href'])
+                      label=' '.join(a.get_text(' ',strip=True).split())
+                      if '.pdf' in href.lower() or any(x in norm(label+href) for x in ('澳博控股','download','下载')):
+                          print('BB_LINK', label[:200], href, flush=True)
+              except Exception as e:
+                  print('BB_ERR',u,repr(e),flush=True)
+
+          print('\n=== NXNY SEARCH / REPORT PAGES ===', flush=True)
+          nx_urls = [
+              'https://www.nxny.com/search.asp?keyword=%B0%C4%B2%A9%BF%D8%B9%C9',
+              'https://www.nxny.com/search.asp?keyword=00880',
+              'https://www.nxny.com/report/search.asp?keyword=00880',
+          ]
+          report_ids=set()
+          for u in nx_urls:
+              try:
+                  r=get(u)
+                  print('NX_SEARCH',r.status_code,len(r.content),r.url,flush=True)
+                  text=r.content.decode('gb18030','ignore')
+                  for m in re.finditer(r'/report/view_(\d+)\.html',text,re.I):
+                      report_ids.add(m.group(1))
+                  for m in re.finditer(r'.{0,100}(?:澳博控股|00880).{0,300}',text,re.I|re.S):
+                      print('NX_CTX',re.sub(r'\s+',' ',m.group(0))[:800],flush=True)
+              except Exception as e:
+                  print('NX_SEARCH_ERR',u,repr(e),flush=True)
+          print('NX_IDS',sorted(report_ids),flush=True)
+          for rid in sorted(report_ids)[:100]:
+              try:
+                  u=f'https://www.nxny.com/report/view_{rid}.html'
+                  r=get(u)
+                  text=r.content.decode('gb18030','ignore')
+                  if not any(x in norm(text) for x in ('澳博控股','00880','sjmholdings')):
+                      continue
+                  soup=BeautifulSoup(text,'lxml')
+                  print('NX_MATCH',rid,soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+                  print('NX_BODY',' '.join(soup.get_text(' ',strip=True).split())[:2500],flush=True)
+                  for tag in soup.find_all(['a','iframe','script'], href=True):
+                      print('NX_LINK',tag.get('href'),flush=True)
+              except Exception as e:
+                  print('NX_PAGE_ERR',rid,repr(e),flush=True)
+
+          print('\n=== SEARCH ENGINES FOR DIRECT PDF LINKS ===', flush=True)
+          queries = [
+              '澳博控股 00880 研报 PDF',
+              '澳博控股 博彩收入恢复不及行业 PDF',
+              'SJM Holdings equity research PDF',
+              'SJM Holdings initiation coverage PDF',
+              'site:pdf.dfcfw.com 澳博控股',
+              'site:research.bocomgroup.com SJM Holdings pdf',
+              'site:htisec.com SJM Holdings pdf',
+              'site:firstshanghai.com.hk SJM Holdings pdf',
+          ]
+          found_urls=set()
+          for q in queries:
+              for engine_url in [
+                  'https://www.google.com/search?q='+quote_plus(q),
+                  'https://www.bing.com/search?q='+quote_plus(q),
+                  'https://html.duckduckgo.com/html/?q='+quote_plus(q),
+              ]:
+                  try:
+                      r=get(engine_url,timeout=(20,90))
+                      print('SEARCH',q,engine_url.split('/')[2],r.status_code,len(r.content),flush=True)
+                      text=html.unescape(r.text).replace('\\/','/')
+                      for m in re.findall(r'https?://[^"\'<>\s]+',text,re.I):
+                          m=m.rstrip(').,;]')
+                          if 'google.' in m or 'bing.' in m or 'duckduckgo.' in m:
+                              # unwrap common redirect urls
+                              try:
+                                  qs=parse_qs(urlparse(m).query)
+                                  for key in ('q','url','uddg'):
+                                      if qs.get(key):
+                                          m=qs[key][0]
+                                          break
+                              except Exception:
+                                  pass
+                          if any(x in norm(m) for x in ('pdf','澳博','00880','sjmholdings','sjm-holdings')):
+                              found_urls.add(m)
+                      for m in re.finditer(r'.{0,200}(?:澳博控股|SJM Holdings|00880).{0,500}',text,re.I|re.S):
+                          print('SEARCH_CTX',q,re.sub(r'\s+',' ',m.group(0))[:1000],flush=True)
+                  except Exception as e:
+                      print('SEARCH_ERR',q,engine_url,repr(e),flush=True)
+                  time.sleep(.2)
+          for u in sorted(found_urls):
+              print('FOUND_URL',u[:1500],flush=True)
+
+          print('\n=== PROBE FOUND PDF URLS ===', flush=True)
+          for u in sorted(found_urls):
+              if '.pdf' not in u.lower():
+                  continue
+              try:
+                  r=get(u,headers={'Accept':'application/pdf,*/*'},timeout=(20,180))
+                  print('PDF_PROBE',r.status_code,len(r.content),r.headers.get('content-type'),r.url,flush=True)
+                  if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>100000:
+                      pdf=PdfReader(BytesIO(r.content),strict=False)
+                      text=''
+                      for p in pdf.pages[:5]:
+                          try:text += '\n'+(p.extract_text() or '')
+                          except:pass
+                      print('PDF_OK',json.dumps({'pages':len(pdf.pages),'bytes':len(r.content),'url':r.url,'front':re.sub(r'\s+',' ',text)[:1000]},ensure_ascii=False),flush=True)
+              except Exception as e:
+                  print('PDF_PROBE_ERR',u,repr(e),flush=True)
+          PY
