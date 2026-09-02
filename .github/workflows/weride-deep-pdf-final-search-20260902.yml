@@ -1,0 +1,291 @@
+name: Final public PDF search for WeRide broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-deep-pdf-final-search-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Search public indexes and probe complete PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          import time
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('weride-final-search')
+          OUT.mkdir(exist_ok=True)
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/json,text/plain,*/*',
+          }
+
+          titles = [
+              '文远知行 全球L4级自动驾驶产品及解决方案先行者 国信证券',
+              '文远知行 L4和L2双轮驱动 看好海外Robotaxi快速扩张 国盛证券',
+              '文远知行 知行全球 行于文远 华泰证券',
+              '文远知行 L4智驾先行者 加速Robotaxi全球布局 招商证券',
+              '文远知行 全球L4自动驾驶领导者 海外商业化落地拐点将至 光大证券',
+              '文远知行 重视国内市场 深厚布局海外的L4平台型公司 东北证券',
+              '文远知行 立足国内发力海外 RoboX商业化落地龙头 东吴证券',
+              '文远知行 知行千里 多元布局 构筑自动驾驶生态版图 中金',
+          ]
+          queries = []
+          for title in titles:
+              queries.extend([
+                  f'"{title}" pdf',
+                  f'"{title}" filetype:pdf',
+                  f'{title} 下载 PDF',
+              ])
+          queries.extend([
+              'site:pdf.dfcfw.com 文远知行',
+              'site:research-cdn* 文远知行 pdf',
+              'site:static* 文远知行 券商 报告 pdf',
+              '文远知行 券商深度报告 PDF 网盘',
+              '文远知行 研报 PDF 百度网盘 OR 夸克网盘 OR 阿里云盘',
+              'WeRide equity research pdf initiation coverage',
+              'WeRide WRD initiation report pdf',
+          ])
+
+          search_templates = [
+              ('bing', 'https://www.bing.com/search?q={q}&count=50'),
+              ('ddg', 'https://html.duckduckgo.com/html/?q={q}'),
+              ('brave', 'https://search.brave.com/search?q={q}&source=web'),
+              ('baidu', 'https://www.baidu.com/s?wd={q}&rn=50'),
+              ('so', 'https://www.so.com/s?q={q}&pn=1'),
+              ('sogou', 'https://www.sogou.com/web?query={q}&num=50'),
+              ('yandex', 'https://yandex.com/search/?text={q}'),
+              ('google', 'https://www.google.com/search?q={q}&num=50'),
+          ]
+
+          report_markers = [
+              '文远知行', 'weride', 'wrd.o', 'wrd.us', '00800', '0800.hk',
+              '全球l4级自动驾驶产品及解决方案先行者',
+              'l4和l2+双轮驱动', '知行全球，行于文远', '知行全球行于文远',
+              'l4智驾先行者', '全球l4自动驾驶领导者',
+              '重视国内市场', 'robox商业化', '知行千里',
+          ]
+          useful_domains = [
+              'guosen.com', 'gszq.com', 'cmschina.com', 'htsc.com.cn', 'ebscn.com',
+              'nesc.cn', 'dwzq.com.cn', 'cicc.com', 'pdf.dfcfw.com', 'dfcfw.com',
+              'sina.com.cn', 'sohu.com', 'vzkoo.com', 'microbell.com', 'hibor.com.cn',
+              'sdyanbao.com', 'fxbaogao.com', '51pdf.cn', 'nxny.com', 'sgpjbg.com',
+              'baogaobox.com', 'book118.com', 'renrendoc.com', 'mbalib.com',
+              'pan.baidu.com', 'pan.quark.cn', 'aliyundrive.com', 'cloud.189.cn',
+              'drive.google.com', 'github.com', 'githubusercontent.com', 'oss-', '.oss-',
+          ]
+
+          results = {
+              'searches': [],
+              'pages': [],
+              'pdf_candidates': [],
+              'working_pdfs': [],
+          }
+          page_queue = []
+          pdf_candidates = []
+
+          def clean_url(value: str, base: str = '') -> str:
+              if not value:
+                  return ''
+              value = html.unescape(unquote(value)).replace('\\/', '/').replace('\\u0026', '&')
+              if value.startswith('//'):
+                  value = 'https:' + value
+              if value.startswith('/') and base:
+                  value = urljoin(base, value)
+              return value.strip().rstrip('),;]}')
+
+          def add_page(url: str, source: str, context: str = '') -> None:
+              url = clean_url(url, source)
+              if not url.startswith('http'):
+                  return
+              if url.lower().endswith(('.jpg','.jpeg','.png','.gif','.webp','.css','.woff','.woff2')):
+                  return
+              if '.pdf' in url.lower():
+                  add_pdf(url, source, context)
+                  return
+              if url not in [x['url'] for x in page_queue]:
+                  page_queue.append({'url': url, 'source': source, 'context': context[:500]})
+
+          def add_pdf(url: str, source: str, context: str = '') -> None:
+              url = clean_url(url, source)
+              if not url.startswith('http'):
+                  return
+              if url not in [x['url'] for x in pdf_candidates]:
+                  pdf_candidates.append({'url': url, 'source': source, 'context': context[:1000]})
+
+          def extract_links(text: str, base: str, engine: str = '') -> None:
+              decoded = html.unescape(text).replace('\\/', '/').replace('\\u0026', '&')
+              soup = BeautifulSoup(decoded, 'lxml')
+              for tag in soup.find_all('a', href=True):
+                  href = clean_url(tag['href'], base)
+                  label = ' '.join(tag.get_text(' ', strip=True).split())
+                  if engine == 'ddg' and 'uddg=' in href:
+                      try:
+                          href = parse_qs(urlparse(href).query).get('uddg', [href])[0]
+                          href = clean_url(href, base)
+                      except Exception:
+                          pass
+                  if engine == 'baidu' and href.startswith('/link?'):
+                      href = urljoin('https://www.baidu.com', href)
+                  low = (href + ' ' + label).lower()
+                  if any(marker.lower() in low for marker in report_markers) or any(domain in href for domain in useful_domains):
+                      add_page(href, base, label)
+              patterns = [
+                  r'https?://[^"\'<>\s]+?\.pdf(?:\?[^"\'<>\s]*)?',
+                  r'https?://[^"\'<>\s]+',
+                  r'(?i)(?:pdf|download|attachment|fileurl|file_url|sourceurl|source_url|originurl|url)["\']?\s*[:=]\s*["\']([^"\']+)',
+              ]
+              for pattern in patterns:
+                  try:
+                      for match in re.findall(pattern, decoded, flags=re.I):
+                          value = match if isinstance(match, str) else match[0]
+                          value = clean_url(value, base)
+                          low = value.lower()
+                          if '.pdf' in low:
+                              add_pdf(value, base, 'regex')
+                          elif any(marker.lower() in low for marker in report_markers) or any(domain in value for domain in useful_domains):
+                              add_page(value, base, 'regex')
+                  except Exception:
+                      pass
+
+          for query in queries:
+              for engine, template in search_templates:
+                  url = template.format(q=quote_plus(query))
+                  record = {'engine': engine, 'query': query, 'requested_url': url}
+                  try:
+                      response = session.get(url, headers=headers, timeout=(15, 60), allow_redirects=True)
+                      record.update({'status': response.status_code, 'bytes': len(response.content), 'final_url': response.url})
+                      print('SEARCH', engine, response.status_code, len(response.content), query, flush=True)
+                      if response.status_code == 200:
+                          extract_links(response.text, response.url, engine)
+                  except Exception as exc:
+                      record['error'] = repr(exc)
+                      print('SEARCH_ERROR', engine, query, repr(exc), flush=True)
+                  results['searches'].append(record)
+                  time.sleep(0.15)
+
+          # Resolve and inspect the most relevant pages. Search result redirects are followed automatically.
+          initial_pages = list(page_queue)
+          for item in initial_pages[:300]:
+              url = item['url']
+              record = dict(item)
+              try:
+                  response = session.get(url, headers=headers, timeout=(20, 90), allow_redirects=True)
+                  record.update({'status': response.status_code, 'bytes': len(response.content), 'final_url': response.url, 'content_type': response.headers.get('content-type','')})
+                  print('CRAWL', response.status_code, len(response.content), url, '=>', response.url, flush=True)
+                  ctype = response.headers.get('content-type','').lower()
+                  if response.status_code == 200 and response.content.startswith(b'%PDF-'):
+                      add_pdf(response.url, item['source'], item.get('context',''))
+                  elif response.status_code == 200 and ('html' in ctype or 'json' in ctype or 'text' in ctype):
+                      extract_links(response.text, response.url)
+                      record['title'] = BeautifulSoup(response.text, 'lxml').title.get_text(' ', strip=True) if BeautifulSoup(response.text, 'lxml').title else ''
+              except Exception as exc:
+                  record['error'] = repr(exc)
+                  print('CRAWL_ERROR', url, repr(exc), flush=True)
+              results['pages'].append(record)
+              time.sleep(0.1)
+
+          # Inspect one additional wave of newly discovered pages, especially static/API endpoints.
+          seen_crawled = {x.get('url') for x in results['pages']}
+          second_wave = [x for x in page_queue if x['url'] not in seen_crawled]
+          for item in second_wave[:200]:
+              url = item['url']
+              record = dict(item)
+              try:
+                  response = session.get(url, headers=headers, timeout=(20, 90), allow_redirects=True)
+                  record.update({'status': response.status_code, 'bytes': len(response.content), 'final_url': response.url, 'content_type': response.headers.get('content-type','')})
+                  print('CRAWL2', response.status_code, len(response.content), url, '=>', response.url, flush=True)
+                  ctype = response.headers.get('content-type','').lower()
+                  if response.status_code == 200 and response.content.startswith(b'%PDF-'):
+                      add_pdf(response.url, item['source'], item.get('context',''))
+                  elif response.status_code == 200 and ('html' in ctype or 'json' in ctype or 'text' in ctype):
+                      extract_links(response.text, response.url)
+              except Exception as exc:
+                  record['error'] = repr(exc)
+              results['pages'].append(record)
+              time.sleep(0.1)
+
+          # Probe each PDF candidate and retain only complete, identity-matched files of meaningful length.
+          for candidate in pdf_candidates[:500]:
+              url = candidate['url']
+              probe = dict(candidate)
+              try:
+                  response = session.get(
+                      url,
+                      headers={
+                          'User-Agent': ua,
+                          'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                          'Referer': candidate['source'] if candidate['source'].startswith('http') else 'https://www.google.com/',
+                      },
+                      timeout=(20, 240),
+                      allow_redirects=True,
+                  )
+                  probe.update({'status': response.status_code, 'bytes': len(response.content), 'final_url': response.url, 'content_type': response.headers.get('content-type','')})
+                  print('PDF_PROBE', response.status_code, len(response.content), url, '=>', response.url, flush=True)
+                  if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 150000:
+                      reader = PdfReader(BytesIO(response.content), strict=False)
+                      pages = len(reader.pages)
+                      chunks = []
+                      for page in reader.pages[:min(15, pages)]:
+                          try:
+                              chunks.append(page.extract_text() or '')
+                          except Exception:
+                              pass
+                      text = re.sub(r'\s+', '', '\n'.join(chunks)).lower()
+                      company_ok = any(marker in text for marker in ('文远知行','weride','wrd.o','wrd.us','00800','0800.hk','0800'))
+                      research_ok = any(marker in text for marker in ('证券研究报告','公司研究','公司深度','首次覆盖','equityresearch','researchreport'))
+                      probe.update({'pages': pages, 'company_ok': company_ok, 'research_ok': research_ok})
+                      if pages >= 12 and company_ok and research_ok:
+                          results['working_pdfs'].append(probe)
+                          print('WORKING_PDF', json.dumps(probe, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  probe['error'] = repr(exc)
+                  print('PDF_ERROR', url, repr(exc), flush=True)
+              results['pdf_candidates'].append(probe)
+
+          (OUT / 'results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          summary = {
+              'search_count': len(results['searches']),
+              'page_count': len(results['pages']),
+              'pdf_candidate_count': len(results['pdf_candidates']),
+              'working_pdf_count': len(results['working_pdfs']),
+              'working_pdfs': results['working_pdfs'],
+          }
+          (OUT / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL_SUMMARY', json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload search diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: weride-final-public-pdf-search-20260902
+          path: weride-final-search/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 3
