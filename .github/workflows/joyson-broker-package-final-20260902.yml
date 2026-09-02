@@ -1,0 +1,385 @@
+name: Package verified Joyson Electronics broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/joyson-broker-package-final-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF validation dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pillow
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY = '宁波均胜电子股份有限公司'
+          SHORT_NAME = '均胜电子'
+          TICKER = '600699.SH'
+          PACKAGE = '均胜电子_券商深度报告_3份_完整PDF'
+          OUT = Path(PACKAGE)
+          PREVIEW = Path('_joyson_broker_previews')
+          OUT.mkdir(exist_ok=True)
+          PREVIEW.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'order': 1,
+                  'institution': '国元证券',
+                  'date': '2025-03-06',
+                  'title': '深度报告：国内领先的汽车科技平台化供应商，全面启动“汽车+机器人Tier1”双轨战略',
+                  'report_type': '公司深度报告',
+                  'expected_pages': 24,
+                  'filename': '01_国元证券_均胜电子_国内领先的汽车科技平台化供应商_汽车加机器人Tier1双轨战略_2025-03-06_24页.pdf',
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP202503061644111965_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H2_AP202503061644111965_1.pdf',
+                  ],
+                  'identity_terms': ['均胜电子', '600699'],
+                  'title_terms': ['国内领先的汽车科技平台化供应商', '汽车+机器人Tier1'],
+                  'institution_terms': ['国元证券'],
+                  'researchers': '刘乐、陈烨尧',
+                  'info_code': 'AP202503061644111965',
+              },
+              {
+                  'order': 2,
+                  'institution': '东吴证券',
+                  'date': '2024-10-13',
+                  'title': '汽零行业稀缺全球资产，周期向上行稳致远',
+                  'report_type': '公司深度研究',
+                  'expected_pages': 43,
+                  'filename': '02_东吴证券_均胜电子_汽零行业稀缺全球资产_周期向上行稳致远_2024-10-13_43页.pdf',
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP202410131640278092_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H2_AP202410131640278092_1.pdf',
+                  ],
+                  'identity_terms': ['均胜电子', '600699'],
+                  'title_terms': ['汽零行业稀缺全球资产', '周期向上行稳致远'],
+                  'institution_terms': ['东吴证券'],
+                  'researchers': '黄细里、孙仁昊',
+                  'info_code': 'AP202410131640278092',
+              },
+              {
+                  'order': 3,
+                  'institution': '山西证券',
+                  'date': '2024-05-22',
+                  'title': '安全龙头，智驾先锋',
+                  'report_type': '公司研究／深度分析',
+                  'expected_pages': 49,
+                  'filename': '03_山西证券_均胜电子_安全龙头智驾先锋_2024-05-22_49页.pdf',
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP202405221634327303_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H2_AP202405221634327303_1.pdf',
+                  ],
+                  'identity_terms': ['均胜电子', '600699'],
+                  'title_terms': ['安全龙头', '智驾先锋'],
+                  'institution_terms': ['山西证券'],
+                  'researchers': '肖索、王雲昊',
+                  'info_code': 'AP202405221634327303',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', '', text or '').upper()
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def fetch_pdf(item: dict) -> tuple[bytes, str]:
+              errors = []
+              for url in item['urls']:
+                  for attempt in range(1, 7):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={
+                                  'User-Agent': ua,
+                                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                                  'Referer': 'https://data.eastmoney.com/',
+                                  'Cache-Control': 'no-cache',
+                                  'Pragma': 'no-cache',
+                              },
+                              timeout=(30, 360),
+                              allow_redirects=True,
+                          )
+                          content_type = response.headers.get('content-type', '')
+                          print(
+                              'GET', item['order'], attempt, response.status_code,
+                              content_type, len(response.content), url, '=>', response.url,
+                              flush=True,
+                          )
+                          if (
+                              response.status_code == 200
+                              and response.content.startswith(b'%PDF-')
+                              and len(response.content) > 200_000
+                          ):
+                              return response.content, response.url
+                          errors.append(
+                              f"{url}: status={response.status_code}; type={content_type}; bytes={len(response.content)}"
+                          )
+                      except Exception as exc:
+                          errors.append(f'{url}: {exc!r}')
+                      time.sleep(min(attempt * 2, 10))
+              raise RuntimeError('PDF download failed:\n' + '\n'.join(errors[-16:]))
+
+          records = []
+          seen_hashes = set()
+          total_pages = 0
+          total_bytes = 0
+
+          for item in reports:
+              data, final_url = fetch_pdf(item)
+              path = OUT / item['filename']
+              path.write_bytes(data)
+
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'PDF signature missing: {path.name}')
+
+              reader = PdfReader(str(path), strict=False)
+              if reader.is_encrypted:
+                  try:
+                      if reader.decrypt('') == 0:
+                          raise RuntimeError(f'Encrypted PDF cannot be opened: {path.name}')
+                  except Exception as exc:
+                      raise RuntimeError(f'Encrypted PDF cannot be opened: {path.name}: {exc}')
+
+              pages = len(reader.pages)
+              if pages != item['expected_pages']:
+                  raise RuntimeError(
+                      f"Page mismatch for {path.name}: actual {pages}, expected {item['expected_pages']}"
+                  )
+
+              extracted = []
+              for page in reader.pages[:min(12, pages)]:
+                  try:
+                      extracted.append(page.extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, repr(exc), flush=True)
+              text = compact('\n'.join(extracted))
+
+              for term in item['identity_terms']:
+                  if compact(term) not in text:
+                      raise RuntimeError(f'Identity term missing in {path.name}: {term}')
+              for term in item['title_terms']:
+                  if compact(term) not in text:
+                      raise RuntimeError(f'Title term missing in {path.name}: {term}')
+              if not any(compact(term) in text for term in item['institution_terms']):
+                  raise RuntimeError(f'Institution validation failed for {path.name}')
+              if item['date'][:4] not in text:
+                  raise RuntimeError(f'Report year missing in first pages: {path.name}')
+              if not any(
+                  compact(marker) in text
+                  for marker in ('证券研究报告', '公司研究', '公司深度', '深度报告', '深度分析')
+              ):
+                  raise RuntimeError(f'Securities-research marker missing: {path.name}')
+
+              qpdf = subprocess.run(
+                  ['qpdf', '--check', str(path)],
+                  capture_output=True,
+                  text=True,
+              )
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {path.name}: {qpdf.stderr[-1200:]}')
+              if qpdf.returncode == 3:
+                  print('QPDF_WARNING', path.name, qpdf.stderr[-1200:], flush=True)
+
+              for label, page_no in (
+                  ('first', 1),
+                  ('middle', max(1, pages // 2)),
+                  ('last', pages),
+              ):
+                  prefix = PREVIEW / f"{item['order']:02d}_{label}"
+                  render = subprocess.run(
+                      [
+                          'pdftoppm', '-f', str(page_no), '-l', str(page_no),
+                          '-singlefile', '-png', '-r', '110', str(path), str(prefix),
+                      ],
+                      capture_output=True,
+                      check=False,
+                  )
+                  png = Path(str(prefix) + '.png')
+                  if render.returncode != 0 or not png.exists() or png.stat().st_size < 10_000:
+                      raise RuntimeError(
+                          f'Render failed for {path.name} page {page_no}: '
+                          + render.stderr.decode('utf-8', errors='ignore')[-1000:]
+                      )
+                  with Image.open(png) as image:
+                      if image.width < 500 or image.height < 650:
+                          raise RuntimeError(
+                              f'Render dimensions invalid for {path.name} page {page_no}: {image.size}'
+                          )
+
+              digest = sha256_bytes(data)
+              if digest in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {path.name}')
+              seen_hashes.add(digest)
+
+              record = {
+                  'order': item['order'],
+                  'company': COMPANY,
+                  'short_name': SHORT_NAME,
+                  'ticker': TICKER,
+                  'institution': item['institution'],
+                  'date': item['date'],
+                  'title': item['title'],
+                  'report_type': item['report_type'],
+                  'researchers': item['researchers'],
+                  'info_code': item['info_code'],
+                  'filename': item['filename'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': final_url,
+                  'source_format': '完整原版PDF',
+              }
+              records.append(record)
+              total_pages += pages
+              total_bytes += len(data)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 3:
+              raise RuntimeError(f'Expected 3 reports, got {len(records)}')
+          if total_pages != 116:
+              raise RuntimeError(f'Expected 116 total pages, got {total_pages}')
+
+          readme = [
+              f'{SHORT_NAME}（{TICKER}）券商深度报告合集',
+              '整理日期：2026-09-02',
+              '',
+              '本包收录3份能够完整公开下载并逐份核验的公司深度／深度分析报告。',
+              '优先选择近年、篇幅完整且覆盖主题互补的报告；未使用仅3—7页的季报、年报或业绩点评凑数。',
+              '',
+              '一、报告清单',
+          ]
+          for record in records:
+              readme.extend([
+                  f"{record['order']}. {record['institution']}：《{record['title']}》",
+                  f"   日期：{record['date']}；研究员：{record['researchers']}；类型：{record['report_type']}；实际页数：{record['pages']}页",
+                  f"   文件：{record['filename']}",
+                  f"   原始PDF：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '二、完整性检查',
+              f'- PDF数量：{len(records)}份；合计页数：{total_pages}页；未压缩PDF总大小：{total_bytes / 1024 / 1024:.2f} MiB。',
+              '- 每份PDF均核对文件头、实际页数、公司名称与证券代码、机构、标题和报告年份。',
+              '- 每份PDF均通过qpdf结构检查，并使用Poppler渲染首页、中间页和末页。',
+              '- 已进行重复文件检查、逐文件SHA-256计算及ZIP CRC测试。',
+              '',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (OUT / '00_报告清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          with (OUT / '报告清单.csv').open('w', encoding='utf-8-sig', newline='') as handle:
+              fields = [
+                  '序号', '机构', '报告日期', '报告标题', '报告类型', '研究员',
+                  '页数', '文件大小_字节', 'SHA256', '原始PDF', '文件名',
+              ]
+              writer = csv.DictWriter(handle, fieldnames=fields)
+              writer.writeheader()
+              for record in records:
+                  writer.writerow({
+                      '序号': record['order'],
+                      '机构': record['institution'],
+                      '报告日期': record['date'],
+                      '报告标题': record['title'],
+                      '报告类型': record['report_type'],
+                      '研究员': record['researchers'],
+                      '页数': record['pages'],
+                      '文件大小_字节': record['bytes'],
+                      'SHA256': record['sha256'],
+                      '原始PDF': record['source_url'],
+                      '文件名': record['filename'],
+                  })
+
+          manifest = {
+              'company': COMPANY,
+              'short_name': SHORT_NAME,
+              'ticker': TICKER,
+              'prepared_date': '2026-09-02',
+              'pdf_count': len(records),
+              'total_pages': total_pages,
+              'total_bytes': total_bytes,
+              'documents': records,
+          }
+          (OUT / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(
+              zip_path,
+              'w',
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+              allowZip64=True,
+          ) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad_member = archive.testzip()
+              if bad_member:
+                  raise RuntimeError(f'ZIP CRC failure: {bad_member}')
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdf_members)} PDFs, expected 3')
+
+          bundle_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          Path('FINAL_ZIP_SHA256.txt').write_text(
+              f'{bundle_sha}  {zip_path.name}\n', encoding='utf-8'
+          )
+          print(
+              'FINAL_ZIP', zip_path.name, zip_path.stat().st_size,
+              bundle_sha, 'TOTAL_PAGES', total_pages, 'TOTAL_BYTES', total_bytes,
+              flush=True,
+          )
+          PY
+
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: joyson-broker-deep-reports-20260902
+          path: |
+            均胜电子_券商深度报告_3份_完整PDF.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
