@@ -1,0 +1,67 @@
+name: Query Eastmoney for China Everbright Limited reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/china-everbright-eastmoney-query-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+
+          out=Path('eastmoney-query'); out.mkdir(exist_ok=True)
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/json,text/plain,*/*'}
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          calls=[]
+          variants=['00165','0165','HK00165','00165.HK','116.00165']
+          for code in variants:
+              for qtype in [0,1,2,3]:
+                  calls.append({'pageNo':1,'pageSize':500,'code':code,'qType':qtype,'beginTime':'2010-01-01','endTime':'2026-09-02'})
+          for key in ['title','keyword','searchText','stockName']:
+              calls.append({'pageNo':1,'pageSize':500,'qType':0,key:'中国光大控股','beginTime':'2010-01-01','endTime':'2026-09-02'})
+          output=[]
+          for p in calls:
+              try:
+                  r=s.get(endpoint,params=p,headers=h,timeout=(15,60))
+                  print('CALL',r.status_code,len(r.content),r.url,flush=True)
+                  item={'params':p,'status':r.status_code,'url':r.url,'bytes':len(r.content)}
+                  try:
+                      data=r.json(); item['raw']=data
+                  except Exception as e:
+                      item['error']=repr(e); item['body']=r.text[:2000]
+                  output.append(item)
+              except Exception as e:
+                  output.append({'params':p,'request_error':repr(e)})
+          Path(out/'all.json').write_text(json.dumps(output,ensure_ascii=False,indent=2),encoding='utf-8')
+          matches=[]
+          for item in output:
+              raw=item.get('raw')
+              rows=raw.get('data',[]) if isinstance(raw,dict) else []
+              if not isinstance(rows,list): continue
+              for row in rows:
+                  text=json.dumps(row,ensure_ascii=False)
+                  if any(x.lower() in text.lower() for x in ['中国光大控股','china everbright limited','00165','165 hk']):
+                      if row not in matches: matches.append(row)
+          Path(out/'matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCHES',json.dumps(matches,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-eastmoney-query
+          path: eastmoney-query/
+          retention-days: 7
