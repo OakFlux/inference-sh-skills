@@ -1,0 +1,380 @@
+name: Package China Conch Venture broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-broker-package-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF and image validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pillow img2pdf pypdf
+
+      - name: Download public page images, rebuild complete PDFs, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY = '海螺创业'
+          TICKER = '00586.HK'
+          PACKAGE = '海螺创业_00586HK_券商深度报告_2份_完整公开影像版'
+          OUT = Path(PACKAGE)
+          WORK = Path('_conch_broker_work')
+          PREVIEW = WORK / 'previews'
+
+          for path in (OUT, WORK):
+              if path.exists():
+                  shutil.rmtree(path)
+          OUT.mkdir(parents=True)
+          PREVIEW.mkdir(parents=True)
+          zip_path = Path(f'{PACKAGE}.zip')
+          zip_path.unlink(missing_ok=True)
+          Path('FINAL_ZIP_SHA256.txt').unlink(missing_ok=True)
+
+          reports = [
+              {
+                  'order': 1,
+                  'doc_id': '4894193',
+                  'institution': '东吴证券',
+                  'date': '2025-06-11',
+                  'title': '资金&效率双强，现金流回正大增，资产价值重估',
+                  'report_type': '公司首次覆盖深度报告',
+                  'analysts': '袁理、陈孜文',
+                  'detail_url': 'https://www.fxbaogao.com/detail/4894193',
+                  'expected_pages': 26,
+                  'title_terms': ['资金', '效率双强', '现金流回正', '资产价值重估'],
+              },
+              {
+                  'order': 2,
+                  'doc_id': '4871262',
+                  'institution': '兴证国际',
+                  'date': '2025-05-28',
+                  'title': '联营公司业绩见底叠加主业现金流改善，公司派息有望持续增长',
+                  'report_type': '公司深度研究报告',
+                  'analysts': '韩亦佳、史一粟、蔡屹、马睿晴',
+                  'detail_url': 'https://www.fxbaogao.com/detail/4871262',
+                  'expected_pages': None,
+                  'title_terms': ['联营公司业绩见底', '主业现金流改善', '派息有望持续增长'],
+              },
+          ]
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          html_headers = {
+              'User-Agent': ua,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+          image_headers = {
+              'User-Agent': ua,
+              'Accept': 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def safe_name(value: str) -> str:
+              value = value.replace('&', '与')
+              return re.sub(r'[\\/:*?"<>|\s，、；：]+', '_', value).strip('_')[:110]
+
+          def get_with_retry(url: str, headers: dict, attempts: int = 5, timeout=(20, 180)) -> requests.Response:
+              errors = []
+              for attempt in range(1, attempts + 1):
+                  try:
+                      response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      if response.status_code == 200:
+                          return response
+                      errors.append(f'HTTP {response.status_code}/{len(response.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(1.5 * attempt)
+              raise RuntimeError(f'GET failed for {url}: {errors[-5:]}')
+
+          def parse_detail(report: dict) -> tuple[str, int | None, str]:
+              response = get_with_retry(report['detail_url'], html_headers)
+              text = response.text
+              visible = BeautifulSoup(text, 'html.parser').get_text(' ', strip=True)
+              compact = re.sub(r'\s+', '', visible)
+              if COMPANY not in compact:
+                  raise RuntimeError(f"Company identity missing on detail page {report['doc_id']}")
+              for term in report['title_terms']:
+                  if re.sub(r'\s+', '', term) not in compact:
+                      raise RuntimeError(f"Title term {term!r} missing on detail page {report['doc_id']}")
+
+              matches = re.findall(
+                  rf'https?://public\.fxbaogao\.com/report-image/[^"\'<>\s]+?/{report["doc_id"]}-1\.png(?:\?[^"\'<>\s]*)?',
+                  text,
+                  flags=re.I,
+              )
+              if not matches:
+                  raise RuntimeError(f"First-page image URL missing on detail page {report['doc_id']}")
+              first_url = matches[0].split('?')[0]
+              template = re.sub(r'-1\.png$', '-{page}.png', first_url)
+
+              candidates = []
+              for pattern in (
+                  r'(?<!\d)1\s*/\s*(\d{1,3})(?!\d)',
+                  r'(?<!\d)1\s*／\s*(\d{1,3})(?!\d)',
+                  r'第\s*1\s*页\s*[，,/]?\s*共\s*(\d{1,3})\s*页',
+              ):
+                  candidates.extend(int(value) for value in re.findall(pattern, visible, flags=re.I))
+              candidates = [value for value in candidates if 5 <= value <= 150]
+              detected = max(candidates) if candidates else None
+              if report['expected_pages'] is not None:
+                  if detected is not None and detected != report['expected_pages']:
+                      print('PAGE_COUNT_NOTE', report['doc_id'], 'metadata', detected, 'expected', report['expected_pages'], flush=True)
+                  detected = report['expected_pages']
+              print('DETAIL', report['doc_id'], report['title'], 'page_count', detected, 'template', template, flush=True)
+              return template, detected, response.url
+
+          def valid_image_response(response: requests.Response) -> bool:
+              if response.status_code != 200 or len(response.content) < 20_000:
+                  return False
+              try:
+                  with Image.open(io.BytesIO(response.content)) as image:
+                      image.verify()
+                  with Image.open(io.BytesIO(response.content)) as image:
+                      width, height = image.size
+                  return width >= 600 and height >= 800
+              except Exception:
+                  return False
+
+          def fetch_image(url: str, referer: str) -> requests.Response | None:
+              headers = {**image_headers, 'Referer': referer}
+              for attempt in range(1, 5):
+                  try:
+                      response = session.get(url, headers=headers, timeout=(20, 180), allow_redirects=True)
+                      print('IMAGE_GET', url, response.status_code, response.headers.get('content-type'), len(response.content), flush=True)
+                      if valid_image_response(response):
+                          return response
+                      if response.status_code in (403, 429, 500, 502, 503, 504):
+                          time.sleep(2 * attempt)
+                          continue
+                      return None
+                  except Exception as exc:
+                      print('IMAGE_RETRY', url, attempt, repr(exc), flush=True)
+                      time.sleep(2 * attempt)
+              return None
+
+          def download_pages(report: dict, template: str, count: int | None) -> tuple[list[Path], int]:
+              page_dir = WORK / f"pages_{report['doc_id']}"
+              jpg_dir = WORK / f"jpg_{report['doc_id']}"
+              page_dir.mkdir(parents=True)
+              jpg_dir.mkdir(parents=True)
+              originals = []
+
+              if count is not None:
+                  page_numbers = range(1, count + 1)
+                  for page in page_numbers:
+                      url = template.format(page=page)
+                      response = fetch_image(url, report['detail_url'])
+                      if response is None:
+                          raise RuntimeError(f"Missing or invalid page {page}/{count} for report {report['doc_id']}")
+                      suffix = '.png'
+                      path = page_dir / f'{page:04d}{suffix}'
+                      path.write_bytes(response.content)
+                      originals.append(path)
+              else:
+                  consecutive_missing = 0
+                  page = 1
+                  while page <= 150:
+                      url = template.format(page=page)
+                      response = fetch_image(url, report['detail_url'])
+                      if response is None:
+                          consecutive_missing += 1
+                          if consecutive_missing >= 2:
+                              break
+                          page += 1
+                          continue
+                      if consecutive_missing:
+                          raise RuntimeError(f"Non-contiguous image sequence before page {page} for report {report['doc_id']}")
+                      path = page_dir / f'{page:04d}.png'
+                      path.write_bytes(response.content)
+                      originals.append(path)
+                      page += 1
+                  count = len(originals)
+                  if count < 15:
+                      raise RuntimeError(f"Only {count} public pages found for purported deep report {report['doc_id']}")
+
+              jpgs = []
+              dimensions = set()
+              for index, source in enumerate(originals, 1):
+                  with Image.open(source) as image:
+                      image.load()
+                      dimensions.add(image.size)
+                      rgb = image.convert('RGB')
+                      target = jpg_dir / f'{index:04d}.jpg'
+                      rgb.save(target, 'JPEG', quality=95, subsampling=0, optimize=True, dpi=(150, 150))
+                      jpgs.append(target)
+              if len(dimensions) > 4:
+                  print('DIMENSION_WARNING', report['doc_id'], sorted(dimensions), flush=True)
+              print('PAGES_READY', report['doc_id'], len(jpgs), sorted(dimensions), flush=True)
+              return jpgs, len(jpgs)
+
+          def build_pdf(report: dict, images: list[Path], pages: int) -> tuple[Path, dict]:
+              filename = (
+                  f"{report['order']:02d}_{report['institution']}_{COMPANY}_"
+                  f"{safe_name(report['title'])}_{report['date'].replace('-', '')}_{pages}页_公开逐页影像版.pdf"
+              )
+              pdf_path = OUT / filename
+              layout = img2pdf.get_fixed_dpi_layout_fun((150, 150))
+              with pdf_path.open('wb') as handle:
+                  handle.write(img2pdf.convert([str(path) for path in images], layout_fun=layout))
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              if len(reader.pages) != pages:
+                  raise RuntimeError(f"PDF page count mismatch for {filename}: {len(reader.pages)} vs {pages}")
+              check = subprocess.run(['qpdf', '--check', str(pdf_path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f"qpdf failed for {filename}: {check.stderr[-800:]}")
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f"{report['order']:02d}_{label}"
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '80', str(pdf_path), str(prefix)],
+                      check=True,
+                      capture_output=True,
+                  )
+                  rendered = Path(str(prefix) + '.png')
+                  if not rendered.exists() or rendered.stat().st_size < 10_000:
+                      raise RuntimeError(f"Render validation failed for {filename} page {page_no}")
+              meta = {
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha256(pdf_path),
+              }
+              return pdf_path, meta
+
+          records = []
+          for report in reports:
+              template, page_count, resolved_detail_url = parse_detail(report)
+              images, actual_pages = download_pages(report, template, page_count)
+              pdf_path, file_meta = build_pdf(report, images, actual_pages)
+              record = {
+                  **report,
+                  **file_meta,
+                  'resolved_detail_url': resolved_detail_url,
+                  'image_url_template': template,
+                  'source_format': '公开网页逐页影像重建的完整PDF；非券商服务器原始PDF二进制',
+              }
+              records.append(record)
+              print('VERIFIED_REPORT', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 2:
+              raise RuntimeError(f'Expected 2 reports, got {len(records)}')
+          if len({record['sha256'] for record in records}) != 2:
+              raise RuntimeError('Duplicate PDF detected')
+
+          with (OUT / '报告清单与来源说明.csv').open('w', encoding='utf-8-sig', newline='') as handle:
+              fields = [
+                  '序号', '机构', '日期', '报告类型', '题目', '分析师', '页数', '文件名',
+                  '文件大小_字节', 'SHA256', '公开详情页', '公开页面图像模板', '文件性质'
+              ]
+              writer = csv.DictWriter(handle, fieldnames=fields)
+              writer.writeheader()
+              for record in records:
+                  writer.writerow({
+                      '序号': record['order'],
+                      '机构': record['institution'],
+                      '日期': record['date'],
+                      '报告类型': record['report_type'],
+                      '题目': record['title'],
+                      '分析师': record['analysts'],
+                      '页数': record['pages'],
+                      '文件名': record['filename'],
+                      '文件大小_字节': record['bytes'],
+                      'SHA256': record['sha256'],
+                      '公开详情页': record['resolved_detail_url'],
+                      '公开页面图像模板': record['image_url_template'],
+                      '文件性质': record['source_format'],
+                  })
+
+          notes = [
+              f'{COMPANY}（{TICKER}）券商深度报告资料包',
+              '',
+              '本包筛选两份公司专项深度报告，排除了财报快评、新闻摘要和仅在行业周报中出现的内容。',
+              '',
+              '收录报告：',
+          ]
+          for record in records:
+              notes.extend([
+                  f"{record['order']}. {record['institution']}：《{record['title']}》",
+                  f"   日期：{record['date']}；类型：{record['report_type']}；分析师：{record['analysts']}；页数：{record['pages']}页",
+                  f"   文件：{record['filename']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          notes.extend([
+              '文件性质说明：公开详情页提供逐页免费查看，但未暴露可匿名下载的券商原始PDF文件地址。',
+              '本包依据公开逐页页面影像，按原顺序重建为完整PDF；没有使用网页摘要代替正文，也没有修改报告内容。',
+              '因此文件是“完整公开影像版”，并非券商服务器上的原始PDF二进制。',
+              '',
+              '核验项目：详情页公司与标题、连续页码、实际页数、图像尺寸、PDF结构、首页与末页渲染、重复文件、SHA-256及ZIP CRC。',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (OUT / 'README_报告清单与文件性质.txt').write_text('\n'.join(notes), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 2:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 2')
+          bundle_sha = sha256(zip_path)
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{bundle_sha}  {zip_path.name}\n', encoding='utf-8')
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, bundle_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: conch-venture-broker-deep-reports-final
+          path: |
+            海螺创业_00586HK_券商深度报告_2份_完整公开影像版.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
