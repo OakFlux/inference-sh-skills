@@ -1,0 +1,475 @@
+name: Package Sany International broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sany-international-broker-deep-reports-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet pypdf requests pillow img2pdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY = '三一国际'
+          COMPANY_KEYWORDS = ('三一国际', '三一重装国际', 'SANY HEAVY EQUIPMENT INTERNATIONAL')
+          CODE = '00631'
+          PACKAGE = '三一国际_券商深度报告_3份_公开完整版'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_sany_international_broker_work')
+          work.mkdir(exist_ok=True)
+          previews = work / 'previews'
+          previews.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          api_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/',
+              'Origin': 'https://data.eastmoney.com',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+
+          def get_json(url: str, params: dict) -> dict:
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      response = session.get(url, params=params, headers=api_headers, timeout=(25, 150))
+                      print('API_GET', attempt, response.status_code, len(response.content), response.url, flush=True)
+                      if response.status_code == 200:
+                          return response.json()
+                      last = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(2 * attempt, 10))
+              raise RuntimeError(f'API request failed: {last}')
+
+          def post_json(url: str, payload: dict) -> dict:
+              headers = {
+                  'User-Agent': ua,
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Content-Type': 'application/json;charset=UTF-8',
+                  'Origin': 'https://www.sdyanbao.com',
+                  'Referer': 'https://www.sdyanbao.com/',
+                  'Device': '1',
+                  'X-Token': '',
+              }
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      response = session.post(url, json=payload, headers=headers, timeout=(30, 180))
+                      print('API_POST', attempt, response.status_code, len(response.content), response.url, response.text[:180], flush=True)
+                      if response.status_code == 200:
+                          return response.json()
+                      last = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(2 * attempt, 10))
+              raise RuntimeError(f'POST request failed: {last}')
+
+          def norm(value: str) -> str:
+              return re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]+', '', value or '').lower()
+
+          def to_int(value, default=0) -> int:
+              try:
+                  return int(value or default)
+              except Exception:
+                  return default
+
+          raw_items: list[dict] = []
+
+          # Eastmoney company-report API. Different mirrors use different code forms for HK stocks.
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          for code_variant in ('00631', '0631', '631', '00631.HK'):
+              for page_no in range(1, 6):
+                  try:
+                      payload = get_json(endpoint, {
+                          'pageNo': page_no,
+                          'pageSize': 100,
+                          'code': code_variant,
+                          'qType': 0,
+                          'beginTime': '2018-01-01',
+                          'endTime': '2026-09-02',
+                      })
+                  except Exception as exc:
+                      print('EASTMONEY_WARNING', code_variant, repr(exc), flush=True)
+                      break
+                  rows = payload.get('data') if isinstance(payload, dict) else []
+                  if not isinstance(rows, list) or not rows:
+                      break
+                  for row in rows:
+                      if not isinstance(row, dict):
+                          continue
+                      raw_items.append({
+                          'source': 'eastmoney',
+                          'title': str(row.get('title') or '').strip(),
+                          'organization': str(row.get('orgSName') or row.get('orgName') or '').strip() or '券商',
+                          'uuid': str(row.get('infoCode') or row.get('infocode') or '').strip(),
+                          'date': str(row.get('publishDate') or '')[:10],
+                          'pages_hint': to_int(row.get('attachPages') or row.get('pageCount') or row.get('pages')),
+                          'researcher': str(row.get('researcher') or ''),
+                          'rating': str(row.get('emRatingName') or ''),
+                          'page_url': '',
+                      })
+                  total = to_int(payload.get('Total') or payload.get('total'), len(rows))
+                  if page_no * 100 >= total or len(rows) < 100:
+                      break
+
+          # Public research-index fallback, useful when HK-company reports are absent from code search.
+          for keyword in ('三一国际', '三一重装国际'):
+              for page_no in range(1, 6):
+                  try:
+                      obj = post_json(
+                          'https://api.sdyanbao.com/api/file/search',
+                          {'keyword': keyword, 'page': page_no, 'pageSize': 100, 'opFrom': 1},
+                      )
+                  except Exception as exc:
+                      print('SDYANBAO_WARNING', keyword, repr(exc), flush=True)
+                      break
+                  data = obj.get('data') if isinstance(obj, dict) else None
+                  files = data.get('files') if isinstance(data, dict) else []
+                  if not isinstance(files, list) or not files:
+                      break
+                  for item in files:
+                      if not isinstance(item, dict):
+                          continue
+                      stock = item.get('stock') if isinstance(item.get('stock'), dict) else {}
+                      stock_code = str(stock.get('code') or item.get('stock_code') or '')
+                      title = str(item.get('name') or item.get('title') or '').strip()
+                      if COMPANY not in title and '三一重装国际' not in title and stock_code not in ('00631', '0631', '631'):
+                          continue
+                      raw_items.append({
+                          'source': 'sdyanbao',
+                          'title': title,
+                          'organization': str(item.get('org_name') or item.get('organization') or item.get('org') or '').strip() or '券商',
+                          'uuid': str(item.get('data_source_uuid') or item.get('uuid') or '').strip(),
+                          'date': str(item.get('time_text') or item.get('publish_time') or item.get('date') or '')[:10],
+                          'pages_hint': to_int(item.get('page_count') or item.get('pages')),
+                          'researcher': str(item.get('author') or item.get('researcher') or ''),
+                          'rating': str(item.get('rating') or ''),
+                          'page_url': str(item.get('page_url') or '').strip(),
+                      })
+                  if len(files) < 100:
+                      break
+
+          Path('sany_international_raw_items.json').write_text(
+              json.dumps(raw_items, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          print('RAW_ITEMS', len(raw_items), flush=True)
+
+          # Deduplicate source mirrors.
+          deduped: list[dict] = []
+          seen_keys = set()
+          for item in raw_items:
+              title = item['title']
+              if not title:
+                  continue
+              key = item['uuid'] or f"{norm(title)}|{item['date']}|{item['pages_hint']}"
+              if key in seen_keys:
+                  continue
+              seen_keys.add(key)
+              deduped.append(item)
+
+          excluded_terms = (
+              '点评', '快评', '简评', '季报', '一季报', '三季报', '中报', '半年报', '半年度',
+              '年报及', '年度报告', '业绩预告', '业绩快报', '盈利预警', '目标价', '评级',
+              '电话会', '调研纪要', '路演', '事项点评', '财报点评', '事件点评', '更新报告',
+          )
+          deep_terms = ('深度', '首次覆盖', '初次覆盖', '公司研究报告', '公司研究', '首次')
+          theme_terms = (
+              '矿机', '矿山', '煤机', '港机', '港口机械', '物流装备', '智能矿山', '无人驾驶',
+              '全球化', '出海', '新能源装备', '装备制造', '成长空间', '成长动力', '龙头',
+          )
+
+          candidates: list[dict] = []
+          for item in deduped:
+              title = item['title']
+              pages = item['pages_hint']
+              if pages < 15 or any(term in title for term in excluded_terms):
+                  continue
+              explicit = any(term in title for term in deep_terms)
+              thematic = any(term in title for term in theme_terms)
+              if not explicit and not (pages >= 24 and thematic):
+                  continue
+              try:
+                  date_ord = datetime.strptime(item['date'], '%Y-%m-%d').toordinal()
+              except Exception:
+                  date_ord = 0
+              preferred_exact = '国产智能矿机重塑矿山生态' in title
+              score = (
+                  (5000 if preferred_exact else 0)
+                  + (2600 if explicit else 0)
+                  + (700 if '首次覆盖' in title or '初次覆盖' in title or '首次' in title else 0)
+                  + (450 if '深度' in title else 0)
+                  + (300 if pages >= 30 else 180 if pages >= 24 else 80)
+                  + (160 if thematic else 0)
+                  + date_ord / 1000
+              )
+              candidates.append({**item, 'explicit': explicit, 'score': score})
+
+          candidates.sort(key=lambda x: (x['score'], x['date'], x['pages_hint']), reverse=True)
+          print('CANDIDATES', json.dumps(candidates, ensure_ascii=False, indent=2), flush=True)
+          if len(candidates) < 2:
+              raise RuntimeError(f'Only {len(candidates)} suitable deep-report candidates found')
+
+          # Prefer three reports from different institutions; allow two if public full-text supply is limited.
+          selected: list[dict] = []
+          seen_orgs = set()
+          for item in candidates:
+              org_key = norm(item['organization'])
+              if org_key and org_key in seen_orgs:
+                  continue
+              selected.append(item)
+              if org_key:
+                  seen_orgs.add(org_key)
+              if len(selected) >= 3:
+                  break
+          for item in candidates:
+              if len(selected) >= 3:
+                  break
+              if item not in selected:
+                  selected.append(item)
+          if len(selected) < 2:
+              raise RuntimeError('Unable to select at least two reports')
+          print('SELECTED', json.dumps(selected, ensure_ascii=False, indent=2), flush=True)
+
+          def safe(value: str) -> str:
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', value).strip('_')[:110]
+
+          def fetch_pdf(item: dict, index: int) -> tuple[bytes, str, str]:
+              urls = []
+              uuid = item.get('uuid') or ''
+              if uuid.startswith(('AP', 'AS')):
+                  urls.extend([
+                      f'https://pdf.dfcfw.com/pdf/H3_{uuid}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{uuid}_1.pdf',
+                  ])
+              for url in urls:
+                  for attempt in range(1, 7):
+                      try:
+                          response = session.get(url, headers=pdf_headers, timeout=(30, 420), allow_redirects=True)
+                          print('PDF_GET', index, attempt, url, response.status_code, response.headers.get('content-type'), len(response.content), flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50_000:
+                              return response.content, url, '公开原始PDF'
+                      except Exception as exc:
+                          print('PDF_ERROR', index, url, repr(exc), flush=True)
+                      time.sleep(min(2 * attempt, 10))
+
+              page_url = str(item.get('page_url') or '').rstrip('/')
+              expected = int(item.get('pages_hint') or 0)
+              if page_url and expected >= 15:
+                  page_dir = work / f'pages_{index:02d}'
+                  page_dir.mkdir(exist_ok=True)
+                  image_paths = []
+                  for page_number in range(expected):
+                      page_candidates = [
+                          f'{page_url}/{page_number}.png',
+                          f'{page_url}/{page_number + 1}.png',
+                          f'{page_url}/{page_number}.jpg',
+                          f'{page_url}/{page_number + 1}.jpg',
+                      ]
+                      page_bytes = b''
+                      used_page_url = ''
+                      for candidate_url in page_candidates:
+                          try:
+                              response = session.get(
+                                  candidate_url,
+                                  headers={
+                                      'User-Agent': ua,
+                                      'Referer': 'https://www.sdyanbao.com/',
+                                      'Accept': 'image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8',
+                                  },
+                                  timeout=(20, 120),
+                                  allow_redirects=True,
+                              )
+                              if response.status_code == 200 and response.content[:4] in (b'\x89PNG', b'\xff\xd8\xff\xe0', b'\xff\xd8\xff\xe1'):
+                                  page_bytes = response.content
+                                  used_page_url = candidate_url
+                                  break
+                          except Exception:
+                              pass
+                      if not page_bytes:
+                          print('PAGE_MISSING', index, page_number, page_url, flush=True)
+                          break
+                      suffix = '.png' if page_bytes.startswith(b'\x89PNG') else '.jpg'
+                      image_path = page_dir / f'{page_number:04d}{suffix}'
+                      image_path.write_bytes(page_bytes)
+                      try:
+                          with Image.open(image_path) as image:
+                              width, height = image.size
+                              image.verify()
+                          if width < 600 or height < 800:
+                              raise RuntimeError(f'Image too small: {width}x{height}')
+                      except Exception as exc:
+                          print('PAGE_INVALID', index, page_number, repr(exc), flush=True)
+                          break
+                      image_paths.append(image_path)
+                      print('PAGE_OK', index, page_number + 1, used_page_url, flush=True)
+                  if len(image_paths) == expected:
+                      pdf_bytes = img2pdf.convert([str(path) for path in image_paths])
+                      return pdf_bytes, page_url, '公开完整逐页版重建PDF'
+
+              raise RuntimeError(f"Unable to obtain full PDF for {item['title']}")
+
+          records = []
+          seen_hashes = set()
+          successful = 0
+          failures = []
+          for candidate in selected + [c for c in candidates if c not in selected]:
+              if successful >= 3:
+                  break
+              index = successful + 1
+              try:
+                  pdf_bytes, source_url, source_format = fetch_pdf(candidate, index)
+                  filename = f"{index:02d}_{safe(candidate['organization'])}_{COMPANY}_{safe(candidate['title'])}_{candidate['date']}_{candidate['pages_hint']}页.pdf"
+                  path = out / filename
+                  path.write_bytes(pdf_bytes)
+
+                  reader = PdfReader(str(path), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 15:
+                      raise RuntimeError(f'{filename} is too short: {pages} pages')
+                  if candidate['pages_hint'] and abs(pages - candidate['pages_hint']) > 1:
+                      raise RuntimeError(f'{filename}: page count mismatch, actual {pages}, expected {candidate["pages_hint"]}')
+
+                  texts = []
+                  for page in reader.pages[: min(pages, 15)]:
+                      try:
+                          texts.append(page.extract_text() or '')
+                      except Exception:
+                          pass
+                  compact = norm('\n'.join(texts))
+                  text_available = len(compact) > 80
+                  if text_available:
+                      identity_ok = any(norm(keyword) in compact for keyword in COMPANY_KEYWORDS) or '00631' in compact or '631hk' in compact
+                      if not identity_ok:
+                          raise RuntimeError(f'Company identity validation failed for {filename}')
+
+                  check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+                  if check.returncode not in (0, 3):
+                      raise RuntimeError(f'qpdf check failed for {filename}: {check.stderr[-1200:]}')
+                  if check.returncode == 3:
+                      print('QPDF_WARNING', filename, check.stderr[-1200:], flush=True)
+
+                  first_prefix = previews / f'{index:02d}_first'
+                  last_prefix = previews / f'{index:02d}_last'
+                  subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(path), str(first_prefix)], check=True, capture_output=True)
+                  subprocess.run(['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90', str(path), str(last_prefix)], check=True, capture_output=True)
+                  if not Path(str(first_prefix) + '.png').exists() or not Path(str(last_prefix) + '.png').exists():
+                      raise RuntimeError(f'Render verification failed for {filename}')
+
+                  digest = hashlib.sha256(pdf_bytes).hexdigest()
+                  if digest in seen_hashes:
+                      raise RuntimeError('Duplicate PDF detected')
+                  seen_hashes.add(digest)
+                  record = {
+                      **candidate,
+                      'filename': filename,
+                      'pages': pages,
+                      'bytes': len(pdf_bytes),
+                      'sha256': digest,
+                      'source_url': source_url,
+                      'source_format': source_format,
+                      'text_identity_checked': text_available,
+                  }
+                  records.append(record)
+                  successful += 1
+                  print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  failures.append({'title': candidate['title'], 'error': repr(exc)})
+                  print('CANDIDATE_FAILURE', candidate['title'], repr(exc), flush=True)
+                  continue
+
+          if len(records) < 2:
+              raise RuntimeError(f'Only {len(records)} full reports successfully packaged; failures={failures}')
+
+          lines = [
+              f'{COMPANY}（{CODE}.HK）券商深度报告包',
+              '',
+              f'本包共{len(records)}份公开可获取的完整券商公司深度/首次覆盖类研究报告。',
+              '筛选原则：优先近年、篇幅完整、明确标注深度或首次覆盖，并尽量选择不同研究机构；排除几页的业绩点评。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {record['organization']}：《{record['title']}》",
+                  f"   日期：{record['date']}；页数：{record['pages']}页；评级：{record['rating'] or '未标注'}",
+                  f"   分析师：{record['researcher'] or '未标注'}",
+                  f"   文件：{record['filename']}",
+                  f"   文件形式：{record['source_format']}",
+                  f"   公开来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          if failures:
+              lines.extend(['未纳入候选及原因：', json.dumps(failures, ensure_ascii=False, indent=2), ''])
+          lines.extend([
+              '核验项目：PDF文件头和结构、实际页数、公司名称/证券代码（可提取文本时）、首页与末页渲染、文件哈希、ZIP CRC。',
+              '报告中的评级、目标价、盈利预测和估值结论均对应报告出具时点，不构成当前投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records), encoding='utf-8'
+          )
+
+          zip_path = Path(f'{PACKAGE}.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != len(records):
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of {len(records)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'REPORTS', len(records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sany-international-broker-deep-reports-final
+          path: |
+            三一国际_券商深度报告_3份_公开完整版/
+            三一国际_券商深度报告_3份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
