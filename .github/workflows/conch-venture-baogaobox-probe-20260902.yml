@@ -1,0 +1,53 @@
+name: Inspect public China Conch Venture report pages
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-baogaobox-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Inspect report metadata and public links
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          urls=[
+              'https://www.baogaobox.com/reports/250530000061807.html',
+              'https://www.baogaobox.com/reports/250611000063250.html',
+              'https://www.baogaobox.com/reports/250517000060055.html',
+              'https://www.baogaobox.com/reports/240623000021235.html',
+          ]
+          for url in urls:
+              r=requests.get(url,headers={'User-Agent':ua,'Accept':'text/html,*/*'},timeout=(20,120),allow_redirects=True)
+              print('\n=== PAGE',url,r.status_code,r.headers.get('content-type'),len(r.content),r.url,'===',flush=True)
+              print(r.text[:50000],flush=True)
+              soup=BeautifulSoup(r.text,'html.parser')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+              print('VISIBLE',soup.get_text(' ',strip=True)[:20000],flush=True)
+              for tag in soup.find_all(['a','iframe','embed','object','script','source'],href=True):
+                  value=tag.get('href')
+                  print('HREF',tag.name,urljoin(r.url,value),flush=True)
+              for tag in soup.find_all(['iframe','embed','script','source','img'],src=True):
+                  value=tag.get('src')
+                  full=urljoin(r.url,value)
+                  if any(key in full.lower() for key in ('pdf','download','file','report','2505','2506','2406')):
+                      print('SRC',tag.name,full,flush=True)
+              for match in sorted(set(re.findall(r'https?://[^"\'<>\s\\]+',r.text))):
+                  if any(key in match.lower() for key in ('pdf','download','file','report','oss','cos')):
+                      print('URLMATCH',match[:2000],flush=True)
+          PY
