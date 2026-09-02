@@ -1,0 +1,73 @@
+name: Focus Sdyanbao search on REPT BATTERO reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-focused-search-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Focused API queries
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests, concurrent.futures
+          from pathlib import Path
+
+          BASE='https://api.sdyanbao.com/api/file/search'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          H={'User-Agent':UA,'Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','X-Token':'','Device':'1'}
+          queries=[
+            ('2025-03','瑞浦兰钧','2025-03-20','2025-04-03'),
+            ('2025-03-short','瑞浦','2025-03-20','2025-04-03'),
+            ('2025-03-title','规模效应','2025-03-20','2025-04-03'),
+            ('2025-08','瑞浦兰钧','2025-08-05','2025-08-20'),
+            ('2025-08-short','瑞浦','2025-08-05','2025-08-20'),
+            ('2025-08-title','毛利率稳步提升','2025-08-05','2025-08-20'),
+            ('2025-09','瑞浦兰钧','2025-09-08','2025-09-22'),
+            ('2025-09-short','瑞浦','2025-09-08','2025-09-22'),
+            ('2025-09-title','出货量高增','2025-09-08','2025-09-22'),
+            ('2026-02','瑞浦兰钧','2026-01-27','2026-02-10'),
+            ('2026-08','瑞浦兰钧','2026-08-23','2026-09-02'),
+          ]
+
+          def run(q):
+            label,kw,start,end=q
+            payload={'device':1,'hideTrader':0,'onlyTitle':0,'order':1,'page':1,'pageSize':30,'keyword':kw,'pageCount':0,'dateRange':0,'startTime':start,'endTime':end,'typeIds':'2','industryIds':'','opFrom':1}
+            s=requests.Session()
+            try:
+              r=s.post(BASE,headers=H,json=payload,timeout=(10,35))
+              rec={'label':label,'keyword':kw,'start':start,'end':end,'http_status':r.status_code,'bytes':len(r.content)}
+              try:
+                j=r.json(); rec['raw']=j
+                d=j.get('data') if isinstance(j,dict) else None; fs=d.get('files') if isinstance(d,dict) else []
+                rec['total']=d.get('total') if isinstance(d,dict) else None
+                rec['files']=[]
+                if isinstance(fs,list):
+                  for f in fs:
+                    rec['files'].append({k:f.get(k) for k in ['id','name','time_text','page_count','file_size','data_source','data_source_uuid','original_id','page_url','share_url','online_url','organization','researcher','stock','type','industry','summary']})
+              except Exception as e: rec['json_error']=repr(e); rec['text']=r.text[:10000]
+              return rec
+            except Exception as e: return {'label':label,'keyword':kw,'start':start,'end':end,'error':repr(e)}
+
+          with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+            results=list(ex.map(run,queries))
+          for rec in results:
+            print('RESULT',rec['label'],'error' if rec.get('error') else f"total={rec.get('total')} files={len(rec.get('files',[]))}",flush=True)
+            for f in rec.get('files',[]): print('FILE',rec['label'],json.dumps(f,ensure_ascii=False),flush=True)
+          Path('rept_sdy_focused.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-focused-search
+          path: rept_sdy_focused.json
+          retention-days: 7
