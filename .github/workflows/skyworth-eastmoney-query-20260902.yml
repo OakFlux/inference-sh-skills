@@ -1,0 +1,63 @@
+name: Query Eastmoney for Skyworth Group broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-eastmoney-query-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          out=Path('skyworth-eastmoney-query'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/json,text/plain,*/*'}
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          calls=[]
+          variants=['00751','0751','HK00751','00751.HK','116.00751','100.00751']
+          for code in variants:
+              for qtype in [0,1,2,3]:
+                  calls.append({'pageNo':1,'pageSize':500,'code':code,'qType':qtype,'beginTime':'2010-01-01','endTime':'2026-09-02'})
+          for key in ['title','keyword','searchText','stockName']:
+              calls.append({'pageNo':1,'pageSize':500,'qType':0,key:'创维集团','beginTime':'2010-01-01','endTime':'2026-09-02'})
+          output=[]; matches=[]
+          for p in calls:
+              try:
+                  r=s.get(endpoint,params=p,headers=h,timeout=(15,60))
+                  item={'params':p,'status':r.status_code,'url':r.url,'bytes':len(r.content)}
+                  try:
+                      data=r.json(); item['raw']=data
+                      rows=data.get('data',[]) if isinstance(data,dict) else []
+                      if isinstance(rows,list):
+                          for row in rows:
+                              text=json.dumps(row,ensure_ascii=False)
+                              if any(x.lower() in text.lower() for x in ['创维集团','skyworth group','00751','751 hk']):
+                                  if row not in matches: matches.append(row)
+                  except Exception as e:
+                      item['error']=repr(e); item['body']=r.text[:2000]
+                  output.append(item)
+                  print('CALL',r.status_code,len(r.content),r.url,flush=True)
+              except Exception as e:
+                  output.append({'params':p,'request_error':repr(e)})
+          (out/'all.json').write_text(json.dumps(output,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCHES',json.dumps(matches,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-eastmoney-query
+          path: skyworth-eastmoney-query/
+          retention-days: 7
