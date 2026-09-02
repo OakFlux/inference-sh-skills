@@ -1,0 +1,358 @@
+name: Package validated SJM Holdings broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sjm-broker-package-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf pymupdf
+          mkdir -p output/work
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import zipfile
+          from dataclasses import dataclass, asdict
+          from datetime import datetime
+          from io import BytesIO
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+
+          ROOT = Path('output')
+          WORK = ROOT / 'work'
+          ROOT.mkdir(exist_ok=True)
+          WORK.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          PDF_HEADERS = {
+              'User-Agent': UA,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+          API_HEADERS = {
+              'User-Agent': UA,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/report/stock.jshtml',
+          }
+
+          @dataclass
+          class Candidate:
+              key: str
+              broker: str
+              title: str
+              date: str
+              url: str
+              kind: str
+              priority: int
+              expected_min_pages: int = 4
+
+          candidates: list[Candidate] = [
+              Candidate(
+                  key='huatai_20241010', broker='华泰证券',
+                  title='上葡京爬坡见成效，业务有望重回正轨，上调目标价至4.7港元',
+                  date='2024-10-10',
+                  url='https://pdf.dfcfw.com/pdf/H3_AP202410111640256905_1.pdf',
+                  kind='公司专题/深度更新', priority=96, expected_min_pages=8,
+              ),
+              Candidate(
+                  key='dongwu_20250307', broker='东吴证券（香港）',
+                  title='2024年四季报点评：业绩基本符合预期，市占率维持稳定',
+                  date='2025-03-07',
+                  url='https://pdf.dfcfw.com/pdf/H3_AP202503071644143955_1.pdf?1741356449000.pdf',
+                  kind='公司研究', priority=82, expected_min_pages=3,
+              ),
+              Candidate(
+                  key='dongwu_20240513', broker='东吴证券（香港）',
+                  title='2024年一季报点评：受一次性开业费用影响业绩略低于预期；博收加速恢复',
+                  date='2024-05-13',
+                  url='https://pdf.dfcfw.com/pdf/H3_AP202405141633043170_1.pdf',
+                  kind='公司研究', priority=76, expected_min_pages=3,
+              ),
+              Candidate(
+                  key='dongwu_20250506', broker='东吴证券（香港）',
+                  title='2025年一季报点评：业绩略低于预期，市占率维持稳定',
+                  date='2025-05-06',
+                  url='https://pdf.dfcfw.com/pdf/H3_AP202505121671775582_1.pdf',
+                  kind='公司研究', priority=80, expected_min_pages=3,
+              ),
+              Candidate(
+                  key='guangfa_20200527', broker='广发证券',
+                  title='公司治理改善有望带动盈利能力提升',
+                  date='2020-05-27',
+                  url='https://img3.gelonghui.com/pdf/68d8e-6c5399c9-048a-45a6-90d3-c4e5df7e14d0.pdf',
+                  kind='公司深度', priority=92, expected_min_pages=8,
+              ),
+              Candidate(
+                  key='legacy_governance', broker='待核验',
+                  title='何超琼联手霍家确立控制权，公司治理提升将减少估值折价',
+                  date='待核验',
+                  url='https://img3.gelonghui.com/pdf/3b71c-7208c73c-618c-445d-9de5-6a9716bba7d7.pdf',
+                  kind='公司深度', priority=74, expected_min_pages=8,
+              ),
+          ]
+
+          # Find the 2024-03-07 Hua Tai thematic company report through the public report API.
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          discovered: dict[str, Candidate] = {}
+          for qtype in (0, 1):
+              for page in range(1, 5):
+                  params = {
+                      'pageNo': page,
+                      'pageSize': 500,
+                      'qType': qtype,
+                      'beginTime': '2024-03-05',
+                      'endTime': '2024-03-10',
+                      'industryCode': '*',
+                      'rating': '*',
+                      'ratingChange': '*',
+                  }
+                  try:
+                      r = session.get(endpoint, params=params, headers=API_HEADERS, timeout=(20, 120))
+                      print('API', qtype, page, r.status_code, len(r.content), flush=True)
+                      r.raise_for_status()
+                      payload = r.json()
+                      rows = payload.get('data') or []
+                      for row in rows:
+                          raw = json.dumps(row, ensure_ascii=False)
+                          if '澳博' not in raw and '00880' not in raw and '0880.HK' not in raw:
+                              continue
+                          info = str(row.get('infoCode') or '')
+                          title = str(row.get('title') or '')
+                          if not info.startswith('AP'):
+                              continue
+                          c = Candidate(
+                              key=f'discovered_{info}',
+                              broker=str(row.get('orgSName') or row.get('orgName') or '券商'),
+                              title=title,
+                              date=str(row.get('publishDate') or '2024-03-07')[:10],
+                              url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                              kind='公司专题/深度更新',
+                              priority=100 if ('博彩收入恢复不及行业' in title or '利润率转正' in title) else 86,
+                              expected_min_pages=8,
+                          )
+                          discovered[info] = c
+                          print('DISCOVERED', json.dumps(asdict(c), ensure_ascii=False), flush=True)
+                      if len(rows) < 100:
+                          break
+                  except Exception as exc:
+                      print('API_ERROR', qtype, page, repr(exc), flush=True)
+                      break
+          candidates = list(discovered.values()) + candidates
+
+          # Dedupe URLs while keeping priority order.
+          deduped: list[Candidate] = []
+          seen_urls: set[str] = set()
+          for c in sorted(candidates, key=lambda x: x.priority, reverse=True):
+              base = c.url.split('?')[0]
+              if base in seen_urls:
+                  continue
+              seen_urls.add(base)
+              deduped.append(c)
+
+          valid: list[dict] = []
+          for idx, c in enumerate(deduped, 1):
+              try:
+                  r = session.get(c.url, headers=PDF_HEADERS, timeout=(25, 240), allow_redirects=True)
+                  print('GET', c.key, r.status_code, len(r.content), r.headers.get('content-type'), r.url, flush=True)
+                  data = r.content
+                  if r.status_code != 200 or not data.startswith(b'%PDF-') or len(data) < 100_000:
+                      continue
+                  reader = PdfReader(BytesIO(data), strict=False)
+                  pages = len(reader.pages)
+                  if pages < c.expected_min_pages:
+                      print('REJECT_SHORT', c.key, pages, flush=True)
+                      continue
+                  front_chunks = []
+                  for p in reader.pages[:min(8, pages)]:
+                      try:
+                          front_chunks.append(p.extract_text() or '')
+                      except Exception as exc:
+                          print('TEXT_WARN', c.key, repr(exc), flush=True)
+                  front = '\n'.join(front_chunks)
+                  compact = re.sub(r'\s+', '', front).lower()
+                  company_ok = any(marker in compact for marker in ('澳博控股', '澳門博彩控股', '澳门博彩控股', 'sjmholdings', '0880.hk', '00880.hk', '0880hk'))
+                  research_ok = any(marker in compact for marker in ('证券研究报告', '證券研究報告', '公司研究', 'companyresearch', 'equityresearch', '研究报告'))
+                  if not company_ok:
+                      print('REJECT_COMPANY', c.key, re.sub(r'\s+', ' ', front)[:1200], flush=True)
+                      continue
+
+                  # Infer broker/title/date from the PDF front matter where possible.
+                  broker = c.broker
+                  broker_aliases = ['华泰证券', '華泰證券', '东吴证券', '東吳證券', '广发证券', '廣發證券', '第一上海', '海通国际', '海通國際']
+                  for alias in broker_aliases:
+                      if alias.lower().replace(' ', '') in compact:
+                          broker = alias.replace('華泰證券', '华泰证券').replace('東吳證券', '东吴证券').replace('廣發證券', '广发证券')
+                          break
+                  report_date = c.date
+                  date_patterns = [
+                      r'(20\d{2})[年./-](\d{1,2})[月./-](\d{1,2})日?',
+                      r'(20\d{2})(\d{2})(\d{2})',
+                  ]
+                  for pat in date_patterns:
+                      m = re.search(pat, front[:8000])
+                      if m:
+                          try:
+                              report_date = f'{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
+                              break
+                          except Exception:
+                              pass
+
+                  tmp = WORK / f'{idx:02d}_{c.key}.pdf'
+                  tmp.write_bytes(data)
+                  sha = hashlib.sha256(data).hexdigest()
+                  valid.append({
+                      'candidate': c,
+                      'path': tmp,
+                      'broker': broker,
+                      'report_date': report_date,
+                      'pages': pages,
+                      'bytes': len(data),
+                      'sha256': sha,
+                      'company_ok': company_ok,
+                      'research_ok': research_ok,
+                      'front_text': re.sub(r'\s+', ' ', front)[:2500],
+                      'final_url': r.url,
+                  })
+                  print('VALID', json.dumps({
+                      'key': c.key, 'broker': broker, 'title': c.title, 'date': report_date,
+                      'pages': pages, 'bytes': len(data), 'sha256': sha,
+                      'research_ok': research_ok, 'url': r.url,
+                      'front': re.sub(r'\s+', ' ', front)[:1200],
+                  }, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('GET_ERROR', c.key, repr(exc), flush=True)
+
+          if len(valid) < 2:
+              raise SystemExit(f'Only {len(valid)} valid reports; need at least 2')
+
+          # Select up to three, prioritizing substantial company reports and broker diversity.
+          selected: list[dict] = []
+          used_brokers: set[str] = set()
+          # First pass: reports >= 8 pages with diverse brokers.
+          for rec in sorted(valid, key=lambda x: (x['candidate'].priority, x['pages']), reverse=True):
+              normalized_broker = rec['broker'].replace('（香港）','').replace('(香港)','').replace(' ', '')
+              if rec['pages'] >= 8 and normalized_broker not in used_brokers:
+                  selected.append(rec)
+                  used_brokers.add(normalized_broker)
+              if len(selected) == 3:
+                  break
+          # Second pass: strongest remaining reports, including concise company research.
+          if len(selected) < 3:
+              for rec in sorted(valid, key=lambda x: (x['candidate'].priority, x['pages']), reverse=True):
+                  if rec in selected:
+                      continue
+                  selected.append(rec)
+                  if len(selected) == 3:
+                      break
+
+          # Avoid two near-duplicate Dongwu quarterly notes when alternatives exist.
+          if len(selected) > 3:
+              selected = selected[:3]
+
+          safe_re = re.compile(r'[\\/:*?"<>|]')
+          records = []
+          final_files: list[Path] = []
+          for order, rec in enumerate(selected, 1):
+              c: Candidate = rec['candidate']
+              title_short = c.title
+              if len(title_short) > 45:
+                  title_short = title_short[:45]
+              filename = f'{order:02d}_{rec["broker"]}_{rec["report_date"]}_{title_short}.pdf'
+              filename = safe_re.sub('_', filename).replace(' ', '')
+              dst = ROOT / filename
+              shutil.copy2(rec['path'], dst)
+              # Open with PyMuPDF and render page 1 to ensure the PDF can be rasterized.
+              doc = fitz.open(dst)
+              pix = doc[0].get_pixmap(matrix=fitz.Matrix(1.2, 1.2), alpha=False)
+              cover = ROOT / f'{dst.stem}_封面.png'
+              pix.save(cover)
+              doc.close()
+              final_files.append(dst)
+              records.append({
+                  '序号': order,
+                  '券商': rec['broker'],
+                  '报告日期': rec['report_date'],
+                  '报告名称': c.title,
+                  '报告类型': c.kind,
+                  '页数': rec['pages'],
+                  '文件大小_MB': round(rec['bytes'] / 1024 / 1024, 2),
+                  'SHA256': rec['sha256'],
+                  '公开来源': rec['final_url'],
+                  '文件名': filename,
+              })
+
+          readme_lines = [
+              '# 澳博控股（00880.HK）券商研究报告',
+              '',
+              f'- 整理日期：{datetime.now().strftime("%Y-%m-%d")}',
+              f'- 文件数量：{len(records)}',
+              '- 筛选原则：仅纳入能够直接取得、可正常打开、页数完整且封面/正文明确指向澳博控股的券商PDF。',
+              '- 用途说明：仅供个人研究与学习，请遵守原发布机构的版权及使用条款。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for r in records:
+              readme_lines.extend([
+                  f'### {r["序号"]}. {r["券商"]}｜{r["报告日期"]}',
+                  f'- 报告：{r["报告名称"]}',
+                  f'- 类型：{r["报告类型"]}',
+                  f'- 页数：{r["页数"]}页',
+                  f'- 大小：{r["文件大小_MB"]} MB',
+                  f'- 文件：`{r["文件名"]}`',
+                  f'- SHA-256：`{r["SHA256"]}`',
+                  f'- 公开来源：{r["公开来源"]}',
+                  '',
+              ])
+          (ROOT / 'README.md').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text('\n'.join(f'{r["SHA256"]}  {r["文件名"]}' for r in records) + '\n', encoding='utf-8')
+
+          archive = ROOT / '澳博控股_券商研究报告_2-3份_20260902.zip'
+          with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for path in final_files + [ROOT/'README.md', ROOT/'manifest.json', ROOT/'SHA256SUMS.txt']:
+                  zf.write(path, arcname=path.name)
+          print('SELECTED_RECORDS', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          print('ARCHIVE', archive, archive.stat().st_size, hashlib.sha256(archive.read_bytes()).hexdigest(), flush=True)
+          PY
+
+          ls -lah output
+          find output -maxdepth 1 -type f -print0 | xargs -0 file
+
+      - name: Upload report package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sjm-holdings-broker-reports-20260902
+          path: |
+            output/澳博控股_券商研究报告_2-3份_20260902.zip
+            output/*.pdf
+            output/README.md
+            output/manifest.json
+            output/SHA256SUMS.txt
+            output/*_封面.png
+          if-no-files-found: error
+          retention-days: 7
