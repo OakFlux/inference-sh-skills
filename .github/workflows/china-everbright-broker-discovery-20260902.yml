@@ -1,0 +1,258 @@
+name: Discover China Everbright Limited broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/china-everbright-broker-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml
+
+      - name: Search public sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          out = Path('china-everbright-broker-discovery')
+          out.mkdir(exist_ok=True)
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/json,text/plain,*/*',
+          }
+
+          results = {'eastmoney': [], 'search_pages': [], 'crawled_pages': [], 'pdf_candidates': []}
+
+          def add_pdf(url, source, context=''):
+              if not url:
+                  return
+              url = html.unescape(unquote(url)).replace('\\/', '/')
+              if url.startswith('//'):
+                  url = 'https:' + url
+              if url.startswith('/') and source.startswith('http'):
+                  url = urljoin(source, url)
+              if not url.startswith('http'):
+                  return
+              lowered = url.lower()
+              if '.pdf' not in lowered and 'download' not in lowered and 'attachment' not in lowered:
+                  return
+              key = (url, source)
+              if any(x['url'] == url for x in results['pdf_candidates']):
+                  return
+              results['pdf_candidates'].append({'url': url, 'source': source, 'context': context[:500]})
+
+          # Eastmoney report API: try common Hong Kong ticker encodings and query parameters.
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          code_variants = ['00165', '0165', 'HK00165', '00165.HK', '116.00165']
+          param_variants = []
+          for code in code_variants:
+              param_variants.extend([
+                  {'pageNo': 1, 'pageSize': 500, 'code': code, 'qType': 0, 'beginTime': '2010-01-01', 'endTime': '2026-09-02'},
+                  {'pageNo': 1, 'pageSize': 500, 'code': code, 'qType': 1, 'beginTime': '2010-01-01', 'endTime': '2026-09-02'},
+              ])
+          for keyword_key in ['title', 'keyword', 'searchText', 'stockName']:
+              param_variants.append({'pageNo': 1, 'pageSize': 500, 'qType': 0, keyword_key: '中国光大控股', 'beginTime': '2010-01-01', 'endTime': '2026-09-02'})
+          for params in param_variants:
+              try:
+                  r = session.get(endpoint, params=params, headers={**headers, 'Referer': 'https://data.eastmoney.com/'}, timeout=(15, 60))
+                  print('EASTMONEY', r.status_code, len(r.content), r.url, flush=True)
+                  entry = {'params': params, 'status': r.status_code, 'url': r.url, 'bytes': len(r.content)}
+                  try:
+                      payload = r.json()
+                      entry['payload_type'] = type(payload).__name__
+                      rows = payload.get('data') if isinstance(payload, dict) else payload
+                      if not isinstance(rows, list):
+                          rows = []
+                      filtered = []
+                      for row in rows:
+                          if not isinstance(row, dict):
+                              continue
+                          text = json.dumps(row, ensure_ascii=False)
+                          if any(term.lower() in text.lower() for term in ['中国光大控股', 'china everbright limited', '00165', '165 hk']):
+                              filtered.append(row)
+                              info_code = str(row.get('infoCode') or row.get('infocode') or '')
+                              if info_code.startswith('AP'):
+                                  add_pdf(f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf', r.url, str(row))
+                                  add_pdf(f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf', r.url, str(row))
+                      entry['filtered'] = filtered
+                      entry['row_count'] = len(rows)
+                  except Exception as exc:
+                      entry['json_error'] = repr(exc)
+                      entry['body'] = r.text[:1000]
+                  results['eastmoney'].append(entry)
+              except Exception as exc:
+                  results['eastmoney'].append({'params': params, 'error': repr(exc)})
+              time.sleep(0.5)
+
+          queries = [
+              '"中国光大控股" 券商 深度 报告 PDF',
+              '"中国光大控股深度" PDF',
+              '"跨境资管标的，业绩弹性可期" PDF',
+              '"中国领先的跨境资产管理投资稀缺标的" PDF',
+              '"China Everbright Limited" equity research PDF',
+              '"00165 HK" initiation PDF',
+              'site:pdf.dfcfw.com "中国光大控股"',
+              'site:pdf.dfcfw.com "00165" "光大控股"',
+              'site:vzkoo.com 中国光大控股 研报',
+              'site:sdyanbao.com 中国光大控股',
+              'site:fhyanbao.com 中国光大控股',
+          ]
+
+          search_templates = [
+              ('bing', 'https://www.bing.com/search?q={q}&count=50'),
+              ('duckduckgo', 'https://html.duckduckgo.com/html/?q={q}'),
+              ('brave', 'https://search.brave.com/search?q={q}&source=web'),
+              ('baidu', 'https://www.baidu.com/s?wd={q}&rn=50'),
+          ]
+
+          discovered_pages = []
+          for query in queries:
+              for engine, template in search_templates:
+                  url = template.format(q=quote_plus(query))
+                  try:
+                      r = session.get(url, headers=headers, timeout=(15, 60), allow_redirects=True)
+                      print('SEARCH', engine, r.status_code, len(r.content), query, flush=True)
+                      page_rec = {'engine': engine, 'query': query, 'url': r.url, 'status': r.status_code, 'bytes': len(r.content)}
+                      if r.status_code == 200:
+                          soup = BeautifulSoup(r.text, 'lxml')
+                          links = []
+                          for a in soup.find_all('a', href=True):
+                              href = html.unescape(a['href'])
+                              text = ' '.join(a.get_text(' ', strip=True).split())
+                              if engine == 'duckduckgo' and 'uddg=' in href:
+                                  try:
+                                      href = parse_qs(urlparse(href).query).get('uddg', [href])[0]
+                                  except Exception:
+                                      pass
+                              if engine == 'baidu' and href.startswith('/link?'):
+                                  href = urljoin('https://www.baidu.com', href)
+                              if href.startswith('//'):
+                                  href = 'https:' + href
+                              if href.startswith('http'):
+                                  links.append({'url': href, 'text': text})
+                                  add_pdf(href, r.url, text)
+                                  if any(domain in href for domain in ['vzkoo.com', 'sdyanbao.com', 'fhyanbao.com', 'eastmoney.com', 'sina.com.cn', 'cmbi.com.hk', 'pdf.dfcfw.com', 'stockstar.com', 'hstong.com', 'xueqiu.com']):
+                                      discovered_pages.append(href)
+                          page_rec['links'] = links[:200]
+                      results['search_pages'].append(page_rec)
+                  except Exception as exc:
+                      results['search_pages'].append({'engine': engine, 'query': query, 'url': url, 'error': repr(exc)})
+                  time.sleep(0.5)
+
+          seed_pages = [
+              'https://www.vzkoo.com/read/4661212100247425024.html',
+              'https://daily.hstong.com/news/detail/26042422034988912',
+              'https://finance.sina.com.cn/stock/relnews/hk/2026-04-24/doc-inhvpyyk8130278.shtml',
+              'https://caifuhao.eastmoney.com/news/20260424073426579316850',
+              'https://www.sohu.com/a/507310064_121123883',
+          ]
+          pages = []
+          for u in seed_pages + discovered_pages:
+              if u not in pages:
+                  pages.append(u)
+          for u in pages[:120]:
+              try:
+                  r = session.get(u, headers=headers, timeout=(15, 60), allow_redirects=True)
+                  print('CRAWL', r.status_code, len(r.content), u, r.url, flush=True)
+                  rec = {'requested': u, 'url': r.url, 'status': r.status_code, 'bytes': len(r.content)}
+                  if r.status_code == 200:
+                      text = r.text
+                      rec['title'] = BeautifulSoup(text, 'lxml').title.get_text(' ', strip=True) if BeautifulSoup(text, 'lxml').title else ''
+                      patterns = [
+                          r'https?://[^"\'<>\\s]+?\.pdf(?:\?[^"\'<>\\s]*)?',
+                          r'(?i)(?:pdf|download|attachment|file|url)["\']?\s*[:=]\s*["\']([^"\']+)',
+                      ]
+                      for pat in patterns:
+                          try:
+                              for match in re.findall(pat, text, flags=re.I):
+                                  val = match if isinstance(match, str) else match[0]
+                                  add_pdf(val, r.url, 'regex')
+                          except Exception:
+                              pass
+                      soup = BeautifulSoup(text, 'lxml')
+                      link_recs = []
+                      for tag in soup.find_all(['a', 'iframe', 'embed', 'object', 'source'], href=True):
+                          href = tag.get('href')
+                          context = ' '.join(tag.get_text(' ', strip=True).split())
+                          add_pdf(href, r.url, context)
+                          link_recs.append({'url': urljoin(r.url, href), 'text': context})
+                      for tag in soup.find_all(['iframe', 'embed', 'source'], src=True):
+                          src = tag.get('src')
+                          add_pdf(src, r.url, tag.name)
+                          link_recs.append({'url': urljoin(r.url, src), 'text': tag.name})
+                      for tag in soup.find_all('object', data=True):
+                          data = tag.get('data')
+                          add_pdf(data, r.url, 'object')
+                          link_recs.append({'url': urljoin(r.url, data), 'text': 'object'})
+                      rec['links'] = link_recs[:200]
+                      rec['interesting_strings'] = [
+                          line.strip()[:1000]
+                          for line in text.splitlines()
+                          if any(k in line.lower() for k in ['pdf', 'downloadurl', 'attachment', 'infocode', 'reportid'])
+                      ][:100]
+                  results['crawled_pages'].append(rec)
+              except Exception as exc:
+                  results['crawled_pages'].append({'requested': u, 'error': repr(exc)})
+              time.sleep(0.5)
+
+          # Probe candidate URLs without downloading very large bodies.
+          for candidate in results['pdf_candidates']:
+              url = candidate['url']
+              try:
+                  r = session.get(url, headers={**headers, 'Accept': 'application/pdf,*/*'}, timeout=(15, 60), allow_redirects=True, stream=True)
+                  first = next(r.iter_content(16), b'')
+                  candidate.update({
+                      'probe_status': r.status_code,
+                      'probe_final_url': r.url,
+                      'probe_content_type': r.headers.get('content-type', ''),
+                      'probe_content_length': r.headers.get('content-length', ''),
+                      'probe_pdf_signature': first.startswith(b'%PDF-'),
+                  })
+                  r.close()
+              except Exception as exc:
+                  candidate['probe_error'] = repr(exc)
+              print('PROBE', json.dumps(candidate, ensure_ascii=False), flush=True)
+
+          (out / 'discovery.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          summary = {
+              'eastmoney_matches': sum(len(x.get('filtered', [])) for x in results['eastmoney']),
+              'search_pages': len(results['search_pages']),
+              'crawled_pages': len(results['crawled_pages']),
+              'pdf_candidates': len(results['pdf_candidates']),
+              'working_pdf_candidates': [x for x in results['pdf_candidates'] if x.get('probe_pdf_signature')],
+          }
+          (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('SUMMARY', json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload discovery output
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-broker-discovery
+          path: china-everbright-broker-discovery/
+          if-no-files-found: error
+          retention-days: 7
