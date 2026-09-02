@@ -1,0 +1,377 @@
+name: Package REPT BATTERO annual reports prospectus and latest interim disclosure
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-annual-prospectus-interim-package-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pillow
+
+      - name: Download official PDFs validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from PIL import Image, ImageStat
+          from pypdf import PdfReader
+
+          PACKAGE = '瑞浦兰钧_所有年报_招股说明书_最新中期财务披露_官方版'
+          OUT = Path(PACKAGE)
+          WORK = Path('_rept_filings_work')
+          RENDERS = WORK / 'renders'
+          OUT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          session = requests.Session()
+
+          docs = [
+              {
+                  'order': 1,
+                  'kind': '招股说明书',
+                  'period': '2023-12-08',
+                  'filename': '01_瑞浦兰钧_招股说明书_全球发售_2023-12-08_官方版.pdf',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2023/1208/2023120800020_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2023/1208/2023120800019.pdf',
+                      'https://reptbattero.com/wp-content/uploads/2025/05/20231208-Global-Offering.pdf',
+                  ],
+                  'min_pages': 700,
+                  'expected_pages': 759,
+                  'identity_terms': ['瑞浦蘭鈞', '瑞浦兰钧', 'REPT BATTERO'],
+                  'type_terms': ['GLOBAL OFFERING', 'PROSPECTUS', '全球發售', '招股'],
+                  'year_terms': ['2023'],
+              },
+              {
+                  'order': 2,
+                  'kind': '年度报告',
+                  'period': '2023',
+                  'filename': '02_瑞浦兰钧_2023年度报告_官方版.pdf',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0425/2024042500827_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0425/2024042500826.pdf',
+                      'https://reptbattero.com/wp-content/uploads/2025/05/20240425-Annual-Report-2023.pdf',
+                  ],
+                  'min_pages': 150,
+                  'identity_terms': ['瑞浦蘭鈞', '瑞浦兰钧', 'REPT BATTERO'],
+                  'type_terms': ['ANNUAL REPORT', '年度報告', '年度报告'],
+                  'year_terms': ['2023'],
+              },
+              {
+                  'order': 3,
+                  'kind': '年度报告',
+                  'period': '2024',
+                  'filename': '03_瑞浦兰钧_2024年度报告_官方版.pdf',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0417/2025041701498_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0417/2025041701497.pdf',
+                      'https://reptbattero.com/wp-content/uploads/2025/05/20250417-2024-Annual-Report.pdf',
+                  ],
+                  'min_pages': 180,
+                  'expected_pages': 203,
+                  'identity_terms': ['瑞浦蘭鈞', '瑞浦兰钧', 'REPT BATTERO'],
+                  'type_terms': ['ANNUAL REPORT', '年度報告', '年度报告'],
+                  'year_terms': ['2024'],
+              },
+              {
+                  'order': 4,
+                  'kind': '年度报告',
+                  'period': '2025',
+                  'filename': '04_瑞浦兰钧_2025年度报告_官方版.pdf',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0429/2026042902782_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0429/2026042902781.pdf',
+                      'https://www.reptbattero.com/wp-content/uploads/2026/04/20260429-2025-Annual-Report.pdf',
+                  ],
+                  'min_pages': 170,
+                  'expected_pages': 191,
+                  'identity_terms': ['瑞浦蘭鈞', '瑞浦兰钧', 'REPT BATTERO'],
+                  'type_terms': ['ANNUAL REPORT', '年度報告', '年度报告'],
+                  'year_terms': ['2025'],
+              },
+              {
+                  'order': 5,
+                  'kind': '最新中期业绩公告',
+                  'period': '截至2026-06-30止六个月',
+                  'filename': '05_瑞浦兰钧_2026年中期业绩公告_截至2026-06-30_官方版.pdf',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082601914_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082601913.pdf',
+                      'https://www.reptbattero.com/wp-content/uploads/2026/08/20260826-ANNOUNCEMENT-OF-THE-INTERIM-RESULTS-FOR-THE-SIX-MONTHS-ENDED-30-JUNE-2026.pdf',
+                  ],
+                  'min_pages': 25,
+                  'identity_terms': ['瑞浦蘭鈞', '瑞浦兰钧', 'REPT BATTERO'],
+                  'type_terms': ['INTERIM RESULTS', '中期業績', '中期业绩'],
+                  'year_terms': ['2026'],
+              },
+              {
+                  'order': 6,
+                  'kind': '最新已发布完整中期报告',
+                  'period': '截至2025-06-30止六个月',
+                  'filename': '06_瑞浦兰钧_2025年中期报告_当前最新完整中期报告_官方版.pdf',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0827/2025082702306_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0827/2025082702305.pdf',
+                      'https://www.reptbattero.com/wp-content/uploads/2025/08/2025082702305.pdf',
+                  ],
+                  'min_pages': 50,
+                  'expected_pages': 59,
+                  'identity_terms': ['瑞浦蘭鈞', '瑞浦兰钧', 'REPT BATTERO'],
+                  'type_terms': ['INTERIM REPORT', '中期報告', '中期报告'],
+                  'year_terms': ['2025'],
+              },
+          ]
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', '', text).upper()
+
+          def fetch_pdf(url: str) -> tuple[bytes, str, str]:
+              errors = []
+              for attempt in range(1, 5):
+                  for referer in ('https://www1.hkexnews.hk/', 'https://www.reptbattero.com/'):
+                      try:
+                          response = session.get(
+                              url,
+                              headers={
+                                  'User-Agent': UA,
+                                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                                  'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
+                                  'Referer': referer,
+                              },
+                              timeout=(30, 900),
+                              allow_redirects=True,
+                          )
+                          print('GET', url, response.status_code, response.headers.get('content-type'), len(response.content), response.url, flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50_000:
+                              return response.content, response.url, response.headers.get('content-type', '')
+                          errors.append(f'{response.status_code}/{len(response.content)}')
+                      except Exception as exc:
+                          errors.append(repr(exc))
+                  time.sleep(attempt)
+              raise RuntimeError(f'Unable to download {url}: {errors[-8:]}')
+
+          def validate_pdf(path: Path, spec: dict) -> dict:
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError('PDF signature missing')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'Only {pages} pages, minimum {spec["min_pages"]}')
+              if spec.get('expected_pages') and pages != spec['expected_pages']:
+                  raise RuntimeError(f'Page count {pages}, expected {spec["expected_pages"]}')
+
+              text_parts = []
+              sample_indices = sorted(set(list(range(min(20, pages))) + [max(0, pages // 2 - 1), max(0, pages - 5), pages - 1]))
+              for index in sample_indices:
+                  try:
+                      text_parts.append(reader.pages[index].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, index + 1, repr(exc), flush=True)
+              text = '\n'.join(text_parts)
+              norm = compact(text)
+              if not any(compact(term) in norm for term in spec['identity_terms']):
+                  raise RuntimeError('Company identity not found in sampled text')
+              if not any(compact(term) in norm for term in spec['type_terms']):
+                  raise RuntimeError('Document type marker not found in sampled text')
+              if not any(term in norm for term in spec['year_terms']):
+                  raise RuntimeError('Reporting year not found in sampled text')
+              if not any(t in norm for t in ('0666', '00666')):
+                  raise RuntimeError('Stock code not found in sampled text')
+
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed: {check.stderr[-1000:]}')
+
+              render_checks = []
+              render_pages = sorted(set([1, max(1, (pages + 1) // 2), pages]))
+              for page_number in render_pages:
+                  prefix = RENDERS / f'{path.stem}_p{page_number}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_number), '-singlefile', '-png', '-r', '110', str(path), str(prefix)],
+                      check=True,
+                      capture_output=True,
+                  )
+                  png = Path(str(prefix) + '.png')
+                  if not png.exists() or png.stat().st_size < 8_000:
+                      raise RuntimeError(f'Render failed for page {page_number}')
+                  with Image.open(png) as image:
+                      width, height = image.size
+                      grayscale = image.convert('L')
+                      stat = ImageStat.Stat(grayscale)
+                      extrema = grayscale.getextrema()
+                  if width < 600 or height < 750:
+                      raise RuntimeError(f'Render dimensions too small: {width}x{height}')
+                  if extrema[0] == extrema[1]:
+                      raise RuntimeError(f'Render appears blank/uniform on page {page_number}')
+                  render_checks.append({
+                      'page': page_number,
+                      'file': png.name,
+                      'bytes': png.stat().st_size,
+                      'width': width,
+                      'height': height,
+                      'mean_gray': round(float(stat.mean[0]), 3),
+                      'extrema': list(extrema),
+                  })
+
+              language = '繁体中文' if ('年度報告' in norm or '全球發售' in norm or '中期業績' in norm or '中期報告' in norm) else '英文'
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'language': language,
+                  'sampled_text_pages': [i + 1 for i in sample_indices],
+                  'render_checks': render_checks,
+              }
+
+          records = []
+          used_hashes = set()
+          for spec in docs:
+              errors = []
+              accepted = None
+              for candidate_index, url in enumerate(spec['urls'], 1):
+                  temp = WORK / f'doc_{spec["order"]:02d}_{candidate_index}.pdf'
+                  try:
+                      body, final_url, content_type = fetch_pdf(url)
+                      temp.write_bytes(body)
+                      meta = validate_pdf(temp, spec)
+                      if meta['sha256'] in used_hashes:
+                          raise RuntimeError('Duplicate document hash')
+                      dest = OUT / spec['filename']
+                      shutil.copy2(temp, dest)
+                      used_hashes.add(meta['sha256'])
+                      accepted = {
+                          'order': spec['order'],
+                          'filename': spec['filename'],
+                          'kind': spec['kind'],
+                          'period': spec['period'],
+                          'requested_url': url,
+                          'final_url': final_url,
+                          'content_type': content_type,
+                          **meta,
+                      }
+                      print('VERIFIED', json.dumps({k: accepted[k] for k in ('order','filename','kind','period','pages','bytes','language','sha256','final_url')}, ensure_ascii=False), flush=True)
+                      break
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc}')
+                      print('REJECTED', spec['order'], url, repr(exc), flush=True)
+                      temp.unlink(missing_ok=True)
+              if accepted is None:
+                  raise RuntimeError(f'All candidates failed for {spec["filename"]}:\n' + '\n'.join(errors))
+              records.append(accepted)
+
+          if len(records) != 6 or len({r['sha256'] for r in records}) != 6:
+              raise RuntimeError('Final document count or uniqueness validation failed')
+          if sorted(r['period'] for r in records if r['kind'] == '年度报告') != ['2023', '2024', '2025']:
+              raise RuntimeError('Annual report year coverage is incomplete')
+
+          readme = [
+              '瑞浦兰钧能源股份有限公司（REPT BATTERO，港交所股份代号：00666）',
+              '全部上市后年度报告、最终招股说明书及最新中期财务披露',
+              '整理日期：2026-09-02',
+              '',
+              '一、收录范围',
+          ]
+          for r in records:
+              readme.append(f"{r['order']}. {r['filename']}｜{r['language']}｜{r['pages']}页｜{r['kind']}")
+          readme += [
+              '',
+              '二、年度报告范围说明',
+              '瑞浦兰钧于2023年12月18日在香港联交所上市。上市后已发布的完整年度报告为2023、2024及2025年度报告，本包已全部收录。',
+              '',
+              '三、“最新季报”口径说明',
+              '香港上市公司通常按年度及半年度披露定期财务报告，而非按A股口径强制发布第一季度、第三季度报告。',
+              '截至2026年9月2日，公司最新正式财务披露为2026年8月26日发布的截至2026年6月30日止六个月中期业绩公告；2026年完整中期报告尚未发布。',
+              '为避免资料口径缺失，本包同时附上2025年中期报告，即截至当前已发布的最新完整中期报告。',
+              '',
+              '四、招股说明书说明',
+              '收录文件为2023年12月8日发布的最终“全球发售”文件，即公司上市最终招股章程；未将聆讯后资料集、正式通告及配发结果等重复或辅助文件混入。',
+              '',
+              '五、完整性核验',
+              '已逐份核验PDF文件头、公司名称、股份代号、报告年份、报告类型、实际页数、qpdf结构，以及首页、中间页和末页的渲染结果。',
+              '压缩包另附来源清单、逐份SHA-256校验值及JSON格式详细核验记录。',
+              '',
+              '资料仅供研究参考，版权归瑞浦兰钧及相关发布主体所有，不构成投资建议。',
+          ]
+          (OUT / '00_文件说明与核验结果.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          with (OUT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','文件名','文件类别','报告期','语言','页数','文件大小_字节','SHA256','最终下载地址','首选候选地址']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for r in records:
+                  writer.writerow({
+                      '序号': r['order'], '文件名': r['filename'], '文件类别': r['kind'],
+                      '报告期': r['period'], '语言': r['language'], '页数': r['pages'],
+                      '文件大小_字节': r['bytes'], 'SHA256': r['sha256'],
+                      '最终下载地址': r['final_url'], '首选候选地址': r['requested_url'],
+                  })
+
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 6:
+                  raise RuntimeError(f'ZIP contains {len(pdf_names)} PDFs instead of 6')
+
+          zip_hash = sha256(zip_path)
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{zip_hash}  {zip_path.name}\n', encoding='utf-8')
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, zip_hash, flush=True)
+          print('FINAL_RECORDS', json.dumps([{k:r[k] for k in ('order','filename','kind','period','language','pages','bytes','sha256','final_url')} for r in records], ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-annual-prospectus-latest-interim-final
+          path: |
+            瑞浦兰钧_所有年报_招股说明书_最新中期财务披露_官方版/
+            瑞浦兰钧_所有年报_招股说明书_最新中期财务披露_官方版.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
