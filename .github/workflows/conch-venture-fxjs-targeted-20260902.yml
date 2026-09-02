@@ -1,0 +1,62 @@
+name: Inspect FX reader URL construction
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-fxjs-targeted-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Extract reader endpoint and PDF URL contexts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          page='https://www.fxbaogao.com/view?id=4894193'
+          html=requests.get(page,headers={'User-Agent':ua},timeout=90).text
+          soup=BeautifulSoup(html,'html.parser')
+          scripts=[urljoin(page,t['src']) for t in soup.find_all('script',src=True)]
+          needles=[
+              '/mofoun/report/readReport/readReport',
+              'getReportPreviewImages',
+              'preDownV2',
+              'downloadReportByBean',
+              'HOST_OSSBUY',
+              'HOST_DOWNLOAD_OSSBUY',
+              'urlPdfByDownload',
+              'urlPdf',
+              'pdfPath',
+              'report-image/',
+          ]
+          for url in scripts:
+              r=requests.get(url,headers={'User-Agent':ua,'Referer':page},timeout=120)
+              text=r.text
+              hits=[]
+              low=text.lower()
+              for needle in needles:
+                  start=0
+                  while True:
+                      pos=low.find(needle.lower(),start)
+                      if pos<0: break
+                      hits.append((pos,needle))
+                      start=pos+len(needle)
+              if not hits: continue
+              print('\nSCRIPT',url,'SIZE',len(text),flush=True)
+              for pos,needle in sorted(hits)[:160]:
+                  print('\nNEEDLE',needle,'POS',pos,flush=True)
+                  print(text[max(0,pos-1800):min(len(text),pos+2600)],flush=True)
+          PY
