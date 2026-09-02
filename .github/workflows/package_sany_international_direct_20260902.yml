@@ -1,0 +1,270 @@
+name: package-sany-international-direct-20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_sany_international_direct_20260902.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package official HKEX PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '三一国际_2020-2025年报及最新季报'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_sany_international_direct_work')
+          work.mkdir(exist_ok=True)
+          previews = work / 'previews'
+          previews.mkdir(exist_ok=True)
+
+          targets = [
+              {
+                  'kind': 'annual', 'year': 2020, 'filename': '2020年年度报告.pdf',
+                  'title': '年報 2020 / Annual Report 2020', 'date': '2021-04-20', 'min_pages': 80,
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2021/0420/2021042000548_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2021/0420/2021042000547.pdf',
+                  ],
+              },
+              {
+                  'kind': 'annual', 'year': 2021, 'filename': '2021年年度报告.pdf',
+                  'title': '年報2021 / Annual Report 2021', 'date': '2022-04-26', 'min_pages': 80,
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2022/0426/2022042600873_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2022/0426/2022042600872.pdf',
+                  ],
+              },
+              {
+                  'kind': 'annual', 'year': 2022, 'filename': '2022年年度报告.pdf',
+                  'title': '年報2022 / Annual Report 2022', 'date': '2023-04-26', 'min_pages': 80,
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2023/0426/2023042601910_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2023/0426/2023042601909.pdf',
+                  ],
+              },
+              {
+                  'kind': 'annual', 'year': 2023, 'filename': '2023年年度报告.pdf',
+                  'title': '年報2023 / Annual Report 2023', 'date': '2024-04-25', 'min_pages': 80,
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0425/2024042501019_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0425/2024042501018.pdf',
+                  ],
+              },
+              {
+                  'kind': 'annual', 'year': 2024, 'filename': '2024年年度报告.pdf',
+                  'title': '年報2024 / Annual Report 2024', 'date': '2025-04-28', 'min_pages': 80,
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0428/2025042801815_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0428/2025042801814.pdf',
+                  ],
+              },
+              {
+                  'kind': 'annual', 'year': 2025, 'filename': '2025年年度报告.pdf',
+                  'title': '年報2025 / Annual Report 2025', 'date': '2026-04-28', 'min_pages': 80,
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0428/2026042803316_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0428/2026042803315.pdf',
+                  ],
+              },
+              {
+                  'kind': 'q1', 'year': 2026, 'filename': '2026年第一季度未经审核财务数据.pdf',
+                  'title': '未經審核財務數據（截至2026年3月31日止三個月）', 'date': '2026-05-20', 'min_pages': 3,
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0520/2026052000871_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0520/2026052000870.pdf',
+                  ],
+              },
+              {
+                  'kind': 'interim_results', 'year': 2026, 'filename': '2026年中期业绩公告.pdf',
+                  'title': '截至2026年6月30日止六個月中期業績公告', 'date': '2026-08-26', 'min_pages': 12,
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082600755_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082600754.pdf',
+                  ],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=zh',
+          }
+
+          def download_first(urls: list[str]) -> tuple[bytes, str]:
+              errors = []
+              for url in urls:
+                  for attempt in range(1, 6):
+                      try:
+                          response = session.get(url, headers=headers, timeout=(30, 480), allow_redirects=True)
+                          print('PDF_GET', attempt, response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50_000:
+                              return response.content, str(response.url)
+                          errors.append(f'{url}: HTTP {response.status_code}, {len(response.content)} bytes')
+                      except Exception as exc:
+                          errors.append(f'{url}: {type(exc).__name__}: {exc}')
+                          print('PDF_ERROR', attempt, url, repr(exc), flush=True)
+                      time.sleep(min(2 * attempt, 8))
+              raise RuntimeError('No valid PDF downloaded: ' + ' | '.join(errors[-8:]))
+
+          def extract_compact(reader: PdfReader, page_limit: int = 16) -> str:
+              texts = []
+              for page in reader.pages[:min(len(reader.pages), page_limit)]:
+                  try:
+                      texts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(texts)).lower()
+
+          records = []
+          seen_hashes = set()
+          for index, target in enumerate(targets, 1):
+              data, source_url = download_first(target['urls'])
+              dest = out / target['filename']
+              dest.write_bytes(data)
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < target['min_pages']:
+                  raise RuntimeError(f"{target['filename']} is too short: {pages} pages")
+
+              compact = extract_compact(reader)
+              identity_ok = any(token in compact for token in (
+                  'sanyheavyequipmentinternational', '三一重裝國際', '三一重装国际', '00631'
+              ))
+              if not identity_ok:
+                  raise RuntimeError(f"Company identity validation failed: {target['filename']}")
+              if str(target['year']) not in compact:
+                  print('YEAR_TEXT_WARNING', target['filename'], target['year'], flush=True)
+
+              if target['kind'] == 'annual':
+                  annual_ok = ('annualreport' in compact or '年報' in compact or '年报' in compact)
+                  if not annual_ok:
+                      print('ANNUAL_TEXT_WARNING', target['filename'], flush=True)
+              elif target['kind'] == 'q1':
+                  q1_ok = ('31march2026' in compact or '2026年3月31日' in compact or 'threemonthsended' in compact)
+                  if not q1_ok:
+                      raise RuntimeError(f"Quarter-period validation failed: {target['filename']}")
+              elif target['kind'] == 'interim_results':
+                  h1_ok = ('sixmonthsended30june2026' in compact or '2026年6月30日' in compact or 'interimresults' in compact or '中期業績' in compact or '中期业绩' in compact)
+                  if not h1_ok:
+                      raise RuntimeError(f"Interim-results validation failed: {target['filename']}")
+
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f"qpdf failed for {target['filename']}: {check.stderr[-1200:]}")
+              if check.returncode == 3:
+                  print('QPDF_WARNING', target['filename'], check.stderr[-1200:], flush=True)
+
+              first_prefix = previews / f'{index:02d}_first'
+              last_prefix = previews / f'{index:02d}_last'
+              subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(dest), str(first_prefix)], check=True, capture_output=True)
+              subprocess.run(['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90', str(dest), str(last_prefix)], check=True, capture_output=True)
+              if not Path(str(first_prefix)+'.png').exists() or not Path(str(last_prefix)+'.png').exists():
+                  raise RuntimeError(f"Render verification failed: {target['filename']}")
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in seen_hashes:
+                  raise RuntimeError(f"Duplicate PDF detected: {target['filename']}")
+              seen_hashes.add(digest)
+              record = {
+                  'kind': target['kind'],
+                  'report_year': target['year'],
+                  'filename': target['filename'],
+                  'hkex_title': target['title'],
+                  'disclosure_date': target['date'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': source_url,
+                  'source': '香港交易所披露易（HKEXnews）原始PDF',
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 PDFs, got {len(records)}')
+          annual_years = {r['report_year'] for r in records if r['kind'] == 'annual'}
+          if annual_years != {2020, 2021, 2022, 2023, 2024, 2025}:
+              raise RuntimeError(f'Annual coverage mismatch: {annual_years}')
+
+          lines = [
+              '三一国际（00631.HK）2020—2025年报及最新期内报告',
+              '',
+              '本包共8份香港交易所披露易原始PDF。',
+              '其中2020—2025年度报告均为完整年度报告，不是年度业绩公告或摘要。',
+              '截至2026年9月2日，最新正式季度披露为2026年第一季度未经审核财务数据。',
+              '公司于2026年8月26日另行披露了2026年中期业绩公告，因此一并收入；该文件是中期业绩公告，不冒充尚未发布的完整中期报告。',
+              '',
+          ]
+          for i, record in enumerate(records, 1):
+              lines.extend([
+                  f"{i}. {record['filename']}",
+                  f"   港交所文件：{record['hkex_title']}",
+                  f"   披露日期：{record['disclosure_date']}；实际页数：{record['pages']}页；大小：{record['bytes']/1024/1024:.2f} MB",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、公司名称或证券代码、报告期间、实际页数、qpdf结构、首页与末页渲染、SHA-256及ZIP CRC。',
+              '年度报告按其覆盖的财政年度命名，不按披露年份命名。',
+          ])
+          (out / '报告清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8'
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 8')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'REPORTS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sany-international-2020-2025-annuals-latest-direct-final
+          path: |
+            三一国际_2020-2025年报及最新季报/
+            三一国际_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
