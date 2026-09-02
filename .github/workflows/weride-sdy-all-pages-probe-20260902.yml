@@ -1,0 +1,50 @@
+name: Probe all public WeRide report pages on Sdyanbao
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-sdy-all-pages-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Probe all 28 public page images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pillow
+          python - <<'PY'
+          import hashlib, io, json
+          import requests
+          from PIL import Image, ImageStat
+
+          session=requests.Session(); session.trust_env=False
+          headers={'User-Agent':'Mozilla/5.0 Chrome/151','Referer':'https://www.sdyanbao.com/detail/940420','Accept':'image/*,*/*'}
+          base='https://oss.sdyanbao.com/page/2026/1/5/1280461'
+          results=[]
+          for page in range(28):
+              url=f'{base}/{page}.png'
+              try:
+                  r=session.get(url,headers=headers,timeout=(20,120),allow_redirects=True)
+                  rec={'page':page,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'url':r.url,'sha256':hashlib.sha256(r.content).hexdigest() if r.content else ''}
+                  if r.status_code==200 and r.content:
+                      try:
+                          im=Image.open(io.BytesIO(r.content)); im.load()
+                          stat=ImageStat.Stat(im.convert('L').resize((64,64)))
+                          rec.update({'format':im.format,'width':im.width,'height':im.height,'mode':im.mode,'mean':round(stat.mean[0],2),'stddev':round(stat.stddev[0],2)})
+                      except Exception as exc: rec['image_error']=repr(exc)
+                  print('PAGE',json.dumps(rec,ensure_ascii=False),flush=True)
+                  results.append(rec)
+              except Exception as exc:
+                  rec={'page':page,'error':repr(exc)}; results.append(rec); print('ERROR',json.dumps(rec,ensure_ascii=False),flush=True)
+          ok=[x for x in results if x.get('status')==200 and x.get('width',0)>=800 and x.get('height',0)>=1000 and x.get('stddev',0)>10]
+          print('SUMMARY',json.dumps({'total':len(results),'usable':len(ok),'usable_pages':[x['page'] for x in ok],'unique_hashes':len({x.get('sha256') for x in ok})},ensure_ascii=False),flush=True)
+          if len(ok)!=28 or len({x.get('sha256') for x in ok})!=28:
+              raise SystemExit('Not all 28 pages are publicly available as distinct usable images')
+          PY
