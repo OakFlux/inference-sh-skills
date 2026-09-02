@@ -1,0 +1,296 @@
+name: Discover public Tiangong International broker PDFs v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tiangong-broker-pdf-discovery-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Search, crawl, probe, and inspect PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import io
+          import json
+          import re
+          import time
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('tiangong-broker-pdf-discovery-v2')
+          OUT.mkdir(exist_ok=True)
+          PDF_DIR = OUT / 'pdfs'
+          PDF_DIR.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/json,text/plain,*/*',
+          }
+
+          queries = [
+              '"天工国际" 券商 深度 报告 PDF',
+              '"天工国际" 首次覆盖 报告 PDF',
+              '"全球工模具钢龙头 粉末冶金钢放量在即"',
+              '"工模具钢产量世界第一 高速发展开启"',
+              '"钛合金放量在即，布局机器人和核聚变专用材料"',
+              '"卡位高端制造新材料，2026年业绩与估值双击"',
+              '"Tiangong International" "00826 HK" company report PDF',
+              '"Tiangong International" initiation report PDF',
+              '"Tiangong International Holdings" equity research PDF',
+              '"00826 HK" research report PDF',
+              '"0826 HK" "Tiangong" PDF',
+              'site:pdf.dfcfw.com "天工国际"',
+              'site:pdf.dfcfw.com "00826" 天工',
+              'site:gtjai.com/UploadFiles/gtja_Report "Tiangong International"',
+              'site:gtjai.com/UploadFiles/gtja_Report "00826"',
+              'site:gtjai.com/UploadFiles/gtja_Report "0826" Tiangong',
+              'site:cmbi.com.hk/upload "Tiangong International"',
+              'site:firstshanghai.com.hk "天工国际" PDF',
+              'site:firstshanghai.com.hk Tiangong 00826 PDF',
+              'site:dwzq.com.cn "天工国际" PDF',
+              'site:gjzq.com.cn "天工国际" PDF',
+              'site:gjs.com.cn "天工国际" PDF',
+              'site:research.cicc.com "Tiangong International"',
+              'site:ubs.com "Tiangong International" PDF',
+              'site:hsbc.com "Tiangong International" PDF',
+              'site:guosen.com.cn "天工国际" PDF',
+              'site:chinastock.com.cn "天工国际" PDF',
+              'site:p5w.net "天工国际" 研报 PDF',
+              'site:stock.finance.sina.com.cn "天工国际" 研报',
+              'site:fxbaogao.com/detail "天工国际"',
+          ]
+
+          engines = [
+              ('duck', 'https://html.duckduckgo.com/html/?q={q}'),
+              ('yahoo', 'https://search.yahoo.com/search?p={q}&n=30'),
+              ('bing', 'https://www.bing.com/search?q={q}&count=50'),
+              ('brave', 'https://search.brave.com/search?q={q}&source=web'),
+              ('google', 'https://www.google.com/search?q={q}&num=30&hl=zh-CN'),
+          ]
+
+          candidates: dict[str, dict] = {}
+          page_candidates: list[dict] = []
+          search_records: list[dict] = []
+
+          def normalize_url(url: str, source: str = '') -> str:
+              if not url:
+                  return ''
+              url = html.unescape(unquote(str(url))).replace('\\/', '/').replace('\\u0026', '&').strip(' \"\'')
+              if url.startswith('//'):
+                  url = 'https:' + url
+              if url.startswith('/') and source.startswith('http'):
+                  url = urljoin(source, url)
+              # Yahoo result redirect.
+              if 'r.search.yahoo.com/' in url and '/RU=' in url:
+                  try:
+                      part = url.split('/RU=', 1)[1].split('/RK=', 1)[0]
+                      url = unquote(part)
+                  except Exception:
+                      pass
+              return url
+
+          def relevant(text: str) -> bool:
+              compact = re.sub(r'\s+', '', text).lower()
+              return any(x in compact for x in (
+                  '天工国际', '天工國際', 'tiangonginternational', '00826', '0826hk', '826hk',
+                  '全球工模具钢龙头', '工模具钢产量世界第一', '粉末冶金钢放量在即',
+              ))
+
+          def add_candidate(url: str, source: str, context: str = '') -> None:
+              url = normalize_url(url, source)
+              if not url.startswith('http'):
+                  return
+              low = url.lower()
+              if '.pdf' not in low and not any(x in low for x in ('download', 'attachment', 'file=')):
+                  return
+              if url not in candidates:
+                  candidates[url] = {'url': url, 'sources': [], 'contexts': []}
+              if source and source not in candidates[url]['sources']:
+                  candidates[url]['sources'].append(source)
+              if context and context[:1000] not in candidates[url]['contexts']:
+                  candidates[url]['contexts'].append(context[:1000])
+
+          def add_page(url: str, source: str, context: str = '') -> None:
+              url = normalize_url(url, source)
+              if not url.startswith('http'):
+                  return
+              if any(x in url for x in ('fxbaogao.com/detail/', 'sdyanbao.com/detail/', 'gmg.9fzt.com/report/', 'sgpjbg.com/baogao/', 'vzkoo.com/read/', 'sohu.com/a/', 'sina.com.cn/')):
+                  if not any(x['url'] == url for x in page_candidates):
+                      page_candidates.append({'url': url, 'source': source, 'context': context[:1000]})
+
+          for qi, query in enumerate(queries, 1):
+              encoded = quote_plus(query)
+              for engine, template in engines:
+                  url = template.format(q=encoded)
+                  rec = {'query': query, 'engine': engine, 'requested_url': url}
+                  try:
+                      r = session.get(url, headers=headers, timeout=(15, 70), allow_redirects=True)
+                      rec.update({'status': r.status_code, 'bytes': len(r.content), 'final_url': r.url})
+                      links = []
+                      if r.status_code == 200:
+                          soup = BeautifulSoup(r.text, 'lxml')
+                          for a in soup.find_all('a', href=True):
+                              href = a['href']
+                              label = ' '.join(a.get_text(' ', strip=True).split())
+                              if engine == 'duck' and 'uddg=' in href:
+                                  href = parse_qs(urlparse(href).query).get('uddg', [href])[0]
+                              if engine == 'google' and href.startswith('/url?'):
+                                  href = parse_qs(urlparse(href).query).get('q', [href])[0]
+                              href = normalize_url(href, r.url)
+                              if href.startswith('http'):
+                                  entry = {'url': href, 'text': label[:1000]}
+                                  links.append(entry)
+                                  add_candidate(href, r.url, label)
+                                  add_page(href, r.url, label)
+                                  if relevant(label + ' ' + href):
+                                      print('RESULT', engine, json.dumps(entry, ensure_ascii=False), flush=True)
+                          for raw in re.findall(r'https?://[^"\'<>\s\\]+?\.pdf(?:\?[^"\'<>\s\\]*)?', r.text, re.I):
+                              add_candidate(raw, r.url, 'raw pdf in search HTML')
+                          # Explicit Yahoo redirects are sometimes not parsed as ordinary hrefs.
+                          for match in re.finditer(r'/RU=([^/]+)/RK=', r.text):
+                              target = unquote(match.group(1))
+                              add_candidate(target, r.url, 'Yahoo redirect')
+                              add_page(target, r.url, 'Yahoo redirect')
+                      rec['links'] = links[:250]
+                      print('SEARCH', qi, engine, r.status_code, len(r.content), query, flush=True)
+                  except Exception as exc:
+                      rec['error'] = repr(exc)
+                      print('SEARCH_ERROR', qi, engine, query, repr(exc), flush=True)
+                  search_records.append(rec)
+                  time.sleep(0.2)
+
+          # Crawl relevant report/detail pages for hidden public PDF URLs.
+          crawl_records = []
+          for index, page in enumerate(page_candidates[:180], 1):
+              rec = dict(page)
+              try:
+                  r = session.get(page['url'], headers=headers, timeout=(15, 80), allow_redirects=True)
+                  rec.update({'status': r.status_code, 'bytes': len(r.content), 'final_url': r.url})
+                  if r.status_code == 200:
+                      text = r.text
+                      soup = BeautifulSoup(text, 'lxml')
+                      rec['title'] = soup.title.get_text(' ', strip=True) if soup.title else ''
+                      for raw in re.findall(r'https?://[^"\'<>\s\\]+?\.pdf(?:\?[^"\'<>\s\\]*)?', text, re.I):
+                          add_candidate(raw, r.url, 'raw PDF in crawled page')
+                      for tag in soup.find_all(True):
+                          context = ' '.join(tag.get_text(' ', strip=True).split())[:1000]
+                          for attr in ('href', 'src', 'data', 'data-src', 'data-url', 'data-file', 'download'):
+                              value = tag.get(attr)
+                              if isinstance(value, str):
+                                  add_candidate(value, r.url, context or tag.name)
+                      rec['interesting'] = [
+                          line.strip()[:3000] for line in text.splitlines()
+                          if any(k in line.lower() for k in ('pdf', 'downloadurl', 'attachment', 'infocode', 'fileurl', 'reportid'))
+                      ][:250]
+                  print('CRAWL', index, r.status_code, len(r.content), page['url'], r.url, flush=True)
+              except Exception as exc:
+                  rec['error'] = repr(exc)
+                  print('CRAWL_ERROR', index, page['url'], repr(exc), flush=True)
+              crawl_records.append(rec)
+              time.sleep(0.2)
+
+          # Seed known public-PDF directories with likely exact queries from discovered pages.
+          known_search_only = [
+              'https://www.gtjai.com/UploadFiles/gtja_Report/',
+              'https://pdf.dfcfw.com/pdf/',
+          ]
+
+          pdf_records = []
+          for index, item in enumerate(list(candidates.values()), 1):
+              rec = dict(item)
+              try:
+                  r = session.get(item['url'], headers={
+                      **headers,
+                      'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  }, timeout=(20, 150), allow_redirects=True)
+                  rec.update({
+                      'status': r.status_code,
+                      'bytes': len(r.content),
+                      'final_url': r.url,
+                      'content_type': r.headers.get('content-type', ''),
+                      'pdf_signature': r.content.startswith(b'%PDF-'),
+                  })
+                  if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 30_000:
+                      path = PDF_DIR / f'{index:04d}.pdf'
+                      path.write_bytes(r.content)
+                      reader = PdfReader(str(path), strict=False)
+                      rec['pages'] = len(reader.pages)
+                      text_parts = []
+                      for page in reader.pages[:min(8, len(reader.pages))]:
+                          try:
+                              text_parts.append(page.extract_text() or '')
+                          except Exception:
+                              pass
+                      text = re.sub(r'\s+', ' ', '\n'.join(text_parts)).strip()
+                      rec['text_head'] = text[:25000]
+                      rec['identity_ok'] = relevant(text + ' ' + ' '.join(rec.get('contexts', [])))
+                      rec['broker_terms'] = [x for x in (
+                          '国金证券','国泰君安','东吴证券','华升证券','第一上海','中金公司','瑞银','UBS','CICC','Guotai Junan','Dongwu Securities'
+                      ) if x.lower() in text.lower()]
+                      print('PDF_OK', json.dumps({
+                          'url': rec['final_url'], 'pages': rec['pages'], 'bytes': rec['bytes'],
+                          'identity_ok': rec['identity_ok'], 'brokers': rec['broker_terms'],
+                          'text_head': rec['text_head'][:1500]
+                      }, ensure_ascii=False), flush=True)
+                  else:
+                      print('PDF_NO', r.status_code, len(r.content), item['url'], r.url, r.headers.get('content-type'), flush=True)
+              except Exception as exc:
+                  rec['error'] = repr(exc)
+                  print('PDF_ERROR', index, item['url'], repr(exc), flush=True)
+              pdf_records.append(rec)
+              time.sleep(0.15)
+
+          good = [x for x in pdf_records if x.get('pdf_signature') and x.get('identity_ok')]
+          good.sort(key=lambda x: (x.get('pages', 0), x.get('bytes', 0)), reverse=True)
+
+          (OUT / 'search_records.json').write_text(json.dumps(search_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'crawl_records.json').write_text(json.dumps(crawl_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'pdf_records.json').write_text(json.dumps(pdf_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'ranked_good_pdfs.json').write_text(json.dumps(good, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          print('SUMMARY', json.dumps({
+              'queries': len(queries),
+              'search_calls': len(search_records),
+              'page_candidates': len(page_candidates),
+              'pdf_candidates': len(candidates),
+              'good_pdfs': len(good),
+          }, ensure_ascii=False), flush=True)
+          print('RANKED_GOOD')
+          for rec in good:
+              print(json.dumps({
+                  'url': rec.get('final_url'), 'pages': rec.get('pages'), 'bytes': rec.get('bytes'),
+                  'brokers': rec.get('broker_terms'), 'text_head': rec.get('text_head', '')[:2500],
+                  'contexts': rec.get('contexts', [])[:5],
+              }, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload discovery output
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiangong-broker-pdf-discovery-v2
+          path: tiangong-broker-pdf-discovery-v2/
+          if-no-files-found: error
+          retention-days: 7
