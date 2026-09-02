@@ -1,0 +1,370 @@
+name: Package verified REPT BATTERO broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-final-package-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF validation dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY_CN = '瑞浦兰钧'
+          COMPANY_EN = 'REPT BATTERO'
+          TICKER = '00666.HK'
+          PACKAGE = '瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版'
+          OUT = Path(PACKAGE)
+          WORK = Path('_rept_work')
+          RENDERS = WORK / 'renders'
+          OUT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          session = requests.Session()
+
+          reports = [
+              {
+                  'order': 1,
+                  'institution': '海通国际',
+                  'date': '2024-05-31',
+                  'title': '青山集团旗下锂电池公司，海外营收快速增长',
+                  'report_type': '首次覆盖报告',
+                  'rating': '优于大市',
+                  'researchers': '陈兆庆、曾彪',
+                  'page_count': 22,
+                  'detail_url': 'https://www.sdyanbao.com/detail/768016',
+                  'image_base': 'https://oss.sdyanbao.com/page/2024/5/31/1017103',
+                  'eastmoney_page': 'https://data.eastmoney.com/report/zw_stock.jshtml?infocode=AP202405311635020328',
+                  'direct_pdf_urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP202405311635020328_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H2_AP202405311635020328_1.pdf',
+                  ],
+                  'filename': '01_海通国际_瑞浦兰钧_首次覆盖_青山集团旗下锂电池公司海外营收快速增长_2024-05-31_22页.pdf',
+                  'identity_terms': ['瑞浦兰钧', '瑞浦兰均', 'REPT BATTERO'],
+                  'ticker_terms': ['0666', '00666'],
+                  'title_terms': ['青山集团', '锂电池', '海外营收'],
+              },
+              {
+                  'order': 2,
+                  'institution': '华龙证券',
+                  'date': '2024-07-26',
+                  'title': '动力电池老兵焕发新活力，多元赛道助力全球布局',
+                  'report_type': '公司深度报告',
+                  'rating': '未标注',
+                  'researchers': '未标注',
+                  'page_count': 24,
+                  'detail_url': 'https://www.sdyanbao.com/detail/780251',
+                  'image_base': 'https://oss.sdyanbao.com/page/2024/7/26/1032354',
+                  'eastmoney_page': '',
+                  'direct_pdf_urls': [],
+                  'filename': '02_华龙证券_瑞浦兰钧_动力电池老兵焕发新活力多元赛道助力全球布局_2024-07-26_24页.pdf',
+                  'identity_terms': ['瑞浦兰钧', '瑞浦兰均', 'REPT BATTERO'],
+                  'ticker_terms': ['0666', '00666'],
+                  'title_terms': ['动力电池老兵', '多元赛道', '全球布局'],
+              },
+          ]
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def request_bytes(url: str, referer: str, accept: str, attempts: int = 4) -> tuple[bytes, str, str]:
+              errors = []
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = session.get(
+                          url,
+                          headers={
+                              'User-Agent': UA,
+                              'Accept': accept,
+                              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                              'Referer': referer,
+                              'Cache-Control': 'no-cache',
+                          },
+                          timeout=(20, 180),
+                          allow_redirects=True,
+                      )
+                      print('GET', url, r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+                      if r.status_code == 200:
+                          return r.content, r.url, r.headers.get('content-type', '')
+                      errors.append(f'HTTP {r.status_code}, {len(r.content)} bytes')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(attempt)
+              raise RuntimeError(f'Failed to fetch {url}: {errors}')
+
+          def try_direct_pdf(spec: dict, dest: Path) -> tuple[bool, str, str]:
+              errors = []
+              for url in spec['direct_pdf_urls']:
+                  try:
+                      body, final_url, content_type = request_bytes(
+                          url,
+                          spec['eastmoney_page'] or 'https://data.eastmoney.com/',
+                          'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                      )
+                      if not body.startswith(b'%PDF-'):
+                          raise RuntimeError(f'not PDF; type={content_type}; bytes={len(body)}')
+                      temp = dest.with_suffix('.direct.tmp.pdf')
+                      temp.write_bytes(body)
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages != spec['page_count']:
+                          raise RuntimeError(f'page mismatch {pages} != {spec["page_count"]}')
+                      text = ''
+                      for pg in reader.pages[:min(6, pages)]:
+                          try:
+                              text += '\n' + (pg.extract_text() or '')
+                          except Exception:
+                              pass
+                      compact = ''.join(text.split()).upper()
+                      if text.strip():
+                          if not any(''.join(x.split()).upper() in compact for x in spec['identity_terms']):
+                              raise RuntimeError('company identity absent from extracted text')
+                          if not any(x.upper() in compact for x in spec['ticker_terms']):
+                              raise RuntimeError('ticker absent from extracted text')
+                          if not any(''.join(x.split()).upper() in compact for x in spec['title_terms']):
+                              raise RuntimeError('title marker absent from extracted text')
+                      temp.replace(dest)
+                      return True, final_url, '公开原始PDF'
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc}')
+                      print('DIRECT_REJECT', spec['order'], url, repr(exc), flush=True)
+              return False, '; '.join(errors), ''
+
+          def download_page_images(spec: dict) -> tuple[list[Path], list[dict]]:
+              page_dir = WORK / f"report_{spec['order']:02d}_pages"
+              page_dir.mkdir(parents=True, exist_ok=True)
+              files = []
+              manifest = []
+              for index in range(spec['page_count']):
+                  url = f"{spec['image_base']}/{index}.png"
+                  body, final_url, content_type = request_bytes(
+                      url,
+                      spec['detail_url'],
+                      'image/avif,image/webp,image/apng,image/png,image/jpeg,image/*,*/*;q=0.8',
+                  )
+                  if len(body) < 5000:
+                      raise RuntimeError(f'page {index + 1} too small: {len(body)} bytes')
+                  with Image.open(io.BytesIO(body)) as im:
+                      im.verify()
+                  with Image.open(io.BytesIO(body)) as im:
+                      width, height = im.size
+                      source_format = (im.format or '').upper()
+                      if width < 700 or height < 900:
+                          raise RuntimeError(f'page {index + 1} dimensions too small: {width}x{height}')
+                      normalized = im.convert('RGB')
+                      dest = page_dir / f'{index + 1:03d}.png'
+                      normalized.save(dest, format='PNG', optimize=False)
+                  source_hash = hashlib.sha256(body).hexdigest()
+                  saved_hash = sha256_file(dest)
+                  files.append(dest)
+                  manifest.append({
+                      'page': index + 1,
+                      'source_url': final_url,
+                      'content_type': content_type,
+                      'source_format': source_format,
+                      'source_width': width,
+                      'source_height': height,
+                      'source_bytes': len(body),
+                      'source_sha256': source_hash,
+                      'normalized_file': dest.name,
+                      'normalized_sha256': saved_hash,
+                  })
+                  print('PAGE_OK', spec['order'], index + 1, source_format, width, height, len(body), flush=True)
+              if len(files) != spec['page_count']:
+                  raise RuntimeError('page count incomplete')
+              if len({x['source_sha256'] for x in manifest}) != len(manifest):
+                  raise RuntimeError('duplicate source page image detected')
+              return files, manifest
+
+          def images_to_pdf(images: list[Path], dest: Path) -> None:
+              pdf_bytes = img2pdf.convert([str(p) for p in images])
+              dest.write_bytes(pdf_bytes)
+
+          def validate_pdf(path: Path, expected_pages: int) -> dict:
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError(f'PDF signature missing: {path}')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages != expected_pages:
+                  raise RuntimeError(f'actual pages {pages}, expected {expected_pages}: {path}')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed: {check.stderr[-1000:]}')
+              render_info = []
+              for label, page_no in [('first', 1), ('last', pages)]:
+                  prefix = RENDERS / f'{path.stem}_{label}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '110', str(path), str(prefix)],
+                      check=True,
+                      capture_output=True,
+                  )
+                  png = Path(str(prefix) + '.png')
+                  if not png.exists() or png.stat().st_size < 10000:
+                      raise RuntimeError(f'render failed: {path}, {label}')
+                  with Image.open(png) as im:
+                      width, height = im.size
+                      if width < 700 or height < 900:
+                          raise RuntimeError(f'render too small: {path}, {label}, {width}x{height}')
+                  render_info.append({'label': label, 'page': page_no, 'file': png.name, 'bytes': png.stat().st_size, 'width': width, 'height': height})
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256_file(path),
+                  'render_check': render_info,
+              }
+
+          records = []
+          seen_pdf_hashes = set()
+          for spec in reports:
+              dest = OUT / spec['filename']
+              direct_ok, direct_info, source_type = try_direct_pdf(spec, dest)
+              image_manifest = []
+              if direct_ok:
+                  source_url = direct_info
+                  source_pattern = ''
+              else:
+                  images, image_manifest = download_page_images(spec)
+                  images_to_pdf(images, dest)
+                  source_url = spec['detail_url']
+                  source_pattern = spec['image_base'] + '/{page_index_0_based}.png'
+                  source_type = '公开逐页原版图像按原页序无损合成PDF'
+              meta = validate_pdf(dest, spec['page_count'])
+              if meta['sha256'] in seen_pdf_hashes:
+                  raise RuntimeError('duplicate PDF detected')
+              seen_pdf_hashes.add(meta['sha256'])
+              record = {
+                  'order': spec['order'],
+                  'company': COMPANY_CN,
+                  'company_en': COMPANY_EN,
+                  'ticker': TICKER,
+                  'institution': spec['institution'],
+                  'date': spec['date'],
+                  'title': spec['title'],
+                  'report_type': spec['report_type'],
+                  'rating': spec['rating'],
+                  'researchers': spec['researchers'],
+                  'filename': spec['filename'],
+                  'source_type': source_type,
+                  'source_page': spec['detail_url'],
+                  'source_url': source_url,
+                  'source_image_pattern': source_pattern,
+                  'eastmoney_page': spec['eastmoney_page'],
+                  'image_manifest': image_manifest,
+                  **meta,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps({k: record[k] for k in ['order','institution','date','title','pages','bytes','source_type','sha256']}, ensure_ascii=False), flush=True)
+
+          if len(records) != 2 or len({x['sha256'] for x in records}) != 2:
+              raise RuntimeError('record count or uniqueness check failed')
+          if sum(x['pages'] for x in records) != 46:
+              raise RuntimeError('combined page count must be 46')
+
+          readme = [
+              f'{COMPANY_CN}（{COMPANY_EN}，{TICKER}）券商深度报告合集',
+              '整理日期：2026-09-02',
+              '',
+              '一、收录报告',
+          ]
+          for r in records:
+              readme.extend([
+                  f"{r['order']}. {r['institution']}｜{r['date']}｜{r['report_type']}｜{r['pages']}页",
+                  f"   标题：{r['title']}",
+                  f"   评级：{r['rating']}；分析师：{r['researchers']}",
+                  f"   文件：{r['filename']}",
+                  f"   版本：{r['source_type']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '二、版本说明',
+              '优先采用可公开取得的券商原始PDF。原始PDF不可稳定取得时，使用公开详情页所对应的逐页原版图像，按原报告页序逐页无损合成为PDF；未改写、删页或重排。',
+              '本包没有收录仅开放前两页预览的2025年及2026年跟踪报告。',
+              '',
+              '三、完整性核验',
+              '已核验：逐页图像数量与顺序、图像格式与尺寸、重复页、PDF文件头、实际页数、qpdf结构、首页及末页渲染、SHA-256、文件去重和ZIP CRC。',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (OUT / '00_报告清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          with (OUT / '报告清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','机构','报告日期','报告类型','标题','评级','分析师','页数','文件大小_字节','版本','SHA256','来源页面','原始索引页面','文件名']
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              for r in records:
+                  w.writerow({
+                      '序号': r['order'], '机构': r['institution'], '报告日期': r['date'],
+                      '报告类型': r['report_type'], '标题': r['title'], '评级': r['rating'],
+                      '分析师': r['researchers'], '页数': r['pages'], '文件大小_字节': r['bytes'],
+                      '版本': r['source_type'], 'SHA256': r['sha256'], '来源页面': r['source_page'],
+                      '原始索引页面': r['eastmoney_page'], '文件名': r['filename'],
+                  })
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 2:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 2')
+          bundle_hash = sha256_file(zip_path)
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{bundle_hash}  {zip_path.name}\n', encoding='utf-8')
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, bundle_hash, flush=True)
+          print('FINAL_RECORDS', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-broker-deep-reports-final
+          path: |
+            瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版/
+            瑞浦兰钧_00666HK_券商深度报告_2份_完整公开版.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
