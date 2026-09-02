@@ -1,0 +1,441 @@
+name: Package Sihuan Pharmaceutical annual and interim reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sihuan-periodic-reports-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf httpx
+
+      - name: Download verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY_CN = ('四環醫藥', '四环医药', '四環醫藥控股集團有限公司', '四环医药控股集团有限公司')
+          COMPANY_EN = ('SIHUAN PHARMACEUTICAL', 'SIHUAN PHARMACEUTICAL HOLDINGS GROUP LTD')
+          STOCK_CODE = '00460'
+          PACKAGE = '四环医药_00460_2020-2025年报及最新半年报'
+          OUT = Path(PACKAGE)
+          WORK = Path('_sihuan_work')
+          PREVIEW = WORK / 'preview'
+          OUT.mkdir(exist_ok=True)
+          PREVIEW.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          html_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/html,application/xhtml+xml,*/*;q=0.8',
+              'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'\s+', '', value or '').upper()
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def fetch_html(url: str, *, params=None, attempts: int = 5, timeout=(30, 180)) -> requests.Response:
+              errors = []
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = session.get(url, params=params, headers=html_headers, timeout=timeout, allow_redirects=True)
+                      print('HTML_GET', attempt, r.status_code, len(r.content), r.url, flush=True)
+                      if r.status_code == 200 and r.content:
+                          return r
+                      errors.append(f'HTTP {r.status_code}/{len(r.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(min(attempt * 2, 8))
+              raise RuntimeError(f'Unable to fetch {url}: ' + ' | '.join(errors[-5:]))
+
+          def fetch_pdf(url: str, *, attempts: int = 5) -> requests.Response:
+              errors = []
+              referers = (
+                  'https://ir.sihuanpharm.com/',
+                  'https://www1.hkexnews.hk/',
+                  'https://www.hkexnews.hk/',
+              )
+              candidates = [url]
+              if url.startswith('http://'):
+                  candidates.append('https://' + url[len('http://'):])
+              for candidate in candidates:
+                  for attempt in range(1, attempts + 1):
+                      for referer in referers:
+                          try:
+                              r = session.get(
+                                  candidate,
+                                  headers={**pdf_headers, 'Referer': referer},
+                                  timeout=(30, 900),
+                                  allow_redirects=True,
+                              )
+                              print('PDF_GET', attempt, r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+                              if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 20000:
+                                  return r
+                              errors.append(f'{candidate} | {referer} | HTTP {r.status_code}/{len(r.content)}')
+                          except Exception as exc:
+                              errors.append(f'{candidate} | {referer} | {exc!r}')
+                      time.sleep(min(attempt * 2, 8))
+              raise RuntimeError('PDF download failed: ' + ' || '.join(errors[-10:]))
+
+          FINANCIAL_PAGE = 'https://ir.sihuanpharm.com/cn/investor-relations/information-disclosure/financial-statements-esg-information/'
+
+          def scrape_financial_links() -> list[dict]:
+              response = fetch_html(FINANCIAL_PAGE)
+              response.encoding = response.apparent_encoding or 'utf-8'
+              soup = BeautifulSoup(response.text, 'html.parser')
+              rows = []
+              for a in soup.find_all('a', href=True):
+                  text = ' '.join(a.get_text(' ', strip=True).split())
+                  href = urljoin(response.url, html.unescape(a['href']))
+                  if href.lower().split('?', 1)[0].endswith('.pdf'):
+                      rows.append({'text': text, 'url': href})
+              print('IR_FINANCIAL_LINKS', json.dumps(rows, ensure_ascii=False, indent=2), flush=True)
+              return rows
+
+          ir_links = scrape_financial_links()
+
+          fixed_annual = {
+              2020: ['https://ir.sihuanpharm.com/media/wn3js2eh/2020-ar.pdf'],
+              2021: ['https://ir.sihuanpharm.com/media/fjhlecue/2021-annual-report.pdf'],
+              2022: ['https://ir.sihuanpharm.com/media/pu1ncuyj/c22ar.pdf'],
+              2023: ['https://ir.sihuanpharm.com/media/okqbni3v/sihuan-23ar.pdf'],
+              2024: ['https://ir.sihuanpharm.com/media/m0ncd4i0/hkex-eps_20250428_11646350_0.pdf'],
+              2025: ['https://ir.sihuanpharm.com/media/4xghdcny/hkex-eps_20260427_12124140_0.pdf'],
+          }
+
+          def ir_candidates(year: int, kind: str) -> list[str]:
+              result = []
+              for row in ir_links:
+                  label = compact(row['text'])
+                  if str(year) not in label:
+                      continue
+                  if kind == 'annual':
+                      if not any(x in label for x in ('年度報告', '年度报告', 'ANNUALREPORT')):
+                          continue
+                      if any(x in label for x in ('環境', '环境', 'ESG', '中期')):
+                          continue
+                  else:
+                      if not any(x in label for x in ('中期報告', '中期报告', 'INTERIMREPORT')):
+                          continue
+                  if row['url'] not in result:
+                      result.append(row['url'])
+              return result
+
+          def recursive_dicts(obj):
+              if isinstance(obj, str):
+                  stripped = obj.strip()
+                  if stripped.startswith(('[', '{')):
+                      try:
+                          yield from recursive_dicts(json.loads(stripped))
+                      except Exception:
+                          return
+                  return
+              if isinstance(obj, dict):
+                  yield obj
+                  for value in obj.values():
+                      yield from recursive_dicts(value)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      yield from recursive_dicts(value)
+
+          def find_stock_id() -> str:
+              urls = (
+                  'https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_c.json',
+                  'https://www1.hkexnews.hk/ncms/script/eds/activestock_sehk_e.json',
+              )
+              for url in urls:
+                  try:
+                      r = fetch_html(url)
+                      data = r.json()
+                      for item in recursive_dicts(data):
+                          code = str(item.get('c') or item.get('code') or item.get('stockCode') or item.get('STOCK_CODE') or '').strip()
+                          name = str(item.get('n') or item.get('name') or item.get('stockName') or item.get('STOCK_NAME') or '')
+                          stock_id = str(item.get('i') or item.get('id') or item.get('stockId') or item.get('STOCK_ID') or '').strip()
+                          if code.zfill(5) == STOCK_CODE or code.lstrip('0') == STOCK_CODE.lstrip('0') or any(x in name for x in ('四環醫藥', '四环医药', 'SIHUAN')):
+                              if stock_id:
+                                  print('HKEX_STOCK_ID', code, name, stock_id, flush=True)
+                                  return stock_id
+                  except Exception as exc:
+                      print('STOCK_ID_SOURCE_ERROR', url, repr(exc), flush=True)
+              try:
+                  r = fetch_html(
+                      'https://www1.hkexnews.hk/search/prefix.do',
+                      params={'type': 'A', 'market': 'SEHK', 'name': STOCK_CODE, 'lang': 'ZH'},
+                  )
+                  data = r.json()
+                  for item in recursive_dicts(data):
+                      raw = json.dumps(item, ensure_ascii=False)
+                      if STOCK_CODE in raw or '四環醫藥' in raw or '四环医药' in raw:
+                          for key in ('i', 'id', 'stockId', 'STOCK_ID'):
+                              if item.get(key):
+                                  stock_id = str(item[key])
+                                  print('HKEX_STOCK_ID_PREFIX', stock_id, raw, flush=True)
+                                  return stock_id
+              except Exception as exc:
+                  print('PREFIX_ERROR', repr(exc), flush=True)
+              return '-1'
+
+          def pdf_urls_from_obj(obj) -> list[str]:
+              raw = html.unescape(json.dumps(obj, ensure_ascii=False)).replace('\\/', '/')
+              urls = []
+              patterns = (
+                  r'https?://[^"\'<>\s]+?\.pdf(?:\?[^"\'<>\s]*)?',
+                  r'/listedco/listconews/[^"\'<>\s]+?\.pdf(?:\?[^"\'<>\s]*)?',
+                  r'listedco/listconews/[^"\'<>\s]+?\.pdf(?:\?[^"\'<>\s]*)?',
+              )
+              for pattern in patterns:
+                  for value in re.findall(pattern, raw, flags=re.I):
+                      value = unquote(value).replace('\\u0026', '&')
+                      if value.startswith('/'):
+                          value = urljoin('https://www1.hkexnews.hk', value)
+                      elif value.startswith('listedco/'):
+                          value = urljoin('https://www1.hkexnews.hk/', value)
+                      if value not in urls:
+                          urls.append(value)
+              return urls
+
+          def discover_2026_interim_results() -> list[str]:
+              endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              stock_id = find_stock_id()
+              collected = []
+              seen_rows = set()
+              for sid in (stock_id, '-1'):
+                  for lang in ('zh', 'en'):
+                      for t2code in ('40100', '40300', '-2'):
+                          params = {
+                              'sortDir': '0', 'sortByOptions': 'DateTime',
+                              'category': '0', 'market': 'SEHK', 'stockId': sid,
+                              'documentType': '-1', 'fromDate': '20260820',
+                              'toDate': '20260902', 'title': '', 'searchType': '1',
+                              't1code': '40000', 't2Gcode': '-2', 't2code': t2code,
+                              'rowRange': '500', 'lang': lang,
+                          }
+                          try:
+                              r = fetch_html(endpoint, params=params)
+                              outer = r.json()
+                              for row in recursive_dicts(outer):
+                                  raw = json.dumps(row, ensure_ascii=False)
+                                  if raw in seen_rows:
+                                      continue
+                                  seen_rows.add(raw)
+                                  hay = compact(raw)
+                                  company_ok = STOCK_CODE in hay or '00460' in hay or '四環醫藥' in hay or '四环医药' in hay or 'SIHUANPHARMACEUTICAL' in hay
+                                  type_ok = any(x in hay for x in ('中期業績', '中期业绩', 'INTERIMRESULTS'))
+                                  period_ok = '2026' in hay or '二零二六' in hay or '30JUNE2026' in hay or '六月三十日' in hay
+                                  exclude = any(x in hay for x in ('盈利預告', '盈利预告', 'PROFITALERT', '董事會會議', '董事会会议'))
+                                  if company_ok and type_ok and period_ok and not exclude:
+                                      for url in pdf_urls_from_obj(row):
+                                          if url not in collected:
+                                              collected.append(url)
+                              print('HKEX_SEARCH_DONE', sid, lang, t2code, len(r.content), flush=True)
+                          except Exception as exc:
+                              print('HKEX_SEARCH_ERROR', sid, lang, t2code, repr(exc), flush=True)
+              print('HKEX_2026_INTERIM_CANDIDATES', json.dumps(collected, ensure_ascii=False, indent=2), flush=True)
+              return collected
+
+          def validate_pdf(path: Path, year: int, kind: str, min_pages: int) -> dict:
+              if path.read_bytes()[:5] != b'%PDF-':
+                  raise RuntimeError('PDF signature missing')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'unexpectedly short: {pages} pages')
+              texts = []
+              for page in reader.pages[:min(45, pages)]:
+                  try:
+                      texts.append(page.extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, repr(exc), flush=True)
+              norm = compact('\n'.join(texts))
+              if not any(compact(x) in norm for x in COMPANY_CN + COMPANY_EN) and STOCK_CODE not in norm and '0460' not in norm:
+                  raise RuntimeError('company identity validation failed')
+              if str(year) not in norm and ('二零二六' not in norm if year == 2026 else True):
+                  raise RuntimeError(f'report year {year} not found')
+              if kind == '年度报告' and not any(x in norm for x in ('年度報告', '年度报告', 'ANNUALREPORT')):
+                  raise RuntimeError('annual-report marker missing')
+              if kind in ('中期报告', '中期业绩公告') and not any(x in norm for x in ('中期報告', '中期报告', '中期業績', '中期业绩', 'INTERIMREPORT', 'INTERIMRESULTS')):
+                  raise RuntimeError('interim marker missing')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError('qpdf validation failed: ' + check.stderr[-1000:])
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f'{path.stem}_{label}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '72', str(path), str(prefix)],
+                      check=True, capture_output=True,
+                  )
+                  rendered = Path(str(prefix) + '.png')
+                  if not rendered.exists() or rendered.stat().st_size < 1000:
+                      raise RuntimeError(f'{label}-page render failed')
+              return {'pages': pages, 'bytes': path.stat().st_size, 'sha256': sha256(path)}
+
+          def obtain(index: int, year: int, kind: str, filename: str, urls: list[str], min_pages: int) -> dict:
+              candidates = []
+              for url in urls:
+                  if url and url not in candidates:
+                      candidates.append(url)
+              errors = []
+              for candidate_index, url in enumerate(candidates, 1):
+                  temp = WORK / f'{index:02d}_{year}_{candidate_index}.pdf'
+                  try:
+                      response = fetch_pdf(url)
+                      temp.write_bytes(response.content)
+                      meta = validate_pdf(temp, year, kind, min_pages)
+                      dest = OUT / filename
+                      shutil.copy2(temp, dest)
+                      record = {
+                          'filename': filename,
+                          'year': year,
+                          'report_type': kind,
+                          'source_url': response.url,
+                          'requested_url': url,
+                          **meta,
+                      }
+                      print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+                      return record
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc}')
+                      print('REJECTED', errors[-1], flush=True)
+                      temp.unlink(missing_ok=True)
+              raise RuntimeError(f'All candidates failed for {filename}:\n' + '\n'.join(errors))
+
+          records = []
+          for index, year in enumerate(range(2020, 2026), 1):
+              records.append(obtain(
+                  index, year, '年度报告',
+                  f'{index:02d}_四环医药_{year}年年度报告.pdf',
+                  ir_candidates(year, 'annual') + fixed_annual[year],
+                  120,
+              ))
+
+          full_interims = []
+          for row in ir_links:
+              label = compact(row['text'])
+              if any(x in label for x in ('中期報告', '中期报告', 'INTERIMREPORT')):
+                  match = re.search(r'20\d{2}', row['text'])
+                  if match:
+                      full_interims.append((int(match.group()), row['url'], row['text']))
+          full_interims.sort(reverse=True)
+          if not full_interims:
+              raise RuntimeError('No full interim report found on official IR page')
+          latest_full_year = full_interims[0][0]
+          latest_full_urls = [url for year, url, _ in full_interims if year == latest_full_year]
+          print('LATEST_FULL_INTERIM', latest_full_year, json.dumps(latest_full_urls, ensure_ascii=False), flush=True)
+
+          interim_results_urls = discover_2026_interim_results()
+          if not interim_results_urls:
+              raise RuntimeError('Unable to discover official 2026 interim results announcement from HKEX')
+
+          records.append(obtain(
+              7, 2026, '中期业绩公告',
+              '07_四环医药_2026年中期业绩公告_截至2026年6月30日.pdf',
+              interim_results_urls,
+              25,
+          ))
+
+          if latest_full_year < 2026:
+              records.append(obtain(
+                  8, latest_full_year, '中期报告',
+                  f'08_四环医药_{latest_full_year}年中期报告_最新完整中报.pdf',
+                  latest_full_urls,
+                  60,
+              ))
+
+          if len(records) not in (7, 8):
+              raise RuntimeError(f'Unexpected record count: {len(records)}')
+          hashes = [record['sha256'] for record in records]
+          if len(set(hashes)) != len(hashes):
+              raise RuntimeError('Duplicate PDF detected')
+
+          readme = [
+              '四环医药控股集团有限公司（00460.HK）定期报告资料包',
+              '',
+              '内容范围：2020—2025年年度报告，以及截至2026年9月2日的最新半年期财务资料。',
+              '截至构建日，2026年完整中期报告尚未列入公司官网“财务报告和ESG报告”栏目，因此本包收录港交所正式披露的2026年中期业绩公告；同时附上官网当前最新的完整中期报告，便于查阅完整章节。',
+              '',
+          ]
+          for record in records:
+              readme.extend([
+                  f"- {record['filename']}",
+                  f"  类型：{record['report_type']}｜年份：{record['year']}｜页数：{record['pages']}｜大小：{record['bytes']} bytes",
+                  f"  官方来源：{record['source_url']}",
+                  f"  SHA-256：{record['sha256']}",
+              ])
+          readme.extend([
+              '',
+              '核验项目：PDF文件头、公司名称/证券代码、年份与报告类型、实际页数、qpdf结构检查、首页与末页渲染、SHA-256及ZIP CRC。',
+              '资料仅供研究使用，版权归四环医药、香港交易所及原披露主体所有。',
+          ])
+          (OUT / '报告清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for path in sorted(OUT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, arcname=f'{OUT.name}/{path.relative_to(OUT)}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_members = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != len(records):
+                  raise RuntimeError(f'ZIP contains {len(pdf_members)} PDFs, expected {len(records)}')
+              print('ZIP_MEMBERS', json.dumps(zf.namelist(), ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, sha256(zip_path), flush=True)
+          PY
+
+      - name: Upload packaged reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: sihuan-pharmaceutical-00460-reports-20260902
+          path: 四环医药_00460_2020-2025年报及最新半年报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
