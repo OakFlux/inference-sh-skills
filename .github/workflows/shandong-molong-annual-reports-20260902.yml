@@ -1,0 +1,368 @@
+name: Package Shandong Molong annual and latest periodic reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shandong-molong-annual-reports-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet pypdf beautifulsoup4 requests
+
+      - name: Discover download verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK_CODE = '002490'
+          HK_CODE = '00568'
+          COMPANY_KEYWORDS = ('山东墨龙', 'ST墨龙', '山东墨龙石油机械股份有限公司')
+          PACKAGE = '山东墨龙_2020-2025年报及最新季报'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_shandong_molong_periodic_work')
+          work.mkdir(exist_ok=True)
+          previews = work / 'previews'
+          previews.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          html_headers = {
+              'User-Agent': ua,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          def fetch(url: str, *, headers: dict, attempts: int = 7, timeout=(30, 360)) -> requests.Response:
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      print('GET', attempt, url, response.status_code, response.headers.get('content-type'), len(response.content), response.url, flush=True)
+                      if response.status_code == 200 and response.content:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}, {len(response.content)} bytes')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(min(2 * attempt, 12))
+              raise RuntimeError(f'Unable to fetch {url}: {last}')
+
+          def decode_html(response: requests.Response) -> str:
+              for encoding in ('gb18030', 'gbk', 'utf-8'):
+                  try:
+                      text = response.content.decode(encoding)
+                      if '墨龙' in text or '年度报告' in text or '季度报告' in text or '半年度报告' in text:
+                          return text
+                  except Exception:
+                      pass
+              response.encoding = response.apparent_encoding or 'utf-8'
+              return response.text
+
+          def parse_sina_listing(page_type: str) -> list[dict]:
+              url = f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_CODE}/page_type/{page_type}.phtml'
+              response = fetch(url, headers={**html_headers, 'Referer': 'https://money.finance.sina.com.cn/'}, timeout=(25, 180))
+              text = decode_html(response)
+              soup = BeautifulSoup(text, 'html.parser')
+              rows = []
+              seen = set()
+              for anchor in soup.find_all('a', href=True):
+                  label = ' '.join(anchor.get_text(' ', strip=True).split())
+                  href = urljoin(response.url, html.unescape(anchor['href']))
+                  if 'vCB_AllBulletinDetail.php' not in href:
+                      continue
+                  if '墨龙' not in label:
+                      continue
+                  parent_text = ' '.join(anchor.parent.get_text(' ', strip=True).split()) if anchor.parent else label
+                  date_match = re.search(r'(20\d{2}-\d{2}-\d{2})', parent_text)
+                  key = (label, href)
+                  if key in seen:
+                      continue
+                  seen.add(key)
+                  rows.append({
+                      'title': label,
+                      'detail_url': href,
+                      'date': date_match.group(1) if date_match else '',
+                  })
+              print('SINA_LIST', page_type, json.dumps(rows, ensure_ascii=False, indent=2), flush=True)
+              return rows
+
+          def extract_sina_pdf(detail_url: str) -> str:
+              response = fetch(detail_url, headers={**html_headers, 'Referer': 'https://money.finance.sina.com.cn/'}, timeout=(25, 240))
+              text = decode_html(response)
+              patterns = [
+                  r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+?\.PDF',
+                  r'https?:\\/\\/file\.finance\.sina\.com\.cn\\/[^\"\'<>\s]+?\.PDF',
+              ]
+              candidates = []
+              for pattern in patterns:
+                  for match in re.findall(pattern, text, flags=re.I):
+                      candidate = html.unescape(match).replace('\\/', '/')
+                      if candidate not in candidates:
+                          candidates.append(candidate)
+              if not candidates:
+                  soup = BeautifulSoup(text, 'html.parser')
+                  for anchor in soup.find_all('a', href=True):
+                      href = urljoin(response.url, html.unescape(anchor['href']))
+                      if 'file.finance.sina.com.cn' in href and href.lower().endswith('.pdf'):
+                          candidates.append(href)
+              if not candidates:
+                  raise RuntimeError(f'No Sina PDF link found in {detail_url}')
+              print('SINA_PDF', detail_url, json.dumps(candidates, ensure_ascii=False), flush=True)
+              return candidates[0]
+
+          annual_rows = parse_sina_listing('ndbg')
+          q1_rows = parse_sina_listing('yjdbg')
+          half_rows = parse_sina_listing('zqbg')
+
+          targets: list[dict] = []
+          for year in range(2020, 2026):
+              exact = [
+                  row for row in annual_rows
+                  if f'{year}年年度报告' in row['title']
+                  and '摘要' not in row['title']
+                  and '英文版' not in row['title']
+                  and '取消' not in row['title']
+              ]
+              if not exact:
+                  raise RuntimeError(f'Sina listing missing full {year} annual report')
+              row = sorted(exact, key=lambda item: item['date'], reverse=True)[0]
+              targets.append({
+                  'year': year,
+                  'type': '年度报告',
+                  'title': row['title'],
+                  'source_url': extract_sina_pdf(row['detail_url']),
+                  'disclosure_date': row['date'],
+                  'min_pages': 100,
+              })
+
+          q1_exact = [
+              row for row in q1_rows
+              if re.search(r'2026年(?:第一季度|一季度)报告', row['title'])
+              and '摘要' not in row['title']
+              and '取消' not in row['title']
+          ]
+          if not q1_exact:
+              raise RuntimeError('Sina listing missing full 2026 first-quarter report')
+          q1_row = sorted(q1_exact, key=lambda item: item['date'], reverse=True)[0]
+          targets.append({
+              'year': 2026,
+              'type': '第一季度报告',
+              'title': q1_row['title'],
+              'source_url': extract_sina_pdf(q1_row['detail_url']),
+              'disclosure_date': q1_row['date'],
+              'min_pages': 8,
+          })
+
+          half_exact = [
+              row for row in half_rows
+              if '2026年半年度报告' in row['title']
+              and '摘要' not in row['title']
+              and '英文版' not in row['title']
+              and '取消' not in row['title']
+          ]
+          if not half_exact:
+              raise RuntimeError('Sina listing missing full 2026 half-year report')
+          half_row = sorted(half_exact, key=lambda item: item['date'], reverse=True)[0]
+          targets.append({
+              'year': 2026,
+              'type': '半年度报告',
+              'title': half_row['title'],
+              'source_url': extract_sina_pdf(half_row['detail_url']),
+              'disclosure_date': half_row['date'],
+              'min_pages': 50,
+          })
+
+          print('TARGETS', json.dumps(targets, ensure_ascii=False, indent=2), flush=True)
+
+          records = []
+          seen_hashes = set()
+          for index, target in enumerate(targets, 1):
+              year = target['year']
+              report_type = target['type']
+              filename = f'{index:02d}_山东墨龙_{year}年{report_type}.pdf'
+              dest = out / filename
+              original_url = target['source_url']
+              source_urls = [original_url]
+              if original_url.startswith('http://'):
+                  source_urls.append('https://' + original_url[len('http://'):])
+
+              pdf_bytes = b''
+              used_url = ''
+              errors = []
+              for url in source_urls:
+                  for referer in (
+                      'https://money.finance.sina.com.cn/',
+                      'https://www.cninfo.com.cn/',
+                      'https://www.szse.cn/',
+                  ):
+                      try:
+                          response = fetch(
+                              url,
+                              headers={**pdf_headers, 'Referer': referer},
+                              attempts=5,
+                              timeout=(30, 900),
+                          )
+                      except Exception as exc:
+                          errors.append(f'{url} | {referer} | {exc!r}')
+                          continue
+                      if response.content.startswith(b'%PDF-') and len(response.content) > 20_000:
+                          pdf_bytes = response.content
+                          used_url = url
+                          break
+                      errors.append(f'{url} | {referer} | invalid PDF {len(response.content)} bytes')
+                  if pdf_bytes:
+                      break
+              if not pdf_bytes:
+                  raise RuntimeError(f'Failed to download {filename}: ' + ' || '.join(errors[-8:]))
+              dest.write_bytes(pdf_bytes)
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < int(target['min_pages']):
+                  raise RuntimeError(f'{filename} is unexpectedly short: {pages} pages')
+
+              texts = []
+              for page in reader.pages[: min(pages, 30)]:
+                  try:
+                      texts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              compact = re.sub(r'\s+', '', '\n'.join(texts))
+              if not any(keyword in compact for keyword in COMPANY_KEYWORDS) and STOCK_CODE not in compact and HK_CODE not in compact:
+                  raise RuntimeError(f'Company identity validation failed for {filename}')
+              if str(year) not in compact:
+                  raise RuntimeError(f'Report year validation failed for {filename}')
+              if report_type == '年度报告' and '年度报告' not in compact:
+                  raise RuntimeError(f'Annual-report type validation failed for {filename}')
+              if report_type == '第一季度报告' and not ('第一季度报告' in compact or '一季度报告' in compact):
+                  raise RuntimeError(f'Quarter-report type validation failed for {filename}')
+              if report_type == '半年度报告' and not ('半年度报告' in compact or '中期报告' in compact):
+                  raise RuntimeError(f'Half-year-report type validation failed for {filename}')
+
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {filename}: {check.stderr[-1500:]}')
+              if check.returncode == 3:
+                  print('QPDF_WARNING', filename, check.stderr[-1500:], flush=True)
+
+              first_prefix = previews / f'{index:02d}_first'
+              last_prefix = previews / f'{index:02d}_last'
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(dest), str(first_prefix)],
+                  check=True,
+                  capture_output=True,
+              )
+              subprocess.run(
+                  ['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90', str(dest), str(last_prefix)],
+                  check=True,
+                  capture_output=True,
+              )
+              if not Path(str(first_prefix) + '.png').exists() or not Path(str(last_prefix) + '.png').exists():
+                  raise RuntimeError(f'Render verification failed for {filename}')
+
+              digest = hashlib.sha256(pdf_bytes).hexdigest()
+              if digest in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {filename}')
+              seen_hashes.add(digest)
+              record = {
+                  'filename': filename,
+                  'year': year,
+                  'report_type': report_type,
+                  'original_title': target['title'],
+                  'disclosure_date': target.get('disclosure_date') or '',
+                  'pages': pages,
+                  'bytes': len(pdf_bytes),
+                  'sha256': digest,
+                  'source_url': used_url,
+                  'source_format': '公开披露原始PDF',
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 reports, got {len(records)}')
+          if len({record['sha256'] for record in records}) != 8:
+              raise RuntimeError('Duplicate report files detected')
+
+          lines = [
+              '山东墨龙（002490.SZ / 00568.HK）2020—2025年年度报告及最新定期报告',
+              '',
+              '本包共8份完整PDF：2020—2025年年度报告、2026年第一季度报告，以及截至2026年9月2日最新披露的2026年半年度报告。',
+              '其中2026年第一季度报告是当前最新的正式季度报告；2026年半年度报告是当前最新的定期报告，故一并收录。',
+              '所有年度报告均为全文版，未以年度报告摘要替代。',
+              '',
+          ]
+          for record in records:
+              lines.extend([
+                  f"- {record['filename']}｜{record['pages']}页｜披露日期：{record['disclosure_date']}",
+                  f"  原公告标题：{record['original_title']}",
+                  f"  公开来源：{record['source_url']}",
+                  f"  SHA-256：{record['sha256']}",
+              ])
+          lines.extend([
+              '',
+              '核验项目：PDF文件头和结构、实际页数、公司名称/证券代码、报告年份与类型、首页和末页渲染、文件哈希、ZIP文件数量与CRC。',
+              '资料仅供研究使用，版权归山东墨龙及原披露平台所有。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(f'{PACKAGE}.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 8')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: shandong-molong-periodic-reports-final
+          path: |
+            山东墨龙_2020-2025年报及最新季报/
+            山东墨龙_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
