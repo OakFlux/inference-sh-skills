@@ -1,0 +1,128 @@
+name: Inspect FxBaogao viewer for WeRide deep report
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-fxbaogao-viewer-inspect-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Inspect report viewer and frontend endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, time
+          from urllib.parse import urljoin, unquote
+          import requests
+          from bs4 import BeautifulSoup
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          base_headers={
+              'User-Agent':ua,
+              'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+          pages=[
+              'https://www.fxbaogao.com/detail/5095181',
+              'https://www.fxbaogao.com/view?id=5095181',
+              'https://www.fxbaogao.com/view/5095181',
+              'https://www.fxbaogao.com/report/5095181',
+          ]
+          scripts=[]
+          for url in pages:
+              try:
+                  r=s.get(url,headers=base_headers,timeout=(20,120),allow_redirects=True)
+                  print('\n=== PAGE',url,r.status_code,r.headers.get('content-type'),len(r.content),r.url,'===',flush=True)
+                  print('COOKIES',s.cookies.get_dict(),flush=True)
+                  print(r.text[:120000],flush=True)
+                  soup=BeautifulSoup(r.text,'html.parser')
+                  for tag in soup.find_all('script',src=True):
+                      src=urljoin(r.url,tag['src'])
+                      scripts.append(src)
+                      print('SCRIPT',src,flush=True)
+                  for tag in soup.find_all(['a','iframe','embed','object','source'],href=True):
+                      print('LINK',tag.name,urljoin(r.url,tag['href']),flush=True)
+                  for tag in soup.find_all(['iframe','embed','script','source','img'],src=True):
+                      full=urljoin(r.url,tag['src'])
+                      if any(k in unquote(full.lower()) for k in ('pdf','report','file','download','5095181','viewer')):
+                          print('RESOURCE',tag.name,full,flush=True)
+                  for pat in [
+                      r'https?://[^"\'<>\s\\]+',
+                      r'[^"\']{0,200}(?:pdfPath|fileUrl|download|auth_key|5095181|reportInfo|viewReport)[^"\']{0,800}',
+                  ]:
+                      for m in re.finditer(pat,r.text,re.I):
+                          val=m.group(0)
+                          if any(k in unquote(val.lower()) for k in ('pdf','report','file','download','auth_key','5095181','viewer')):
+                              print('HTMLMATCH',repr(val[:3000]),flush=True)
+              except Exception as exc:
+                  print('PAGE_ERROR',url,repr(exc),flush=True)
+
+          print('\n=== SCRIPT_COUNT',len(set(scripts)),'===',flush=True)
+          for src in sorted(set(scripts)):
+              try:
+                  r=s.get(src,headers={**base_headers,'Accept':'*/*','Referer':'https://www.fxbaogao.com/view?id=5095181'},timeout=(20,120))
+                  print('\nJS',src,r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+                  text=r.text
+                  hits=[]
+                  for key in ['pdfPath','fileUrl','downloadReport','download','auth_key','oss-buy','getReport','reportInfo','searchReport','viewReport','public.fxbaogao','report.fxbaogao','api.fxbaogao','pdfjs','pdf.js']:
+                      for m in re.finditer(re.escape(key),text,re.I):
+                          hits.append((m.start(),key))
+                  for pos,key in sorted(hits)[:200]:
+                      print('JSMATCH',key,repr(text[max(0,pos-700):pos+1800]),flush=True)
+              except Exception as exc:
+                  print('JS_ERROR',src,repr(exc),flush=True)
+
+          api_base='https://api.fxbaogao.com'
+          candidates=[
+              f'{api_base}/mofoun/report/reportInfo/getReportInfoNoAuth?id=5095181',
+              f'{api_base}/mofoun/report/reportInfo/getReportInfo?id=5095181',
+              f'{api_base}/mofoun/report/getReportInfoNoAuth?id=5095181',
+              f'{api_base}/mofoun/report/getReportInfo?id=5095181',
+              f'{api_base}/mofoun/report/detail/5095181',
+              f'{api_base}/mofoun/report/view/5095181',
+              f'{api_base}/mofoun/report/download/5095181',
+              f'{api_base}/mofoun/report/downloadReport?id=5095181',
+              f'{api_base}/mofoun/report/searchReport/getReportDetail?id=5095181',
+          ]
+          for url in candidates:
+              for method in ('GET','POST'):
+                  try:
+                      headers={
+                          'User-Agent':ua,'Accept':'application/json,text/plain,*/*',
+                          'Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/detail/5095181',
+                          'Content-Type':'application/json;charset=UTF-8','x-fp':'','x-bot':''
+                      }
+                      if method=='GET': r=s.get(url,headers=headers,timeout=(15,60),allow_redirects=True)
+                      else: r=s.post(url,headers=headers,json={'id':5095181,'docId':5095181},timeout=(15,60),allow_redirects=True)
+                      print('API',method,url,r.status_code,r.headers.get('content-type'),len(r.content),r.url,repr(r.text[:3000]),flush=True)
+                  except Exception as exc:
+                      print('API_ERROR',method,url,repr(exc),flush=True)
+
+          paths=[
+              'report/2025/08/22/5095181.pdf',
+              'report/2025/08/25/5095181.pdf',
+          ]
+          hosts=['https://public.fxbaogao.com/','https://report.fxbaogao.com/','https://dr.fxbaogao.com/','https://oss-buy.hufangde.com/']
+          for host in hosts:
+              for path in paths:
+                  url=host+path
+                  try:
+                      r=s.get(url,headers={
+                          'User-Agent':ua,'Accept':'application/pdf,*/*',
+                          'Referer':'https://www.fxbaogao.com/view?id=5095181',
+                          'Range':'bytes=0-4095'
+                      },timeout=(15,60),allow_redirects=True)
+                      print('FILETEST',url,r.status_code,r.headers.get('content-type'),r.headers.get('content-length'),len(r.content),r.url,r.content[:16],flush=True)
+                  except Exception as exc:
+                      print('FILE_ERROR',url,repr(exc),flush=True)
+          PY
