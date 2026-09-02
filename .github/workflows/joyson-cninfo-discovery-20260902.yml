@@ -1,0 +1,85 @@
+name: Discover older Joyson annual reports from CNINFO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/joyson-cninfo-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Query CNINFO
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json
+          import requests
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=600699&orgId=',
+              'Accept': 'application/json, text/plain, */*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Origin': 'https://www.cninfo.com.cn',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+
+          for url in (
+              'https://www.cninfo.com.cn/new/information/topSearch/query?keyWord=600699&maxNum=20',
+              'http://www.cninfo.com.cn/new/information/topSearch/query?keyWord=600699&maxNum=20',
+          ):
+              try:
+                  response = session.get(url, headers=headers, timeout=(30, 180), allow_redirects=True)
+                  print('TOPSEARCH', response.status_code, len(response.content), response.url, response.text[:5000], flush=True)
+              except Exception as exc:
+                  print('TOPSEARCH_ERROR', url, repr(exc), flush=True)
+
+          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          stock_variants = [
+              '600699,shmb0600699',
+              '600699,9900003280',
+              '600699',
+              '',
+          ]
+          for stock in stock_variants:
+              data = {
+                  'pageNum': 1,
+                  'pageSize': 100,
+                  'column': 'sse',
+                  'tabName': 'fulltext',
+                  'plate': 'sh',
+                  'stock': stock,
+                  'searchkey': '均胜电子',
+                  'secid': '',
+                  'category': 'category_ndbg_szsh;',
+                  'trade': '',
+                  'seDate': '2011-01-01~2017-12-31',
+                  'sortName': '',
+                  'sortType': '',
+                  'isHLtitle': 'true',
+              }
+              try:
+                  response = session.post(endpoint, data=data, headers=headers, timeout=(30, 240), allow_redirects=True)
+                  print('\nQUERY', repr(stock), response.status_code, len(response.content), response.url, response.text[:800], flush=True)
+                  response.raise_for_status()
+                  payload = response.json()
+                  print('META', {key: payload.get(key) for key in ('totalAnnouncement', 'totalRecordNum', 'totalpages', 'hasMore')}, flush=True)
+                  announcements = payload.get('announcements') or []
+                  for item in announcements:
+                      title = str(item.get('announcementTitle', ''))
+                      if any(marker in title for marker in ('年度报告', '年年度报告', '年报')):
+                          print('MATCH', json.dumps(item, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('QUERY_ERROR', repr(stock), repr(exc), flush=True)
+          PY
