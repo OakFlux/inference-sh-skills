@@ -1,0 +1,62 @@
+name: Scan dated report indexes for China Everbright Limited
+
+on:
+  push:
+    paths:
+      - '.github/workflows/china-everbright-date-scan-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Scan Eastmoney report API by date
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests, time
+          from pathlib import Path
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/json,text/plain,*/*'}
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          windows=[
+            ('2026-04-15','2026-04-25',['跨境资管标的','业绩弹性可期','中国光大控股']),
+            ('2025-08-28','2025-09-10',['资负共振','锚定科创','中国光大控股']),
+            ('2021-11-20','2021-12-20',['中国领先的跨境资产管理投资稀缺标的','中国光大控股']),
+          ]
+          output=[]; matches=[]
+          for begin,end,terms in windows:
+            for qtype in [0,1,2,3]:
+              for page in range(1,21):
+                p={'pageNo':page,'pageSize':100,'qType':qtype,'beginTime':begin,'endTime':end}
+                r=s.get(endpoint,params=p,headers=h,timeout=(15,60))
+                print('CALL',begin,end,qtype,page,r.status_code,len(r.content),flush=True)
+                try: raw=r.json()
+                except Exception as e:
+                  output.append({'params':p,'status':r.status_code,'error':repr(e),'body':r.text[:1000]}); break
+                rows=raw.get('data') if isinstance(raw,dict) else []
+                if not isinstance(rows,list): rows=[]
+                output.append({'params':p,'hits':raw.get('hits') if isinstance(raw,dict) else None,'totalPage':raw.get('TotalPage') if isinstance(raw,dict) else None,'rows':rows})
+                for row in rows:
+                  text=json.dumps(row,ensure_ascii=False)
+                  if any(term.lower() in text.lower() for term in terms):
+                    if row not in matches: matches.append(row)
+                total=int(raw.get('TotalPage') or 0) if isinstance(raw,dict) else 0
+                if not rows or (total and page>=total): break
+                time.sleep(.15)
+          out=Path('china-everbright-date-scan'); out.mkdir(exist_ok=True)
+          (out/'matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'all.json').write_text(json.dumps(output,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MATCHES',json.dumps(matches,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-date-scan
+          path: china-everbright-date-scan/
+          retention-days: 7
