@@ -1,0 +1,76 @@
+name: Find Joyson 2011 annual report and restructuring document
+
+on:
+  push:
+    paths:
+      - '.github/workflows/joyson-cninfo-2011-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Query CNINFO historical disclosures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json
+          import requests
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=600699&orgId=gssh0600699',
+              'Accept': 'application/json, text/plain, */*',
+              'Origin': 'https://www.cninfo.com.cn',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+          endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          queries = [
+              ('annual_stock', {'stock': '600699,gssh0600699', 'searchkey': '', 'category': 'category_ndbg_szsh;', 'seDate': '2011-01-01~2013-12-31'}),
+              ('annual_global', {'stock': '', 'searchkey': '', 'category': 'category_ndbg_szsh;', 'seDate': '2011-01-01~2013-12-31'}),
+              ('search_2011_report', {'stock': '', 'searchkey': '2011年年度报告', 'category': '', 'seDate': '2012-01-01~2012-12-31'}),
+              ('search_restructure', {'stock': '', 'searchkey': '重大资产置换及发行股份购买资产暨关联交易报告书', 'category': '', 'seDate': '2010-01-01~2012-12-31'}),
+              ('search_joyson_restructure', {'stock': '', 'searchkey': '均胜 重大资产置换', 'category': '', 'seDate': '2010-01-01~2012-12-31'}),
+          ]
+          for label, custom in queries:
+              for page in range(1, 5):
+                  data = {
+                      'pageNum': page,
+                      'pageSize': 100,
+                      'column': 'sse',
+                      'tabName': 'fulltext',
+                      'plate': 'sh',
+                      'stock': custom['stock'],
+                      'searchkey': custom['searchkey'],
+                      'secid': '',
+                      'category': custom['category'],
+                      'trade': '',
+                      'seDate': custom['seDate'],
+                      'sortName': '',
+                      'sortType': '',
+                      'isHLtitle': 'true',
+                  }
+                  response = session.post(endpoint, data=data, headers=headers, timeout=(30, 240), allow_redirects=True)
+                  print('\nQUERY', label, page, response.status_code, len(response.content), flush=True)
+                  response.raise_for_status()
+                  payload = response.json()
+                  print('META', {key: payload.get(key) for key in ('totalAnnouncement','totalRecordNum','totalpages','hasMore')}, flush=True)
+                  announcements = payload.get('announcements') or []
+                  for item in announcements:
+                      if str(item.get('secCode','')) != '600699':
+                          continue
+                      raw = json.dumps(item, ensure_ascii=False)
+                      title = str(item.get('announcementTitle',''))
+                      if any(marker in title for marker in ('2011年年度报告','重大资产置换','发行股份购买资产','重组报告书')) or label.startswith('annual'):
+                          print('MATCH', raw, flush=True)
+                  if not payload.get('hasMore'):
+                      break
+          PY
