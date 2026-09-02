@@ -1,0 +1,45 @@
+name: Query related reports for REPT BATTERO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-similar-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: python -m pip install --quiet requests
+      - name: Query detail and related report lists
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import concurrent.futures,json
+          from pathlib import Path
+          import requests
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/detail/646994','Device':'1','X-Token':''}
+          calls=[('/api/file/detail',{'id':646994}),('/api/file/similarlist',{'id':646994,'pageSize':100}),('/api/file/sameOrganizationlist',{'id':646994,'pageSize':100}),('api/file/chartlist',{'id':646994,'pageSize':100})]
+          def one(x):
+            path,body=x
+            try:
+              r=requests.post('https://api.sdyanbao.com/'+path.lstrip('/'),headers=h,json={**body,'opFrom':1},timeout=(5,25)); rec={'path':path,'body':body,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type','')}
+              try:rec['json']=r.json()
+              except Exception:rec['text']=r.text[:20000]
+            except Exception as e:rec={'path':path,'body':body,'error':repr(e)}
+            return rec
+          with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex: res=list(ex.map(one,calls))
+          Path('related').mkdir(); Path('related/result.json').write_text(json.dumps(res,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(res,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-related
+          path: related/
+          retention-days: 7
+          if-no-files-found: error
