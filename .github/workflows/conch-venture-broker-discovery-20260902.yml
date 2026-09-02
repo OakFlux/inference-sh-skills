@@ -1,0 +1,88 @@
+name: Discover China Conch Venture broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-broker-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query public report indexes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, requests
+          from urllib.parse import urlencode
+
+          s = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          for code in ['00586', '0586', '586', '00586.HK']:
+              params = {
+                  'pageNo': 1,
+                  'pageSize': 500,
+                  'code': code,
+                  'qType': 0,
+                  'beginTime': '2015-01-01',
+                  'endTime': '2026-09-02',
+              }
+              try:
+                  r = s.get(endpoint, params=params, headers=headers, timeout=(30,180))
+                  print('\n=== EASTMONEY', code, r.status_code, r.headers.get('content-type'), len(r.content), r.url, '===', flush=True)
+                  print(r.text[:2000], flush=True)
+                  if r.status_code != 200:
+                      continue
+                  obj = r.json()
+                  data = obj.get('data') if isinstance(obj, dict) else None
+                  if not isinstance(data, list):
+                      continue
+                  print('COUNT', code, len(data), flush=True)
+                  for row in data:
+                      if not isinstance(row, dict):
+                          continue
+                      title = str(row.get('title') or '')
+                      pages = row.get('attachPages') or row.get('pageCount') or row.get('pages')
+                      out = {
+                          'title': title,
+                          'orgSName': row.get('orgSName'),
+                          'orgName': row.get('orgName'),
+                          'publishDate': row.get('publishDate'),
+                          'attachPages': pages,
+                          'infoCode': row.get('infoCode') or row.get('infocode'),
+                          'researcher': row.get('researcher'),
+                          'rating': row.get('emRatingName'),
+                          'stockName': row.get('stockName'),
+                          'stockCode': row.get('stockCode'),
+                          'indvInduName': row.get('indvInduName'),
+                      }
+                      print('ROW', json.dumps(out, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('ERROR', code, repr(exc), flush=True)
+
+          # Probe Reportify search pages for exact company name and ticker.
+          for url in [
+              'https://reportify.cn/search?q=%E6%B5%B7%E8%9E%BA%E5%88%9B%E4%B8%9A',
+              'https://reportify.cn/search?q=00586',
+          ]:
+              try:
+                  r = s.get(url, headers={'User-Agent': ua, 'Accept': 'text/html,*/*'}, timeout=(30,120))
+                  print('\n=== REPORTIFY', r.status_code, len(r.content), r.url, '===', flush=True)
+                  text = re.sub(r'\s+', ' ', r.text)
+                  for match in re.finditer(r'.{0,200}(?:海螺创业|00586|Conch Venture).{0,500}', text, flags=re.I):
+                      print('MATCH', match.group(0)[:1000], flush=True)
+              except Exception as exc:
+                  print('REPORTIFY_ERROR', repr(exc), flush=True)
+          PY
