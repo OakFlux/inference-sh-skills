@@ -1,0 +1,52 @@
+name: Quick inspect WeRide PDF links
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-quick-link-inspect-20260902-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Inspect direct links
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import re, json
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session()
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,*/*'}
+          urls=[
+            'https://ir.weride.ai/node/6571',
+            'https://ir.weride.ai/zh-hant/node/6571',
+            'https://ir.weride.ai/node/7836',
+            'https://ir.weride.ai/node/9276',
+            'https://www.hibor.com.cn/repinfodetail_4594909.html',
+          ]
+          for u in urls:
+            try:
+              r=s.get(u,headers=headers,timeout=(15,45),allow_redirects=True)
+              print('\nPAGE',u,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              soup=BeautifulSoup(r.text,'html.parser')
+              for a in soup.find_all('a',href=True):
+                href=urljoin(r.url,a['href'])
+                label=' '.join(a.get_text(' ',strip=True).split())
+                print('A',repr(label),href,flush=True)
+              for key in ['pdf','download','static-files','system/files','hkexnews','listedco/listconews','repinfodetail','4594909']:
+                for m in re.finditer(key,r.text,re.I):
+                  print('CTX',key,repr(r.text[max(0,m.start()-500):m.start()+1000]),flush=True)
+            except Exception as e:
+              print('ERR',u,repr(e),flush=True)
+          PY
