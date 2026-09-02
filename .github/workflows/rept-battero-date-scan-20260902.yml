@@ -1,0 +1,82 @@
+name: Scan report indexes for REPT BATTERO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-date-scan-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Scan Eastmoney report API by date
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests, time
+          from datetime import date, timedelta
+          from pathlib import Path
+
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/','Accept':'application/json,text/plain,*/*'}
+          anchors=['2023-12-18','2024-03-27','2024-08-29','2025-02-17','2025-03-27','2025-08-12','2025-09-15','2025-09-17','2026-02-03','2026-03-30','2026-08-31']
+          dates=[]
+          for a in anchors:
+              d=date.fromisoformat(a)
+              for off in range(-3,4):
+                  ds=(d+timedelta(days=off)).isoformat()
+                  if ds not in dates: dates.append(ds)
+          hits=[]; audit=[]
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          for ds in sorted(dates):
+              for qtype in [0,1,2]:
+                  for page in range(1,21):
+                      params={'pageNo':page,'pageSize':500,'qType':qtype,'beginTime':ds,'endTime':ds}
+                      try:
+                          r=s.get(endpoint,params=params,headers=h,timeout=(10,45))
+                          j=r.json()
+                          rows=j.get('data') if isinstance(j,dict) else []
+                          audit.append({'date':ds,'qType':qtype,'page':page,'status':r.status_code,'rows':len(rows) if isinstance(rows,list) else None,'hits':j.get('hits') if isinstance(j,dict) else None})
+                          if not isinstance(rows,list) or not rows: break
+                          for row in rows:
+                              if not isinstance(row,dict): continue
+                              text=json.dumps(row,ensure_ascii=False).lower()
+                              if any(term in text for term in ['瑞浦兰钧','瑞浦蘭鈞','rept battero','666 hk','00666']):
+                                  hits.append({'query_date':ds,'qType':qtype,'page':page,'row':row})
+                                  print('HIT',json.dumps(row,ensure_ascii=False),flush=True)
+                          if len(rows)<500: break
+                          time.sleep(.2)
+                      except Exception as exc:
+                          audit.append({'date':ds,'qType':qtype,'page':page,'error':repr(exc)})
+                          break
+          # Also try name/title/stockName parameters directly.
+          direct=[]
+          for key in ['name','title','stockName','keyword','search']:
+              for val in ['瑞浦兰钧','REPT BATTERO','666 HK']:
+                  try:
+                      r=s.get(endpoint,params={'pageNo':1,'pageSize':500,'qType':0,'beginTime':'2023-01-01','endTime':'2026-09-02',key:val},headers=h,timeout=(10,45))
+                      j=r.json(); rows=j.get('data') if isinstance(j,dict) else []
+                      matched=[]
+                      if isinstance(rows,list):
+                          for row in rows:
+                              t=json.dumps(row,ensure_ascii=False).lower()
+                              if any(x in t for x in ['瑞浦兰钧','瑞浦蘭鈞','rept battero','666 hk','00666']): matched.append(row)
+                      direct.append({'key':key,'value':val,'status':r.status_code,'hits':j.get('hits') if isinstance(j,dict) else None,'row_count':len(rows) if isinstance(rows,list) else None,'matched':matched})
+                  except Exception as e: direct.append({'key':key,'value':val,'error':repr(e)})
+          out={'hits':hits,'audit':audit,'direct':direct}
+          Path('rept_date_scan.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL_HITS',len(hits),flush=True)
+          print('DIRECT_MATCHES',sum(len(x.get('matched',[])) for x in direct),flush=True)
+          PY
+      - name: Upload scan
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-date-scan
+          path: rept_date_scan.json
+          retention-days: 7
