@@ -1,0 +1,198 @@
+name: package-skyworth-annuals-20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_skyworth_annuals_20260902.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          package = '创维集团_2020-2025年报及最新期内报告'
+          out = Path(package)
+          out.mkdir(parents=True, exist_ok=True)
+          previews = Path('_skyworth_previews')
+          previews.mkdir(exist_ok=True)
+
+          targets = [
+              ('annual', 2020, '2020年年度报告.pdf', '2020年報', '2021-04-19', 100,
+               'https://www1.hkexnews.hk/listedco/listconews/sehk/2021/0419/2021041900447_c.pdf'),
+              ('annual', 2021, '2021年年度报告.pdf', '2021年報', '2022-04-19', 100,
+               'https://www1.hkexnews.hk/listedco/listconews/sehk/2022/0419/2022041900852_c.pdf'),
+              ('annual', 2022, '2022年年度报告.pdf', '2022年報', '2023-04-20', 100,
+               'https://www1.hkexnews.hk/listedco/listconews/sehk/2023/0420/2023042000804_c.pdf'),
+              ('annual', 2023, '2023年年度报告.pdf', '2023年報', '2024-04-18', 100,
+               'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0418/2024041800549_c.pdf'),
+              ('annual', 2024, '2024年年度报告.pdf', '2024年報', '2025-04-17', 100,
+               'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0417/2025041700432_c.pdf'),
+              ('annual', 2025, '2025年年度报告.pdf', '2025年報', '2026-04-16', 100,
+               'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0416/2026041600651_c.pdf'),
+              ('interim_results', 2026, '2026年中期业绩公告.pdf', '截至2026年6月30日止六個月的中期業績公佈', '2026-08-27', 15,
+               'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0827/2026082701018_c.pdf'),
+          ]
+
+          s = requests.Session()
+          s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?lang=zh',
+          }
+
+          def download(url):
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      r = s.get(url, headers=headers, timeout=(30, 600), allow_redirects=True)
+                      print('PDF_GET', attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50000:
+                          return r.content, str(r.url)
+                      last = RuntimeError(f'HTTP {r.status_code}, {len(r.content)} bytes')
+                  except Exception as exc:
+                      last = exc
+                      print('PDF_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'Download failed for {url}: {last}')
+
+          def compact_text(reader, limit=18):
+              chunks = []
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      chunks.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(chunks)).lower()
+
+          records = []
+          seen_hashes = set()
+          for index, (kind, year, filename, title, disclosure_date, min_pages, url) in enumerate(targets, 1):
+              data, final_url = download(url)
+              path = out / filename
+              path.write_bytes(data)
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{filename}: only {pages} pages; expected at least {min_pages}')
+
+              text = compact_text(reader)
+              identity_ok = any(token in text for token in (
+                  'skyworthgroup', '創維集團', '创维集团', '00751'
+              ))
+              if not identity_ok:
+                  raise RuntimeError(f'{filename}: company identity validation failed')
+              if str(year) not in text:
+                  print('YEAR_TEXT_WARNING', filename, year, flush=True)
+              if kind == 'annual' and not any(token in text for token in ('年報', '年报', 'annualreport')):
+                  print('ANNUAL_TEXT_WARNING', filename, flush=True)
+              if kind == 'interim_results' and not any(token in text for token in (
+                  '2026年6月30日', '中期業績', '中期业绩', 'sixmonthsended30june2026', 'interimresults'
+              )):
+                  raise RuntimeError(f'{filename}: interim period validation failed')
+
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'{filename}: qpdf failed: {q.stderr[-1200:]}')
+              if q.returncode == 3:
+                  print('QPDF_WARNING', filename, q.stderr[-1200:], flush=True)
+
+              first_prefix = previews / f'{index:02d}_first'
+              last_prefix = previews / f'{index:02d}_last'
+              subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(path), str(first_prefix)], check=True, capture_output=True)
+              subprocess.run(['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90', str(path), str(last_prefix)], check=True, capture_output=True)
+              if not Path(str(first_prefix) + '.png').exists() or not Path(str(last_prefix) + '.png').exists():
+                  raise RuntimeError(f'{filename}: render validation failed')
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in seen_hashes:
+                  raise RuntimeError(f'{filename}: duplicate PDF detected')
+              seen_hashes.add(digest)
+              record = {
+                  'kind': kind,
+                  'report_year': year,
+                  'filename': filename,
+                  'hkex_title': title,
+                  'disclosure_date': disclosure_date,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': final_url,
+                  'source': '香港交易所披露易（HKEXnews）原始PDF',
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 PDFs, got {len(records)}')
+          if {r['report_year'] for r in records if r['kind'] == 'annual'} != set(range(2020, 2026)):
+              raise RuntimeError('Annual report coverage mismatch')
+
+          lines = [
+              '创维集团（00751.HK）2020—2025年报及最新集团层面期内财务报告',
+              '',
+              '本包共7份香港交易所披露易公开的中文原始PDF。',
+              '2020—2025年度文件均为完整年报，不是年度业绩公告、摘要或媒体转载。',
+              '截至2026年9月2日，创维集团尚未在港交所发布2026年完整中期报告；最新集团层面财务披露为2026年8月27日的中期业绩公告，故一并收入。',
+              '2026年4月披露的“创维数字股份有限公司2026年第一季度业绩”属于上市附属公司创维数字，并非创维集团合并季报，未收入本包。',
+              '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines.extend([
+                  f"{i}. {r['filename']}",
+                  f"   港交所标题：{r['hkex_title']}",
+                  f"   披露日期：{r['disclosure_date']}；实际页数：{r['pages']}页；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、公司名称或证券代码、报告年度/期间、实际页数、qpdf结构、首末页渲染、SHA-256及ZIP CRC。',
+              '年度报告按其覆盖的财政年度命名，不按PDF披露年份命名。',
+          ])
+          (out / '报告清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(package + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for p in sorted(out.iterdir()):
+                  z.write(p, arcname=f'{package}/{p.name}')
+          with zipfile.ZipFile(zip_path, 'r') as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 7')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'REPORTS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-2020-2025-annuals-latest-final
+          path: |
+            创维集团_2020-2025年报及最新期内报告/
+            创维集团_2020-2025年报及最新期内报告.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
