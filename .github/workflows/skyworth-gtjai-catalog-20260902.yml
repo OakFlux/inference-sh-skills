@@ -1,0 +1,135 @@
+name: Catalog official GTJAI Skyworth reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-gtjai-catalog-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  catalog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install
+        run: python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+
+      - name: Find and inspect reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, re, time
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          out=Path('skyworth-gtjai-catalog'); out.mkdir(exist_ok=True)
+          pdfdir=out/'pdfs'; pdfdir.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          queries=[
+            'site:gtjai.com/UploadFiles/gtja_Report "Skyworth Digital"',
+            'site:gtjai.com/UploadFiles/gtja_Report "Skyworth Group"',
+            'site:gtjai.com/UploadFiles/gtja_Report 00751',
+            'site:gtjai.com/UploadFiles/gtja_Report 创维数码',
+            'site:gtjai.com/UploadFiles/gtja_Report 751 Skyworth',
+          ]
+          urls=[]
+          contexts={}
+          def add(url,ctx=''):
+            url=html.unescape(unquote(url)).replace('\\/','/')
+            if url.startswith('http://www.gtjai.com/'): url='https://www.gtjai.com/'+url.split('http://www.gtjai.com/',1)[1]
+            if url.startswith('http://gtjai.com/'): url='https://www.gtjai.com/'+url.split('http://gtjai.com/',1)[1]
+            if 'gtjai.com/UploadFiles/gtja_Report/' not in url or '.pdf' not in url.lower(): return
+            url=url.split('#')[0]
+            if url not in urls: urls.append(url)
+            contexts.setdefault(url,[]).append(ctx[:1000])
+
+          for q in queries:
+            for start in (0,30,60,90,120):
+              search='https://html.duckduckgo.com/html/?q='+quote_plus(q)+'&s='+str(start)
+              try:
+                r=s.get(search,headers=h,timeout=(15,60))
+                print('DDG',r.status_code,len(r.content),q,start,flush=True)
+                soup=BeautifulSoup(r.text,'lxml')
+                for a in soup.find_all('a',href=True):
+                  href=a['href']; label=' '.join(a.get_text(' ',strip=True).split())
+                  if 'uddg=' in href: href=parse_qs(urlparse(href).query).get('uddg',[href])[0]
+                  add(href,label)
+                for m in re.findall(r'https?://[^"\'<>\s]+?\.pdf',r.text,re.I): add(m,'raw')
+              except Exception as e: print('DDG_ERR',repr(e),flush=True)
+              time.sleep(.6)
+            for b in (1,8,15,22,29,36,43):
+              search='https://search.yahoo.com/search?p='+quote_plus(q)+'&b='+str(b)+'&pz=7&bct=0&xargs=0'
+              try:
+                r=s.get(search,headers=h,timeout=(15,60))
+                print('YAHOO',r.status_code,len(r.content),q,b,flush=True)
+                text=r.text
+                for m in re.finditer(r'/RU=([^/]+)/RK=',text):
+                  add(unquote(m.group(1)),'yahoo redirect')
+                for m in re.findall(r'https?://[^"\'<>\s]+?\.pdf',text,re.I): add(m,'raw yahoo')
+              except Exception as e: print('YAHOO_ERR',repr(e),flush=True)
+              time.sleep(.6)
+
+          # Add known indexed links to avoid search pagination omissions.
+          for u in [
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2019/09/20190925127758.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2019/09/20190916127689.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2018/12/20181204125159.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2018/11/20181130125138.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2018/06/20180615123557.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2017/05/20170511_00751_HK_CR.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2017/05/00751-MAY11-GTJAHK-%E4%B8%AD%E6%96%87%E7%89%88.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2016/12/751%201HFY17.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2015/12/751%201H16.pdf',
+            'https://www.gtjai.com/UploadFiles/gtja_Report/2015/08/20150811-CR-751.pdf',
+          ]: add(u,'known index')
+
+          print('FOUND_URLS',len(urls),flush=True)
+          catalog=[]
+          for i,url in enumerate(urls,1):
+            rec={'url':url,'contexts':contexts.get(url,[])}
+            try:
+              r=s.get(url,headers={**h,'Accept':'application/pdf,*/*','Referer':'https://www.gtjai.com/'},timeout=(20,180),allow_redirects=True)
+              rec.update({'status':r.status_code,'bytes':len(r.content),'final_url':r.url,'content_type':r.headers.get('content-type')})
+              if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>30000:
+                filename=f'{i:03d}.pdf'; p=pdfdir/filename; p.write_bytes(r.content)
+                reader=PdfReader(str(p),strict=False); rec['pages']=len(reader.pages)
+                text=''
+                for page in reader.pages[:min(4,len(reader.pages))]:
+                  try: text += '\n'+(page.extract_text() or '')
+                  except Exception: pass
+                rec['text_head']=re.sub(r'\s+',' ',text).strip()[:12000]
+                compact=re.sub(r'\s+','',text).lower()
+                rec['identity_ok']=any(x in compact for x in ('skyworthdigital','skyworthgroup','创维数码','創維數碼','创维集团','創維集團','00751'))
+                # Infer date and title hints.
+                dates=re.findall(r'\b(?:[0-3]?\d\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}|20\d{2}[-/.]\d{1,2}[-/.]\d{1,2})\b',rec['text_head'],re.I)
+                rec['dates']=dates[:10]
+                print('PDF',i,rec['pages'],rec['bytes'],url,'IDENT',rec['identity_ok'],'HEAD',rec['text_head'][:500],flush=True)
+              else:
+                print('NOTPDF',i,r.status_code,len(r.content),url,flush=True)
+            except Exception as e:
+              rec['error']=repr(e); print('ERR',i,url,repr(e),flush=True)
+            catalog.append(rec)
+            time.sleep(.2)
+          (out/'catalog.json').write_text(json.dumps(catalog,ensure_ascii=False,indent=2),encoding='utf-8')
+          good=[x for x in catalog if x.get('identity_ok')]
+          good.sort(key=lambda x:(x.get('pages',0),x.get('bytes',0)),reverse=True)
+          (out/'ranked.json').write_text(json.dumps(good,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('RANKED')
+          for x in good: print(json.dumps({k:x.get(k) for k in ('pages','bytes','url','dates','text_head')},ensure_ascii=False)[:1500],flush=True)
+          PY
+
+      - name: Upload catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-gtjai-catalog
+          path: skyworth-gtjai-catalog/
+          retention-days: 7
