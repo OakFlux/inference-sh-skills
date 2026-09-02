@@ -1,0 +1,587 @@
+name: Package all Joyson reports and prospectus
+
+on:
+  push:
+    paths:
+      - '.github/workflows/joyson-all-reports-package-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Download verify and package all reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY = '宁波均胜电子股份有限公司'
+          STOCK_A = '600699.SH'
+          STOCK_H = '00699.HK'
+          PACKAGE = '均胜电子_全部年报_2025年H股招股章程_2011年重组报告书及2026年最新半年报_完整PDF'
+          OUT = Path(PACKAGE)
+          WORK = Path('_joyson_work')
+          PREVIEWS = WORK / 'previews'
+          ANNUAL_DIR = OUT / '01_年度报告_2011-2025'
+          PROSPECTUS_DIR = OUT / '02_H股招股章程'
+          RESTRUCTURING_DIR = OUT / '03_A股重组上市核心文件_非招股说明书'
+          HALF_DIR = OUT / '04_最新半年度报告'
+          for directory in (ANNUAL_DIR, PROSPECTUS_DIR, RESTRUCTURING_DIR, HALF_DIR, PREVIEWS):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          user_agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          html_headers = {
+              'User-Agent': user_agent,
+              'Accept': 'application/json,text/html,application/xhtml+xml,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Origin': 'https://www.cninfo.com.cn',
+              'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=600699&orgId=gssh0600699',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+          pdf_headers = {
+              'User-Agent': user_agent,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          FALLBACK_ANNUAL = {
+              2011: ['https://static.cninfo.com.cn/finalpage/2012-02-14/60538065.PDF'],
+              2012: ['https://static.cninfo.com.cn/finalpage/2013-04-25/62423293.PDF'],
+              2013: ['https://static.cninfo.com.cn/finalpage/2014-04-22/63889595.PDF'],
+              2014: ['https://static.cninfo.com.cn/finalpage/2015-04-20/1200869755.PDF'],
+              2015: ['https://static.cninfo.com.cn/finalpage/2016-04-20/1202205228.PDF'],
+              2016: [
+                  'https://static.cninfo.com.cn/finalpage/2017-04-15/1203301678.PDF',
+                  'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2017/2017-4/2017-04-15/3233618.PDF',
+              ],
+              2017: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2018/2018-4/2018-04-28/4398958.PDF'],
+              2018: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2019/2019-4/2019-04-23/5238804.PDF'],
+              2019: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2020/2020-4/2020-04-22/6082375.PDF'],
+              2020: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2021/2021-3/2021-03-31/7004011.PDF'],
+              2021: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2022/2022-4/2022-04-26/8071605.PDF'],
+              2022: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2023/2023-3/2023-03-31/8939157.PDF'],
+              2023: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2024/2024-3/2024-03-28/9908481.PDF'],
+              2024: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2025/2025-3/2025-03-28/10816416.PDF'],
+              2025: ['http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2026/2026-3/2026-03-31/12040243.PDF'],
+          }
+          HALF_FALLBACK = [
+              'http://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2026/2026-8/2026-08-26/12538201.PDF',
+          ]
+          H_PROSPECTUS_URL = 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/1028/2025102800058_c.pdf'
+          RESTRUCTURING_URL = 'https://static.cninfo.com.cn/finalpage/2011-12-23/60358357.PDF'
+
+          def clean_title(value: str) -> str:
+              return ' '.join(BeautifulSoup(html.unescape(value or ''), 'html.parser').get_text(' ', strip=True).split())
+
+          def compact(value: str) -> str:
+              return re.sub(r'\s+', '', value or '').upper()
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for block in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def timestamp_date(value) -> str:
+              try:
+                  stamp = int(value) / 1000
+                  return datetime.fromtimestamp(stamp, tz=timezone.utc).strftime('%Y-%m-%d')
+              except Exception:
+                  return ''
+
+          def query_cninfo(category: str, date_range: str) -> list[dict]:
+              endpoint = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              rows = []
+              seen_ids = set()
+              for page_number in range(1, 8):
+                  form = {
+                      'pageNum': page_number,
+                      'pageSize': 100,
+                      'column': 'sse',
+                      'tabName': 'fulltext',
+                      'plate': 'sh',
+                      'stock': '600699,gssh0600699',
+                      'searchkey': '',
+                      'secid': '',
+                      'category': category,
+                      'trade': '',
+                      'seDate': date_range,
+                      'sortName': '',
+                      'sortType': '',
+                      'isHLtitle': 'true',
+                  }
+                  response = session.post(
+                      endpoint,
+                      data=form,
+                      headers=html_headers,
+                      timeout=(30, 240),
+                      allow_redirects=True,
+                  )
+                  print('CNINFO_QUERY', category, page_number, response.status_code, len(response.content), flush=True)
+                  response.raise_for_status()
+                  payload = response.json()
+                  announcements = payload.get('announcements') or []
+                  for row in announcements:
+                      announcement_id = str(row.get('announcementId') or row.get('adjunctUrl') or '')
+                      if announcement_id in seen_ids:
+                          continue
+                      seen_ids.add(announcement_id)
+                      row = dict(row)
+                      row['clean_title'] = clean_title(str(row.get('announcementTitle', '')))
+                      rows.append(row)
+                  if not payload.get('hasMore') or not announcements:
+                      break
+              print('CNINFO_ROWS', category, len(rows), json.dumps([
+                  {
+                      'title': row.get('clean_title'),
+                      'date': timestamp_date(row.get('announcementTime')),
+                      'url': row.get('adjunctUrl'),
+                      'secName': clean_title(str(row.get('secName', ''))),
+                  }
+                  for row in rows
+              ], ensure_ascii=False, indent=2), flush=True)
+              return rows
+
+          def cninfo_url(row: dict) -> str:
+              adjunct = str(row.get('adjunctUrl', '')).lstrip('/')
+              if not adjunct:
+                  return ''
+              return urljoin('https://static.cninfo.com.cn/', adjunct)
+
+          annual_rows = query_cninfo('category_ndbg_szsh;', '2011-01-01~2026-12-31')
+          half_rows = query_cninfo('category_bndbg_szsh;', '2026-01-01~2026-12-31')
+
+          targets = []
+          for year in range(2011, 2026):
+              candidates = []
+              for row in annual_rows:
+                  title = row['clean_title']
+                  if f'{year}年年度报告' not in title:
+                      continue
+                  if any(excluded in title for excluded in ('摘要', '英文版', '取消')):
+                      continue
+                  candidates.append(row)
+              candidates.sort(key=lambda item: int(item.get('announcementTime') or 0), reverse=True)
+              urls = []
+              disclosure_date = ''
+              original_title = f'{year}年年度报告'
+              disclosure_short_name = '均胜电子'
+              if candidates:
+                  urls.append(cninfo_url(candidates[0]))
+                  disclosure_date = timestamp_date(candidates[0].get('announcementTime'))
+                  original_title = candidates[0]['clean_title']
+                  disclosure_short_name = clean_title(str(candidates[0].get('secName', ''))) or disclosure_short_name
+              urls.extend(FALLBACK_ANNUAL[year])
+              unique_urls = []
+              for url in urls:
+                  if url and url not in unique_urls:
+                      unique_urls.append(url)
+              suffix = '_披露时简称ST得亨' if year == 2011 else ''
+              targets.append({
+                  'index': year - 2010,
+                  'year': year,
+                  'category': 'Annual Report',
+                  'report_type': '年度报告',
+                  'filename': f'01_年度报告_2011-2025/{year - 2010:02d}_均胜电子_{year}年年度报告{suffix}.pdf',
+                  'urls': unique_urls,
+                  'min_pages': 35 if year == 2011 else 70,
+                  'original_title': original_title,
+                  'disclosure_date': disclosure_date,
+                  'disclosure_short_name': disclosure_short_name,
+              })
+
+          half_candidates = []
+          for row in half_rows:
+              title = row['clean_title']
+              if '2026年半年度报告' not in title:
+                  continue
+              if any(excluded in title for excluded in ('摘要', '英文版', '取消')):
+                  continue
+              half_candidates.append(row)
+          half_candidates.sort(key=lambda item: int(item.get('announcementTime') or 0), reverse=True)
+          half_urls = []
+          half_disclosure_date = '2026-08-26'
+          half_original_title = '均胜电子：2026年半年度报告'
+          if half_candidates:
+              half_urls.append(cninfo_url(half_candidates[0]))
+              half_disclosure_date = timestamp_date(half_candidates[0].get('announcementTime')) or half_disclosure_date
+              half_original_title = half_candidates[0]['clean_title']
+          half_urls.extend(HALF_FALLBACK)
+
+          targets.extend([
+              {
+                  'index': 16,
+                  'year': 2025,
+                  'category': 'H-share Prospectus',
+                  'report_type': 'H股全球发售招股章程',
+                  'filename': '02_H股招股章程/均胜电子_2025年H股全球发售招股章程_中文版.pdf',
+                  'urls': [H_PROSPECTUS_URL],
+                  'min_pages': 300,
+                  'original_title': '全球發售（上市文件）',
+                  'disclosure_date': '2025-10-28',
+                  'disclosure_short_name': '均勝電子',
+              },
+              {
+                  'index': 17,
+                  'year': 2011,
+                  'category': 'A-share Restructuring Listing Document',
+                  'report_type': 'A股重组上市核心文件（非招股说明书）',
+                  'filename': '03_A股重组上市核心文件_非招股说明书/均胜电子_2011年发行股份购买资产暨关联交易报告书_修订稿.pdf',
+                  'urls': [RESTRUCTURING_URL],
+                  'min_pages': 60,
+                  'original_title': '发行股份购买资产暨关联交易报告书（修订稿）',
+                  'disclosure_date': '2011-12-23',
+                  'disclosure_short_name': 'ST得亨',
+              },
+              {
+                  'index': 18,
+                  'year': 2026,
+                  'category': 'Latest Half-Year Report',
+                  'report_type': '半年度报告',
+                  'filename': '04_最新半年度报告/均胜电子_2026年半年度报告.pdf',
+                  'urls': list(dict.fromkeys(url for url in half_urls if url)),
+                  'min_pages': 70,
+                  'original_title': half_original_title,
+                  'disclosure_date': half_disclosure_date,
+                  'disclosure_short_name': '均胜电子',
+              },
+          ])
+
+          if len(targets) != 18:
+              raise RuntimeError(f'Expected 18 targets, got {len(targets)}')
+
+          def download_pdf(urls: list[str]) -> tuple[requests.Response, str]:
+              expanded = []
+              for url in urls:
+                  if url not in expanded:
+                      expanded.append(url)
+                  if url.startswith('http://'):
+                      https_url = 'https://' + url[len('http://'):]
+                      if https_url not in expanded:
+                          expanded.append(https_url)
+              errors = []
+              referers = (
+                  'https://www.cninfo.com.cn/',
+                  'https://money.finance.sina.com.cn/',
+                  'https://www1.hkexnews.hk/',
+                  'https://www.joyson.com/',
+              )
+              for url in expanded:
+                  for attempt in range(1, 6):
+                      for referer in referers:
+                          try:
+                              response = session.get(
+                                  url,
+                                  headers={**pdf_headers, 'Referer': referer},
+                                  timeout=(30, 1200),
+                                  allow_redirects=True,
+                              )
+                              print(
+                                  'PDF_GET', attempt, response.status_code,
+                                  response.headers.get('content-type'), len(response.content),
+                                  url, '=>', response.url,
+                                  flush=True,
+                              )
+                              if (
+                                  response.status_code == 200
+                                  and response.content.startswith(b'%PDF-')
+                                  and len(response.content) > 20000
+                              ):
+                                  return response, url
+                              errors.append(f'{url} | {referer} | HTTP {response.status_code}/{len(response.content)}')
+                          except Exception as exc:
+                              errors.append(f'{url} | {referer} | {exc!r}')
+                      time.sleep(min(attempt * 2, 8))
+              raise RuntimeError('All download candidates failed: ' + ' || '.join(errors[-16:]))
+
+          def extract_text(path: Path, pages: int) -> str:
+              end_page = min(50, pages)
+              result = subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(end_page), str(path), '-'],
+                  capture_output=True,
+                  check=False,
+              )
+              chunks = []
+              if result.returncode == 0 and result.stdout:
+                  chunks.append(result.stdout.decode('utf-8', errors='ignore'))
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  for page in reader.pages[:min(25, pages)]:
+                      try:
+                          chunks.append(page.extract_text() or '')
+                      except Exception:
+                          pass
+              except Exception:
+                  pass
+              return compact('\n'.join(chunks))
+
+          def validate(path: Path, target: dict) -> dict:
+              with path.open('rb') as handle:
+                  if handle.read(5) != b'%PDF-':
+                      raise RuntimeError('PDF signature missing')
+
+              reader = PdfReader(str(path), strict=False)
+              if reader.is_encrypted:
+                  try:
+                      if reader.decrypt('') == 0:
+                          raise RuntimeError('Encrypted PDF cannot be opened')
+                  except Exception as exc:
+                      raise RuntimeError(f'Encrypted PDF cannot be opened: {exc}')
+              pages = len(reader.pages)
+              if pages < int(target['min_pages']):
+                  raise RuntimeError(f"Unexpectedly short PDF: {pages} pages, minimum {target['min_pages']}")
+
+              text = extract_text(path, pages)
+              year = int(target['year'])
+              chinese_years = {
+                  2011: '二零一一', 2012: '二零一二', 2013: '二零一三', 2014: '二零一四',
+                  2015: '二零一五', 2016: '二零一六', 2017: '二零一七', 2018: '二零一八',
+                  2019: '二零一九', 2020: '二零二零', 2021: '二零二一', 2022: '二零二二',
+                  2023: '二零二三', 2024: '二零二四', 2025: '二零二五', 2026: '二零二六',
+              }
+              if str(year) not in text and chinese_years[year] not in text:
+                  raise RuntimeError(f'Report year {year} not found')
+
+              category = target['category']
+              if category == 'Annual Report':
+                  company_ok = any(marker in text for marker in (
+                      compact('均胜电子'), compact('宁波均胜电子股份有限公司'),
+                      compact('ST得亨'), compact('辽源得亨股份有限公司'), '600699',
+                  ))
+                  type_ok = compact('年度报告') in text or 'ANNUALREPORT' in text
+              elif category == 'H-share Prospectus':
+                  company_ok = any(marker in text for marker in (
+                      compact('均勝電子'), compact('均胜电子'), 'JOYSONELECTRONICS',
+                      '00699', '600699',
+                  ))
+                  type_ok = any(marker in text for marker in (
+                      compact('全球發售'), compact('全球发售'), compact('招股章程'),
+                      'GLOBALOFFERING', 'PROSPECTUS',
+                  ))
+              elif category == 'A-share Restructuring Listing Document':
+                  company_ok = any(marker in text for marker in (
+                      compact('ST得亨'), compact('辽源得亨'), compact('宁波均胜'),
+                      compact('均胜集团'), '600699',
+                  ))
+                  type_ok = any(marker in text for marker in (
+                      compact('发行股份购买资产'), compact('發行股份購買資產'),
+                      compact('关联交易报告书'), compact('關聯交易報告書'),
+                  ))
+              else:
+                  company_ok = any(marker in text for marker in (
+                      compact('均胜电子'), compact('宁波均胜电子股份有限公司'),
+                      compact('均勝電子'), '600699', '00699',
+                  ))
+                  type_ok = any(marker in text for marker in (
+                      compact('半年度报告'), compact('半年度報告'),
+                      compact('中期报告'), compact('中期報告'), 'INTERIMREPORT',
+                  ))
+              if not company_ok:
+                  raise RuntimeError('Company identity validation failed')
+              if not type_ok:
+                  raise RuntimeError(f"Document type validation failed: {target['report_type']}")
+
+              qpdf = subprocess.run(
+                  ['qpdf', '--check', str(path)],
+                  capture_output=True,
+                  text=True,
+              )
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError('qpdf validation failed: ' + qpdf.stderr[-1500:])
+              if qpdf.returncode == 3:
+                  print('QPDF_WARNING', path.name, qpdf.stderr[-1500:], flush=True)
+
+              for label, page_number in (
+                  ('first', 1),
+                  ('middle', max(1, pages // 2)),
+                  ('last', pages),
+              ):
+                  prefix = PREVIEWS / f"{target['index']:02d}_{label}"
+                  render = subprocess.run(
+                      [
+                          'pdftoppm', '-f', str(page_number), '-l', str(page_number),
+                          '-singlefile', '-png', '-r', '72', str(path), str(prefix),
+                      ],
+                      capture_output=True,
+                      check=False,
+                  )
+                  image = Path(str(prefix) + '.png')
+                  if render.returncode != 0 or not image.exists() or image.stat().st_size < 1000:
+                      raise RuntimeError(
+                          f"Render failed on {label} page {page_number}: "
+                          + render.stderr.decode('utf-8', errors='ignore')[-800:]
+                      )
+
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+              }
+
+          records = []
+          seen_hashes = set()
+          total_pages = 0
+          total_bytes = 0
+          for target in targets:
+              response, requested_url = download_pdf(target['urls'])
+              temporary = WORK / f"{target['index']:02d}.pdf"
+              temporary.write_bytes(response.content)
+              metadata = validate(temporary, target)
+              if metadata['sha256'] in seen_hashes:
+                  raise RuntimeError(f"Duplicate PDF detected: {target['filename']}")
+              seen_hashes.add(metadata['sha256'])
+              destination = OUT / target['filename']
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              shutil.copy2(temporary, destination)
+              record = {
+                  'file': target['filename'],
+                  'year': target['year'],
+                  'category': target['category'],
+                  'report_type': target['report_type'],
+                  'original_title': target['original_title'],
+                  'disclosure_date': target['disclosure_date'],
+                  'disclosure_short_name': target['disclosure_short_name'],
+                  'source_url': response.url,
+                  'requested_url': requested_url,
+                  **metadata,
+              }
+              records.append(record)
+              total_pages += metadata['pages']
+              total_bytes += metadata['bytes']
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 18:
+              raise RuntimeError(f'Expected 18 verified PDFs, got {len(records)}')
+          annual_years = sorted(record['year'] for record in records if record['category'] == 'Annual Report')
+          if annual_years != list(range(2011, 2026)):
+              raise RuntimeError(f'Annual report coverage mismatch: {annual_years}')
+
+          manifest = {
+              'company': COMPANY,
+              'short_name': '均胜电子',
+              'a_share_ticker': STOCK_A,
+              'h_share_ticker': STOCK_H,
+              'prepared_date': '2026-09-02',
+              'annual_report_scope': '2011-2025',
+              'scope_note': (
+                  '均胜电子当前汽车电子业务于2011年通过发行股份购买资产进入600699上市主体。'
+                  '本包从2011年度报告起收录全部年度报告；2010年及以前为重组前辽源得亨旧主体资料，未混入。'
+              ),
+              'prospectus_note': (
+                  '均胜电子当前A股业务并非通过传统首次公开发行上市，故不存在对应的A股IPO招股说明书。'
+                  '本包收录2025年H股全球发售中文招股章程，并另附2011年A股重组上市核心报告书，二者分目录标注。'
+              ),
+              'latest_half_year': 2026,
+              'pdf_count': len(records),
+              'total_pages': total_pages,
+              'total_bytes': total_bytes,
+              'documents': records,
+          }
+          (OUT / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['file']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          readme = [
+              '宁波均胜电子股份有限公司（600699.SH / 00699.HK）资料包',
+              '全部年度报告、H股招股章程、A股重组上市核心文件及最新半年度报告',
+              '整理日期：2026-09-02',
+              '',
+              '一、年度报告口径',
+              '1. 均胜电子当前汽车电子业务于2011年通过发行股份购买资产进入600699上市主体。',
+              '2. 本包收录2011—2025年全部年度报告，共15份。',
+              '3. 2011年年度报告披露时证券简称仍为“ST得亨”，属于重组完成当年的过渡报告；文件名已明确标注。',
+              '4. 2010年及以前的年度报告属于重组前辽源得亨旧业务，不作为均胜电子当前业务年报收录。',
+              '',
+              '二、招股及上市文件口径',
+              '1. 均胜电子当前A股业务不是通过传统IPO上市，因此不存在对应的A股首次公开发行招股说明书。',
+              '2. 本包收录2025年10月28日披露的H股全球发售中文招股章程。',
+              '3. 另附2011年12月23日披露的《发行股份购买资产暨关联交易报告书（修订稿）》，作为A股重组上市核心文件；该文件未冒充招股说明书。',
+              '',
+              '三、最新半年度报告',
+              '收录完整《均胜电子2026年半年度报告》，不是半年报摘要。',
+              '',
+              '四、文件清单',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. {record['file']}",
+                  f"   类型：{record['report_type']}｜年份：{record['year']}｜披露日期：{record['disclosure_date']}",
+                  f"   披露时简称：{record['disclosure_short_name']}｜页数：{record['pages']}｜大小：{record['bytes']} bytes",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '五、完整性检查',
+              f'- PDF数量：{len(records)}份；合计页数：{total_pages}页；未压缩总大小：{total_bytes / 1024 / 1024:.2f} MiB。',
+              '- 每份PDF均核对文件头、实际页数、公司或证券代码、报告年份及文档类型。',
+              '- 每份PDF均通过qpdf结构检查，并使用Poppler渲染首页、中间页和末页。',
+              '- 已生成逐文件SHA-256清单，最终ZIP通过CRC完整性检查。',
+              '',
+              '资料仅供研究使用，版权归均胜电子、香港交易所、巨潮资讯及原披露主体所有。',
+          ])
+          (OUT / 'README_来源与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(OUT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, arcname=f'{OUT.name}/{path.relative_to(OUT)}')
+
+          with zipfile.ZipFile(zip_path) as archive:
+              bad_member = archive.testzip()
+              if bad_member:
+                  raise RuntimeError(f'ZIP CRC failure: {bad_member}')
+              pdf_members = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 18:
+                  raise RuntimeError(f'ZIP contains {len(pdf_members)} PDFs, expected 18')
+              print('ZIP_MEMBERS', json.dumps(archive.namelist(), ensure_ascii=False, indent=2), flush=True)
+
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, sha256(zip_path), flush=True)
+          print('TOTAL_PAGES', total_pages, 'TOTAL_BYTES', total_bytes, flush=True)
+          PY
+
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: joyson-all-reports-prospectus-20260902
+          path: 均胜电子_全部年报_2025年H股招股章程_2011年重组报告书及2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
