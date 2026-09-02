@@ -1,0 +1,46 @@
+name: Fast find exact REPT BATTERO report metadata
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-exact-metadata-fast-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: python -m pip install --quiet requests
+      - name: Query exact report title phrases
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, time
+          from pathlib import Path
+          import requests
+          out=Path('rept_exact_metadata'); out.mkdir()
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','Device':'1','X-Token':''}
+          qs=['规模效应下毛利率提升','动力电池业务增速强劲','1H25毛利率稳步提升','预计全年亏损大幅收窄','出货量高增，看好盈利改善趋势','2026上半年业绩大超预期','青山集团旗下锂电池公司']
+          result=[]
+          for q in qs:
+            for only in (1,0):
+              b={'device':1,'hideTrader':0,'onlyTitle':only,'order':1,'page':1,'pageSize':30,'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+              try:
+                r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=b,timeout=(5,15)); obj=r.json(); data=obj.get('data',{}) if isinstance(obj,dict) else {}; rows=data.get('files',[]) if isinstance(data,dict) else []
+                rec={'query':q,'onlyTitle':only,'status':r.status_code,'bytes':len(r.content),'total':data.get('total') if isinstance(data,dict) else None,'rows':rows}
+              except Exception as e: rec={'query':q,'onlyTitle':only,'error':repr(e),'rows':[]}
+              result.append(rec); print('Q',q,only,rec.get('total'),len(rec.get('rows',[])),rec.get('error'),flush=True)
+          (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-exact-metadata-fast
+          path: rept_exact_metadata/
+          retention-days: 7
+          if-no-files-found: error
