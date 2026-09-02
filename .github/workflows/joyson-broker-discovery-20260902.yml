@@ -1,0 +1,175 @@
+name: Discover Joyson Electronics broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/joyson-broker-discovery-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Query report sources and probe PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import time
+          from io import BytesIO
+
+          import requests
+          from pypdf import PdfReader
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/report/stock.jshtml',
+          }
+
+          def compact(value):
+              return re.sub(r'\s+', '', str(value or '')).lower()
+
+          rows_by_key = {}
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          parameter_sets = []
+          for qtype in (0, 1):
+              for code in ('600699', '1.600699', 'SH600699'):
+                  parameter_sets.append({
+                      'pageNo': 1,
+                      'pageSize': 500,
+                      'code': code,
+                      'qType': qtype,
+                      'beginTime': '2018-01-01',
+                      'endTime': '2026-09-02',
+                      'industryCode': '*',
+                      'rating': '*',
+                      'ratingChange': '*',
+                  })
+          for params in parameter_sets:
+              try:
+                  response = session.get(endpoint, params=params, headers=headers, timeout=(30, 180))
+                  print('QUERY', response.status_code, len(response.content), response.url, flush=True)
+                  response.raise_for_status()
+                  payload = response.json()
+                  rows = payload.get('data') or []
+                  print('ROW_COUNT', len(rows), 'META', {k: payload.get(k) for k in ('hits','size','TotalPage','pageNo')}, flush=True)
+                  for row in rows:
+                      raw = json.dumps(row, ensure_ascii=False)
+                      hay = compact(raw)
+                      if '均胜电子' not in raw and '600699' not in raw:
+                          continue
+                      key = str(row.get('infoCode') or row.get('infocode') or row.get('id') or raw)
+                      rows_by_key[key] = row
+              except Exception as exc:
+                  print('QUERY_ERROR', repr(exc), flush=True)
+
+          print('UNIQUE_MATCHES', len(rows_by_key), flush=True)
+          ranked = []
+          for key, row in rows_by_key.items():
+              title = str(row.get('title') or '')
+              report_type = str(row.get('reportType') or row.get('reportTypeName') or '')
+              pages = row.get('attachPages') or row.get('pageCount') or row.get('pages') or 0
+              try:
+                  pages = int(pages)
+              except Exception:
+                  pages = 0
+              score = 0
+              text = title + ' ' + report_type
+              for marker, weight in (
+                  ('深度', 50), ('首次覆盖', 45), ('公司深度', 50), ('系列报告', 25),
+                  ('汽车智能化', 12), ('汽车电子', 10), ('全球', 6), ('机器人', 6),
+              ):
+                  if marker in text:
+                      score += weight
+              if pages >= 20:
+                  score += 25
+              elif pages >= 15:
+                  score += 15
+              elif pages >= 10:
+                  score += 5
+              if any(marker in text for marker in ('点评', '季报', '年报点评', '半年报点评', '信息更新')):
+                  score -= 20
+              ranked.append((score, pages, key, row))
+
+          ranked.sort(key=lambda item: (item[0], item[1], str(item[3].get('publishDate') or '')), reverse=True)
+          for score, pages, key, row in ranked:
+              keep = {k: row.get(k) for k in (
+                  'infoCode','title','publishDate','orgSName','orgName','researcher','stockName','stockCode',
+                  'attachPages','attachSize','emRatingName','ratingName','reportType','encodeUrl'
+              )}
+              print('CANDIDATE', score, pages, json.dumps(keep, ensure_ascii=False), flush=True)
+
+          # Probe the strongest candidates and report actual PDF page counts.
+          successful = []
+          for score, pages, key, row in ranked[:30]:
+              info_code = str(row.get('infoCode') or '')
+              if not info_code.startswith('AP'):
+                  continue
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+              ]
+              for url in urls:
+                  try:
+                      response = session.get(
+                          url,
+                          headers={
+                              'User-Agent': ua,
+                              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                              'Referer': 'https://data.eastmoney.com/',
+                          },
+                          timeout=(30, 300),
+                          allow_redirects=True,
+                      )
+                      print('PDF_GET', response.status_code, response.headers.get('content-type'), len(response.content), url, '=>', response.url, flush=True)
+                      if response.status_code != 200 or not response.content.startswith(b'%PDF-') or len(response.content) < 100000:
+                          continue
+                      reader = PdfReader(BytesIO(response.content), strict=False)
+                      actual_pages = len(reader.pages)
+                      front = []
+                      for page in reader.pages[:min(8, actual_pages)]:
+                          try:
+                              front.append(page.extract_text() or '')
+                          except Exception:
+                              pass
+                      front_text = compact('\n'.join(front))
+                      record = {
+                          'score': score,
+                          'metadata_pages': pages,
+                          'actual_pages': actual_pages,
+                          'url': response.url,
+                          'infoCode': info_code,
+                          'title': row.get('title'),
+                          'publishDate': row.get('publishDate'),
+                          'orgSName': row.get('orgSName'),
+                          'researcher': row.get('researcher'),
+                          'company_ok': ('均胜电子' in ''.join(front)) or ('600699' in front_text),
+                          'deep_marker': any(x in front_text for x in ('深度报告','公司深度','首次覆盖','证券研究报告','公司研究')),
+                          'bytes': len(response.content),
+                      }
+                      successful.append(record)
+                      print('WORKING_PDF', json.dumps(record, ensure_ascii=False), flush=True)
+                      break
+                  except Exception as exc:
+                      print('PDF_ERROR', info_code, url, repr(exc), flush=True)
+              if len(successful) >= 12:
+                  break
+
+          print('SUCCESSFUL', json.dumps(successful, ensure_ascii=False, indent=2), flush=True)
+          if not successful:
+              raise SystemExit('No complete working PDF candidates found')
+          PY
