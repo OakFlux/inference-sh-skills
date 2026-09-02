@@ -1,0 +1,60 @@
+name: Scan Eastmoney for China Conch Venture reports v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-eastmoney-global-scan-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query all report API pages around target dates
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          from __future__ import annotations
+          import json,time,requests
+
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':ua,'Accept':'application/json,text/plain,*/*','Referer':'https://data.eastmoney.com/'}
+          windows=[('2023-03-20','2023-04-05'),('2025-05-10','2025-06-20')]
+          needles=['海螺创业','00586','0586','后手致胜','扬帆掘金新能源','资金&效率双强','现金流回正大增','资产价值重估','联营公司业绩见底','主业现金流改善','派息有望持续增长','利润及现金流迎来拐点','分红提升可期','底部反转双重奏']
+          for begin,end in windows:
+              print('\n=== WINDOW',begin,end,'===',flush=True)
+              seen=set()
+              for qtype in (0,1,2):
+                  page=1
+                  page_total=1
+                  while page<=page_total and page<=500:
+                      params={'pageNo':page,'pageSize':100,'code':'','qType':qtype,'beginTime':begin,'endTime':end}
+                      last=None
+                      for attempt in range(4):
+                          try:
+                              r=requests.get(endpoint,params=params,headers=headers,timeout=(20,120))
+                              r.raise_for_status(); obj=r.json(); rows=obj.get('data') if isinstance(obj,dict) else []
+                              if not isinstance(rows,list): rows=[]
+                              page_total=int(obj.get('TotalPage') or obj.get('totalPage') or obj.get('pages') or 1)
+                              print('PAGE',qtype,page,'/',page_total,'ROWS',len(rows),flush=True)
+                              for row in rows:
+                                  raw=json.dumps(row,ensure_ascii=False)
+                                  if any(n.lower() in raw.lower() for n in needles):
+                                      key=str(row.get('infoCode') or row.get('infocode') or raw)
+                                      if key not in seen:
+                                          seen.add(key); print('MATCH',json.dumps(row,ensure_ascii=False,indent=2),flush=True)
+                              last=None; break
+                          except Exception as exc:
+                              last=exc; print('RETRY',qtype,page,attempt,repr(exc),flush=True); time.sleep(2*(attempt+1))
+                      if last is not None: raise last
+                      if not rows: break
+                      page+=1
+              print('WINDOW_MATCH_COUNT',begin,end,len(seen),flush=True)
+          PY
