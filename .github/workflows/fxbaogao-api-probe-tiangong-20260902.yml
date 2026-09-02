@@ -1,0 +1,69 @@
+name: Probe fxbaogao API for Tiangong reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fxbaogao-api-probe-tiangong-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Query public API endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests, os, re
+          from pathlib import Path
+
+          out=Path('fx-api-probe'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          base_headers={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            'Accept':'application/json,text/plain,*/*',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+            'Origin':'https://www.fxbaogao.com',
+          }
+          endpoints=[
+            '/mofoun/report/readReport/readReport?reportId={rid}',
+            '/mofoun/report/report/getReportPreviewImages?reportId={rid}',
+            '/mofoun/report/report/downloadReportByBean?reportId={rid}',
+            '/mofoun/report/report/file/downloadReport?reportId={rid}',
+            '/mofoun/report/report/report/preDownV2?reportId={rid}',
+            '/mofoun/report/searchReport/detail/catalog?reportId={rid}',
+          ]
+          allrecs=[]
+          for rid in ('5349100','5136394'):
+            # Establish cookies from view/detail pages first.
+            for pageurl in (f'https://www.fxbaogao.com/detail/{rid}', f'https://www.fxbaogao.com/view?id={rid}'):
+              try:
+                r=s.get(pageurl,headers={**base_headers,'Accept':'text/html,application/xhtml+xml,*/*'},timeout=(20,90))
+                print('PAGE',rid,r.status_code,len(r.content),r.url,'COOKIES',s.cookies.get_dict(),flush=True)
+              except Exception as e: print('PAGE_ERR',rid,repr(e),flush=True)
+            for ep in endpoints:
+              url='https://api.fxbaogao.com'+ep.format(rid=rid)
+              rec={'rid':rid,'url':url}
+              try:
+                r=s.get(url,headers={**base_headers,'Referer':f'https://www.fxbaogao.com/view?id={rid}'},timeout=(20,90),allow_redirects=True)
+                rec.update({'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'final_url':r.url,'headers':dict(r.headers)})
+                body=r.text
+                rec['body']=body[:100000]
+                try: rec['json']=r.json()
+                except Exception as e: rec['json_error']=repr(e)
+                print('API',json.dumps(rec,ensure_ascii=False)[:120000],flush=True)
+              except Exception as e:
+                rec['error']=repr(e); print('API_ERR',rid,url,repr(e),flush=True)
+              allrecs.append(rec)
+          (out/'responses.json').write_text(json.dumps(allrecs,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-api-probe-tiangong
+          path: fx-api-probe/
+          retention-days: 7
