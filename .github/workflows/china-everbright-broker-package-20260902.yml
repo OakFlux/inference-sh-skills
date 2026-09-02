@@ -1,0 +1,347 @@
+name: Package China Everbright Limited broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/china-everbright-broker-package-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validators and PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Download, reconstruct, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '中国光大控股_00165HK_券商深度报告_3份_完整公开版'
+          OUT = Path(PACKAGE)
+          WORK = Path('_work')
+          PREVIEW = WORK / 'preview'
+          OUT.mkdir(exist_ok=True)
+          PREVIEW.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          BASE_HEADERS = {
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def get(url: str, *, referer: str, stream: bool = False) -> requests.Response:
+              errors = []
+              headers = {
+                  **BASE_HEADERS,
+                  'Referer': referer,
+                  'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8' if 'report-image' in url else 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              }
+              for attempt in range(1, 4):
+                  try:
+                      r = session.get(url, headers=headers, timeout=(20, 180), allow_redirects=True, stream=stream)
+                      if r.status_code == 200:
+                          return r
+                      errors.append(f'{r.status_code}:{len(r.content) if not stream else "stream"}')
+                      r.close()
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(attempt)
+              raise RuntimeError(f'GET failed {url}: {errors}')
+
+          def download_public_page_images(spec: dict) -> tuple[list[Path], list[dict]]:
+              page_dir = WORK / spec['slug']
+              page_dir.mkdir(parents=True, exist_ok=True)
+              saved: list[Path] = []
+              page_meta: list[dict] = []
+              consecutive_misses = 0
+              for page in range(1, spec.get('max_pages', 60) + 1):
+                  root = f"https://public.fxbaogao.com/report-image/{spec['date_path']}/{spec['report_id']}-{page}.png"
+                  candidates = [
+                      root,
+                      root + '?x-oss-process=image%2Fformat%2Cpng',
+                      root + '?x-oss-process=image%2Fformat%2Cwebp',
+                  ]
+                  accepted = None
+                  last_error = None
+                  for url in candidates:
+                      try:
+                          r = get(url, referer=spec['detail_url'])
+                          body = r.content
+                          content_type = r.headers.get('content-type', '')
+                          if len(body) < 5000 or not content_type.lower().startswith('image/'):
+                              last_error = f'not image: {content_type} {len(body)} bytes'
+                              continue
+                          with Image.open(io.BytesIO(body)) as im:
+                              im.verify()
+                          with Image.open(io.BytesIO(body)) as im:
+                              width, height = im.size
+                              fmt = (im.format or '').upper()
+                          if width < 800 or height < 1000:
+                              last_error = f'image too small: {width}x{height}'
+                              continue
+                          accepted = (url, body, content_type, fmt, width, height)
+                          break
+                      except Exception as exc:
+                          last_error = repr(exc)
+                  if accepted is None:
+                      print('PAGE MISS', spec['slug'], page, last_error, flush=True)
+                      consecutive_misses += 1
+                      if page <= spec['min_pages']:
+                          raise RuntimeError(f"Missing required page {page} for {spec['slug']}: {last_error}")
+                      if consecutive_misses >= 2:
+                          break
+                      continue
+                  consecutive_misses = 0
+                  url, body, content_type, fmt, width, height = accepted
+                  raw_hash = hashlib.sha256(body).hexdigest()
+                  # Keep PNG/JPEG bytes directly. Convert WebP and other formats to lossless PNG.
+                  if fmt in ('PNG', 'JPEG', 'JPG'):
+                      suffix = '.png' if fmt == 'PNG' else '.jpg'
+                      dest = page_dir / f'{page:03d}{suffix}'
+                      dest.write_bytes(body)
+                  else:
+                      dest = page_dir / f'{page:03d}.png'
+                      with Image.open(io.BytesIO(body)) as im:
+                          if im.mode not in ('RGB', 'L'):
+                              im = im.convert('RGB')
+                          im.save(dest, format='PNG', optimize=False)
+                  saved.append(dest)
+                  page_meta.append({
+                      'page': page, 'source_url': url, 'content_type': content_type,
+                      'source_format': fmt, 'width': width, 'height': height,
+                      'source_bytes': len(body), 'source_sha256': raw_hash,
+                      'saved_file': dest.name, 'saved_sha256': sha256(dest),
+                  })
+                  print('PAGE OK', spec['slug'], page, fmt, width, height, len(body), flush=True)
+
+              expected = list(range(1, len(saved) + 1))
+              actual = [x['page'] for x in page_meta]
+              if actual != expected:
+                  raise RuntimeError(f'Page sequence gap for {spec["slug"]}: {actual}')
+              if len(saved) < spec['min_pages']:
+                  raise RuntimeError(f'Only {len(saved)} pages for {spec["slug"]}')
+              if len({x['source_sha256'] for x in page_meta}) != len(page_meta):
+                  raise RuntimeError(f'Duplicate page image detected for {spec["slug"]}')
+              return saved, page_meta
+
+          def images_to_pdf(images: list[Path], dest: Path) -> None:
+              with dest.open('wb') as f:
+                  f.write(img2pdf.convert([str(p) for p in images]))
+
+          def download_pdf(url: str, dest: Path, referer: str) -> str:
+              r = get(url, referer=referer)
+              if not r.content.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Not a PDF: {url}')
+              dest.write_bytes(r.content)
+              return r.url
+
+          def validate_pdf(path: Path, min_pages: int, *, searchable_identity: bool) -> dict:
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError(f'PDF signature missing: {path}')
+              reader = PdfReader(str(path))
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'Only {pages} pages: {path}')
+              extracted = ''
+              if searchable_identity:
+                  for pg in reader.pages[:min(8, pages)]:
+                      try:
+                          extracted += '\n' + (pg.extract_text() or '')
+                      except Exception:
+                          pass
+                  compact = ''.join(extracted.split()).upper()
+                  if not any(''.join(x.split()).upper() in compact for x in ('中国光大控股', 'CHINA EVERBRIGHT LIMITED')):
+                      raise RuntimeError(f'Company identity missing: {path}')
+                  if not any(x in compact for x in ('00165', '0165.HK', '00165.HK')):
+                      raise RuntimeError(f'Ticker missing: {path}')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {path}: {check.stderr[-1000:]}')
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f'{path.stem}_{label}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '100', str(path), str(prefix)],
+                      check=True, capture_output=True,
+                  )
+                  rendered = Path(str(prefix) + '.png')
+                  if not rendered.exists() or rendered.stat().st_size < 10000:
+                      raise RuntimeError(f'Render failed for {path}, {label}')
+                  with Image.open(rendered) as im:
+                      if im.width < 500 or im.height < 700:
+                          raise RuntimeError(f'Render too small for {path}, {label}')
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'searchable_text': bool(extracted.strip()),
+              }
+
+          specs = [
+              {
+                  'slug': 'guojin_2026',
+                  'institution': '国金证券',
+                  'date': '2026-04-17',
+                  'date_path': '2026/04/17',
+                  'report_id': '5370196',
+                  'title': '跨境资管标的，业绩弹性可期',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5370196',
+                  'filename': '01_国金证券_中国光大控股_跨境资管标的业绩弹性可期_2026-04-17_完整报告.pdf',
+                  'min_pages': 18,
+                  'max_pages': 35,
+              },
+              {
+                  'slug': 'guotaihaitong_2025',
+                  'institution': '国泰海通证券',
+                  'date': '2025-09-03',
+                  'date_path': '2025/09/03',
+                  'report_id': '5040903',
+                  'title': '资负共振，锚定科创，拐点已现',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5040903',
+                  'filename': '02_国泰海通证券_中国光大控股_资负共振锚定科创拐点已现_2025-09-03_完整报告.pdf',
+                  'min_pages': 22,
+                  'max_pages': 40,
+              },
+          ]
+
+          records = []
+          for spec in specs:
+              images, image_manifest = download_public_page_images(spec)
+              pdf_path = OUT / spec['filename']
+              images_to_pdf(images, pdf_path)
+              meta = validate_pdf(pdf_path, spec['min_pages'], searchable_identity=False)
+              records.append({
+                  'filename': spec['filename'],
+                  'institution': spec['institution'], 'date': spec['date'],
+                  'title': spec['title'], 'report_type': '公司深度/首次覆盖',
+                  'source_type': '公开逐页原版图像无损合成PDF',
+                  'source_page': spec['detail_url'],
+                  'source_image_pattern': f"https://public.fxbaogao.com/report-image/{spec['date_path']}/{spec['report_id']}-{{page}}.png",
+                  'image_manifest': image_manifest,
+                  **meta,
+              })
+
+          direct = {
+              'institution': '天风证券',
+              'date': '2021-12-06',
+              'title': '中国领先的跨境资产管理投资稀缺标的',
+              'url': 'https://pdf.dfcfw.com/pdf/H3_AP202112071533346305_1.pdf',
+              'filename': '03_天风证券_中国光大控股_中国领先的跨境资产管理投资稀缺标的_2021-12-06_16页.pdf',
+          }
+          direct_path = OUT / direct['filename']
+          final_url = download_pdf(direct['url'], direct_path, 'https://data.eastmoney.com/')
+          meta = validate_pdf(direct_path, 15, searchable_identity=True)
+          if meta['pages'] != 16:
+              raise RuntimeError(f'Unexpected Tianfeng page count: {meta["pages"]}')
+          records.append({
+              'filename': direct['filename'], 'institution': direct['institution'],
+              'date': direct['date'], 'title': direct['title'],
+              'report_type': '首次覆盖报告', 'source_type': '公开原始PDF',
+              'source_page': final_url, 'source_image_pattern': '',
+              'image_manifest': [], **meta,
+          })
+
+          if len(records) != 3 or len({r['sha256'] for r in records}) != 3:
+              raise RuntimeError('Report count or uniqueness validation failed')
+
+          # Confirm chronological order and minimum quality.
+          if not (records[0]['date'] > records[1]['date'] > records[2]['date']):
+              raise RuntimeError('Chronological ordering failed')
+          if sum(r['pages'] for r in records) < 55:
+              raise RuntimeError('Combined page count unexpectedly low')
+
+          with (OUT / '00_报告清单与核验说明.txt').open('w', encoding='utf-8') as f:
+              f.write('中国光大控股有限公司（China Everbright Limited，00165.HK）券商深度报告合集\n')
+              f.write('整理日期：2026-09-02\n\n')
+              f.write('一、收录报告\n')
+              for i, r in enumerate(records, 1):
+                  f.write(f"{i}. {r['institution']}｜{r['date']}｜{r['title']}｜{r['pages']}页\n")
+                  f.write(f"   文件：{r['filename']}\n")
+                  f.write(f"   版本：{r['source_type']}\n")
+                  f.write(f"   SHA-256：{r['sha256']}\n")
+                  f.write(f"   来源：{r['source_page']}\n\n")
+              f.write('二、版本说明\n')
+              f.write('2026年国金证券、2025年国泰海通证券两份报告的公开详情页提供完整逐页原版图像；本包按原始页序无损合成为PDF，没有改写、删节或重排页面。\n')
+              f.write('2021年天风证券报告为公开可获取的券商原始PDF。\n\n')
+              f.write('三、核验项目\n')
+              f.write('已核验页码连续性、逐页图像格式与尺寸、重复页、PDF文件头、实际页数、qpdf结构、首页及末页可渲染性、SHA-256，以及压缩包CRC。\n')
+
+          with (OUT / '报告清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '机构', '报告日期', '报告标题', '报告类型', '页数', '文件大小_字节', '版本', 'SHA256', '来源页面', '文件名']
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              for i, r in enumerate(records, 1):
+                  w.writerow({
+                      '序号': i, '机构': r['institution'], '报告日期': r['date'],
+                      '报告标题': r['title'], '报告类型': r['report_type'],
+                      '页数': r['pages'], '文件大小_字节': r['bytes'],
+                      '版本': r['source_type'], 'SHA256': r['sha256'],
+                      '来源页面': r['source_page'], '文件名': r['filename'],
+                  })
+
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for path in sorted(OUT.iterdir()):
+                  z.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs, expected 3')
+          print('FINAL_RECORDS', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, sha256(zip_path), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-broker-deep-reports-final
+          path: |
+            中国光大控股_00165HK_券商深度报告_3份_完整公开版/
+            中国光大控股_00165HK_券商深度报告_3份_完整公开版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
