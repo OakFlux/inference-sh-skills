@@ -1,0 +1,41 @@
+name: Exact search Sdyanbao for REPT BATTERO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-exact-search-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Exact API search
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,requests
+          from pathlib import Path
+          s=requests.Session(); h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report?keyword=%E7%91%9E%E6%B5%A6%E5%85%B0%E9%92%A7','X-Token':'','Device':'1'}
+          p={'device':1,'hideTrader':0,'onlyTitle':1,'order':1,'page':1,'pageSize':100,'keyword':'瑞浦兰钧','pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+          r=s.post('https://api.sdyanbao.com/api/file/search',headers=h,json=p,timeout=(15,45))
+          print('STATUS',r.status_code,len(r.content),r.text[:1000],flush=True)
+          j=r.json(); files=(j.get('data') or {}).get('files') or []
+          concise=[]
+          for f in files:
+            x={k:f.get(k) for k in ['id','name','time_text','page_count','size','file_size','data_source','data_source_uuid','original_id','online_url','page_url','share_url','organization','researcher','stock','type','industry']}
+            concise.append(x); print('FILE',json.dumps(x,ensure_ascii=False),flush=True)
+          out={'raw':j,'concise':concise}
+          Path('rept_sdy_exact.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-exact-search
+          path: rept_sdy_exact.json
+          retention-days: 7
