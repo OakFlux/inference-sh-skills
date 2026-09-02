@@ -1,0 +1,58 @@
+name: Probe CMBI Skyworth candidates
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-cmbi-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - run: python -m pip install --quiet requests pypdf
+      - name: Inspect PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+          urls=[
+            'https://www.cmbi.com.hk/upload/202108/20210817289134.pdf',
+            'https://www.cmbi.com.hk/upload/20170728719715.pdf',
+          ]
+          out=Path('skyworth-cmbi-probe'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://www.cmbi.com.hk/','Accept':'application/pdf,*/*'}
+          records=[]
+          for i,u in enumerate(urls,1):
+            rec={'url':u}
+            try:
+              r=s.get(u,headers=h,timeout=(20,180),allow_redirects=True)
+              rec.update({'status':r.status_code,'bytes':len(r.content),'final_url':r.url,'type':r.headers.get('content-type')})
+              if r.status_code==200 and r.content.startswith(b'%PDF-'):
+                p=out/f'{i:02d}.pdf'; p.write_bytes(r.content)
+                rd=PdfReader(str(p),strict=False); rec['pages']=len(rd.pages)
+                text=''
+                for page in rd.pages[:min(5,len(rd.pages))]:
+                  try:text+='\n'+(page.extract_text() or '')
+                  except:pass
+                rec['text_head']=re.sub(r'\s+',' ',text).strip()[:15000]
+                rec['skyworth']=any(x in re.sub(r'\s+','',text).lower() for x in ('skyworth','创维','創維','00751'))
+              print('REC',json.dumps(rec,ensure_ascii=False)[:10000],flush=True)
+            except Exception as e:rec['error']=repr(e)
+            records.append(rec)
+          (out/'records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-cmbi-probe
+          path: skyworth-cmbi-probe/
+          retention-days: 7
