@@ -1,0 +1,244 @@
+name: Package Tiangong International broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tiangong-international-broker-package-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Download full public report pages and build PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import io
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '天工国际_券商深度报告_2份_公开完整阅览版'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_tiangong_broker_work')
+          work.mkdir(exist_ok=True)
+          preview = work / 'previews'
+          preview.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '华升证券',
+                  'title': '卡位高端制造新材料，2026年业绩与估值双击',
+                  'date': '2026-03-31',
+                  'analysts': '陈熙、欧阳晓辉',
+                  'ticker': '00826.HK',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5349100',
+                  'image_base': 'https://public.fxbaogao.com/report-image/2026/03/31/5349100-{page}.png',
+                  'min_pages': 15,
+                  'filename': '01_华升证券_卡位高端制造新材料_2026年业绩与估值双击_20260331.pdf',
+              },
+              {
+                  'broker': '东吴证券',
+                  'title': '钛合金放量在即，布局机器人和核聚变专用材料',
+                  'date': '2025-11-05',
+                  'analysts': '王紫敬',
+                  'ticker': '00826.HK',
+                  'detail_url': 'https://www.fxbaogao.com/detail/5136394',
+                  'image_base': 'https://public.fxbaogao.com/report-image/2025/11/05/5136394-{page}.png',
+                  'min_pages': 16,
+                  'filename': '02_东吴证券_钛合金放量在即_布局机器人和核聚变专用材料_20251105.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          def fetch_page(report: dict, page: int) -> tuple[bytes, str] | None:
+              base = report['image_base'].format(page=page)
+              urls = [
+                  base,
+                  base + '?x-oss-process=image%2Fformat%2Cwebp',
+                  base + '?x-oss-process=image/format,webp',
+              ]
+              headers = {
+                  'User-Agent': ua,
+                  'Accept': 'image/avif,image/webp,image/apng,image/png,image/*,*/*;q=0.8',
+                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                  'Referer': report['detail_url'],
+              }
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, headers=headers, timeout=(20, 120), allow_redirects=True)
+                          print('IMAGE_GET', report['broker'], page, attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                          if r.status_code == 404:
+                              break
+                          if r.status_code == 200 and len(r.content) > 40_000:
+                              try:
+                                  with Image.open(io.BytesIO(r.content)) as im:
+                                      im.verify()
+                                  with Image.open(io.BytesIO(r.content)) as im:
+                                      width, height = im.size
+                                  if width >= 900 and height >= 1100:
+                                      return r.content, str(r.url)
+                                  print('IMAGE_TOO_SMALL', page, width, height, flush=True)
+                              except Exception as exc:
+                                  print('IMAGE_INVALID', page, repr(exc), flush=True)
+                      except Exception as exc:
+                          print('IMAGE_ERROR', report['broker'], page, attempt, repr(exc), flush=True)
+                      time.sleep(attempt)
+              return None
+
+          records = []
+          for report_index, report in enumerate(reports, 1):
+              page_dir = work / f'report_{report_index:02d}'
+              page_dir.mkdir(exist_ok=True)
+              image_paths: list[Path] = []
+              source_urls: list[str] = []
+              missing_after_content = 0
+
+              for page in range(1, 45):
+                  result = fetch_page(report, page)
+                  if result is None:
+                      if page <= report['min_pages']:
+                          raise RuntimeError(f"Missing required page {page} for {report['broker']} report")
+                      missing_after_content += 1
+                      if missing_after_content >= 2:
+                          break
+                      continue
+                  if missing_after_content:
+                      raise RuntimeError(f"Non-contiguous pages detected before page {page} for {report['broker']}")
+                  data, source_url = result
+                  png_path = page_dir / f'{page:03d}.png'
+                  with Image.open(io.BytesIO(data)) as im:
+                      # Preserve the full page at its source resolution and normalize for PDF embedding.
+                      if im.mode not in ('RGB', 'L'):
+                          if 'A' in im.mode:
+                              background = Image.new('RGB', im.size, 'white')
+                              alpha = im.getchannel('A')
+                              background.paste(im.convert('RGB'), mask=alpha)
+                              im = background
+                          else:
+                              im = im.convert('RGB')
+                      elif im.mode == 'L':
+                          im = im.convert('RGB')
+                      im.save(png_path, format='PNG', optimize=True)
+                  image_paths.append(png_path)
+                  source_urls.append(source_url)
+
+              page_count = len(image_paths)
+              if page_count < report['min_pages']:
+                  raise RuntimeError(f"Only {page_count} pages downloaded for {report['broker']}; expected at least {report['min_pages']}")
+
+              # A4 portrait layout, preserving aspect ratio and without cropping.
+              a4 = (img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297))
+              layout_fun = img2pdf.get_layout_fun(a4)
+              pdf_bytes = img2pdf.convert([str(p) for p in image_paths], layout_fun=layout_fun)
+              pdf_path = out / report['filename']
+              pdf_path.write_bytes(pdf_bytes)
+
+              reader = PdfReader(str(pdf_path), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != page_count:
+                  raise RuntimeError(f"PDF page mismatch for {report['broker']}: {actual_pages} vs {page_count}")
+
+              q = subprocess.run(['qpdf', '--check', str(pdf_path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f"qpdf check failed for {pdf_path.name}: {q.stderr[-1500:]}")
+              first_prefix = preview / f'{report_index:02d}_first'
+              last_prefix = preview / f'{report_index:02d}_last'
+              subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(pdf_path), str(first_prefix)], check=True, capture_output=True)
+              subprocess.run(['pdftoppm', '-f', str(actual_pages), '-singlefile', '-png', '-r', '90', str(pdf_path), str(last_prefix)], check=True, capture_output=True)
+              if not Path(str(first_prefix) + '.png').exists() or not Path(str(last_prefix) + '.png').exists():
+                  raise RuntimeError(f"Render check failed for {pdf_path.name}")
+
+              digest = hashlib.sha256(pdf_bytes).hexdigest()
+              record = {
+                  **{k: report[k] for k in ('broker', 'title', 'date', 'analysts', 'ticker', 'detail_url', 'filename')},
+                  'pages': actual_pages,
+                  'bytes': len(pdf_bytes),
+                  'sha256': digest,
+                  'page_image_first': source_urls[0],
+                  'page_image_last': source_urls[-1],
+                  'format_note': '由报告平台公开、连续的完整逐页阅览图无裁切合成为PDF；非券商服务器原始PDF文件。',
+              }
+              records.append(record)
+              print('VERIFIED_REPORT', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 2:
+              raise RuntimeError(f'Expected 2 reports, got {len(records)}')
+          if len({r['sha256'] for r in records}) != 2:
+              raise RuntimeError('Duplicate PDFs detected')
+
+          lines = [
+              '天工国际（00826.HK）券商深度报告公开完整阅览版',
+              '',
+              '本压缩包包含2份近年的公司首次覆盖/深度研究报告。',
+              '由于公开网页未提供券商服务器原始PDF直链，本包依据网页明确提供的“免费查看完整报告”功能，将连续完整的逐页阅览图无裁切合成为PDF。',
+              '合成PDF保留全部页面内容与原始页面比例，不是摘要，也未混入财报点评或新闻转载。',
+              '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines.extend([
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   日期：{r['date']}；分析师：{r['analysts']}；证券代码：{r['ticker']}",
+                  f"   文件：{r['filename']}；实际页数：{r['pages']}页；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   公开详情页：{r['detail_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：逐页连续性、图片文件有效性与分辨率、PDF实际页数、qpdf结构、首末页渲染、SHA-256及ZIP CRC。',
+              '报告中的投资评级、目标价及盈利预测均为报告发布时点观点，不代表当前投资建议。',
+          ])
+          (out / '报告清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [n for n in archive.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 2:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'REPORTS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiangong-international-broker-reports-final
+          path: 天工国际_券商深度报告_2份_公开完整阅览版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
