@@ -1,0 +1,88 @@
+name: Probe BOCOM research site for REPT BATTERO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-bocom-site-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Probe site and assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re,urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('bocom_probe'); out.mkdir(exist_ok=True)
+          s=requests.Session(); ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          h={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,application/json,*/*','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          bases=['https://research.bocomgroup.com/','http://research.bocomgroup.com/']
+          result={'pages':[],'assets':[],'probes':[]}
+          for base in bases:
+            try:
+              r=s.get(base,headers=h,timeout=(15,60),allow_redirects=True)
+              result['pages'].append({'requested':base,'status':r.status_code,'url':r.url,'bytes':len(r.content),'headers':dict(r.headers),'text':r.text[:200000]})
+              (out/('root_https.html' if base.startswith('https') else 'root_http.html')).write_text(r.text,encoding='utf-8',errors='ignore')
+              soup=BeautifulSoup(r.text,'html.parser')
+              urls=[]
+              for tag,attr in [('script','src'),('link','href'),('a','href')]:
+                for x in soup.find_all(tag):
+                  u=x.get(attr)
+                  if u: urls.append(urllib.parse.urljoin(r.url,u))
+              print('ROOT',base,r.status_code,r.url,len(r.content),'links',len(urls),flush=True)
+              for u in list(dict.fromkeys(urls))[:80]:
+                if any(ext in u.lower() for ext in ['.js','.css']) or 'api' in u.lower():
+                  try:
+                    rr=s.get(u,headers={**h,'Referer':r.url},timeout=(10,45))
+                    text=rr.text[:1000000]
+                    rec={'url':u,'status':rr.status_code,'bytes':len(rr.content),'type':rr.headers.get('content-type'),'matches':{}}
+                    for key,pat in {
+                      'api_urls':r'https?://[^\"\'<>\\s]+',
+                      'api_paths':r'[\"\'](/[^\"\']*(?:api|search|report|research|download)[^\"\']*)[\"\']',
+                      'keywords':r'.{0,80}(?:瑞浦兰钧|REPT|search|download|report).{0,120}',
+                    }.items():
+                      try: rec['matches'][key]=list(dict.fromkeys(re.findall(pat,text,flags=re.I)))[:200]
+                      except Exception as e: rec['matches'][key]=[repr(e)]
+                    result['assets'].append(rec)
+                    fn=re.sub(r'[^A-Za-z0-9._-]+','_',urllib.parse.urlparse(u).path.split('/')[-1] or 'asset')[:120]
+                    (out/fn).write_text(text,encoding='utf-8',errors='ignore')
+                    print('ASSET',rr.status_code,len(rr.content),u,flush=True)
+                  except Exception as e: result['assets'].append({'url':u,'error':repr(e)})
+            except Exception as e: result['pages'].append({'requested':base,'error':repr(e)})
+
+          # Common endpoints and query patterns.
+          roots=['https://research.bocomgroup.com']
+          paths=[
+            '/robots.txt','/sitemap.xml','/api','/api/search','/api/report','/search','/search?keyword=瑞浦兰钧',
+            '/search?keyword=REPT%20BATTERO','/?s=瑞浦兰钧','/report/search?keyword=瑞浦兰钧',
+            '/api/v1/search?keyword=瑞浦兰钧','/api/report/list?keyword=瑞浦兰钧','/index.php?keyword=瑞浦兰钧'
+          ]
+          for root in roots:
+            for p in paths:
+              u=root+p
+              try:
+                r=s.get(u,headers=h,timeout=(10,45),allow_redirects=True)
+                result['probes'].append({'url':u,'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'type':r.headers.get('content-type'),'text':r.text[:10000]})
+                print('PROBE',r.status_code,len(r.content),u,'->',r.url,flush=True)
+              except Exception as e: result['probes'].append({'url':u,'error':repr(e)})
+          (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-bocom-site-probe
+          path: bocom_probe/
+          retention-days: 7
