@@ -1,0 +1,259 @@
+name: Package verified public China Conch Venture broker PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-eastmoney-pack-20260902-v5.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Find, download, validate, and package public broker PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib
+          import json
+          import re
+          import time
+          import zipfile
+          from pathlib import Path
+          from typing import Any
+          import requests
+          from pypdf import PdfReader
+
+          out = Path('out')
+          pdf_dir = out / 'reports'
+          pdf_dir.mkdir(parents=True, exist_ok=True)
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/',
+              'Cache-Control': 'no-cache',
+          }
+
+          targets = [
+              {
+                  'key': 'dw_20250615',
+                  'begin': '2025-06-14', 'end': '2025-06-16',
+                  'title_contains': ['海螺创业迎现金流拐点'],
+                  'org_contains': '东吴',
+                  'preferred_name': '01_东吴证券_2025-06-15_环保行业跟踪周报_海螺创业迎现金流拐点.pdf',
+                  'description': '东吴证券环保行业跟踪周报，标题直接聚焦海螺创业现金流、分红与供热IDC拓展。',
+              },
+              {
+                  'key': 'dw_20260223',
+                  'begin': '2026-02-22', 'end': '2026-02-24',
+                  'title_contains': ['海螺集团拟对海螺创业增持10.61'],
+                  'org_contains': '东吴',
+                  'preferred_name': '02_东吴证券_2026-02-23_环保行业跟踪周报_海螺集团拟增持海螺创业.pdf',
+                  'description': '东吴证券环保行业跟踪周报，含海螺创业增持、价值重估与公司跟踪专题。',
+              },
+              {
+                  'key': 'dw_20250612',
+                  'begin': '2025-06-11', 'end': '2025-06-13',
+                  'title_exact': '晨会纪要',
+                  'org_contains': '东吴',
+                  'pages': 22,
+                  'preferred_name': '03_东吴证券_2025-06-12_晨会纪要_含海螺创业首次覆盖深度核心内容.pdf',
+                  'description': '东吴证券晨会纪要，正文收录海螺创业首次覆盖深度报告的投资要点与核心论证。',
+              },
+              {
+                  'key': 'gf_20250629',
+                  'begin': '2025-06-28', 'end': '2025-06-30',
+                  'title_contains': ['环保行业2025年中期策略', '稳进有为'],
+                  'org_contains': '广发',
+                  'preferred_name': '04_广发证券_2025-06-29_环保行业中期策略_含海螺创业估值分析.pdf',
+                  'description': '广发证券环保行业中期策略，包含海螺创业估值及同业比较，作为备用报告。',
+              },
+          ]
+
+          session = requests.Session()
+
+          def get_rows(begin: str, end: str) -> list[dict[str, Any]]:
+              rows_all: list[dict[str, Any]] = []
+              seen: set[str] = set()
+              for qtype in (0, 1, 2):
+                  page = 1
+                  total_pages = 1
+                  while page <= total_pages and page <= 80:
+                      params = {
+                          'pageNo': page,
+                          'pageSize': 100,
+                          'code': '',
+                          'qType': qtype,
+                          'beginTime': begin,
+                          'endTime': end,
+                          '_': int(time.time() * 1000) + page + qtype * 1000,
+                      }
+                      r = session.get(endpoint, params=params, headers=headers, timeout=(20, 120))
+                      r.raise_for_status()
+                      obj = r.json()
+                      rows = obj.get('data') or []
+                      if not isinstance(rows, list):
+                          rows = []
+                      total_pages = int(obj.get('TotalPage') or 1)
+                      for row in rows:
+                          code = str(row.get('infoCode') or '')
+                          if code and code not in seen:
+                              seen.add(code)
+                              rows_all.append(row)
+                      if not rows:
+                          break
+                      page += 1
+              return rows_all
+
+          cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+          def match_target(target: dict[str, Any]) -> dict[str, Any] | None:
+              key = (target['begin'], target['end'])
+              if key not in cache:
+                  cache[key] = get_rows(*key)
+              candidates = []
+              for row in cache[key]:
+                  title = str(row.get('title') or '')
+                  org = str(row.get('orgSName') or row.get('orgName') or '')
+                  pages = int(row.get('attachPages') or 0)
+                  if target.get('org_contains') and target['org_contains'] not in org:
+                      continue
+                  if target.get('title_exact') and title != target['title_exact']:
+                      continue
+                  if target.get('title_contains') and not all(x in title for x in target['title_contains']):
+                      continue
+                  if target.get('pages') and pages != int(target['pages']):
+                      continue
+                  candidates.append(row)
+              candidates.sort(key=lambda r: (int(r.get('attachPages') or 0), str(r.get('publishDate') or '')), reverse=True)
+              return candidates[0] if candidates else None
+
+          def download_pdf(info_code: str, dest: Path) -> tuple[str, int]:
+              ts = int(time.time() * 1000)
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf?{ts}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf?{ts}.pdf',
+              ]
+              errors=[]
+              for url in urls:
+                  try:
+                      r = session.get(url, headers={**headers, 'Accept': 'application/pdf,*/*'}, timeout=(20, 180), allow_redirects=True)
+                      content = r.content
+                      if r.status_code == 200 and content.startswith(b'%PDF') and len(content) > 20_000:
+                          dest.write_bytes(content)
+                          reader = PdfReader(str(dest), strict=False)
+                          pages = len(reader.pages)
+                          if pages <= 0:
+                              raise ValueError('PDF has no pages')
+                          return url, pages
+                      errors.append(f'{url} status={r.status_code} type={r.headers.get("content-type")} len={len(content)}')
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError(' | '.join(errors))
+
+          manifest=[]
+          for target in targets:
+              row = match_target(target)
+              if not row:
+                  print('TARGET_NOT_FOUND', target['key'], json.dumps(target, ensure_ascii=False), flush=True)
+                  continue
+              info_code = str(row['infoCode'])
+              dest = pdf_dir / target['preferred_name']
+              try:
+                  source_url, actual_pages = download_pdf(info_code, dest)
+              except Exception as exc:
+                  print('DOWNLOAD_FAILED', target['key'], info_code, repr(exc), flush=True)
+                  continue
+              reader = PdfReader(str(dest), strict=False)
+              sample=[]
+              for p in reader.pages[:min(8, len(reader.pages))]:
+                  try:
+                      sample.append(p.extract_text() or '')
+                  except Exception:
+                      pass
+              sample_text='\n'.join(sample)
+              # Directly titled company reports or report metadata must identify 海螺创业.
+              title = str(row.get('title') or '')
+              if '海螺创业' not in title and '海螺创业' not in sample_text:
+                  print('CONTENT_MISMATCH', target['key'], title, flush=True)
+                  dest.unlink(missing_ok=True)
+                  continue
+              sha = hashlib.sha256(dest.read_bytes()).hexdigest()
+              manifest.append({
+                  'key': target['key'],
+                  'filename': dest.name,
+                  'broker': row.get('orgSName') or row.get('orgName'),
+                  'title': title,
+                  'publish_date': str(row.get('publishDate') or '')[:10],
+                  'pages': actual_pages,
+                  'eastmoney_info_code': info_code,
+                  'source_url': source_url,
+                  'description': target['description'],
+                  'sha256': sha,
+                  'bytes': dest.stat().st_size,
+              })
+              print('VERIFIED', json.dumps(manifest[-1], ensure_ascii=False), flush=True)
+
+          # Select up to three, prioritizing the two directly titled reports and the deep-report morning-note reproduction.
+          priority = {'dw_20250615':0, 'dw_20260223':1, 'dw_20250612':2, 'gf_20250629':3}
+          manifest.sort(key=lambda x: priority.get(x['key'], 99))
+          selected = manifest[:3]
+          if len(selected) < 2:
+              raise RuntimeError(f'Only {len(selected)} verified reports were obtained; refusing to publish an incomplete or misleading package.')
+
+          selected_names={x['filename'] for x in selected}
+          for path in pdf_dir.glob('*.pdf'):
+              if path.name not in selected_names:
+                  path.unlink()
+
+          readme_lines = [
+              '# 海螺创业（00586.HK）券商研究报告包',
+              '',
+              '本压缩包仅收录能够从公开网页直接取得、且已通过 PDF 结构和实际页数校验的券商原始文件。',
+              '鉴于公开渠道中纯公司深度报告全文有限，本包优先选择标题直接聚焦海螺创业的长篇跟踪报告，并补充一份收录首次覆盖深度核心内容的券商晨会纪要。',
+              '',
+          ]
+          for i, item in enumerate(selected, 1):
+              readme_lines += [
+                  f'## {i}. {item["broker"]}｜{item["publish_date"]}',
+                  f'- 文件：{item["filename"]}',
+                  f'- 原题：{item["title"]}',
+                  f'- 实际页数：{item["pages"]}',
+                  f'- 说明：{item["description"]}',
+                  f'- SHA-256：{item["sha256"]}',
+                  '',
+              ]
+          (out / 'README.md').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = out / '海螺创业_00586HK_券商深度相关研究报告_3份_公开原始PDF.zip'
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for item in selected:
+                  zf.write(pdf_dir / item['filename'], arcname=item['filename'])
+              zf.write(out / 'README.md', arcname='README.md')
+              zf.write(out / 'manifest.json', arcname='manifest.json')
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed at {bad}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+      - name: Upload verified package
+        uses: actions/upload-artifact@v4
+        with:
+          name: conch-venture-verified-broker-reports
+          path: out/海螺创业_00586HK_券商深度相关研究报告_3份_公开原始PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
