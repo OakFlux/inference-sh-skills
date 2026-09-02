@@ -1,0 +1,102 @@
+name: Inspect Microbell WeRide report endpoints
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-microbell-inspection-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect report page and probe file URLs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          from io import BytesIO
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          session=requests.Session(); session.trust_env=False
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Accept':'text/html,application/json,*/*','Referer':'https://www.microbell.com/'}
+          page='https://www.microbell.com/repinfodetail_4671782.html'
+          r=session.get(page,headers=headers,timeout=(30,180),allow_redirects=True)
+          print('PAGE',r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+          r.raise_for_status()
+          text=html.unescape(r.text).replace('\\/','/').replace('\\u0026','&')
+          print('RAW_HEAD',text[:4000],flush=True)
+          soup=BeautifulSoup(text,'lxml')
+          for tag in soup.find_all(True):
+              attrs={k:v for k,v in tag.attrs.items() if any(x in k.lower() for x in ('href','src','url','file','down','onclick','data'))}
+              if attrs:
+                  raw=json.dumps(attrs,ensure_ascii=False)
+                  if any(x in raw.lower() for x in ('4671782','202511141040085086','pdf','download','checkmd5file','huibobjb','report','open')):
+                      print('TAG',tag.name,raw,'TEXT',tag.get_text(' ',strip=True)[:500],flush=True)
+          for keyword in ('4671782','202511141040085086','CheckMd5File','huibobjb','download','DownLoad','repinfo','openreport','pdf','gif'):
+              positions=[m.start() for m in re.finditer(re.escape(keyword),text,flags=re.I)]
+              print('KEY',keyword,'COUNT',len(positions),flush=True)
+              for pos in positions[:20]:
+                  print('CTX',keyword,re.sub(r'\s+',' ',text[max(0,pos-1000):pos+2500])[:3500],flush=True)
+          scripts=[]
+          for tag in soup.find_all('script',src=True):
+              url=urljoin(r.url,tag['src'])
+              if url not in scripts:scripts.append(url)
+          print('SCRIPTS',json.dumps(scripts,ensure_ascii=False,indent=2),flush=True)
+          for url in scripts:
+              try:
+                  js=session.get(url,headers=headers,timeout=(30,180),allow_redirects=True)
+                  print('SCRIPT',js.status_code,len(js.content),url,js.url,flush=True)
+                  if js.status_code!=200 or len(js.content)>4_000_000:continue
+                  jst=html.unescape(js.text).replace('\\/','/')
+                  interesting=False
+                  for keyword in ('CheckMd5File','huibobjb','download','repinfodetail','openreport','reportid','pdf','gif'):
+                      poslist=[m.start() for m in re.finditer(re.escape(keyword),jst,flags=re.I)]
+                      if poslist:
+                          interesting=True; print('JS_KEY',url,keyword,len(poslist),flush=True)
+                      for pos in poslist[:10]:
+                          print('JS_CTX',url,keyword,re.sub(r'\s+',' ',jst[max(0,pos-800):pos+2200])[:3000],flush=True)
+                  if not interesting:print('SCRIPT_NO_KEYS',url,flush=True)
+              except Exception as exc:
+                  print('SCRIPT_ERROR',url,repr(exc),flush=True)
+
+          stem='202511141040085086'
+          hosts=['https://huibobjb.hibor.com.cn','http://huibobjb.hibor.com.cn','https://www.microbell.com','https://www.hibor.com.cn']
+          paths=[
+              f'/CheckMd5File/img/2025/11/{stem}.pdf',f'/CheckMd5File/pdf/2025/11/{stem}.pdf',f'/CheckMd5File/file/2025/11/{stem}.pdf',
+              f'/CheckMd5File/down/2025/11/{stem}.pdf',f'/CheckMd5File/download/2025/11/{stem}.pdf',f'/CheckMd5File/img/2025/11/{stem}.PDF',
+              f'/CheckMd5File/PDF/2025/11/{stem}.pdf',f'/report/2025/11/{stem}.pdf',f'/data/2025/11/{stem}.pdf',f'/upload/2025/11/{stem}.pdf',
+              f'/CheckMd5File/img/2025/11/{stem}.gif',f'/CheckMd5File/img/2025/11/{stem}_1.pdf',f'/CheckMd5File/pdf/2025/11/{stem}_1.pdf',
+          ]
+          for host in hosts:
+              for path in paths:
+                  url=host+path
+                  try:
+                      res=session.get(url,headers={**headers,'Accept':'application/pdf,image/*,*/*'},timeout=(20,90),allow_redirects=True,stream=True)
+                      first=next(res.iter_content(32),b'')
+                      length=res.headers.get('content-length')
+                      print('PROBE',res.status_code,res.headers.get('content-type'),length,first[:16],url,'=>',res.url,flush=True)
+                      if res.status_code==200 and first.startswith(b'%PDF-'):
+                          body=first+b''.join(res.iter_content(1024*1024))
+                          try: pages=len(PdfReader(BytesIO(body),strict=False).pages)
+                          except Exception as exc: pages=f'ERR:{exc!r}'
+                          print('FOUND_PDF',url,res.url,len(body),pages,flush=True)
+                      res.close()
+                  except Exception as exc:
+                      print('PROBE_ERROR',url,repr(exc),flush=True)
+          PY
