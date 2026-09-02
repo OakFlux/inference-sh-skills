@@ -1,0 +1,139 @@
+name: Probe REPT BATTERO broker report sources
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-battero-broker-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pillow pypdf
+
+      - name: Probe APIs and report files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import io, json, re, time
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+
+          out = Path('rept_probe')
+          out.mkdir(exist_ok=True)
+          s = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {'User-Agent': ua, 'Accept': 'application/json,text/html,*/*', 'Referer': 'https://data.eastmoney.com/'}
+          results = {'eastmoney': [], 'fxbaogao': [], 'sina': []}
+
+          # Eastmoney report API: probe several code conventions and parameter combinations.
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          code_variants = ['00666', '666', 'HK00666', '00666.HK', '116.00666', 'REPT BATTERO', '瑞浦兰钧']
+          for code in code_variants:
+              for qtype in [0, 1, 2]:
+                  params = {
+                      'pageNo': 1, 'pageSize': 200, 'code': code, 'qType': qtype,
+                      'beginTime': '2023-01-01', 'endTime': '2026-09-02',
+                  }
+                  try:
+                      r = s.get(endpoint, params=params, headers=headers, timeout=(15, 90))
+                      entry = {'code': code, 'qType': qtype, 'status': r.status_code, 'bytes': len(r.content), 'url': r.url}
+                      try:
+                          data = r.json()
+                          rows = data.get('data') if isinstance(data, dict) else None
+                          entry['row_count'] = len(rows) if isinstance(rows, list) else None
+                          entry['sample'] = rows[:10] if isinstance(rows, list) else data
+                      except Exception:
+                          entry['text'] = r.text[:2000]
+                      results['eastmoney'].append(entry)
+                      print('EASTMONEY', code, qtype, r.status_code, len(r.content), entry.get('row_count'), flush=True)
+                  except Exception as exc:
+                      results['eastmoney'].append({'code': code, 'qType': qtype, 'error': repr(exc)})
+
+          # Known fxbaogao detail pages and image accessibility.
+          specs = [
+              {'id': '4749230', 'date': '2025/03/27', 'title': '规模效应下毛利率提升，动力电池业务增速强劲；上调至买入评级'},
+              {'id': '4994227', 'date': '2025/08/12', 'title': '1H25毛利率稳步提升，预计全年亏损大幅收窄；上调盈利预测及目标价'},
+              {'id': '5063388', 'date': '2025/09/15', 'title': '出货量高增，看好盈利改善趋势'},
+          ]
+          for spec in specs:
+              detail_url = f"https://www.fxbaogao.com/detail/{spec['id']}"
+              item = {**spec, 'detail_url': detail_url, 'pages': []}
+              try:
+                  r = s.get(detail_url, headers={'User-Agent': ua}, timeout=(15, 60))
+                  item['detail_status'] = r.status_code
+                  item['detail_bytes'] = len(r.content)
+                  item['detail_links'] = [a.get('href') for a in BeautifulSoup(r.text, 'html.parser').find_all('a') if a.get('href') and ('.pdf' in a.get('href').lower() or 'download' in a.get('href').lower())][:30]
+                  item['html_pdf_urls'] = re.findall(r'https?://[^\"\'<>\\s]+?\.pdf(?:\?[^\"\'<>\\s]*)?', r.text, flags=re.I)[:30]
+              except Exception as exc:
+                  item['detail_error'] = repr(exc)
+              misses = 0
+              for page in range(1, 61):
+                  base = f"https://public.fxbaogao.com/report-image/{spec['date']}/{spec['id']}-{page}.png"
+                  accepted = None
+                  attempts = [base, base+'?x-oss-process=image%2Fformat%2Cpng', base+'?x-oss-process=image%2Fformat%2Cwebp']
+                  for url in attempts:
+                      try:
+                          rr = s.get(url, headers={'User-Agent': ua, 'Referer': detail_url, 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'}, timeout=(10, 45))
+                          if rr.status_code == 200 and len(rr.content) > 3000 and rr.headers.get('content-type','').lower().startswith('image/'):
+                              with Image.open(io.BytesIO(rr.content)) as im:
+                                  accepted = {'page': page, 'url': url, 'bytes': len(rr.content), 'format': im.format, 'size': im.size}
+                              break
+                      except Exception:
+                          pass
+                  if accepted:
+                      item['pages'].append(accepted)
+                      misses = 0
+                      print('FX PAGE', spec['id'], page, accepted['bytes'], accepted['format'], flush=True)
+                  else:
+                      misses += 1
+                      print('FX MISS', spec['id'], page, flush=True)
+                      if page > 2 and misses >= 2:
+                          break
+              item['accessible_pages'] = len(item['pages'])
+              results['fxbaogao'].append(item)
+
+          # Sina report-list pages for the HK ticker/name.
+          sina_urls = [
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=00666',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=0666',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?name=%E7%91%9E%E6%B5%A6%E5%85%B0%E9%92%A7',
+          ]
+          for url in sina_urls:
+              try:
+                  r = s.get(url, headers={'User-Agent': ua}, timeout=(15,60))
+                  results['sina'].append({'url': url, 'status': r.status_code, 'bytes': len(r.content), 'title_hits': re.findall(r'瑞浦兰钧.{0,100}', r.text)[:20], 'report_ids': re.findall(r'rptid/(\d+)', r.text)[:100]})
+              except Exception as exc:
+                  results['sina'].append({'url': url, 'error': repr(exc)})
+
+          (out / 'probe.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          # Concise summary for quick inspection.
+          summary = []
+          for x in results['eastmoney']:
+              if x.get('row_count'):
+                  summary.append({'source': 'eastmoney', 'code': x['code'], 'qType': x['qType'], 'rows': x['row_count'], 'sample': x.get('sample')})
+          for x in results['fxbaogao']:
+              summary.append({'source': 'fxbaogao', 'id': x['id'], 'title': x['title'], 'accessible_pages': x['accessible_pages'], 'detail_links': x.get('detail_links'), 'html_pdf_urls': x.get('html_pdf_urls')})
+          for x in results['sina']:
+              if x.get('report_ids') or x.get('title_hits'):
+                  summary.append({'source': 'sina', **x})
+          (out / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('SUMMARY', json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload probe output
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-battero-broker-probe
+          path: rept_probe/
+          if-no-files-found: error
+          retention-days: 7
