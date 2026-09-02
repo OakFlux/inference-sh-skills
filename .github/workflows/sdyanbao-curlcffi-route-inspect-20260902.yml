@@ -1,0 +1,102 @@
+name: Inspect public Sdyanbao routes with browser client
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sdyanbao-curlcffi-route-inspect-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet curl_cffi beautifulsoup4
+
+      - name: Fetch public pages and inspect scripts
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup
+          from curl_cffi import requests
+
+          out=Path('sdy_curlcffi'); out.mkdir(exist_ok=True)
+          pages=[
+            'https://www.sdyanbao.com/',
+            'https://www.sdyanbao.com/detail/916241',
+            'https://www.sdyanbao.com/detail/906591',
+            'https://www.sdyanbao.com/detail/432907',
+            'https://www.sdyanbao.com/detail/414349',
+          ]
+          scripts=set(); records=[]
+          for idx,url in enumerate(pages,1):
+            try:
+              r=requests.get(url,impersonate='chrome',timeout=120,allow_redirects=True,headers={'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+              print('PAGE',idx,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              text=r.text
+              (out/f'page_{idx}.html').write_text(text,encoding='utf-8')
+              soup=BeautifulSoup(text,'html.parser')
+              rec={'url':r.url,'status':r.status_code,'length':len(r.content),'scripts':[],'links':[],'hits':[]}
+              for sc in soup.find_all('script',src=True):
+                u=urljoin(r.url,html.unescape(sc['src'])); scripts.add(u); rec['scripts'].append(u)
+              for a in soup.find_all('a',href=True):
+                u=urljoin(r.url,html.unescape(a['href'])); label=' '.join(a.get_text(' ',strip=True).split())
+                if any(k in (u+' '+label).lower() for k in ('download','file','pdf','api','detail','login')):
+                  rec['links'].append({'label':label,'url':u})
+              pats=[
+                r'.{0,250}(?:download|立即下载|file_url|fileUrl|online_url|original_id|data_source_uuid|page_url|/api/file/|api/file).{0,500}',
+                r'["\']([^"\']*(?:download|file|pdf|api)[^"\']*)["\']',
+              ]
+              for pat in pats:
+                for m in re.finditer(pat,text,flags=re.I|re.S):
+                  val=m.group(0)
+                  if val not in rec['hits']: rec['hits'].append(val)
+                  if len(rec['hits'])>=500: break
+                if len(rec['hits'])>=500: break
+              records.append(rec)
+              print('REC',idx,json.dumps(rec,ensure_ascii=False,indent=2)[:50000],flush=True)
+            except Exception as e:
+              print('PAGE_ERROR',idx,url,repr(e),flush=True)
+              records.append({'url':url,'error':repr(e)})
+
+          assets=[]
+          for i,u in enumerate(sorted(scripts),1):
+            try:
+              r=requests.get(u,impersonate='chrome',timeout=120,allow_redirects=True,headers={'Referer':pages[0],'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+              print('SCRIPT',i,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              if r.status_code!=200 or len(r.content)>15_000_000: continue
+              data=r.content
+              (out/f'script_{i:03d}.js').write_bytes(data)
+              text=r.text
+              hits=[]
+              for pat in [
+                r'.{0,350}(?:download|file/download|downloadFile|download_url|fileUrl|file_url|online_url|original_id|data_source_uuid|page_url|api/file|/api/).{0,700}',
+                r'["\']([^"\']*(?:download|file|pdf|api)[^"\']*)["\']',
+              ]:
+                for m in re.finditer(pat,text,flags=re.I|re.S):
+                  val=m.group(0)
+                  if val not in hits: hits.append(val)
+                  if len(hits)>=1000: break
+                if len(hits)>=1000: break
+              if hits:
+                (out/f'script_{i:03d}_hits.txt').write_text('\n\n---\n\n'.join(hits),encoding='utf-8')
+                print('SCRIPT_HITS',i,'\n'.join(hits[:60])[:50000],flush=True)
+              assets.append({'url':u,'status':r.status_code,'length':len(data),'hits':len(hits)})
+            except Exception as e:
+              print('SCRIPT_ERROR',u,repr(e),flush=True)
+          (out/'manifest.json').write_text(json.dumps({'pages':records,'assets':assets},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdyanbao-curlcffi-route-inspection
+          path: sdy_curlcffi/
+          if-no-files-found: error
+          retention-days: 7
