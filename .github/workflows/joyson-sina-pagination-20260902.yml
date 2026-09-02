@@ -1,0 +1,58 @@
+name: Inspect older Joyson annual reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/joyson-sina-pagination-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: List paginated Sina annual reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import html, json
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {'User-Agent': 'Mozilla/5.0 Chrome/151', 'Referer': 'https://money.finance.sina.com.cn/'}
+
+          for page in range(1, 8):
+              base = 'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/600699/page_type/ndbg.phtml'
+              variants = [
+                  (f'p={page}', {'p': page}),
+                  (f'page={page}', {'page': page}),
+                  (f'urlpath/{page}', None),
+              ]
+              for label, params in variants:
+                  url = base if label != f'urlpath/{page}' else base + f'?p={page}'
+                  response = session.get(url, params=params, headers=headers, timeout=(30, 180), allow_redirects=True)
+                  response.encoding = 'gb18030'
+                  soup = BeautifulSoup(response.text, 'html.parser')
+                  rows = []
+                  seen = set()
+                  for a in soup.find_all('a', href=True):
+                      title = ' '.join(a.get_text(' ', strip=True).split())
+                      href = urljoin(response.url, html.unescape(a['href']))
+                      if 'vCB_AllBulletinDetail.php' not in href:
+                          continue
+                      if not any(x in title for x in ('均胜电子', '辽源得亨', '得亨')):
+                          continue
+                      key = (title, href)
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      rows.append({'title': title, 'url': href})
+                  print('PAGE', page, label, response.url, len(response.content), json.dumps(rows, ensure_ascii=False), flush=True)
+          PY
