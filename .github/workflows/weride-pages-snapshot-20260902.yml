@@ -1,0 +1,82 @@
+name: Snapshot WeRide report pages
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-pages-snapshot-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Fetch report pages and scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('weride-pages-snapshot'); out.mkdir()
+          session=requests.Session(); session.trust_env=False
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          pages={
+              'sdyanbao_940420':'https://www.sdyanbao.com/detail/940420',
+              'nxny_6191969':'https://www.nxny.com/report/view_6191969.html',
+              'pdf51_5781611':'https://www.51pdf.cn/report/view_5781611.html',
+              'microbell_4671782':'https://www.microbell.com/repinfodetail_4671782.html',
+              'sgpjbg_1010236':'https://m.sgpjbg.com.cn/bgdown/1010236.html',
+              'vzkoo':'https://www.vzkoo.com/read/20251117cce1c44fd3dd6f0974e3048a.html',
+              'baogaobox':'https://www.baogaobox.com/insights/260112000024754.html',
+              'book118':'https://max.book118.com/html/2026/0211/8047123005010046.shtm',
+          }
+          manifest=[]
+          scripts=[]
+          for name,url in pages.items():
+              try:
+                  r=session.get(url,headers=headers,timeout=(30,180),allow_redirects=True)
+                  suffix='.html'
+                  path=out/f'{name}{suffix}'
+                  path.write_bytes(r.content)
+                  print('PAGE',name,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+                  manifest.append({'name':name,'requested_url':url,'final_url':r.url,'status':r.status_code,'bytes':len(r.content),'file':path.name,'content_type':r.headers.get('content-type')})
+                  if r.status_code==200 and 'html' in (r.headers.get('content-type') or '').lower():
+                      soup=BeautifulSoup(r.text,'lxml')
+                      for tag in soup.find_all('script',src=True):
+                          src=urljoin(r.url,tag['src'])
+                          if src not in scripts:scripts.append(src)
+              except Exception as exc:
+                  print('PAGE_ERROR',name,repr(exc),flush=True)
+                  manifest.append({'name':name,'requested_url':url,'error':repr(exc)})
+          # Fetch only scripts under same report-site domains and cap size.
+          for idx,url in enumerate(scripts,1):
+              try:
+                  host=urlparse(url).netloc.replace(':','_')
+                  r=session.get(url,headers=headers,timeout=(30,180),allow_redirects=True)
+                  print('SCRIPT',idx,r.status_code,len(r.content),url,r.url,flush=True)
+                  if r.status_code==200 and len(r.content)<=6_000_000:
+                      ext='.js' if '.js' in urlparse(r.url).path.lower() else '.txt'
+                      file=f'script_{idx:03d}_{host}{ext}'
+                      (out/file).write_bytes(r.content)
+                      manifest.append({'type':'script','requested_url':url,'final_url':r.url,'status':r.status_code,'bytes':len(r.content),'file':file,'content_type':r.headers.get('content-type')})
+              except Exception as exc:
+                  print('SCRIPT_ERROR',idx,url,repr(exc),flush=True)
+          (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload snapshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: weride-report-pages-snapshot-20260902
+          path: weride-pages-snapshot/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 3
