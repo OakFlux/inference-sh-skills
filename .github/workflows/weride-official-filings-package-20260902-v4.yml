@@ -1,0 +1,199 @@
+name: Package official WeRide filings v4
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-official-filings-package-20260902-v4.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          package = '文远知行_WRD_0800_所有年报_招股说明书_最新季报_官方文件'
+          root = Path(package)
+          dirs = {
+              '年度报告': root / '01_年度报告',
+              '招股说明书': root / '02_招股说明书',
+              '最新季度业绩': root / '03_最新季度业绩',
+          }
+          preview_dir = Path('_preview_checks')
+          for p in [*dirs.values(), preview_dir]: p.mkdir(parents=True, exist_ok=True)
+
+          docs = [
+              dict(category='年度报告', filename='01_文远知行_2024年年度报告_Form20-F.pdf',
+                   url='https://ir.weride.ai/static-files/72a895d1-7999-4f63-9d97-476c54e7ecab',
+                   page='https://ir.weride.ai/financials-filings/annual-reports', date='2025-03-25',
+                   period='截至2024年12月31日止年度', form='Form 20-F / Annual Report', min_pages=300,
+                   identity=['weride inc.'], markers=['2024 annual report','december 31, 2024','fiscal year ended december 31, 2024']),
+              dict(category='年度报告', filename='02_文远知行_2025年年度报告_Form20-F.pdf',
+                   url='https://ir.weride.ai/system/files-encrypted/nasdaq_kms/assets/2026/04/23/10-08-17/20-F.pdf',
+                   page='https://ir.weride.ai/financials-filings/annual-reports', date='2026-04-23',
+                   period='截至2025年12月31日止年度', form='Form 20-F / Annual Report', min_pages=250,
+                   identity=['weride inc.'], markers=['2025 annual report','december 31, 2025','fiscal year ended december 31, 2025']),
+              dict(category='招股说明书', filename='01_文远知行_2024年纳斯达克IPO最终招股说明书_Form424B4.pdf',
+                   url='https://ir.weride.ai/static-files/406cbf25-bb49-4020-b913-f9cca1283c6e',
+                   page='https://ir.weride.ai/sec-filings/sec-filing/424b4/0001193125-24-243435', date='2024-10-25',
+                   period='纳斯达克首次公开发行', form='SEC Form 424B4', min_pages=100,
+                   identity=['weride inc.'], markers=['prospectus','american depositary shares','424b4']),
+              dict(category='招股说明书', filename='02_文远知行_2025年香港全球发售最终招股说明书补充文件_Form424B5.pdf',
+                   url='https://ir.weride.ai/static-files/fb48ee00-ab87-4767-a900-602a0b80e9ef',
+                   page='https://ir.weride.ai/sec-filings/sec-filing/424b5/0001104659-25-105307', date='2025-11-04',
+                   period='香港全球发售及国际发售', form='SEC Form 424B5 / Final Prospectus Supplement', min_pages=30,
+                   identity=['weride inc.'], markers=['global offering','prospectus supplement','class a ordinary shares']),
+              dict(category='最新季度业绩', filename='01_文远知行_2026年第二季度及上半年未经审计业绩新闻稿.pdf',
+                   url='https://ir.weride.ai/node/9266/pdf',
+                   page='https://ir.weride.ai/news-releases/news-release-details/accelerating-european-expansion-through-proven-asset-light-model', date='2026-08-12',
+                   period='截至2026年6月30日止第二季度及上半年', form='Quarterly Earnings Release', min_pages=3,
+                   identity=['weride'], markers=['2q2026','second quarter 2026','june 30, 2026','rmb231.7 million']),
+              dict(category='最新季度业绩', filename='02_文远知行_2026年第二季度及上半年业绩_SEC_Form6-K.pdf',
+                   url='https://ir.weride.ai/static-files/342000de-a739-4108-84df-674d8620032f',
+                   page='https://ir.weride.ai/sec-filings/sec-filing/6-k/0001104659-26-094571', date='2026-08-12',
+                   period='截至2026年6月30日止第二季度及上半年', form='SEC Form 6-K', min_pages=2,
+                   identity=['weride inc.'], markers=['form 6-k','june 30, 2026','second quarter 2026','2q2026']),
+          ]
+
+          session = requests.Session()
+          browser_ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          def fetch(doc, dest):
+              errors=[]
+              for attempt in range(6):
+                  try:
+                      r=session.get(doc['url'], headers={
+                          'User-Agent': browser_ua,
+                          'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                          'Accept-Language':'en-US,en;q=0.9,zh-CN;q=0.8',
+                          'Referer':doc['page'],
+                          'Cache-Control':'no-cache',
+                      }, timeout=(30,300), allow_redirects=True)
+                      b=r.content
+                      print('GET',doc['filename'],r.status_code,r.headers.get('content-type'),len(b),r.url,flush=True)
+                      if r.status_code==200 and b.startswith(b'%PDF-') and len(b)>20000:
+                          dest.write_bytes(b); return r.url,b
+                      errors.append(f"{r.status_code} {r.headers.get('content-type')} {len(b)}")
+                  except Exception as e: errors.append(repr(e))
+                  time.sleep(2*(attempt+1))
+              raise RuntimeError('download failed: '+doc['filename']+' | '+' | '.join(errors))
+
+          def sample_text(reader):
+              n=len(reader.pages)
+              ids=list(range(min(15,n)))
+              if n>30: ids += [n//3,n//2,(2*n)//3,n-2,n-1]
+              out=[]
+              for i in sorted(set(x for x in ids if 0<=x<n)):
+                  try: out.append(reader.pages[i].extract_text() or '')
+                  except Exception: pass
+              return re.sub(r'\s+',' ','\n'.join(out)).lower()
+
+          records=[]; hashes=set()
+          for idx,doc in enumerate(docs,1):
+              dest=dirs[doc['category']]/doc['filename']
+              final_url,raw=fetch(doc,dest)
+
+              q=subprocess.run(['qpdf','--check',str(dest)],capture_output=True,text=True)
+              if q.returncode not in (0,3):
+                  raise RuntimeError(f"qpdf hard failure {q.returncode}: {dest.name}\n{q.stdout}\n{q.stderr}")
+              qstatus='通过（有结构警告但文件可正常读取）' if q.returncode==3 else '通过'
+              qdetails=(q.stdout+'\n'+q.stderr).strip()[-3000:]
+
+              reader=PdfReader(str(dest),strict=False)
+              pages=len(reader.pages)
+              if pages < doc['min_pages']:
+                  raise RuntimeError(f"page count too small: {dest.name} {pages}")
+              text=sample_text(reader)
+              if not any(x in text for x in doc['identity']):
+                  raise RuntimeError('identity mismatch: '+dest.name)
+              if not any(x in text for x in doc['markers']):
+                  raise RuntimeError('type/date mismatch: '+dest.name)
+
+              for label,pageno in [('first',1),('last',pages)]:
+                  prefix=preview_dir/f'{idx:02d}_{label}'
+                  r=subprocess.run(['pdftoppm','-f',str(pageno),'-l',str(pageno),'-singlefile','-png','-r','72',str(dest),str(prefix)],capture_output=True,text=True)
+                  if r.returncode!=0 or not Path(str(prefix)+'.png').exists():
+                      raise RuntimeError(f'render failure {dest.name} page {pageno}: {r.stderr}')
+
+              sha=hashlib.sha256(raw).hexdigest()
+              if sha in hashes: raise RuntimeError('duplicate PDF: '+dest.name)
+              hashes.add(sha)
+              rec={
+                  'order':idx,'category':doc['category'],'filename':doc['filename'],
+                  'filing_date':doc['date'],'period_or_offering':doc['period'],'form':doc['form'],
+                  'pages':pages,'bytes':len(raw),'sha256':sha,'official_page':doc['page'],
+                  'official_pdf':final_url,'qpdf_status':qstatus,'qpdf_details':qdetails,
+                  'checks':['PDF文件头','qpdf结构检查','实际页数','公司及文件类型','首页和末页渲染','SHA-256','重复文件'],
+              }
+              records.append(rec)
+              print('VERIFIED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          lines=[
+              '# 文远知行（Nasdaq: WRD；HKEX: 0800）官方披露文件包','',
+              '截至2026年9月2日，本包收录公司官方年报页面列示的全部年度报告、纳斯达克IPO与香港全球发售对应的最终招股文件，以及最新季度财务披露。','',
+              '## 口径说明','',
+              '- 公司于2024年10月完成纳斯达克IPO，因此公开年报从2024年度开始；官方年报页面目前列示2024、2025两期。',
+              '- 美股IPO文件为SEC Form 424B4最终招股说明书。',
+              '- 香港全球发售文件为SEC Form 424B5最终招股说明书补充文件，覆盖香港公开发售与国际发售。',
+              '- 最新季度披露为2026年8月12日公布的2026年第二季度及上半年未经审计业绩，收入业绩新闻稿和对应SEC Form 6-K。','',
+              '## 文件清单',''
+          ]
+          for r in records:
+              lines += [
+                  f"### {r['order']}. {r['filename']}",
+                  f"- 类别：{r['category']}",f"- 发布/申报日：{r['filing_date']}",
+                  f"- 期间/发行事项：{r['period_or_offering']}",f"- 文件类型：{r['form']}",
+                  f"- 实际页数：{r['pages']}页",f"- SHA-256：{r['sha256']}",
+                  f"- qpdf：{r['qpdf_status']}",f"- 官方页面：{r['official_page']}",f"- 官方PDF：{r['official_pdf']}",'']
+          lines += ['## 校验','',
+                    '全部PDF均完成文件头、实际页数、公司名称和文件类型、首末页渲染、重复文件及SHA-256检查；ZIP完成CRC检查。qpdf返回结构警告的原始监管PDF保留原件，不擅自改写。','',
+                    '资料仅供研究和存档，版权归文远知行及相关监管披露平台所有。']
+          (root/'README_文件清单与口径说明.md').write_text('\n'.join(lines),encoding='utf-8')
+          (root/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['category']}/{r['filename']}\n" for r in records),encoding='utf-8')
+
+          zpath=Path(package+'.zip')
+          with zipfile.ZipFile(zpath,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file(): z.write(p,arcname=str(p))
+          with zipfile.ZipFile(zpath,'r') as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError('ZIP CRC failure: '+bad)
+              pdfs=[x for x in z.namelist() if x.lower().endswith('.pdf')]
+              if len(pdfs)!=6: raise RuntimeError(f'expected 6 PDFs, got {len(pdfs)}')
+          zsha=hashlib.sha256(zpath.read_bytes()).hexdigest()
+          summary={'zip_name':zpath.name,'zip_bytes':zpath.stat().st_size,'zip_sha256':zsha,'pdf_count':6,'records':records}
+          Path('PACKAGE_SUMMARY.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{zsha}  {zpath.name}\n',encoding='utf-8')
+          print('FINAL_ZIP',zpath.name,zpath.stat().st_size,zsha,flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: weride-official-filings-package-20260902-v4
+          path: |
+            文远知行_WRD_0800_所有年报_招股说明书_最新季报_官方文件.zip
+            PACKAGE_SUMMARY.json
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
