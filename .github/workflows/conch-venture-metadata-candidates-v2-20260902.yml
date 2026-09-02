@@ -1,0 +1,86 @@
+name: Enumerate China Conch Venture broker report candidates v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/conch-venture-metadata-candidates-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  enumerate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Enumerate all report candidates from public search metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json,time,re
+          from datetime import datetime, timezone
+          import requests
+
+          url='https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers={
+              'User-Agent':ua,'Accept':'application/json,text/plain,*/*',
+              'Content-Type':'application/json; charset=UTF-8',
+              'Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/',
+              'x-fp':'','x-bot':''
+          }
+          all_rows=[]
+          seen=set()
+          total_pages=None
+          for page in range(1,60):
+              payload={'keywords':'海螺创业','pageNum':page,'pageSize':20,'order':0}
+              success=False
+              for attempt in range(4):
+                  try:
+                      r=requests.post(url,headers=headers,json=payload,timeout=(20,120))
+                      r.raise_for_status(); obj=r.json(); data=obj.get('data') or {}
+                      rows=data.get('dataList') or []
+                      total_pages=int(data.get('pageCount') or 0)
+                      print('PAGE',page,'rows',len(rows),'count',data.get('count'),'pages',total_pages,'first_ids',[x.get('docId') for x in rows[:3]],flush=True)
+                      for row in rows:
+                          rid=row.get('docId')
+                          if rid in seen: continue
+                          seen.add(rid); all_rows.append(row)
+                      success=True
+                      break
+                  except Exception as e:
+                      print('RETRY',page,attempt,repr(e),flush=True); time.sleep(2*(attempt+1))
+              if not success:
+                  raise RuntimeError(f'Failed page {page}')
+              if total_pages and page>=total_pages:
+                  break
+          print('UNIQUE_ROWS',len(all_rows),flush=True)
+          candidates=[]
+          for row in all_rows:
+              title=re.sub(r'</?em>','',str(row.get('title') or ''),flags=re.I)
+              pages=int(row.get('pageNum') or 0)
+              org=str(row.get('orgName') or '')
+              dtype=int(row.get('docType') or -1)
+              rtype=int(row.get('reportType') or -1)
+              ts=int(row.get('pubTime') or 0)
+              date=datetime.fromtimestamp(ts,tz=timezone.utc).strftime('%Y-%m-%d') if ts else ''
+              stocks=row.get('stocks') or []
+              stock_text=json.dumps(stocks,ensure_ascii=False)
+              company_specific=(dtype==1 or rtype==11 or '00586' in stock_text or '海螺创业' in title)
+              excluded=any(k in title for k in ('年报','年報','中期报告','中期報告','季报','年度报告','招股书','导读','近况交流','晨会','周报','月报','行业'))
+              deep_signal=pages>=10 or bool(row.get('isDeep')) or any(k in title for k in ('深度','首次覆盖','底部反转','价值重估','现金流','分红','派息','股权价值','利润及现金流','重估','拐点'))
+              if company_specific and not excluded and deep_signal:
+                  candidates.append({
+                      'docId':row.get('docId'),'date':date,'org':org,'pages':pages,
+                      'title':title,'pdfPath':row.get('pdfPath'),'isDeep':row.get('isDeep'),
+                      'authors':row.get('authors'),'docType':dtype,'reportType':rtype,
+                      'language':row.get('language'),'stocks':stocks,
+                      'detail_url':f"https://www.fxbaogao.com/detail/{row.get('docId')}"
+                  })
+          candidates.sort(key=lambda x:(x['date'],x['pages']),reverse=True)
+          print('\n=== ALL_CANDIDATES',len(candidates),'===',flush=True)
+          print(json.dumps(candidates,ensure_ascii=False,indent=2),flush=True)
+          PY
