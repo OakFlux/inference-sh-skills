@@ -1,0 +1,45 @@
+name: Query related reports for REPT BATTERO correct id
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdy-related-correct-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: python -m pip install --quiet requests
+      - shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import concurrent.futures,json
+          from pathlib import Path
+          import requests
+          rid=768016
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':f'https://www.sdyanbao.com/detail/{rid}','Device':'1','X-Token':''}
+          calls=[('/api/file/detail',{'id':rid}),('/api/file/similarlist',{'id':rid,'pageSize':200}),('/api/file/sameOrganizationlist',{'id':rid,'pageSize':200})]
+          def one(x):
+            path,b=x
+            try:
+              r=requests.post('https://api.sdyanbao.com'+path,headers=h,json={**b,'opFrom':1},timeout=(5,30)); z={'path':path,'status':r.status_code,'bytes':len(r.content)}
+              try:z['json']=r.json()
+              except Exception:z['text']=r.text[:50000]
+            except Exception as e:z={'path':path,'error':repr(e)}
+            return z
+          with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:r=list(ex.map(one,calls))
+          Path('related_correct').mkdir(); Path('related_correct/result.json').write_text(json.dumps(r,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(r,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdy-related-correct
+          path: related_correct/
+          retention-days: 7
+          if-no-files-found: error
