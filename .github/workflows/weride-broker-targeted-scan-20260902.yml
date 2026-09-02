@@ -1,1 +1,154 @@
-placeholder
+name: Target scan WeRide broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-broker-targeted-scan-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Scan exact publication dates and probe PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import time
+          from io import BytesIO
+
+          import requests
+          from pypdf import PdfReader
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/report/stock.jshtml',
+          }
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          dates = [
+              '2025-11-14', '2025-11-15',
+              '2025-12-25', '2025-12-26', '2025-12-27',
+              '2026-01-07', '2026-01-08', '2026-01-09',
+              '2025-12-09', '2025-11-25',
+          ]
+          title_markers = [
+              '文远知行',
+              '知行全球，行于文远',
+              'L4智驾先行者',
+              '全球L4自动驾驶领导者',
+              '海外商业化落地拐点将至',
+              'RoboX商业化落地龙头',
+              '重视国内市场、深厚布局海外',
+          ]
+
+          def compact(value: object) -> str:
+              return re.sub(r'\s+', '', str(value or '')).lower()
+
+          matches: dict[str, dict] = {}
+          for date in dates:
+              for page in range(1, 31):
+                  params = {
+                      'pageNo': page,
+                      'pageSize': 500,
+                      'qType': 0,
+                      'beginTime': date,
+                      'endTime': date,
+                      'industryCode': '*',
+                      'rating': '*',
+                      'ratingChange': '*',
+                  }
+                  try:
+                      response = session.get(endpoint, params=params, headers=headers, timeout=(25, 150))
+                      print('QUERY', date, page, response.status_code, len(response.content), flush=True)
+                      response.raise_for_status()
+                      payload = response.json()
+                      rows = payload.get('data') or []
+                      total_pages = int(payload.get('TotalPage') or 0)
+                      print('META', date, page, len(rows), total_pages, payload.get('hits'), flush=True)
+                      for row in rows:
+                          raw = json.dumps(row, ensure_ascii=False)
+                          title = str(row.get('title') or '')
+                          stock_name = str(row.get('stockName') or '')
+                          hay = compact(raw)
+                          company_match = '文远知行' in raw or 'weride' in hay
+                          title_match = any(compact(marker) in compact(title) for marker in title_markers[1:])
+                          if not company_match and not title_match:
+                              continue
+                          key = str(row.get('infoCode') or raw)
+                          matches[key] = row
+                          print('MATCH', json.dumps({k: row.get(k) for k in (
+                              'infoCode','title','publishDate','orgSName','orgName','researcher',
+                              'stockName','stockCode','attachPages','attachSize','emRatingName','reportType','encodeUrl'
+                          )}, ensure_ascii=False), flush=True)
+                      if not rows or (total_pages and page >= total_pages):
+                          break
+                  except Exception as exc:
+                      print('ERROR', date, page, repr(exc), flush=True)
+                      time.sleep(1)
+                      continue
+
+          print('MATCH_COUNT', len(matches), flush=True)
+          working = []
+          for info_code, row in matches.items():
+              if not info_code.startswith('AP'):
+                  continue
+              for prefix in ('H3', 'H2'):
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info_code}_1.pdf'
+                  try:
+                      response = session.get(
+                          url,
+                          headers={
+                              'User-Agent': ua,
+                              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                              'Referer': 'https://data.eastmoney.com/',
+                          },
+                          timeout=(30, 300),
+                          allow_redirects=True,
+                      )
+                      print('PDF_GET', info_code, prefix, response.status_code, len(response.content), response.headers.get('content-type'), flush=True)
+                      if response.status_code != 200 or not response.content.startswith(b'%PDF-') or len(response.content) < 100000:
+                          continue
+                      reader = PdfReader(BytesIO(response.content), strict=False)
+                      pages = len(reader.pages)
+                      front = []
+                      for p in reader.pages[:min(10, pages)]:
+                          try:
+                              front.append(p.extract_text() or '')
+                          except Exception:
+                              pass
+                      text = compact('\n'.join(front))
+                      record = {
+                          'infoCode': info_code,
+                          'title': row.get('title'),
+                          'publishDate': row.get('publishDate'),
+                          'orgSName': row.get('orgSName'),
+                          'researcher': row.get('researcher'),
+                          'metadata_pages': row.get('attachPages'),
+                          'actual_pages': pages,
+                          'bytes': len(response.content),
+                          'url': response.url,
+                          'company_ok': '文远知行' in ''.join(front) or 'weride' in text,
+                      }
+                      working.append(record)
+                      print('WORKING', json.dumps(record, ensure_ascii=False), flush=True)
+                      break
+                  except Exception as exc:
+                      print('PDF_ERROR', info_code, prefix, repr(exc), flush=True)
+
+          print('WORKING_ALL', json.dumps(working, ensure_ascii=False, indent=2), flush=True)
+          PY
