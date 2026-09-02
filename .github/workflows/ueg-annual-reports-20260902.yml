@@ -1,0 +1,465 @@
+name: Package United Energy Group annual reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ueg-annual-reports-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4
+
+      - name: Discover, download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY_CN = '联合能源集团'
+          COMPANY_EN = 'UNITED ENERGY GROUP LIMITED'
+          CODE = '00467.HK'
+          STOCK_ID = '943'
+          PACKAGE = '联合能源集团_00467HK_2020-2025年报及最新财务披露'
+          OUT = Path(PACKAGE)
+          WORK = Path('_ueg_annual_work')
+          PREVIEW = WORK / 'preview'
+          OUT.mkdir(parents=True, exist_ok=True)
+          PREVIEW.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          search_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.8',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[^A-Z0-9\u4e00-\u9fff]+', '', value.upper())
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def extract_pdf_urls(obj) -> list[str]:
+              raw = html.unescape(json.dumps(obj, ensure_ascii=False)).replace('\\/', '/')
+              urls: list[str] = []
+              patterns = [
+                  r'https?://[^"\'<>\s]+?\.pdf(?:\?[^"\'<>\s]*)?',
+                  r'/listedco/listconews/[^"\'<>\s]+?\.pdf(?:\?[^"\'<>\s]*)?',
+              ]
+              for pattern in patterns:
+                  for value in re.findall(pattern, raw, flags=re.I):
+                      value = unquote(value).replace('\\u0026', '&')
+                      if value.startswith('/'):
+                          value = urljoin('https://www1.hkexnews.hk', value)
+                      value = value.rstrip('\\')
+                      if value not in urls:
+                          urls.append(value)
+              return urls
+
+          def normalize_rows(payload) -> list:
+              outer = payload
+              if isinstance(outer, dict) and 'result' in outer:
+                  outer = outer['result']
+              if isinstance(outer, str):
+                  text = html.unescape(outer)
+                  try:
+                      outer = json.loads(text)
+                  except Exception:
+                      soup = BeautifulSoup(text, 'html.parser')
+                      rows = []
+                      for anchor in soup.find_all('a', href=True):
+                          href = anchor.get('href', '')
+                          title = anchor.get_text(' ', strip=True)
+                          if '.pdf' in href.lower():
+                              rows.append({'TITLE': title, 'FILE_LINK': href})
+                      return rows
+              if isinstance(outer, list):
+                  return outer
+              if isinstance(outer, dict):
+                  rows = []
+                  for key in ('data', 'rows', 'items', 'result'):
+                      value = outer.get(key)
+                      if isinstance(value, list):
+                          rows.extend(value)
+                  return rows or [outer]
+              return []
+
+          def hkex_search(from_date: str, to_date: str) -> list[dict]:
+              endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              collected: list[dict] = []
+              for lang in ('en', 'zh'):
+                  params = {
+                      'sortDir': '0',
+                      'sortByOptions': 'DateTime',
+                      'category': '0',
+                      'market': 'SEHK',
+                      'stockId': STOCK_ID,
+                      'documentType': '-1',
+                      'fromDate': from_date,
+                      'toDate': to_date,
+                      'title': '',
+                      'searchType': '1',
+                      't1code': '40000',
+                      't2Gcode': '-2',
+                      't2code': '-2',
+                      'rowRange': '200',
+                      'lang': lang,
+                  }
+                  last_error = None
+                  for attempt in range(1, 5):
+                      try:
+                          response = session.get(
+                              endpoint,
+                              params=params,
+                              headers=search_headers,
+                              timeout=(30, 240),
+                          )
+                          print('HKEX_SEARCH', from_date, to_date, lang, response.status_code, len(response.content), response.url, flush=True)
+                          response.raise_for_status()
+                          rows = normalize_rows(response.json())
+                          for row in rows:
+                              if isinstance(row, dict):
+                                  collected.append(row)
+                          last_error = None
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          print('HKEX_SEARCH_RETRY', from_date, to_date, lang, attempt, repr(exc), flush=True)
+                          time.sleep(2 * attempt)
+                  if last_error is not None:
+                      raise RuntimeError(f'HKEX search failed for {from_date}-{to_date} {lang}: {last_error}')
+              print('HKEX_ROWS', from_date, to_date, len(collected), flush=True)
+              return collected
+
+          def row_text(row: dict) -> str:
+              return compact(json.dumps(row, ensure_ascii=False))
+
+          def discover_annual(year: int) -> list[str]:
+              rows = hkex_search(f'{year + 1}0101', f'{year + 1}0630')
+              candidates: list[str] = []
+              for row in rows:
+                  text = row_text(row)
+                  annual_marker = ('ANNUALREPORT' in text or '年報' in text or '年度報告' in text or '年报' in text or '年度报告' in text)
+                  excluded = any(term in text for term in ('INTERIM', '中期', 'ESG', 'ENVIRONMENTAL', 'SUSTAINABILITY', '業績公告', '业绩公告'))
+                  if annual_marker and str(year) in text and not excluded:
+                      for url in extract_pdf_urls(row):
+                          if url not in candidates:
+                              candidates.append(url)
+              print('ANNUAL_CANDIDATES', year, json.dumps(candidates, ensure_ascii=False), flush=True)
+              return candidates
+
+          def discover_latest_interim_results() -> list[str]:
+              rows = hkex_search('20260801', '20260902')
+              candidates: list[str] = []
+              for row in rows:
+                  text = row_text(row)
+                  if 'INTERIMRESULTS' in text and '2026' in text and ('30JUNE2026' in text or 'SIXMONTHSENDED30JUNE2026' in text):
+                      for url in extract_pdf_urls(row):
+                          if url not in candidates:
+                              candidates.append(url)
+              print('INTERIM_2026_CANDIDATES', json.dumps(candidates, ensure_ascii=False), flush=True)
+              return candidates
+
+          def discover_latest_quarterly_operational_update() -> list[str]:
+              rows = hkex_search('20250101', '20260902')
+              found: list[tuple[str, str]] = []
+              for row in rows:
+                  text = row_text(row)
+                  if 'OPERATIONALUPDATE' in text and 'QUARTER' in text:
+                      date_values = []
+                      for key, value in row.items():
+                          if 'DATE' in str(key).upper() or 'TIME' in str(key).upper():
+                              date_values.append(str(value))
+                      sort_key = max(date_values) if date_values else ''
+                      for url in extract_pdf_urls(row):
+                          found.append((sort_key, url))
+              found.sort(reverse=True)
+              candidates = []
+              for _, url in found:
+                  if url not in candidates:
+                      candidates.append(url)
+              print('QUARTERLY_UPDATE_CANDIDATES', json.dumps(candidates, ensure_ascii=False), flush=True)
+              return candidates
+
+          fixed_annual = {
+              2020: ['https://www.annualreports.com/HostedData/AnnualReportArchive/U/HKG_0467_2020.pdf'],
+              2021: ['https://www.annualreports.com/HostedData/AnnualReportArchive/U/HKG_0467_2021.pdf'],
+              2022: ['https://www.annualreports.com/HostedData/AnnualReportArchive/U/HKG_0467_2022.pdf'],
+              2023: ['https://www.annualreports.com/HostedData/AnnualReportArchive/U/HKG_0467_2023.pdf'],
+              2024: [
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0430/2025043000015.pdf',
+                  'https://www.annualreports.com/HostedData/AnnualReportArchive/U/HKG_0467_2024.pdf',
+              ],
+              2025: [
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0430/2026043000239.pdf',
+                  'https://www.annualreports.com/HostedData/AnnualReportArchive/U/HKG_0467_2025.pdf',
+              ],
+          }
+
+          def fetch_pdf(url: str) -> tuple[bytes, str]:
+              errors = []
+              referers = (
+                  'https://www1.hkexnews.hk/',
+                  'https://www.hkexnews.hk/',
+                  'https://www.ueg.com/',
+                  'https://www.annualreports.com/',
+              )
+              for attempt in range(1, 5):
+                  for referer in referers:
+                      try:
+                          response = session.get(
+                              url,
+                              headers={**pdf_headers, 'Referer': referer},
+                              timeout=(30, 900),
+                              allow_redirects=True,
+                          )
+                          print('PDF_GET', url, response.status_code, response.headers.get('content-type'), len(response.content), response.url, flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50000:
+                              return response.content, response.url
+                          errors.append(f'{response.status_code}/{len(response.content)}')
+                      except Exception as exc:
+                          errors.append(repr(exc))
+                  time.sleep(2 * attempt)
+              raise RuntimeError('; '.join(errors[-10:]))
+
+          def validate_pdf(path: Path, expected_year: int, kind: str, min_pages: int) -> dict:
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError('PDF signature missing')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'only {pages} pages; expected at least {min_pages}')
+
+              text_parts = []
+              for page in reader.pages[:min(55, pages)]:
+                  try:
+                      text_parts.append(page.extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, repr(exc), flush=True)
+              normalized = compact('\n'.join(text_parts))
+              if compact(COMPANY_EN) not in normalized and 'UNITEDENERGYGROUP' not in normalized:
+                  raise RuntimeError('company identity missing')
+              if str(expected_year) not in normalized:
+                  raise RuntimeError(f'expected year {expected_year} missing')
+
+              if kind == '年度报告':
+                  markers = ('ANNUALREPORT', '年報', '年度報告', '年报', '年度报告')
+              elif kind == '中期业绩公告':
+                  markers = ('INTERIMRESULTS', '中期業績', '中期业绩', 'SIXMONTHSENDED30JUNE')
+              else:
+                  markers = ('OPERATIONALUPDATE', 'FOURTHQUARTER', '季度', 'QUARTER')
+              if not any(marker in normalized for marker in markers):
+                  raise RuntimeError(f'{kind} marker missing')
+
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed: {check.stderr[-800:]}')
+
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f'{path.stem}_{label}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '80', str(path), str(prefix)],
+                      check=True,
+                      capture_output=True,
+                  )
+                  rendered = Path(str(prefix) + '.png')
+                  if not rendered.exists() or rendered.stat().st_size < 1000:
+                      raise RuntimeError(f'{label}-page render verification failed')
+
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'language': '英文/双语封面',
+              }
+
+          def obtain(expected_year: int, kind: str, filename_prefix: str, urls: list[str], min_pages: int) -> dict:
+              unique_urls = []
+              for url in urls:
+                  if url and url not in unique_urls:
+                      unique_urls.append(url)
+              errors = []
+              for index, url in enumerate(unique_urls, 1):
+                  temp = WORK / f'{filename_prefix}_{index}.pdf'
+                  try:
+                      pdf_bytes, final_url = fetch_pdf(url)
+                      temp.write_bytes(pdf_bytes)
+                      meta = validate_pdf(temp, expected_year, kind, min_pages)
+                      filename = f'{filename_prefix}_{meta["pages"]}页.pdf'
+                      dest = OUT / filename
+                      shutil.copy2(temp, dest)
+                      record = {
+                          'filename': filename,
+                          'period': expected_year,
+                          'report_type': kind,
+                          'requested_url': url,
+                          'source_url': final_url,
+                          **meta,
+                      }
+                      print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+                      return record
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc}')
+                      print('REJECTED', expected_year, kind, url, repr(exc), flush=True)
+                      temp.unlink(missing_ok=True)
+              raise RuntimeError(f'All candidates failed for {filename_prefix}:\n' + '\n'.join(errors))
+
+          records = []
+          for index, year in enumerate(range(2020, 2026), 1):
+              records.append(
+                  obtain(
+                      expected_year=year,
+                      kind='年度报告',
+                      filename_prefix=f'{index:02d}_{COMPANY_CN}_{year}年年度报告',
+                      urls=discover_annual(year) + fixed_annual.get(year, []),
+                      min_pages=100,
+                  )
+              )
+
+          interim_urls = discover_latest_interim_results()
+          records.append(
+              obtain(
+                  expected_year=2026,
+                  kind='中期业绩公告',
+                  filename_prefix=f'07_{COMPANY_CN}_2026年中期业绩公告_截至2026年6月30日',
+                  urls=interim_urls,
+                  min_pages=20,
+              )
+          )
+
+          quarterly_urls = discover_latest_quarterly_operational_update()
+          records.append(
+              obtain(
+                  expected_year=2025,
+                  kind='季度经营更新',
+                  filename_prefix=f'08_{COMPANY_CN}_2025年第四季度经营更新',
+                  urls=quarterly_urls,
+                  min_pages=5,
+              )
+          )
+
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 verified PDFs, got {len(records)}')
+          if len({record['sha256'] for record in records}) != len(records):
+              raise RuntimeError('Duplicate PDF detected')
+
+          csv_path = OUT / '来源与校验清单.csv'
+          with csv_path.open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '文件名', '报告期', '报告类型', '语言', '页数', '文件大小_字节', 'SHA256', '最终下载地址', '候选来源地址']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for i, record in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': i,
+                      '文件名': record['filename'],
+                      '报告期': record['period'],
+                      '报告类型': record['report_type'],
+                      '语言': record['language'],
+                      '页数': record['pages'],
+                      '文件大小_字节': record['bytes'],
+                      'SHA256': record['sha256'],
+                      '最终下载地址': record['source_url'],
+                      '候选来源地址': record['requested_url'],
+                  })
+
+          readme_lines = [
+              f'{COMPANY_CN}（{COMPANY_EN.title()}，{CODE}）',
+              '2020-2025年年度报告及最新财务披露资料包',
+              '',
+              '一、收录文件',
+          ]
+          for i, record in enumerate(records, 1):
+              readme_lines.append(
+                  f"{i}. {record['filename']}｜{record['report_type']}｜{record['pages']}页｜SHA-256：{record['sha256']}"
+              )
+          readme_lines += [
+              '',
+              '二、“最新季报”的口径说明',
+              '联合能源集团为香港联交所主板上市公司，并无按A股口径强制发布第一季度、第三季度财务报告的常规定期披露安排。',
+              '截至2026年9月2日，最新正式财务披露为2026年8月31日发布的“截至2026年6月30日止六个月中期业绩公告”，本包将其作为最新财务定期披露收录。',
+              '公司最近一份明确按季度发布的经营资料为2026年1月30日披露的“2025年第四季度经营更新”，本包亦同时收录，以覆盖用户所称“最新季报”的季度经营口径。',
+              '',
+              '三、核验项目',
+              '每份PDF均已核对文件头、公司名称、报告期、报告类型、实际页数、qpdf结构、首页与末页渲染、SHA-256及重复文件。',
+              '压缩包已执行ZIP CRC完整性检查。',
+              '',
+              '资料来源以香港交易所披露易原始文件为主；AnnualReports仅作为官方链接异常时的备用来源。',
+              '资料仅供研究使用，版权归联合能源集团及相关披露平台所有，不构成投资建议。',
+          ]
+          (OUT / '资料包说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(f'{PACKAGE}.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 8')
+
+          bundle_sha = sha256(zip_path)
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{bundle_sha}  {zip_path.name}\n', encoding='utf-8')
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, bundle_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ueg-annual-reports-20260902-final
+          path: |
+            联合能源集团_00467HK_2020-2025年报及最新财务披露/
+            联合能源集团_00467HK_2020-2025年报及最新财务披露.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
