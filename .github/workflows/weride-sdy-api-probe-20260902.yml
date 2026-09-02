@@ -1,0 +1,117 @@
+name: Probe public Sdyanbao APIs for WeRide report files
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-sdy-api-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Probe unauthenticated API responses and public object paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          from io import BytesIO
+
+          import requests
+          from pypdf import PdfReader
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          base_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www.sdyanbao.com/detail/940420',
+              'Origin': 'https://www.sdyanbao.com',
+          }
+
+          def show(label: str, response: requests.Response) -> None:
+              print('\n===', label, '===', flush=True)
+              print('STATUS', response.status_code, 'TYPE', response.headers.get('content-type'), 'BYTES', len(response.content), 'URL', response.url, flush=True)
+              if response.content.startswith(b'%PDF-'):
+                  try:
+                      print('PDF_PAGES', len(PdfReader(BytesIO(response.content), strict=False).pages), flush=True)
+                  except Exception as exc:
+                      print('PDF_PARSE_ERROR', repr(exc), flush=True)
+              else:
+                  print('BODY', response.text[:20000], flush=True)
+
+          endpoints = [
+              ('POST_JSON_DETAIL', 'https://www.sdyanbao.com/api/file/detail', 'post', {'id': 940420}, 'json'),
+              ('POST_FORM_DETAIL', 'https://www.sdyanbao.com/api/file/detail', 'post', {'id': 940420}, 'form'),
+              ('GET_DETAIL', 'https://www.sdyanbao.com/api/file/detail?id=940420', 'get', None, None),
+              ('POST_JSON_DOWNLOAD_ID', 'https://www.sdyanbao.com/api/file/download', 'post', {'id': 940420}, 'json'),
+              ('POST_FORM_DOWNLOAD_ID', 'https://www.sdyanbao.com/api/file/download', 'post', {'id': 940420}, 'form'),
+              ('POST_JSON_DOWNLOAD_ORIGINAL', 'https://www.sdyanbao.com/api/file/download', 'post', {'id': 940420, 'original_id': 1280461}, 'json'),
+              ('POST_JSON_DOWNLOAD_FULL', 'https://www.sdyanbao.com/api/file/download', 'post', {'file_id': 940420, 'id': 940420, 'original_id': 1280461, 'data_source_uuid': '3_71b2d396-c19d-3829-945e-79ce3dd9cf5e'}, 'json'),
+              ('GET_DOWNLOAD', 'https://www.sdyanbao.com/api/file/download?id=940420', 'get', None, None),
+          ]
+          for label, url, method, payload, mode in endpoints:
+              try:
+                  if method == 'get':
+                      response = session.get(url, headers=base_headers, timeout=(20, 120), allow_redirects=True)
+                  elif mode == 'json':
+                      response = session.post(url, json=payload, headers={**base_headers, 'Content-Type': 'application/json'}, timeout=(20, 120), allow_redirects=True)
+                  else:
+                      response = session.post(url, data=payload, headers=base_headers, timeout=(20, 120), allow_redirects=True)
+                  show(label, response)
+              except Exception as exc:
+                  print('\n===', label, 'ERROR ===', repr(exc), flush=True)
+
+          # The page's public preview object exposes the object namespace. Probe only natural public-object variants;
+          # no login cookie, token, signature, or access-control bypass is used.
+          roots = [
+              'https://oss.sdyanbao.com',
+              'http://oss.sdyanbao.com',
+          ]
+          paths = [
+              '/file/2026/1/5/1280461.pdf',
+              '/files/2026/1/5/1280461.pdf',
+              '/pdf/2026/1/5/1280461.pdf',
+              '/report/2026/1/5/1280461.pdf',
+              '/upload/2026/1/5/1280461.pdf',
+              '/source/2026/1/5/1280461.pdf',
+              '/original/2026/1/5/1280461.pdf',
+              '/page/2026/1/5/1280461.pdf',
+              '/page/2026/1/5/1280461/1280461.pdf',
+              '/page/2026/1/5/1280461/original.pdf',
+              '/page/2026/1/5/1280461/source.pdf',
+              '/page/2026/1/5/1280461/0.pdf',
+              '/page/2026/1/5/1280461/27.pdf',
+          ]
+          for root in roots:
+              for path in paths:
+                  url = root + path
+                  try:
+                      response = session.get(
+                          url,
+                          headers={
+                              'User-Agent': ua,
+                              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                              'Referer': 'https://www.sdyanbao.com/detail/940420',
+                          },
+                          timeout=(15, 90),
+                          allow_redirects=True,
+                      )
+                      sig = response.content[:12]
+                      print('OBJECT_PROBE', response.status_code, response.headers.get('content-type'), len(response.content), sig, url, '=>', response.url, flush=True)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF-'):
+                          print('FOUND_PUBLIC_PDF', url, response.url, len(response.content), len(PdfReader(BytesIO(response.content), strict=False).pages), flush=True)
+                  except Exception as exc:
+                      print('OBJECT_ERROR', url, repr(exc), flush=True)
+          PY
