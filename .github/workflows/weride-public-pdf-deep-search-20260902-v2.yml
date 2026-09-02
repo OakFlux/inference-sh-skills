@@ -1,0 +1,248 @@
+name: Deep search public WeRide broker PDFs v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-public-pdf-deep-search-20260902-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Search and verify public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 pypdf ddgs
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, os, re, time
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          try:
+              from ddgs import DDGS
+          except Exception:
+              DDGS = None
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          H={'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          QUERIES=[
+              '"文远知行" 券商 深度报告 pdf',
+              '"文远知行" "证券研究报告" pdf',
+              '"文远知行" "公司深度" pdf',
+              '"文远知行" "首次覆盖" pdf',
+              '"文远知行" "国信证券" pdf',
+              '"全球L4级自动驾驶产品及解决方案先行者"',
+              '"文远知行" "招商证券" pdf',
+              '"L4智驾先行者" "文远知行"',
+              '"加速Robotaxi全球布局" pdf',
+              '"00800.HK" 券商 研报 pdf',
+              '"0800.HK" 券商 研报 pdf',
+              '"WRD.O" 券商 研报 pdf',
+              '"WeRide" broker research report pdf',
+              '"WeRide Inc." initiation report pdf',
+              '"WeRide" equity research pdf',
+              'site:pdf.dfcfw.com 文远知行',
+              'site:stockn.xueqiu.com 文远知行 pdf',
+              'site:research.95579.com 文远知行',
+              'site:pdf.hanspub.org 文远知行',
+              'site:pdf-oss.* 文远知行',
+              'site:static-file.* 文远知行 研报',
+              '文远知行 国泰海通 研报',
+              '文远知行 中信建投 研报',
+              '文远知行 华泰证券 研报',
+              '文远知行 中金公司 研报',
+              '文远知行 东吴证券 研报',
+              '文远知行 浙商证券 研报',
+              '文远知行 光大证券 研报',
+              '文远知行 中银国际 研报',
+              '文远知行 广发证券 研报',
+          ]
+          sess=requests.Session(); sess.trust_env=False
+          results=[]; urls=set(); errors=[]
+
+          def add_result(engine,q,title,url,snippet=''):
+              if not url or not url.startswith('http'): return
+              url=html.unescape(url)
+              if 'duckduckgo.com/l/?' in url:
+                  try:
+                      url=parse_qs(urlparse(url).query).get('uddg',[url])[0]
+                  except Exception: pass
+              urls.add(url)
+              results.append({'engine':engine,'query':q,'title':title,'url':url,'snippet':snippet})
+
+          if DDGS:
+              for q in QUERIES:
+                  try:
+                      with DDGS(timeout=20) as d:
+                          for x in d.text(q,region='cn-zh',safesearch='off',max_results=30):
+                              add_result('ddgs',q,x.get('title',''),x.get('href') or x.get('url',''),x.get('body',''))
+                  except Exception as e:
+                      errors.append({'engine':'ddgs','q':q,'error':repr(e)})
+                  time.sleep(.2)
+
+          def bing(q):
+              u='https://www.bing.com/search?q='+quote_plus(q)+'&count=50&setlang=zh-cn'
+              r=sess.get(u,headers=H,timeout=(15,60)); r.raise_for_status()
+              soup=BeautifulSoup(r.text,'html.parser')
+              for li in soup.select('li.b_algo'):
+                  a=li.select_one('h2 a')
+                  if not a: continue
+                  p=li.select_one('.b_caption p')
+                  add_result('bing',q,a.get_text(' ',strip=True),a.get('href',''),p.get_text(' ',strip=True) if p else '')
+          for q in QUERIES:
+              try: bing(q)
+              except Exception as e: errors.append({'engine':'bing','q':q,'error':repr(e)})
+              time.sleep(.25)
+
+          # Google lightweight HTML, useful for indexed direct object-storage URLs.
+          for q in QUERIES[:20]:
+              try:
+                  u='https://www.google.com/search?q='+quote_plus(q)+'&num=50&hl=zh-CN&filter=0'
+                  r=sess.get(u,headers=H,timeout=(15,60)); r.raise_for_status()
+                  soup=BeautifulSoup(r.text,'html.parser')
+                  for a in soup.select('a[href]'):
+                      href=a.get('href','')
+                      if href.startswith('/url?'):
+                          href=parse_qs(urlparse(href).query).get('q',[''])[0]
+                      if href.startswith('http') and 'google.' not in urlparse(href).netloc:
+                          add_result('google',q,a.get_text(' ',strip=True),href,'')
+              except Exception as e: errors.append({'engine':'google','q':q,'error':repr(e)})
+              time.sleep(.4)
+
+          # Supplemental Baidu HTML search.
+          for q in QUERIES[:20]:
+              try:
+                  u='https://www.baidu.com/s?wd='+quote_plus(q)+'&rn=50'
+                  r=sess.get(u,headers=H,timeout=(15,60)); r.raise_for_status()
+                  soup=BeautifulSoup(r.text,'html.parser')
+                  for block in soup.select('.result, .c-container'):
+                      a=block.select_one('h3 a')
+                      if a:
+                          add_result('baidu',q,a.get_text(' ',strip=True),a.get('href',''),block.get_text(' ',strip=True)[:500])
+              except Exception as e: errors.append({'engine':'baidu','q':q,'error':repr(e)})
+              time.sleep(.25)
+
+          # Deduplicate and crawl plausible pages for embedded public PDF URLs.
+          candidates=set(urls)
+          pdf_url_re=re.compile(r'https?://[^\s"\'<>\\]+?\.pdf(?:\?[^\s"\'<>\\]*)?',re.I)
+          interesting=('文远','weride','00800','0800','wrd','5095181','1010236','1156306286569197568','1218993723300515840','dfcfw','fxbaogao','sgpjbg','reportify','pdf')
+          crawl_urls=[u for u in urls if any(k in unquote(u).lower() for k in interesting)]
+          crawl_urls=crawl_urls[:500]
+          crawled=[]
+          for idx,u in enumerate(crawl_urls):
+              try:
+                  r=sess.get(u,headers={**H,'Accept':'text/html,application/xhtml+xml,application/pdf,*/*'},timeout=(12,50),allow_redirects=True)
+                  ct=(r.headers.get('content-type') or '').lower()
+                  rec={'url':u,'final_url':r.url,'status':r.status_code,'content_type':ct,'bytes':len(r.content)}
+                  crawled.append(rec)
+                  candidates.add(r.url)
+                  if r.content.startswith(b'%PDF-') or 'application/pdf' in ct:
+                      continue
+                  if len(r.content)>5_000_000: continue
+                  text=r.text
+                  for m in pdf_url_re.findall(text): candidates.add(html.unescape(m))
+                  soup=BeautifulSoup(text,'html.parser')
+                  for tag in soup.find_all(['a','iframe','embed','object','source'],href=True):
+                      href=urljoin(r.url,tag['href'])
+                      if '.pdf' in href.lower() or any(x in href.lower() for x in ('download','file','report')):
+                          candidates.add(href)
+                  for tag in soup.find_all(['iframe','embed','script','source'],src=True):
+                      src=urljoin(r.url,tag['src'])
+                      if '.pdf' in src.lower(): candidates.add(src)
+                  # Find escaped PDF URLs in JSON/JS blobs.
+                  dec=unquote(text).replace('\\/','/')
+                  for m in pdf_url_re.findall(dec): candidates.add(html.unescape(m))
+              except Exception as e:
+                  crawled.append({'url':u,'error':repr(e)})
+              if idx % 50 == 0: print('CRAWL',idx,'/',len(crawl_urls),flush=True)
+
+          # Add exact known report pages and common downloadable URL variants.
+          known_pages=[
+              'https://www.fxbaogao.com/detail/5095181',
+              'https://www.sgpjbg.com/bgdown/1010236.html',
+              'https://reportify.cn/reports/1156306286569197568',
+              'https://reportify.cn/reports/1218993723300515840',
+          ]
+          candidates.update(known_pages)
+
+          def clean_url(u):
+              return u.strip().rstrip(').,;\'"')
+          candidates={clean_url(u) for u in candidates if u.startswith('http')}
+
+          # Validate direct PDFs. To reduce load, prioritize .pdf/object-store URLs and report endpoints.
+          prio=[]
+          for u in candidates:
+              score=0; low=unquote(u).lower()
+              if '.pdf' in low: score+=10
+              if any(k in low for k in ('dfcfw','xueqiu','oss','cos','cdn','static','file','download')): score+=5
+              if any(k in low for k in ('文远','weride','00800','0800','wrd','5095181','1010236')): score+=5
+              prio.append((score,u))
+          prio=sorted(prio,reverse=True)[:1200]
+
+          verified=[]; tested=[]
+          identity_needles=['文远知行','文遠知行','WeRide','WRD.O','00800.HK','0800.HK']
+          broker_needles=['证券','證券','Securities','Research','研究报告','研究報告']
+          for i,(score,u) in enumerate(prio):
+              low=u.lower()
+              if score<10 and not any(k in low for k in ('download','pdf','report')): continue
+              try:
+                  r=sess.get(u,headers={**H,'Accept':'application/pdf,application/octet-stream,text/html;q=0.8,*/*;q=0.5','Referer':'https://www.baidu.com/'},timeout=(15,120),allow_redirects=True)
+                  rec={'url':u,'final_url':r.url,'status':r.status_code,'content_type':r.headers.get('content-type'),'bytes':len(r.content),'score':score}
+                  tested.append(rec)
+                  if r.status_code!=200 or not r.content.startswith(b'%PDF-') or len(r.content)<100_000:
+                      continue
+                  try:
+                      rd=PdfReader(BytesIO(r.content),strict=False)
+                      pages=len(rd.pages)
+                      text=''
+                      sample_pages=list(range(min(8,pages)))
+                      if pages>8: sample_pages += [pages-1]
+                      for p in sample_pages:
+                          try: text += (rd.pages[p].extract_text() or '')+'\n'
+                          except Exception: pass
+                      norm=re.sub(r'\s+',' ',text)
+                      identity=any(n.lower() in norm.lower() for n in identity_needles)
+                      broker=any(n.lower() in norm.lower() for n in broker_needles)
+                      verified.append({'url':u,'final_url':r.url,'pages':pages,'bytes':len(r.content),'identity':identity,'broker_like':broker,'sample':norm[:6000]})
+                  except Exception as e:
+                      rec['pdf_error']=repr(e)
+              except Exception as e:
+                  tested.append({'url':u,'error':repr(e),'score':score})
+              if i % 100 == 0: print('TEST',i,'/',len(prio),'VERIFIED',len(verified),flush=True)
+
+          out={
+              'queries':QUERIES,
+              'search_results':results,
+              'unique_search_urls':len(urls),
+              'crawled':crawled,
+              'candidate_count':len(candidates),
+              'tested':tested,
+              'verified_pdfs':verified,
+              'errors':errors,
+          }
+          Path('research_output').mkdir(exist_ok=True)
+          Path('research_output/weride_public_pdf_search_20260902.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SUMMARY',json.dumps({'search_results':len(results),'unique_urls':len(urls),'crawled':len(crawled),'candidate_count':len(candidates),'tested':len(tested),'verified':len(verified),'identity_verified':sum(1 for x in verified if x['identity'])},ensure_ascii=False),flush=True)
+          for x in verified:
+              if x['identity']:
+                  print('IDENTITY_PDF',json.dumps(x,ensure_ascii=False),flush=True)
+          PY
+      - name: Commit search results
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add research_output/weride_public_pdf_search_20260902.json
+          git commit -m 'Add WeRide public PDF deep-search results' || exit 0
+          git push
