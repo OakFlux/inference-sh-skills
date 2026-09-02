@@ -1,0 +1,272 @@
+name: Package China Everbright Limited complete broker deep reports v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/china-everbright-broker-package-v2-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF validation dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pillow
+
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          COMPANY = '中国光大控股'
+          TICKER = '00165.HK'
+          PACKAGE = '中国光大控股_00165HK_券商深度报告_2份_完整原版PDF'
+          OUT = Path(PACKAGE)
+          PREVIEW = Path('_previews')
+          OUT.mkdir(exist_ok=True)
+          PREVIEW.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'order': 1,
+                  'institution': '天风证券',
+                  'date': '2021-12-06',
+                  'title': '中国领先的跨境资产管理投资稀缺标的',
+                  'report_type': '首次覆盖报告',
+                  'expected_pages': 16,
+                  'filename': '01_天风证券_中国光大控股_中国领先的跨境资产管理投资稀缺标的_2021-12-06_16页.pdf',
+                  'urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP202112071533346305_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H2_AP202112071533346305_1.pdf',
+                  ],
+                  'referer': 'https://data.eastmoney.com/',
+                  'identity_terms': ['中国光大控股', '00165'],
+                  'title_terms': ['中国领先的跨境资产管理投资稀缺标的'],
+                  'institution_terms': ['天风证券'],
+                  'date_terms': ['2021年12月06日', '2021年12月6日', '2021-12-06'],
+              },
+              {
+                  'order': 2,
+                  'institution': '广发证券',
+                  'date': '2020-03-29',
+                  'title': '壮大资管，开启价值发现之旅',
+                  'report_type': '公司深度研究／首次覆盖',
+                  'expected_pages': 29,
+                  'filename': '02_广发证券_中国光大控股_壮大资管开启价值发现之旅_2020-03-29_29页.pdf',
+                  'urls': [
+                      'https://img3.gelonghui.com/pdf/e131e-8bda7f07-3f6b-4194-b242-2f1f4a9fe4dc.pdf',
+                  ],
+                  'referer': 'https://www.gelonghui.com/',
+                  'identity_terms': ['中国光大控股', '00165'],
+                  'title_terms': ['壮大资管', '开启价值发现之旅'],
+                  'institution_terms': ['广发证券'],
+                  'date_terms': ['2020-03-29', '2020年3月29日', '2020年03月29日'],
+              },
+          ]
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def fetch_pdf(item: dict) -> tuple[bytes, str]:
+              errors = []
+              for url in item['urls']:
+                  for attempt in range(1, 7):
+                      try:
+                          r = session.get(
+                              url,
+                              headers={
+                                  'User-Agent': ua,
+                                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                                  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+                                  'Referer': item['referer'],
+                                  'Cache-Control': 'no-cache',
+                                  'Pragma': 'no-cache',
+                              },
+                              timeout=(30, 300),
+                              allow_redirects=True,
+                          )
+                          ctype = r.headers.get('content-type', '')
+                          print('GET', item['order'], url, r.status_code, ctype, len(r.content), r.url, flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 200_000:
+                              return r.content, r.url
+                          errors.append(f'{url}: status={r.status_code}; type={ctype}; bytes={len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{url}: {exc!r}')
+                      time.sleep(attempt * 2)
+              raise RuntimeError('Download failed\n' + '\n'.join(errors[-12:]))
+
+          def compact(text: str) -> str:
+              return re.sub(r'\s+', '', text).upper()
+
+          records = []
+          seen_hashes = set()
+          for item in reports:
+              data, final_url = fetch_pdf(item)
+              path = OUT / item['filename']
+              path.write_bytes(data)
+
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages != item['expected_pages']:
+                  raise RuntimeError(f"Page mismatch for {path.name}: actual {pages}, expected {item['expected_pages']}")
+
+              extracted = []
+              for page in reader.pages[:min(12, pages)]:
+                  try:
+                      extracted.append(page.extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, repr(exc), flush=True)
+              text = compact('\n'.join(extracted))
+              for term in item['identity_terms']:
+                  if compact(term) not in text:
+                      raise RuntimeError(f'Identity term missing in {path.name}: {term}')
+              if not all(compact(term) in text for term in item['title_terms']):
+                  raise RuntimeError(f'Title validation failed for {path.name}')
+              if not any(compact(term) in text for term in item['institution_terms']):
+                  raise RuntimeError(f'Institution validation failed for {path.name}')
+              # Date formatting differs among PDFs; require year and report date metadata in filename,
+              # while searching the first pages for at least the report year.
+              if item['date'][:4] not in text:
+                  raise RuntimeError(f'Report year missing in {path.name}')
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {path.name}: {qpdf.stderr[-1000:]}')
+
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f"{item['order']:02d}_{label}"
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '120', str(path), str(prefix)],
+                      check=True,
+                      capture_output=True,
+                  )
+                  png = Path(str(prefix) + '.png')
+                  if not png.exists() or png.stat().st_size < 10_000:
+                      raise RuntimeError(f'Render failed for {path.name}: {label}')
+                  with Image.open(png) as im:
+                      if im.width < 500 or im.height < 700:
+                          raise RuntimeError(f'Render dimensions invalid for {path.name}: {label} {im.size}')
+
+              digest = sha256_bytes(data)
+              if digest in seen_hashes:
+                  raise RuntimeError('Duplicate PDF detected')
+              seen_hashes.add(digest)
+              record = {
+                  'order': item['order'],
+                  'company': COMPANY,
+                  'ticker': TICKER,
+                  'institution': item['institution'],
+                  'date': item['date'],
+                  'title': item['title'],
+                  'report_type': item['report_type'],
+                  'filename': item['filename'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': final_url,
+                  'source_format': '券商完整原版PDF',
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 2 or sum(r['pages'] for r in records) != 45:
+              raise RuntimeError('Final report count/page total validation failed')
+
+          lines = [
+              f'{COMPANY}（{TICKER}）券商深度报告合集',
+              '整理日期：2026-09-02',
+              '',
+              '本包收录2份能够完整公开下载并逐页核验的券商公司深度/首次覆盖原版PDF。',
+              '没有使用网页摘要、仅两页预览、二次整理稿或自行改写内容补足数量。',
+              '',
+              '一、报告清单',
+          ]
+          for r in records:
+              lines.extend([
+                  f"{r['order']}. {r['institution']}：《{r['title']}》",
+                  f"   日期：{r['date']}；类型：{r['report_type']}；实际页数：{r['pages']}页",
+                  f"   文件：{r['filename']}",
+                  f"   SHA-256：{r['sha256']}",
+                  f"   原始PDF：{r['source_url']}",
+                  '',
+              ])
+          lines.extend([
+              '二、筛选说明',
+              '已识别到2025年国泰海通证券、2026年国金证券的更新深度报告，但其公开页面仅提供前两页预览，未将不完整文件混入本包。',
+              '',
+              '三、核验项目',
+              'PDF文件头、文件结构、实际页数、公司名称及证券代码、机构与标题、首页和末页渲染、文件重复性、SHA-256、ZIP CRC。',
+              '',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (OUT / '00_报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          with (OUT / '报告清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','机构','报告日期','报告标题','报告类型','页数','文件大小_字节','SHA256','原始PDF','文件名']
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader()
+              for r in records:
+                  w.writerow({
+                      '序号': r['order'], '机构': r['institution'], '报告日期': r['date'],
+                      '报告标题': r['title'], '报告类型': r['report_type'], '页数': r['pages'],
+                      '文件大小_字节': r['bytes'], 'SHA256': r['sha256'],
+                      '原始PDF': r['source_url'], '文件名': r['filename'],
+                  })
+
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8'
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for path in sorted(OUT.iterdir()):
+                  z.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [x for x in z.namelist() if x.lower().endswith('.pdf')]
+              if len(pdfs) != 2:
+                  raise RuntimeError(f'ZIP PDF count is {len(pdfs)}, expected 2')
+          bundle_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{bundle_sha}  {zip_path.name}\n', encoding='utf-8')
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, bundle_sha, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-broker-deep-reports-final-v2
+          path: |
+            中国光大控股_00165HK_券商深度报告_2份_完整原版PDF/
+            中国光大控股_00165HK_券商深度报告_2份_完整原版PDF.zip
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
