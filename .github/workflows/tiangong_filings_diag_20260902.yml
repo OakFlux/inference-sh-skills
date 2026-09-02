@@ -1,0 +1,79 @@
+name: Tiangong filings discovery 20260902
+
+on:
+  push:
+    paths:
+      - '.github/workflows/tiangong_filings_diag_20260902.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Discover report endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, html
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('tiangong-filings-diag'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          urls=[
+            'https://www.tggj.cn/report.html',
+            'https://tc.tggj.cn/report.html',
+            'https://en.tggj.cn/report.html',
+            'https://iframesolution.website.wisdomir.com/main/page2.php?id=763&lang=en',
+            'https://iframesolution.website.wisdomir.com/main/page2.php?id=763&lang=tc',
+            'https://iframesolution.website.wisdomir.com/main/page2.php?id=763&lang=sc',
+            'http://iframesolution.website.wisdomir.com/main/page2.php?id=763&lang=en',
+          ]
+          all_links=[]
+          for i,url in enumerate(urls,1):
+            rec={'requested':url}
+            try:
+              r=s.get(url,headers=headers,timeout=(20,120),allow_redirects=True)
+              rec.update(status=r.status_code,bytes=len(r.content),final_url=r.url,type=r.headers.get('content-type'))
+              print('FETCH',json.dumps(rec,ensure_ascii=False),flush=True)
+              (out/f'{i:02d}.html').write_bytes(r.content)
+              text=r.text
+              soup=BeautifulSoup(text,'lxml')
+              title=soup.title.get_text(' ',strip=True) if soup.title else ''
+              print('TITLE',i,title,flush=True)
+              for tag in soup.find_all(True):
+                for attr in ('href','src','action','data-url','data-file','data-src'):
+                  val=tag.get(attr)
+                  if isinstance(val,str) and val.strip():
+                    absu=urljoin(r.url,html.unescape(val.strip()))
+                    context=' '.join(tag.get_text(' ',strip=True).split())[:500]
+                    item={'from':r.url,'tag':tag.name,'attr':attr,'url':absu,'context':context}
+                    all_links.append(item)
+                    if any(k in absu.lower() for k in ('.pdf','report','download','file','ajax','api','json','page2')) or any(k in context.lower() for k in ('annual','interim','年报','中期')):
+                      print('LINK',json.dumps(item,ensure_ascii=False),flush=True)
+              for raw in re.findall(r'https?://[^\"\'<>\s\\]+',text,re.I):
+                if any(k in raw.lower() for k in ('.pdf','report','download','file','ajax','api','json')):
+                  print('RAW',raw[:2000],flush=True)
+              for line in text.splitlines():
+                low=line.lower()
+                if any(k in low for k in ('pdf','annual','interim','download','ajax','api','fileurl','report')):
+                  print('LINE',i,line.strip()[:5000],flush=True)
+            except Exception as e:
+              rec['error']=repr(e); print('ERROR',json.dumps(rec,ensure_ascii=False),flush=True)
+          (out/'links.json').write_text(json.dumps(all_links,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiangong-filings-diag-20260902
+          path: tiangong-filings-diag/
+          if-no-files-found: error
+          retention-days: 7
