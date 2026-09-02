@@ -1,0 +1,332 @@
+name: Package China Everbright Limited reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/china-everbright-annual-reports-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf beautifulsoup4
+
+      - name: Download, verify and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, html, json, re, shutil, subprocess, time, zipfile
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '中国光大控股_2020-2025年报及2026年最新中期业绩'
+          OUT = Path(PACKAGE)
+          WORK = Path('_work')
+          PREVIEW = WORK / 'preview'
+          OUT.mkdir(exist_ok=True)
+          PREVIEW.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-TW,zh;q=0.9,en;q=0.7',
+          }
+          html_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/html,*/*',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+
+          def compact(text):
+              return re.sub(r'\s+', '', text).upper()
+
+          def digest(path):
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def fetch_pdf(url):
+              errors = []
+              for attempt in range(1, 4):
+                  for referer in ('https://www1.hkexnews.hk/', 'https://www.everbright.com/'):
+                      try:
+                          r = session.get(
+                              url,
+                              headers={**pdf_headers, 'Referer': referer},
+                              timeout=(30, 900),
+                              allow_redirects=True,
+                          )
+                          print('GET', url, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-'):
+                              return r
+                          errors.append(f'{r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(repr(exc))
+                  time.sleep(2 * attempt)
+              raise RuntimeError('; '.join(errors[-6:]))
+
+          def pdf_urls(obj):
+              raw = html.unescape(json.dumps(obj, ensure_ascii=False)).replace('\\/', '/')
+              found = []
+              for pattern in (
+                  r'https?://[^"\'< >\s]+?\.pdf(?:\?[^"\'< >\s]*)?'.replace(' ', ''),
+                  r'/listedco/listconews/[^"\'< >\s]+?\.pdf(?:\?[^"\'< >\s]*)?'.replace(' ', ''),
+              ):
+                  for value in re.findall(pattern, raw, flags=re.I):
+                      value = unquote(value)
+                      if value.startswith('/'):
+                          value = urljoin('https://www1.hkexnews.hk', value)
+                      if value not in found:
+                          found.append(value)
+              return found
+
+          def discover_annual(year):
+              endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              result = []
+              for lang in ('zh', 'en'):
+                  params = {
+                      'sortDir': '0', 'sortByOptions': 'DateTime',
+                      'category': '0', 'market': 'SEHK', 'stockId': '289',
+                      'documentType': '-1', 'fromDate': f'{year + 1}0101',
+                      'toDate': f'{year + 1}0630', 'title': '',
+                      'searchType': '1', 't1code': '40000',
+                      't2Gcode': '-2', 't2code': '-2',
+                      'rowRange': '100', 'lang': lang,
+                  }
+                  try:
+                      r = session.get(endpoint, params=params, headers=html_headers, timeout=(30, 180))
+                      print('HKEX SEARCH', year, lang, r.status_code, len(r.content), flush=True)
+                      r.raise_for_status()
+                      outer = r.json()
+                      inner = outer.get('result', outer) if isinstance(outer, dict) else outer
+                      if isinstance(inner, str):
+                          try:
+                              inner = json.loads(inner)
+                          except Exception:
+                              inner = BeautifulSoup(inner, 'html.parser').get_text(' ', strip=True)
+                      if isinstance(inner, list):
+                          rows = inner
+                      elif isinstance(inner, dict):
+                          rows = []
+                          for key in ('data', 'rows', 'items', 'result'):
+                              if isinstance(inner.get(key), list):
+                                  rows += inner[key]
+                          if not rows:
+                              rows = [inner]
+                      else:
+                          rows = [inner]
+                      for row in rows:
+                          hay = compact(json.dumps(row, ensure_ascii=False))
+                          annual = ('年報' in hay or '年度報告' in hay) if lang == 'zh' else 'ANNUALREPORT' in hay
+                          if annual and str(year) in hay and not any(x in hay for x in ('INTERIM', '中期', 'SUSTAINABILITY', 'ESG')):
+                              for url in pdf_urls(row):
+                                  if url not in result:
+                                      result.append(url)
+                  except Exception as exc:
+                      print('HKEX SEARCH ERROR', year, lang, repr(exc), flush=True)
+              print('HKEX CANDIDATES', year, json.dumps(result, ensure_ascii=False), flush=True)
+              return result
+
+          fixed = {
+              2020: [
+                  'https://www.everbright.com/sites/default/files/results-announcements/CW00165-AR20.pdf',
+                  'https://companiesmarketcap.com/annual-reports/112294.ar.en.2020.pdf',
+                  'https://www.annualreports.com/HostedData/AnnualReportArchive/C/HKG_0165_2020.pdf',
+              ],
+              2021: [
+                  'https://www.everbright.com/sites/default/files/results-announcements/CW00165-AR21.pdf',
+                  'https://companiesmarketcap.com/annual-reports/112294.ar.en.2021.pdf',
+                  'https://www.annualreports.com/HostedData/AnnualReportArchive/C/HKG_0165_2021.pdf',
+              ],
+              2022: [
+                  'https://www.everbright.com/sites/default/files/results-announcements/CW00165-AR22.pdf',
+                  'https://companiesmarketcap.com/annual-reports/112294.ar.en.2022.pdf',
+                  'https://www.annualreports.com/HostedData/AnnualReportArchive/C/HKG_0165_2022.pdf',
+              ],
+              2023: [
+                  'https://www.everbright.com/sites/default/files/results-announcements/CW00165-AR23.pdf',
+                  'https://companiesmarketcap.com/annual-reports/112294.ar.en.2023.pdf',
+                  'https://www.annualreports.com/HostedData/AnnualReportArchive/C/HKG_0165_2023.pdf',
+              ],
+              2024: [
+                  'https://www.hkexnews.hk/listedco/listconews/sehk/2025/0415/2025041500755_c.pdf',
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0415/2025041500754.pdf',
+                  'https://www.everbright.com/sites/default/files/results-announcements/CW00165-AR24.pdf',
+                  'https://companiesmarketcap.com/annual-reports/112294.ar.en.2024.pdf',
+              ],
+              2025: [
+                  'https://www.hkexnews.hk/listedco/listconews/sehk/2026/0416/2026041601915_c.pdf',
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0416/2026041601914.pdf',
+                  'https://www.everbright.com/sites/default/files/results-announcements/C%20Annual%20Report_0.pdf',
+                  'https://companiesmarketcap.com/annual-reports/112294.ar.en.2025.pdf',
+              ],
+          }
+
+          def validate(path, year, kind, min_pages):
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError('PDF signature missing')
+              reader = PdfReader(str(path))
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'only {pages} pages')
+              text = []
+              for page in reader.pages[:min(45, pages)]:
+                  try:
+                      text.append(page.extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT WARNING', path.name, repr(exc), flush=True)
+              norm = compact('\n'.join(text))
+              if not any(compact(x) in norm for x in ('中國光大控股有限公司', '中国光大控股有限公司', 'CHINA EVERBRIGHT LIMITED')):
+                  raise RuntimeError('company identity missing')
+              if str(year) not in norm:
+                  raise RuntimeError(f'year {year} missing')
+              if kind == '年度报告':
+                  type_ok = any(x in norm for x in ('ANNUALREPORT', '年報', '年度報告', '年报', '年度报告'))
+              else:
+                  type_ok = any(x in norm for x in ('INTERIMRESULTS', 'INTERIMREPORT', '中期業績', '中期報告', '中期业绩', '中期报告'))
+              if not type_ok:
+                  raise RuntimeError(f'{kind} marker missing')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed: {check.stderr[-500:]}')
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f'{path.stem}_{label}'
+                  subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '72', str(path), str(prefix)],
+                      check=True, capture_output=True,
+                  )
+                  rendered = Path(str(prefix) + '.png')
+                  if not rendered.exists() or rendered.stat().st_size < 1000:
+                      raise RuntimeError(f'render failed: {label}')
+              language = '繁体中文' if compact('中國光大控股有限公司') in norm else ('简体中文' if compact('中国光大控股有限公司') in norm else '英文')
+              return {'pages': pages, 'bytes': path.stat().st_size, 'sha256': digest(path), 'language': language}
+
+          def obtain(year, kind, filename, urls, min_pages):
+              errors = []
+              seen = []
+              for url in urls:
+                  if url and url not in seen:
+                      seen.append(url)
+              for idx, url in enumerate(seen, 1):
+                  temp = WORK / f'{year}_{idx}.pdf'
+                  try:
+                      response = fetch_pdf(url)
+                      temp.write_bytes(response.content)
+                      meta = validate(temp, year, kind, min_pages)
+                      dest = OUT / filename
+                      shutil.copy2(temp, dest)
+                      record = {
+                          'filename': filename, 'year': year, 'report_type': kind,
+                          'source_url': response.url, 'requested_url': url, **meta,
+                      }
+                      print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+                      return record
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc}')
+                      print('REJECTED', errors[-1], flush=True)
+                      temp.unlink(missing_ok=True)
+              raise RuntimeError('All candidates failed for ' + filename + '\n' + '\n'.join(errors))
+
+          records = []
+          for year in range(2020, 2026):
+              records.append(obtain(
+                  year, '年度报告',
+                  f'{year - 2019:02d}_中国光大控股_{year}年年度报告.pdf',
+                  discover_annual(year) + fixed[year], 100,
+              ))
+
+          records.append(obtain(
+              2026, '中期业绩公告',
+              '07_中国光大控股_2026年中期业绩公告_截至2026年6月30日.pdf',
+              [
+                  'https://www.hkexnews.hk/listedco/listconews/sehk/2026/0827/2026082701530_c.pdf',
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0827/2026082701529.pdf',
+              ],
+              40,
+          ))
+
+          if len(records) != 7 or len({x['sha256'] for x in records}) != 7:
+              raise RuntimeError('record count or uniqueness check failed')
+
+          with (OUT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '文件名', '报告期', '报告类型', '语言', '页数', '文件大小_字节', 'SHA256', '最终下载地址', '候选来源地址']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for i, r in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': i, '文件名': r['filename'], '报告期': r['year'],
+                      '报告类型': r['report_type'], '语言': r['language'],
+                      '页数': r['pages'], '文件大小_字节': r['bytes'],
+                      'SHA256': r['sha256'], '最终下载地址': r['source_url'],
+                      '候选来源地址': r['requested_url'],
+                  })
+
+          lines = [
+              '中国光大控股有限公司（China Everbright Limited）',
+              '香港交易所股份代号：00165',
+              '2020—2025年年度报告及最新定期财务披露',
+              '',
+              '一、收录文件',
+          ]
+          for i, r in enumerate(records, 1):
+              lines.append(f"{i}. {r['filename']}｜{r['language']}｜{r['pages']}页｜SHA-256：{r['sha256']}")
+          lines += [
+              '',
+              '二、“最新季报”的口径说明',
+              '中国光大控股为香港联交所主板上市公司，并无必须按A股口径发布独立第一季度或第三季度报告的常规定期披露安排。',
+              '截至2026年9月2日，最新正式财务定期披露为截至2026年6月30日止六个月的2026年中期业绩公告，披露日期为2026年8月27日；本包据此将其作为“最新季报类文件”收录。',
+              '',
+              '三、核验项目',
+              '已逐份核对PDF文件头、文件结构、实际页数、公司名称、报告年份、报告类型、首页和末页可渲染性、SHA-256，以及压缩包CRC。',
+              '下载时优先采用香港交易所披露易或公司官网原件；若官方站点临时限制访问，则采用经公司名称、年份、报告类型和页数复核的公开原件镜像。',
+          ]
+          (OUT / '00_文件说明与核验结果.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for path in sorted(OUT.iterdir()):
+                  z.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              if len([x for x in z.namelist() if x.lower().endswith('.pdf')]) != 7:
+                  raise RuntimeError('ZIP PDF count is not 7')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-everbright-periodic-reports-final
+          path: |
+            中国光大控股_2020-2025年报及2026年最新中期业绩/
+            中国光大控股_2020-2025年报及2026年最新中期业绩.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
