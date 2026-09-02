@@ -1,0 +1,135 @@
+name: Download and inspect WeRide PDF candidates
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-download-inspect-candidates-20260902-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download candidates and extract identifying text
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          mkdir -p out
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          candidates = [
+              {
+                  "id": "guosen_20250822",
+                  "url": "https://testtoo1.oss-cn-hangzhou.aliyuncs.com/eastmoney_pdf/AP202508221732396725.pdf",
+                  "source": "https://www.sdyanbao.com/detail/912485",
+              },
+              {
+                  "id": "guosheng_20260112",
+                  "url": "https://dsj-sthree.datayes.com/researchreport/RR17671968/7577fe9ea1f0353057fd8f2f2d27e506.pdf",
+                  "source": "https://m-robo.datayes.com/research?id=8325704",
+              },
+              {
+                  "id": "reportify_20250717_16p",
+                  "url": "https://reportify-1252068037.cos.ap-beijing.myqcloud.com/media/production/s_003a1798_003a17986cbe2f48931a2b2dcd850ce5.pdf",
+                  "source": "https://reportify.cn/reports/1217364475397443584",
+              },
+              {
+                  "id": "robotaxi_industry_20250617_56p",
+                  "url": "https://reportify-1252068037.cos.ap-beijing.myqcloud.com/media/production/s_003d82f7_003d82f75f2b1858d9b680ecba8e4e46.pdf",
+                  "source": "https://reportify.cn/reports/1151669715050360832",
+              },
+              {
+                  "id": "eastmoney_20250423_28p",
+                  "url": "https://pdf.dfcfw.com/pdf/H3_AP202504231661085371_1.pdf",
+                  "source": "Eastmoney public PDF",
+              },
+              {
+                  "id": "eastmoney_20250422_19p",
+                  "url": "https://pdf.dfcfw.com/pdf/H3_AP202504221660867862_1.pdf",
+                  "source": "Eastmoney public PDF",
+              },
+          ]
+
+          out = Path("out")
+          s = requests.Session()
+          s.trust_env = False
+          headers = {
+              "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
+              "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+              "Referer": "https://www.google.com/",
+          }
+          results = []
+          for item in candidates:
+              rec = dict(item)
+              path = out / f"{item['id']}.pdf"
+              last = None
+              for attempt in range(4):
+                  try:
+                      r = s.get(item["url"], headers=headers, timeout=(20, 180), allow_redirects=True)
+                      r.raise_for_status()
+                      if not r.content.startswith(b"%PDF-"):
+                          raise RuntimeError(f"not PDF: {r.headers.get('content-type')} {r.content[:30]!r}")
+                      path.write_bytes(r.content)
+                      rec.update({
+                          "status": "ok",
+                          "bytes": len(r.content),
+                          "final_url": r.url,
+                          "sha256": hashlib.sha256(r.content).hexdigest(),
+                      })
+                      break
+                  except Exception as exc:
+                      last = repr(exc)
+                      time.sleep(attempt + 1)
+              else:
+                  rec.update({"status": "error", "error": last})
+                  results.append(rec)
+                  print(json.dumps(rec, ensure_ascii=False), flush=True)
+                  continue
+
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  rec["pages"] = len(reader.pages)
+                  rec["pdf_metadata"] = {str(k): str(v) for k, v in (reader.metadata or {}).items()}
+                  chunks = []
+                  for i in range(min(8, len(reader.pages))):
+                      try:
+                          text = reader.pages[i].extract_text() or ""
+                      except Exception as exc:
+                          text = f"[extract error: {exc!r}]"
+                      chunks.append(f"\n===== PAGE {i+1} =====\n{text}")
+                  if len(reader.pages) > 8:
+                      for i in range(max(8, len(reader.pages)-3), len(reader.pages)):
+                          try:
+                              text = reader.pages[i].extract_text() or ""
+                          except Exception as exc:
+                              text = f"[extract error: {exc!r}]"
+                          chunks.append(f"\n===== PAGE {i+1} =====\n{text}")
+                  extracted = "".join(chunks)
+                  (out / f"{item['id']}_sample.txt").write_text(extracted, encoding="utf-8")
+                  normalized = re.sub(r"\s+", " ", extracted)
+                  rec["sample"] = normalized[:12000]
+                  rec["identity_hits"] = [x for x in ["文远知行", "文遠知行", "WeRide", "国信证券", "国盛证券", "光大证券", "华泰证券", "招商证券", "东北证券", "东吴证券"] if x.lower() in normalized.lower()]
+              except Exception as exc:
+                  rec["parse_error"] = repr(exc)
+              results.append(rec)
+              print(json.dumps(rec, ensure_ascii=False), flush=True)
+
+          (out / "inspection.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
+      - name: Upload candidate PDFs and inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: weride-pdf-candidates-20260902
+          path: out
+          if-no-files-found: error
+          retention-days: 1
