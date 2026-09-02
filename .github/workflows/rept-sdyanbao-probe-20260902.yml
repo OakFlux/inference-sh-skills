@@ -1,0 +1,103 @@
+name: Probe Sdyanbao endpoints for REPT BATTERO
+
+on:
+  push:
+    paths:
+      - '.github/workflows/rept-sdyanbao-probe-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Inspect pages and JavaScript
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re,urllib.parse,hashlib
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('sdy_probe'); out.mkdir(exist_ok=True)
+          s=requests.Session(); ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          h={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,application/json,*/*','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          urls=[
+            'https://www.sdyanbao.com/',
+            'https://www.sdyanbao.com/search?keyword=%E7%91%9E%E6%B5%A6%E5%85%B0%E9%92%A7',
+            'https://www.sdyanbao.com/detail/903940',
+            'https://www.sdyanbao.com/detail/950829',
+          ]
+          result={'pages':[],'assets':[],'probes':[]}
+          assets=[]
+          for u in urls:
+            try:
+              r=s.get(u,headers=h,timeout=(15,60),allow_redirects=True)
+              text=r.text
+              rec={'requested':u,'status':r.status_code,'url':r.url,'bytes':len(r.content),'type':r.headers.get('content-type'),'headers':dict(r.headers),'links':[],'scripts':[],'matches':{}}
+              soup=BeautifulSoup(text,'html.parser')
+              for a in soup.find_all('a'):
+                href=a.get('href')
+                if href: rec['links'].append(urllib.parse.urljoin(r.url,href))
+              for sc in soup.find_all('script'):
+                src=sc.get('src')
+                if src:
+                  su=urllib.parse.urljoin(r.url,src); rec['scripts'].append(su); assets.append(su)
+                elif sc.string and any(k in sc.string for k in ['__NEXT_DATA__','瑞浦','api','download']):
+                  rec.setdefault('inline_scripts',[]).append(sc.string[:200000])
+              pats={
+                'absolute_urls':r'https?://[^\"\'<>\\s]+',
+                'api_paths':r'[\"\'](/[^\"\']*(?:api|download|detail|report|pdf|file)[^\"\']*)[\"\']',
+                'pdf_urls':r'https?://[^\"\'<>\\s]+?\.pdf(?:\?[^\"\'<>\\s]*)?',
+                'ids':r'(?:reportId|report_id|detailId|detail_id|fileId|file_id)[\"\']?\s*[:=]\s*[\"\']?([A-Za-z0-9_-]+)'
+              }
+              for k,p in pats.items(): rec['matches'][k]=list(dict.fromkeys(re.findall(p,text,flags=re.I)))[:500]
+              result['pages'].append(rec)
+              fn='page_'+hashlib.md5(u.encode()).hexdigest()+'.html'; (out/fn).write_text(text,encoding='utf-8',errors='ignore')
+              print('PAGE',r.status_code,len(r.content),r.url,'links',len(rec['links']),'scripts',len(rec['scripts']),flush=True)
+            except Exception as e: result['pages'].append({'requested':u,'error':repr(e)})
+
+          for u in list(dict.fromkeys(assets))[:100]:
+            try:
+              r=s.get(u,headers={**h,'Referer':'https://www.sdyanbao.com/'},timeout=(15,60))
+              text=r.text[:3000000]
+              rec={'url':u,'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'matches':{}}
+              patterns={
+                'api_paths':r'[\"\'`](/[^\"\'`]*(?:api|download|report|detail|pdf|file|search)[^\"\'`]*)[\"\'`]',
+                'absolute_urls':r'https?://[^\"\'`<>\\s]+',
+                'keywords':r'.{0,120}(?:download|\.pdf|reportId|fileId|瑞浦兰钧).{0,180}',
+              }
+              for k,p in patterns.items(): rec['matches'][k]=list(dict.fromkeys(re.findall(p,text,flags=re.I)))[:1000]
+              result['assets'].append(rec)
+              (out/('asset_'+hashlib.md5(u.encode()).hexdigest()+'.js')).write_text(text,encoding='utf-8',errors='ignore')
+              print('ASSET',r.status_code,len(r.content),u,flush=True)
+            except Exception as e: result['assets'].append({'url':u,'error':repr(e)})
+
+          # Try common internal search/download endpoints.
+          candidates=[
+            '/api/search?keyword=瑞浦兰钧','/api/report/search?keyword=瑞浦兰钧','/api/report/list?keyword=瑞浦兰钧',
+            '/api/v1/search?keyword=瑞浦兰钧','/search/瑞浦兰钧','/search?q=瑞浦兰钧','/index.php/search?keyword=瑞浦兰钧',
+            '/api/detail/903940','/api/report/903940','/api/reports/903940','/api/download/903940','/download/903940','/detail/903940/download'
+          ]
+          for p in candidates:
+            u=urllib.parse.urljoin('https://www.sdyanbao.com/',p)
+            try:
+              r=s.get(u,headers={**h,'Referer':'https://www.sdyanbao.com/'},timeout=(10,45),allow_redirects=True)
+              result['probes'].append({'url':u,'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'type':r.headers.get('content-type'),'headers':dict(r.headers),'text':r.text[:30000] if 'text' in r.headers.get('content-type','') or 'json' in r.headers.get('content-type','') else '', 'head_hex':r.content[:20].hex()})
+              print('PROBE',r.status_code,len(r.content),r.headers.get('content-type'),u,'->',r.url,flush=True)
+            except Exception as e: result['probes'].append({'url':u,'error':repr(e)})
+          (out/'result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: rept-sdyanbao-probe
+          path: sdy_probe/
+          retention-days: 7
