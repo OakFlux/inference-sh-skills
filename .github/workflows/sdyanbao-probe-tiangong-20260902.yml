@@ -1,0 +1,78 @@
+name: Probe sdyanbao Tiangong report download
+
+on:
+  push:
+    paths:
+      - '.github/workflows/sdyanbao-probe-tiangong-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Inspect HTML scripts and public endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import html, json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('sdyanbao-probe'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          page='https://www.sdyanbao.com/detail/933043'
+          r=s.get(page,headers=h,timeout=(20,90),allow_redirects=True)
+          print('PAGE',r.status_code,len(r.content),r.url,r.headers.get('content-type'),s.cookies.get_dict(),flush=True)
+          (out/'detail.html').write_bytes(r.content)
+          text=r.text; soup=BeautifulSoup(text,'lxml')
+          rec={'status':r.status_code,'url':r.url,'bytes':len(r.content),'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'scripts':[], 'links':[], 'interesting':[]}
+          for tag in soup.find_all('script',src=True): rec['scripts'].append(urljoin(r.url,tag['src']))
+          for tag in soup.find_all(['a','button','div'],limit=10000):
+              attrs={k:str(v) for k,v in tag.attrs.items() if k in ('href','data-url','data-id','data-report','onclick','class','id','download')}
+              label=' '.join(tag.get_text(' ',strip=True).split())
+              if attrs and (any(k in (label+' '+json.dumps(attrs,ensure_ascii=False)).lower() for k in ('下载','download','pdf','933043','report'))):
+                  rec['links'].append({'tag':tag.name,'attrs':attrs,'text':label[:500]})
+          rec['interesting']=[line.strip()[:4000] for line in text.splitlines() if any(k in line.lower() for k in ('download','下载','pdf','933043','report','fileurl','attachment','oss','sourceurl'))][:500]
+          print('HTML_REC',json.dumps(rec,ensure_ascii=False)[:150000],flush=True)
+          (out/'page.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          scripts=[]
+          for i,u in enumerate(rec['scripts'],1):
+              sr={'url':u}
+              try:
+                  x=s.get(u,headers={**h,'Referer':page},timeout=(20,90),allow_redirects=True)
+                  sr.update({'status':x.status_code,'bytes':len(x.content),'type':x.headers.get('content-type'),'final_url':x.url})
+                  if x.status_code==200 and len(x.content)<20_000_000:
+                      js=x.text
+                      (out/f'script_{i:03d}.js').write_text(js,encoding='utf-8',errors='ignore')
+                      snippets=[]
+                      for pat in ('download','pdf','reportId','detail','fileUrl','oss','attachment','立即下载','api/'):
+                          for m in re.finditer(re.escape(pat),js,re.I):
+                              snippets.append(js[max(0,m.start()-700):min(len(js),m.end()+1800)])
+                              if len(snippets)>=200: break
+                          if len(snippets)>=200: break
+                      sr['snippets']=snippets
+                      sr['urls']=list(dict.fromkeys(html.unescape(u) for u in re.findall(r'https?://[^"\'<>\s\\]+',js)))[:1000]
+                  print('SCRIPT',json.dumps(sr,ensure_ascii=False)[:180000],flush=True)
+              except Exception as e:
+                  sr['error']=repr(e); print('SCRIPT_ERR',u,repr(e),flush=True)
+              scripts.append(sr)
+              time.sleep(.1)
+          (out/'scripts.json').write_text(json.dumps(scripts,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdyanbao-probe-tiangong
+          path: sdyanbao-probe/
+          retention-days: 7
