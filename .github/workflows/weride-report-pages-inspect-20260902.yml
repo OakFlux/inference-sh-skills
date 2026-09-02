@@ -1,0 +1,103 @@
+name: Inspect WeRide report pages for downloadable PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/weride-report-pages-inspect-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect pages and JavaScript assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          pages = [
+              'https://www.sdyanbao.com/detail/940420',
+              'https://www.51pdf.cn/report/view_5781611.html',
+              'https://www.nxny.com/report/view_6191969.html',
+          ]
+          session = requests.Session(); session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/json,*/*',
+          }
+
+          script_urls = []
+          for page_url in pages:
+              print('\n===== PAGE', page_url, '=====', flush=True)
+              try:
+                  response = session.get(page_url, headers=headers, timeout=(30, 180), allow_redirects=True)
+                  print('STATUS', response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                  response.raise_for_status()
+                  text = html.unescape(response.text).replace('\\/', '/')
+                  soup = BeautifulSoup(text, 'lxml')
+                  print('TITLE', soup.title.get_text(' ', strip=True) if soup.title else '', flush=True)
+                  for tag in soup.find_all(['a','button','form','iframe','embed','object','script']):
+                      attrs = {k: v for k, v in tag.attrs.items() if k in ('href','src','action','data','onclick','id','class','data-id','data-url','data-href','data-download')}
+                      label = ' '.join(tag.get_text(' ', strip=True).split())[:300]
+                      raw = json.dumps(attrs, ensure_ascii=False)
+                      combined = (label + ' ' + raw).lower()
+                      if any(k in combined for k in ('下载','download','pdf','940420','5781611','6191969','report','file')):
+                          print('TAG', tag.name, label, raw[:2000], flush=True)
+                      src = attrs.get('src')
+                      if src and str(src).endswith('.js'):
+                          absolute = urljoin(response.url, src)
+                          if absolute not in script_urls:
+                              script_urls.append(absolute)
+                  patterns = [
+                      r'https?://[^"\'<>\s]+?\.pdf(?:\?[^"\'<>\s]*)?',
+                      r'/(?:api|download|report|file)[^"\'<>\s]{0,300}',
+                      r'(?:download|fileUrl|file_url|pdfUrl|pdf_url|reportUrl|report_url|attachmentUrl|attachment_url)["\']?\s*[:=]\s*["\']([^"\']+)',
+                  ]
+                  for pattern in patterns:
+                      for match in re.findall(pattern, text, flags=re.I):
+                          value = match if isinstance(match, str) else match[0]
+                          print('PATTERN', value[:2500], flush=True)
+                  for keyword in ('download','下载','pdf','fileurl','file_url','reportid','report_id','940420','5781611','6191969','token','encrypt'):
+                      positions = [m.start() for m in re.finditer(re.escape(keyword), text, flags=re.I)]
+                      if positions:
+                          print('KEY', keyword, 'COUNT', len(positions), flush=True)
+                      for pos in positions[:10]:
+                          snippet = re.sub(r'\s+', ' ', text[max(0,pos-700):pos+1800])
+                          print('CTX', keyword, snippet[:2500], flush=True)
+              except Exception as exc:
+                  print('PAGE_ERROR', page_url, repr(exc), flush=True)
+
+          print('\n===== JS ASSETS', len(script_urls), '=====', flush=True)
+          for script_url in script_urls[:80]:
+              try:
+                  response = session.get(script_url, headers=headers, timeout=(30, 180), allow_redirects=True)
+                  print('\nSCRIPT', response.status_code, len(response.content), script_url, response.url, flush=True)
+                  if response.status_code != 200 or len(response.content) > 3_000_000:
+                      continue
+                  text = response.text.replace('\\/', '/')
+                  for keyword in ('download','fileUrl','file_url','pdfUrl','report/detail','report/download','api/report','encrypt','decrypt','token'):
+                      positions = [m.start() for m in re.finditer(re.escape(keyword), text, flags=re.I)]
+                      if positions:
+                          print('JSKEY', keyword, 'COUNT', len(positions), flush=True)
+                      for pos in positions[:20]:
+                          snippet = re.sub(r'\s+', ' ', text[max(0,pos-800):pos+2200])
+                          print('JSCTX', keyword, snippet[:3000], flush=True)
+              except Exception as exc:
+                  print('SCRIPT_ERROR', script_url, repr(exc), flush=True)
+          PY
