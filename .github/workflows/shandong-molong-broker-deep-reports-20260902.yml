@@ -1,0 +1,365 @@
+name: Package Shandong Molong broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shandong-molong-broker-deep-reports-20260902.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet pypdf requests
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import requests
+          import urllib3
+          from pypdf import PdfReader
+
+          urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+          COMPANY = '山东墨龙'
+          CODE = '002490'
+          PACKAGE = '山东墨龙_券商深度报告_3份_公开完整版'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          previews = Path('_shandong_molong_previews')
+          previews.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'index': 1,
+                  'broker': '中国中投证券',
+                  'date': '2012-04-24',
+                  'title': '专业石油钻采设备企业，产能进入释放期',
+                  'expected_pages': 9,
+                  'known_urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AP201204270005135326_1.pdf?1373303316000.pdf=',
+                      'https://pdf.dfcfw.com/pdf/H3_AP201204270005135326_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H2_AP201204270005135326_1.pdf',
+                  ],
+                  'match_terms': ['专业石油钻采设备企业', '产能进入释放期'],
+              },
+              {
+                  'index': 2,
+                  'broker': '湘财证券',
+                  'date': '2011-03-11',
+                  'title': '行业景气复苏+产能稳步释放，估值业绩双提升',
+                  'expected_pages': 16,
+                  'known_urls': [
+                      'https://pdf.dfcfw.com/pdf/H3_AS201202260003937256_1.pdf?1601212946000.pdf=',
+                      'https://pdf.dfcfw.com/pdf/H3_AS201202260003937256_1.pdf',
+                      'https://pdf.dfcfw.com/pdf/H2_AS201202260003937256_1.pdf',
+                  ],
+                  'match_terms': ['行业景气复苏', '估值业绩双提升'],
+              },
+              {
+                  'index': 3,
+                  'broker': '日信证券',
+                  'date': '2010-12-16',
+                  'title': '拂去浮尘现真金，给予公司“买入”评级',
+                  'expected_pages': 18,
+                  'known_urls': [
+                      'https://www.p5w.net/stock/lzft/gsyj/201012/P020101223611424510121.pdf',
+                      'http://www.p5w.net/stock/lzft/gsyj/201012/P020101223611424510121.pdf',
+                  ],
+                  'match_terms': ['拂去浮尘现真金', '给予公司买入评级'],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          common_headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Connection': 'keep-alive',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[^0-9A-Za-z\u4e00-\u9fff]+', '', value or '').lower()
+
+          def safe(value: str) -> str:
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', value).strip('_')[:120]
+
+          def discover_eastmoney_urls() -> dict[int, list[str]]:
+              discovered = {report['index']: [] for report in reports}
+              endpoint = 'https://reportapi.eastmoney.com/report/list'
+              headers = {
+                  **common_headers,
+                  'Accept': 'application/json,text/plain,*/*',
+                  'Referer': 'https://data.eastmoney.com/',
+                  'Origin': 'https://data.eastmoney.com',
+              }
+              all_rows = []
+              for page_no in range(1, 5):
+                  response = session.get(
+                      endpoint,
+                      params={
+                          'pageNo': page_no,
+                          'pageSize': 100,
+                          'code': CODE,
+                          'qType': 0,
+                          'beginTime': '2010-01-01',
+                          'endTime': '2013-12-31',
+                      },
+                      headers=headers,
+                      timeout=(20, 90),
+                  )
+                  print('REPORT_API', response.status_code, len(response.content), response.url, flush=True)
+                  response.raise_for_status()
+                  payload = response.json()
+                  rows = payload.get('data') if isinstance(payload, dict) else []
+                  if not isinstance(rows, list) or not rows:
+                      break
+                  all_rows.extend(row for row in rows if isinstance(row, dict))
+                  total = payload.get('Total') or payload.get('total') or 0
+                  if len(all_rows) >= int(total or len(all_rows)) or len(rows) < 100:
+                      break
+
+              Path('eastmoney_report_api_rows.json').write_text(
+                  json.dumps(all_rows, ensure_ascii=False, indent=2), encoding='utf-8'
+              )
+              print('REPORT_ROWS', len(all_rows), flush=True)
+
+              for row in all_rows:
+                  title = str(row.get('title') or '').strip()
+                  organization = str(row.get('orgSName') or row.get('orgName') or '').strip()
+                  info_code = str(row.get('infoCode') or row.get('infocode') or '').strip()
+                  publish_date = str(row.get('publishDate') or '')[:10]
+                  haystack = compact(title)
+                  for report in reports:
+                      terms = [compact(term) for term in report['match_terms']]
+                      same_date = not publish_date or abs(
+                          int((publish_date or '0000-00-00').replace('-', '') or 0)
+                          - int(report['date'].replace('-', ''))
+                      ) <= 20
+                      if info_code and all(term in haystack for term in terms[:1]) and same_date:
+                          for prefix in ('H3', 'H2'):
+                              discovered[report['index']].append(
+                                  f'https://pdf.dfcfw.com/pdf/{prefix}_{info_code}_1.pdf'
+                              )
+                          print(
+                              'DISCOVERED', report['index'], organization, publish_date,
+                              title, info_code, flush=True
+                          )
+              return discovered
+
+          try:
+              discovered = discover_eastmoney_urls()
+          except Exception as exc:
+              print('DISCOVERY_WARNING', repr(exc), flush=True)
+              discovered = {report['index']: [] for report in reports}
+
+          def fetch_pdf(report: dict) -> tuple[bytes, str]:
+              urls = []
+              seen = set()
+              for url in [*report['known_urls'], *discovered.get(report['index'], [])]:
+                  if url not in seen:
+                      urls.append(url)
+                      seen.add(url)
+
+              errors = []
+              for url in urls:
+                  host = urlparse(url).netloc.lower()
+                  referer = 'https://data.eastmoney.com/' if 'dfcfw.com' in host else 'https://www.p5w.net/'
+                  headers = {
+                      **common_headers,
+                      'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                      'Referer': referer,
+                  }
+                  verify = 'p5w.net' not in host
+                  for attempt in range(1, 7):
+                      try:
+                          response = session.get(
+                              url,
+                              headers=headers,
+                              timeout=(30, 300),
+                              allow_redirects=True,
+                              verify=verify,
+                          )
+                          content_type = response.headers.get('content-type', '')
+                          print(
+                              'PDF_GET', report['index'], attempt, url,
+                              response.status_code, content_type, len(response.content),
+                              response.url, flush=True
+                          )
+                          if (
+                              response.status_code == 200
+                              and response.content.startswith(b'%PDF-')
+                              and len(response.content) > 50_000
+                          ):
+                              return response.content, url
+                          errors.append(f'{url}: HTTP {response.status_code}, {len(response.content)} bytes')
+                      except Exception as exc:
+                          errors.append(f'{url}: {type(exc).__name__}: {exc}')
+                      time.sleep(min(3 * attempt, 15))
+              raise RuntimeError(' | '.join(errors[-12:]))
+
+          def validate_report(path: Path, report: dict) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages != report['expected_pages']:
+                  raise RuntimeError(
+                      f"{path.name}: expected {report['expected_pages']} pages, got {pages}"
+                  )
+
+              texts = []
+              for page in reader.pages[: min(pages, 10)]:
+                  try:
+                      texts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              text = compact('\n'.join(texts))
+              identity_ok = compact(COMPANY) in text or CODE in text
+              title_ok = any(compact(term) in text for term in report['match_terms'])
+              if not identity_ok:
+                  raise RuntimeError(f'{path.name}: company identity validation failed')
+              if not title_ok:
+                  print('TITLE_TEXT_WARNING', path.name, flush=True)
+
+              check = subprocess.run(
+                  ['qpdf', '--check', str(path)], capture_output=True, text=True
+              )
+              if check.returncode != 0:
+                  raise RuntimeError(f'qpdf check failed for {path.name}: {check.stderr[-1000:]}')
+
+              first_prefix = previews / f"{report['index']:02d}_first"
+              last_prefix = previews / f"{report['index']:02d}_last"
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '90', str(path), str(first_prefix)],
+                  check=True,
+                  capture_output=True,
+              )
+              subprocess.run(
+                  ['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '90', str(path), str(last_prefix)],
+                  check=True,
+                  capture_output=True,
+              )
+              if not Path(str(first_prefix) + '.png').exists() or not Path(str(last_prefix) + '.png').exists():
+                  raise RuntimeError(f'{path.name}: render validation failed')
+
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              return pages, digest
+
+          records = []
+          seen_hashes = set()
+          for report in reports:
+              print(
+                  f"DOWNLOAD {report['index']}/3 {report['broker']} {report['title']}",
+                  flush=True,
+              )
+              pdf_bytes, source_url = fetch_pdf(report)
+              filename = (
+                  f"{report['index']:02d}_{safe(report['broker'])}_{COMPANY}_"
+                  f"{safe(report['title'])}_{report['date']}_{report['expected_pages']}页.pdf"
+              )
+              path = out / filename
+              path.write_bytes(pdf_bytes)
+              pages, digest = validate_report(path, report)
+              if digest in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {filename}')
+              seen_hashes.add(digest)
+
+              record = {
+                  'broker': report['broker'],
+                  'date': report['date'],
+                  'title': report['title'],
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(pdf_bytes),
+                  'sha256': digest,
+                  'source_url': source_url,
+                  'source_format': '公开原始PDF',
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          lines = [
+              f'{COMPANY}（{CODE}.SZ / 00568.HK）券商深度报告包',
+              '',
+              '本包共3份公开可获取的完整原始PDF。由于公司近年公开券商深度覆盖较少，',
+              '本次可核验的完整深度报告集中在2010—2012年。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {record['broker']}：《{record['title']}》",
+                  f"   日期：{record['date']}；页数：{record['pages']}页",
+                  f"   文件：{record['filename']}",
+                  f"   文件大小：{record['bytes']}字节",
+                  f"   SHA-256：{record['sha256']}",
+                  f"   公开来源：{record['source_url']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、实际页数、公司名称/证券代码、qpdf结构检查、',
+              '首页与末页渲染、文件哈希、ZIP文件数量与CRC。',
+              '报告中的评级、目标价和盈利预测均对应历史出具时点。',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(
+              json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8'
+          )
+          (out / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(f'{PACKAGE}.zip')
+          with zipfile.ZipFile(
+              zip_path,
+              'w',
+              zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+              allowZip64=True,
+          ) as archive:
+              for path in sorted(out.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs instead of 3')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: shandong-molong-broker-deep-reports-final
+          path: |
+            山东墨龙_券商深度报告_3份_公开完整版/
+            山东墨龙_券商深度报告_3份_公开完整版.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
