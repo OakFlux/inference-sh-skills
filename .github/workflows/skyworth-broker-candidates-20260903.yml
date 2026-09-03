@@ -1,0 +1,82 @@
+name: Inspect leading Skyworth broker report candidates
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-broker-candidates-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Download and inspect candidate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf pymupdf urllib3
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          from io import BytesIO
+
+          import pymupdf
+          import requests
+          import urllib3
+          from pypdf import PdfReader
+
+          urllib3.disable_warnings()
+          session=requests.Session(); session.trust_env=False
+          headers={
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer':'http://investor.skyworth.com/sc/ir_research.php',
+          }
+          candidates=[
+              ('天风证券','2022-09-13','家电行业领军者，分布式光伏开启第二成长曲线','https://manager.wisdomir.com/files/399/2022/0913/20220916161009_69066843_sc.pdf'),
+              ('天风证券','2022-04-05','全球黑电龙头入局户用市场，开启新增长曲线','https://manager.wisdomir.com/files/399/2022/0405/20220412160707_81830433_sc.pdf'),
+              ('中金公司','2021-12-02','产业竞争力外溢，户用光伏新龙头','https://manager.wisdomir.com/files/399/2021/1202/20211203103340_80635194_sc.pdf'),
+              ('银河国际证券','2021-11-11','光伏和酷开业务有望推动长远增长','https://manager.wisdomir.com/files/399/2021/1111/20211202181459_17926158_sc.PDF'),
+              ('第一上海','2021-12-09','布局户用光伏带来新的业务增长点','https://manager.wisdomir.com/files/399/2021/1209/20211214100955_39654139_sc.pdf'),
+              ('中金公司','2025-04-09','户用光伏量稳利增，智能家电业务亮眼，高溢价回购提振信心','https://manager.wisdomir.com/files/399/2025/0409/20250627120326_27210171_sc.pdf'),
+              ('中金公司','2024-03-27','新能源及白电增长强劲，2H23盈利能力修复','https://manager.wisdomir.com/files/399/2024/0327/20240409143223_45757441_sc.pdf'),
+              ('星展银行','2020-04-17','关注酷开潜在分拆计划','https://manager.wisdomir.com/files/399/2020/0417/20200421183025_14566857_sc.pdf'),
+          ]
+          for i,(broker,date,title,url) in enumerate(candidates,1):
+              try:
+                  r=session.get(url,headers=headers,verify=False,timeout=(20,180),allow_redirects=True)
+                  print('GET',i,broker,date,r.status_code,len(r.content),r.headers.get('content-type'),r.url,flush=True)
+                  if r.status_code!=200 or not r.content.startswith(b'%PDF-') or len(r.content)<50000:
+                      continue
+                  reader=PdfReader(BytesIO(r.content),strict=False)
+                  pages=len(reader.pages)
+                  chunks=[]
+                  for p in reader.pages[:min(12,pages)]:
+                      try: chunks.append(p.extract_text() or '')
+                      except Exception as exc: print('TEXT_WARN',i,repr(exc),flush=True)
+                  text='\n'.join(chunks)
+                  compact=re.sub(r'\s+','',text).lower()
+                  company_ok=any(x in compact for x in ('创维集团','創維集團','skyworthgroup','00751','0751.hk','751hk')) and not ('创维数字' in compact and '创维集团' not in compact and '創維集團' not in compact)
+                  broker_core=broker.replace('证券','').replace('公司','').replace('银行','')
+                  broker_ok=broker_core in text or broker in text or (broker=='中金公司' and ('中金' in text or 'CICC' in text)) or (broker=='银河国际证券' and ('银河国际' in text or 'CGS International' in text)) or (broker=='星展银行' and ('星展' in text or 'DBS' in text))
+                  report_mark=any(x in compact for x in ('证券研究报告','證券研究報告','公司研究','首次覆盖','首次覆蓋','equityresearch','研究报告','研究報告'))
+                  doc=pymupdf.open(stream=r.content,filetype='pdf')
+                  pix=doc[0].get_pixmap(matrix=pymupdf.Matrix(.4,.4),alpha=False)
+                  render_ok=pix.width>100 and pix.height>100
+                  doc.close()
+                  print('CANDIDATE',json.dumps({
+                      'broker':broker,'date':date,'title':title,'pages':pages,'bytes':len(r.content),
+                      'sha256':hashlib.sha256(r.content).hexdigest(),'url':r.url,
+                      'company_ok':company_ok,'broker_ok':broker_ok,'report_mark':report_mark,'render_ok':render_ok,
+                      'front':re.sub(r'\s+',' ',text)[:2200],
+                  },ensure_ascii=False),flush=True)
+              except Exception as exc:
+                  print('ERROR',i,broker,date,repr(exc),flush=True)
+          PY
