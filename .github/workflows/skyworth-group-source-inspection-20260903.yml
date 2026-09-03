@@ -1,0 +1,105 @@
+name: Inspect Skyworth Group report sources
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-group-source-inspection-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect official IR and NXNY pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          def fetch(url):
+              r = session.get(url, headers=headers, timeout=(25, 180), allow_redirects=True)
+              print('\nFETCH', r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+              r.raise_for_status()
+              r.encoding = r.apparent_encoding or 'utf-8'
+              return r
+
+          print('================ OFFICIAL IR RESEARCH PAGES ================', flush=True)
+          for year in range(2025, 2018, -1):
+              url = f'https://investor.skyworth.com/sc/ir_research.php?year={year}'
+              try:
+                  r = fetch(url)
+                  text = html.unescape(r.text).replace('\\/', '/')
+                  soup = BeautifulSoup(text, 'lxml')
+                  print('YEAR', year, 'TITLE', soup.title.get_text(' ', strip=True) if soup.title else '', flush=True)
+                  for tag in soup.find_all(['a','iframe','embed','object','script']):
+                      attrs = dict(tag.attrs)
+                      label = ' '.join(tag.get_text(' ', strip=True).split())
+                      values = []
+                      for key in ('href','src','data','data-src','data-url','onclick'):
+                          if attrs.get(key): values.append((key, str(attrs[key])))
+                      if not values:
+                          continue
+                      joined = label + ' ' + ' '.join(v for _,v in values)
+                      if any(marker in joined.lower() for marker in ('pdf','research','report','download','天风','中金','第一上海','兴业','华泰','创维','skyworth')):
+                          print('IR_TAG', year, tag.name, json.dumps({'label':label,'attrs':values}, ensure_ascii=False), flush=True)
+                          for key, value in values:
+                              if key != 'onclick':
+                                  print('IR_ABS', year, key, urljoin(r.url, value), flush=True)
+                  # print contexts around report rows
+                  for m in re.finditer(r'(?:中金|天风|第一上海|兴业|华泰|创维集团|Skyworth)', text, flags=re.I):
+                      snippet = re.sub(r'\s+', ' ', text[max(0,m.start()-700):m.start()+1600])
+                      print('IR_CTX', year, snippet[:2200], flush=True)
+              except Exception as exc:
+                  print('IR_ERROR', year, repr(exc), flush=True)
+
+          print('\n================ NXNY REPORT PAGES ================', flush=True)
+          ids = [5070410, 4830128, 5259451, 5188844, 5128154, 5112041, 5055311]
+          for rid in ids:
+              url = f'https://www.nxny.com/report/view_{rid}.html'
+              try:
+                  r = fetch(url)
+                  text = html.unescape(r.text).replace('\\/', '/')
+                  soup = BeautifulSoup(text, 'lxml')
+                  print('NX_ID', rid, 'TITLE', soup.title.get_text(' ', strip=True) if soup.title else '', flush=True)
+                  print('NX_TEXT', rid, ' '.join(soup.get_text(' ', strip=True).split())[:2600], flush=True)
+                  for tag in soup.find_all(['a','form','input','iframe','embed','object','script']):
+                      attrs = dict(tag.attrs)
+                      label = ' '.join(tag.get_text(' ', strip=True).split())
+                      values=[]
+                      for key in ('href','src','action','value','data','data-src','data-url','onclick','name','id'):
+                          if attrs.get(key): values.append((key,str(attrs[key])))
+                      if not values: continue
+                      joined = label + ' ' + ' '.join(v for _,v in values)
+                      if any(marker in joined.lower() for marker in ('pdf','down','file','report','view','login','download','5070410','4830128','5259451','5188844','5128154','5112041','5055311')):
+                          print('NX_TAG', rid, tag.name, json.dumps({'label':label,'attrs':values}, ensure_ascii=False), flush=True)
+                          for key,value in values:
+                              if key in ('href','src','action','data','data-src','data-url'):
+                                  print('NX_ABS', rid, key, urljoin(r.url,value), flush=True)
+                  for keyword in ('download','DownLoad','downLoad','pdf','fileurl','fileUrl','reportid','reportId','ViewState','login'):
+                      for m in list(re.finditer(keyword, text, flags=re.I))[:8]:
+                          snippet = re.sub(r'\s+', ' ', text[max(0,m.start()-900):m.start()+1800])
+                          print('NX_CTX', rid, keyword, snippet[:2600], flush=True)
+              except Exception as exc:
+                  print('NX_ERROR', rid, repr(exc), flush=True)
+          PY
