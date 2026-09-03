@@ -1,0 +1,31 @@
+name: Package Zhongchuang Zhiling reports
+
+on:
+  push:
+    branches:
+      - tmp/zhongchuangzhiling-reports-20260903
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+      - name: Download verify and package reports
+        run: python .github/scripts/package_zhongchuangzhiling_reports.py
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongchuangzhiling-reports-20260903
+          path: 中创智领_原郑煤机_2020-2025年报及2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 0
