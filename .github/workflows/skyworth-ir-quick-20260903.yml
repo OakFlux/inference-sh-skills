@@ -1,0 +1,53 @@
+name: Quick enumerate Skyworth IR attachments
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-ir-quick-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Fetch selected IR pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml urllib3
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests, urllib3
+          from bs4 import BeautifulSoup
+          urllib3.disable_warnings()
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'}
+          for year in (2025,2024,2023,2022,2021,2020):
+              u=f'https://investor.skyworth.com/sc/ir_research.php?year={year}'
+              try:
+                  r=s.get(u,headers=h,verify=False,timeout=(15,45),allow_redirects=True)
+                  print('FETCH',year,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+                  text=html.unescape(r.text).replace('\\/','/')
+                  soup=BeautifulSoup(text,'lxml')
+                  print('TITLE',year,soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+                  for a in soup.find_all('a',href=True):
+                      label=' '.join(a.get_text(' ',strip=True).split())
+                      href=urljoin(r.url,a['href'])
+                      if any(x in (label+' '+href).lower() for x in ('中金','天风','第一上海','兴业','国泰君安','银河国际','星展','pdf','research')):
+                          print('A',year,json.dumps({'label':label,'href':href,'onclick':a.get('onclick'),'class':a.get('class')},ensure_ascii=False),flush=True)
+                  for script in soup.find_all('script'):
+                      src=script.get('src')
+                      body=script.get_text(' ',strip=True)
+                      joined=(src or '')+' '+body
+                      if any(x in joined.lower() for x in ('research','report','pdf','ajax','ir_')):
+                          print('SCRIPT',year,json.dumps({'src':urljoin(r.url,src) if src else None,'body':body[:4000]},ensure_ascii=False),flush=True)
+                  for m in re.finditer(r'(?:中金|天风|第一上海|兴业|国泰君安|银河国际|星展)',text,re.I):
+                      print('CTX',year,re.sub(r'\s+',' ',text[max(0,m.start()-900):m.start()+2200])[:3100],flush=True)
+              except Exception as e:
+                  print('ERR',year,repr(e),flush=True)
+          PY
