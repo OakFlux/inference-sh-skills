@@ -1,0 +1,356 @@
+name: Package verified Skyworth Group broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-group-broker-package-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pymupdf urllib3
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          import urllib3
+          from pypdf import PdfReader
+
+          urllib3.disable_warnings()
+
+          PACKAGE_NAME = '创维集团_券商深度报告_3份_完整PDF'
+          ROOT = Path(PACKAGE_NAME)
+          WORK = Path('_skyworth_work')
+          RENDERS = WORK / 'renders'
+          ROOT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '天风证券',
+                  'date': '2022-09-13',
+                  'title': '家电行业领军者，分布式光伏开启第二成长曲线',
+                  'type': '首次覆盖报告',
+                  'pages': 24,
+                  'sha256': 'd80c18d4830a700f49777e5c0adf8284e83e6ff756569e5da6437df32ffe13e7',
+                  'url': 'https://manager.wisdomir.com/files/399/2022/0913/20220916161009_69066843_sc.pdf',
+                  'title_markers': ['家电行业领军者', '分布式光伏开启第二成长曲线'],
+                  'broker_markers': ['天风证券', 'tfzq.com'],
+              },
+              {
+                  'broker': '中金公司',
+                  'date': '2021-12-02',
+                  'title': '产业竞争力外溢，户用光伏新龙头',
+                  'type': '公司深度研究',
+                  'pages': 27,
+                  'sha256': '6ebd75ebecf48dd7f5d842ffb15d9e2cdcac56d61ecb3c4f830a232b72453d2c',
+                  'url': 'https://manager.wisdomir.com/files/399/2021/1202/20211203103340_80635194_sc.pdf',
+                  'title_markers': ['产业竞争力外溢', '户用光伏新龙头'],
+                  'broker_markers': ['中金公司', 'cicc.com.cn'],
+              },
+              {
+                  'broker': '第一上海',
+                  'date': '2021-12-09',
+                  'title': '布局户用光伏带来新的业务增长点',
+                  'type': '公司更新报告',
+                  'pages': 8,
+                  'sha256': '596fa3aad321d266bb90a8f5b24f7a4edebd478d7ccaf469abfe9e665fb72449',
+                  'url': 'https://manager.wisdomir.com/files/399/2021/1209/20211214100955_39654139_sc.pdf',
+                  'title_markers': ['布局户用光伏', '新的业务增长点'],
+                  'broker_markers': ['第一上海', 'firstshanghai'],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'http://investor.skyworth.com/sc/ir_research.php',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'\s+', '', value or '').lower()
+
+          def hash_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def download(url: str) -> requests.Response:
+              errors = []
+              for attempt in range(1, 6):
+                  try:
+                      response = session.get(
+                          url,
+                          headers=headers,
+                          verify=False,
+                          timeout=(25, 300),
+                          allow_redirects=True,
+                      )
+                      print(
+                          'GET', attempt, response.status_code,
+                          response.headers.get('content-type'),
+                          len(response.content), response.url,
+                          flush=True,
+                      )
+                      if (
+                          response.status_code == 200
+                          and response.content.startswith(b'%PDF-')
+                          and len(response.content) > 100_000
+                      ):
+                          return response
+                      errors.append(f'HTTP {response.status_code}/{len(response.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(min(attempt * 2, 8))
+              raise RuntimeError('下载失败：' + ' | '.join(errors[-5:]))
+
+          records = []
+          pdf_paths = []
+          total_pages = 0
+          total_bytes = 0
+
+          for index, report in enumerate(reports, 1):
+              response = download(report['url'])
+              data = response.content
+              digest = hash_bytes(data)
+              if digest != report['sha256']:
+                  raise RuntimeError(
+                      f"{report['broker']} 文件哈希变化：{digest} != {report['sha256']}"
+                  )
+
+              filename = f"{index:02d}_{report['broker']}_{report['date']}_{report['title']}.pdf"
+              path = ROOT / filename
+              path.write_bytes(data)
+
+              reader = PdfReader(str(path), strict=False)
+              if reader.is_encrypted and reader.decrypt('') == 0:
+                  raise RuntimeError(f'PDF 无法解密：{filename}')
+              pages = len(reader.pages)
+              if pages != report['pages']:
+                  raise RuntimeError(
+                      f"页数不一致：{filename}，{pages} != {report['pages']}"
+                  )
+
+              front_text = []
+              for page in reader.pages[:min(12, pages)]:
+                  try:
+                      front_text.append(page.extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', filename, repr(exc), flush=True)
+              front = '\n'.join(front_text)
+              normalized = compact(front)
+
+              company_markers = (
+                  '创维集团', '創維集團', 'skyworthgroup',
+                  '00751', '0751.hk', '751hk',
+              )
+              if not any(compact(marker) in normalized for marker in company_markers):
+                  raise RuntimeError(f'公司标识缺失：{filename}')
+              if '创维数字' in normalized and '创维集团' not in normalized and '創維集團' not in normalized:
+                  raise RuntimeError(f'误收创维数字报告：{filename}')
+
+              if not any(compact(marker) in normalized for marker in report['broker_markers']):
+                  raise RuntimeError(f'券商标识缺失：{filename}')
+              for marker in report['title_markers']:
+                  if compact(marker) not in normalized:
+                      raise RuntimeError(f'标题特征“{marker}”缺失：{filename}')
+
+              research_markers = (
+                  '证券研究报告', '證券研究報告', '公司报告', '公司研报',
+                  '首次覆盖报告', '更新报告', '研究报告',
+              )
+              if not any(compact(marker) in normalized for marker in research_markers):
+                  raise RuntimeError(f'券商研究报告类型标识缺失：{filename}')
+
+              qpdf = subprocess.run(
+                  ['qpdf', '--check', str(path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  check=False,
+              )
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(
+                      f'qpdf 结构检查失败：{filename}；{qpdf.stderr[-1000:]}'
+                  )
+
+              document = pymupdf.open(path)
+              if document.page_count != pages:
+                  raise RuntimeError(f'PDF 解析器页数不一致：{filename}')
+              for page_index in sorted({0, pages // 2, pages - 1}):
+                  pix = document.load_page(page_index).get_pixmap(
+                      matrix=pymupdf.Matrix(0.55, 0.55),
+                      alpha=False,
+                  )
+                  if pix.width < 150 or pix.height < 150:
+                      raise RuntimeError(
+                          f'PyMuPDF 渲染失败：{filename} 第 {page_index + 1} 页'
+                      )
+              document.close()
+
+              # 再用独立 Poppler 渲染器检查首页。
+              prefix = RENDERS / f'check_{index:02d}'
+              poppler = subprocess.run(
+                  [
+                      'pdftoppm', '-f', '1', '-l', '1', '-singlefile',
+                      '-png', '-r', '90', str(path), str(prefix),
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  check=False,
+              )
+              rendered = prefix.with_suffix('.png')
+              if (
+                  poppler.returncode != 0
+                  or not rendered.exists()
+                  or rendered.stat().st_size < 5_000
+              ):
+                  raise RuntimeError(
+                      f'Poppler 渲染失败：{filename}；{poppler.stderr[-1000:]}'
+                  )
+
+              record = {
+                  'broker': report['broker'],
+                  'publish_date': report['date'],
+                  'title': report['title'],
+                  'report_type': report['type'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source': '创维集团投资者关系网站所列公开PDF附件',
+                  'source_url': response.url,
+                  'file': filename,
+              }
+              records.append(record)
+              pdf_paths.append(path)
+              total_pages += pages
+              total_bytes += len(data)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 3:
+              raise RuntimeError(f'报告数量异常：{len(records)}')
+          if total_pages != 59:
+              raise RuntimeError(f'总页数异常：{total_pages}')
+          if len({record['sha256'] for record in records}) != 3:
+              raise RuntimeError('检测到重复PDF')
+
+          manifest = {
+              'company': '创维集团有限公司',
+              'ticker': '00751.HK',
+              'prepared_date': '2026-09-03',
+              'document_count': len(records),
+              'total_pages': total_pages,
+              'total_bytes': total_bytes,
+              'selection_note': (
+                  '优先选择完整的公司首次覆盖或公司深度研究；第三份为8页公司专题更新。'
+                  '未收录标题含创维集团、但正文实际为多公司分布式光伏行业综述的44页报告；'
+                  '亦未收录仅3—6页的常规业绩点评。'
+              ),
+              'documents': records,
+          }
+          (ROOT / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['file']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          readme = [
+              '创维集团有限公司（00751.HK）券商深度研究报告资料包',
+              '整理日期：2026-09-03',
+              '',
+              '筛选说明',
+              '1. 本包收录2份长篇公司深度/首次覆盖报告，以及1份8页公司专题更新。',
+              '2. 已排除创维数字（000810.SZ）报告。',
+              '3. 已排除虽然在创维投资者关系页列示、但正文实际为多公司分布式光伏行业综述的44页文件。',
+              '4. 已排除仅3—6页的常规业绩点评。',
+              '',
+              '文件清单',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. {record['broker']}｜{record['publish_date']}｜{record['pages']}页",
+                  f"   {record['title']}",
+                  f"   类型：{record['report_type']}",
+                  f"   文件：{record['file']}",
+                  f"   SHA-256：{record['sha256']}",
+                  f"   来源：{record['source_url']}",
+                  '',
+              ])
+          readme.extend([
+              '完整性检查',
+              f'- 共3份PDF，合计{total_pages}页，未压缩总大小{total_bytes / 1024 / 1024:.2f} MiB。',
+              '- 已核对PDF文件头、公司名称及00751.HK代码、券商、标题、页数和文档类型。',
+              '- 每份PDF均通过qpdf结构检查、PyMuPDF首页/中间页/末页渲染及Poppler首页渲染。',
+              '- 已完成逐文件SHA-256校验和ZIP CRC完整性检查。',
+              '',
+              '资料仅供个人研究与学习使用，版权归原券商及相关权利人所有。',
+          ])
+          (ROOT / 'README_来源与校验.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          archive = Path(PACKAGE_NAME + '.zip')
+          with zipfile.ZipFile(
+              archive,
+              'w',
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+              allowZip64=True,
+          ) as bundle:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      bundle.write(path, arcname=str(path.relative_to(ROOT)))
+
+          with zipfile.ZipFile(archive) as bundle:
+              bad = bundle.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC校验失败：{bad}')
+              pdf_members = [name for name in bundle.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 3:
+                  raise RuntimeError(f'ZIP内PDF数量异常：{len(pdf_members)}')
+
+          archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+          print('FINAL_ZIP', archive.name, archive.stat().st_size, archive_sha, flush=True)
+          print('TOTAL_PAGES', total_pages, flush=True)
+          print('TOTAL_BYTES', total_bytes, flush=True)
+          PY
+
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: skyworth-group-broker-reports-20260903
+          path: 创维集团_券商深度报告_3份_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
