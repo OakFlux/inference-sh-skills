@@ -1,0 +1,105 @@
+name: Inspect Skyworth IR research links v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/skyworth-ir-inspection-v2-20260903.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Inspect IR pages and attachments
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml urllib3 pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          from io import BytesIO
+          from urllib.parse import urljoin
+
+          import requests
+          import urllib3
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          }
+
+          def fetch(url):
+              errors=[]
+              alternatives=[url]
+              if url.startswith('https://'):
+                  alternatives.append('http://' + url[len('https://'):])
+              for candidate in alternatives:
+                  for verify in (False, True):
+                      try:
+                          r=session.get(candidate,headers=headers,timeout=(25,180),allow_redirects=True,verify=verify)
+                          print('FETCH',r.status_code,len(r.content),r.url,'verify',verify,r.headers.get('content-type'),flush=True)
+                          if r.status_code==200 and r.content:
+                              r.encoding=r.apparent_encoding or 'utf-8'
+                              return r
+                          errors.append(f'{candidate} verify={verify} HTTP {r.status_code}')
+                      except Exception as exc:
+                          errors.append(f'{candidate} verify={verify} {exc!r}')
+              raise RuntimeError(' | '.join(errors))
+
+          all_urls=[]
+          for lang in ('sc','tc','en'):
+              for year in range(2025,2018,-1):
+                  url=f'https://investor.skyworth.com/{lang}/ir_research.php?year={year}'
+                  try:
+                      r=fetch(url)
+                      text=html.unescape(r.text).replace('\\/','/')
+                      soup=BeautifulSoup(text,'lxml')
+                      print('\nPAGE',lang,year,r.url,soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+                      for tag in soup.find_all(['a','iframe','embed','object','source']):
+                          label=' '.join(tag.get_text(' ',strip=True).split())
+                          for attr in ('href','src','data'):
+                              value=tag.get(attr)
+                              if not value: continue
+                              absolute=urljoin(r.url,value)
+                              joined=(label+' '+absolute).lower()
+                              if any(x in joined for x in ('pdf','report','research','天风','中金','第一上海','兴业','skyworth','创维','創維')):
+                                  print('LINK',lang,year,json.dumps({'label':label,'attr':attr,'url':absolute},ensure_ascii=False),flush=True)
+                                  all_urls.append((label,absolute,year,lang))
+                      for m in re.finditer(r'(?:中金|天风|第一上海|兴业|华泰|光大|创维集团|創維集團|Skyworth)',text,flags=re.I):
+                          snippet=re.sub(r'\s+',' ',text[max(0,m.start()-500):m.start()+1300])
+                          print('CTX',lang,year,snippet[:1800],flush=True)
+                  except Exception as exc:
+                      print('PAGE_ERROR',lang,year,repr(exc),flush=True)
+
+          print('\n================ PDF PROBES ================',flush=True)
+          seen=set()
+          for label,url,year,lang in all_urls:
+              if url in seen or '.pdf' not in url.lower(): continue
+              seen.add(url)
+              try:
+                  r=fetch(url)
+                  print('PDF_RAW',r.status_code,len(r.content),r.headers.get('content-type'),r.url,label,flush=True)
+                  if r.content.startswith(b'%PDF-'):
+                      pdf=PdfReader(BytesIO(r.content),strict=False)
+                      chunks=[]
+                      for p in pdf.pages[:min(8,len(pdf.pages))]:
+                          try: chunks.append(p.extract_text() or '')
+                          except Exception as exc: print('TEXT_WARN',repr(exc),flush=True)
+                      front=re.sub(r'\s+',' ','\n'.join(chunks))
+                      print('PDF_OK',json.dumps({'label':label,'year':year,'lang':lang,'pages':len(pdf.pages),'bytes':len(r.content),'url':r.url,'front':front[:1400]},ensure_ascii=False),flush=True)
+              except Exception as exc:
+                  print('PDF_ERROR',url,repr(exc),flush=True)
+          PY
