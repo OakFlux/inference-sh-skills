@@ -1,0 +1,127 @@
+name: Resolve First Shanghai Zhongsheng from searchInfo archive
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-firstshanghai-searchinfo-20220330.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Fetch archive pages and locate exact PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          python - <<'PY'
+          import hashlib, json, re, subprocess, time
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S=requests.Session(); S.trust_env=False
+          H={'User-Agent':UA,'Accept':'text/html,application/xhtml+xml,*/*','Accept-Language':'zh-TW,zh;q=0.9,en;q=0.8'}
+          urls=[]
+          # Try the indexed searchInfo page and nearby live category pages.
+          page_urls=['https://www.mystockhk.com/searchInfo.aspx?EndDate=&NodeId=81&StartDate=&page=130&stockCode=&strIndustry=']
+          page_urls += [f'https://www.mystockhk.com/category.aspx?NodeID=81&page={p}' for p in range(132,141)]
+          logs=[]
+          for pu in page_urls:
+            try:
+              r=S.get(pu,headers=H,timeout=(20,120),allow_redirects=True)
+              if not r.encoding or r.encoding.lower()=='iso-8859-1': r.encoding=r.apparent_encoding or 'utf-8'
+              text=r.text
+              hit=('中升控股' in text or '中升集團' in text) and ('收購仁孚' in text or '收购仁孚' in text)
+              print('PAGE',pu,r.status_code,len(r.content),r.url,r.encoding,'HIT',hit,flush=True)
+              logs.append({'url':pu,'status':r.status_code,'bytes':len(r.content),'final':r.url,'hit':hit})
+              if not hit: continue
+              Path('target_page.html').write_text(text,encoding='utf-8')
+              idx=max(text.find('收購仁孚'),text.find('收购仁孚'))
+              print('CHUNK',text[max(0,idx-12000):idx+16000],flush=True)
+              soup=BeautifulSoup(text,'html.parser')
+              # Find the smallest ancestor containing the target title and its download icon/anchor.
+              target=None
+              for node in soup.find_all(string=re.compile('收購仁孚|收购仁孚')):
+                target=node.parent; break
+              if target:
+                cur=target
+                for level in range(10):
+                  if cur is None: break
+                  block=cur.get_text(' ',strip=True)
+                  if '中升控股' in block or '中升集團' in block:
+                    print('ANCESTOR',level,cur.name,dict(cur.attrs),str(cur)[:10000],flush=True)
+                    for tag in cur.find_all(True):
+                      for attr in ('href','src','onclick','data','data-url','data-href','value'):
+                        val=tag.get(attr)
+                        if val:
+                          print('ATTR',tag.name,attr,repr(str(val)),flush=True)
+                          for cand in re.findall(r"https?://[^'\"\s<>]+|[^'\"\s<>]+\.pdf(?:\?[^'\"\s<>]*)?|(?:detail|download|view|show|info)[^'\"\s<>]*",str(val),re.I):
+                            urls.append(urljoin(r.url,cand))
+                  cur=cur.parent
+              # Match every anchor whose parent block contains target title.
+              for a in soup.find_all('a'):
+                block=a.parent.get_text(' ',strip=True) if a.parent else ''
+                if ('收購仁孚' in block or '收购仁孚' in block) and ('中升控股' in block or '中升集團' in block):
+                  print('EXACT_A',str(a),repr(block[:3000]),flush=True)
+                  for attr in ('href','onclick','data-url','data-href'):
+                    if a.get(attr): urls.append(urljoin(r.url,str(a.get(attr))))
+              # URLs in target chunk.
+              chunk=text[max(0,idx-15000):idx+20000]
+              for cand in re.findall(r"https?://[^'\"\s<>]+|[^'\"\s<>]+\.pdf(?:\?[^'\"\s<>]*)?",chunk,re.I):
+                urls.append(urljoin(r.url,cand))
+            except Exception as e:
+              print('PAGE_ERROR',pu,repr(e),flush=True)
+          ded=[]; seen=set()
+          for u in urls:
+            u=u.replace('&amp;','&').strip()
+            if u and u not in seen:
+              seen.add(u); ded.append(u)
+          print('URLS',json.dumps(ded,ensure_ascii=False,indent=2),flush=True)
+          verified=[]; out=Path('verified'); out.mkdir(exist_ok=True)
+          for u in ded:
+            try:
+              r=S.get(u,headers={'User-Agent':UA,'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Referer':'https://www.mystockhk.com/'},timeout=(15,120),allow_redirects=True)
+              print('TRY',u,r.status_code,r.headers.get('content-type'),len(r.content),r.url,r.content[:8],flush=True)
+              if r.status_code!=200 or not r.content.startswith(b'%PDF-') or len(r.content)<50000: continue
+              rd=PdfReader(BytesIO(r.content),strict=False); pages=len(rd.pages)
+              full=''
+              for page in rd.pages:
+                try: full+=(page.extract_text() or '')+'\n'
+                except Exception: pass
+              compact=re.sub(r'\s+',' ',full)
+              focus=(('中升控股' in compact or '中升集團' in compact) and ('收購仁孚' in compact or '收购仁孚' in compact) and ('二手車' in compact or '二手车' in compact))
+              print('CHECK',pages,focus,compact[:5000],flush=True)
+              if not focus: continue
+              sha=hashlib.sha256(r.content).hexdigest()
+              fn=f'第一上海_中升控股_收购仁孚巩固行业地位_二手车业务蓄势待发_2022-03-30_{pages}页.pdf'
+              p=out/fn; p.write_bytes(r.content)
+              q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+              verified.append({'filename':fn,'url':r.url,'pages':pages,'bytes':len(r.content),'sha256':sha,'sample':compact[:8000]})
+            except Exception as e: print('TRY_ERROR',u,repr(e),flush=True)
+          Path('manifest.json').write_text(json.dumps({'verified':verified,'logs':logs,'urls':ded},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',len(verified),flush=True)
+          PY
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongsheng-firstshanghai-searchinfo-20220330
+          path: |
+            verified/
+            manifest.json
+            target_page.html
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 0
