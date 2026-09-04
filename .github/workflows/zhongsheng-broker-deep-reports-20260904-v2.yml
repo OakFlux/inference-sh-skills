@@ -1,0 +1,180 @@
+name: Fast package Zhongsheng broker deep reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-broker-deep-reports-20260904-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Fetch public complete page images and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from io import BytesIO
+          from pathlib import Path
+          import requests, img2pdf
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE='中升控股_00881HK_券商深度报告_2份'
+          OUT=Path(PACKAGE); OUT.mkdir(exist_ok=True)
+          WORK=Path('_pages'); WORK.mkdir(exist_ok=True)
+          PREV=Path('_previews'); PREV.mkdir(exist_ok=True)
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+
+          reports=[
+            {'order':1,'doc':'4681578','broker':'开源证券','date':'2025-01-26','date_path':'2025/01/26','title':'汽车经销商龙头基本面或见底反转','full_title':'港股公司首次覆盖报告：汽车经销商龙头基本面或见底反转','type':'港股公司首次覆盖报告','expected':42},
+            {'order':2,'doc':'5187055','broker':'兴证国际','date':'2025-12-12','date_path':'2025/12/12','title':'全力打造高端汽车服务品牌，积极优化网络及品牌布局','full_title':'全力打造高端汽车服务品牌，积极优化网络及品牌布局','type':'首次覆盖报告','expected':None},
+          ]
+
+          def norm(s): return re.sub(r'[\\/:*?"<>|\s]+','_',s).strip('_')[:110]
+          def session():
+            s=requests.Session(); s.trust_env=False
+            s.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+            return s
+
+          # Public no-auth metadata, mainly to obtain the second report's exact page count.
+          try:
+            s=session()
+            r=s.post('https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth',headers={'Content-Type':'application/json;charset=UTF-8','Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/','x-fp':'','x-bot':''},json={'keywords':'中升控股','page':1,'limit':100,'order':0},timeout=(15,90))
+            print('META',r.status_code,len(r.content),r.headers.get('content-type'),flush=True)
+            obj=r.json() if r.status_code==200 else {}
+            data=obj.get('data') or {}
+            rows=data.get('dataList') if isinstance(data,dict) else data
+            rows=rows if isinstance(rows,list) else []
+            for rep in reports:
+              row=next((x for x in rows if str(x.get('docId') or x.get('id') or '')==rep['doc']),None)
+              rep['metadata']=row or {}
+              if not rep['expected'] and row:
+                for k in ('pageNum','pageCount','pages','totalPages','attachPages'):
+                  try:
+                    n=int(row.get(k))
+                    if 10<=n<=200: rep['expected']=n; break
+                  except Exception: pass
+              print('REPORT_META',rep['doc'],json.dumps(row or {},ensure_ascii=False)[:12000],'EXPECTED',rep['expected'],flush=True)
+          except Exception as e:
+            print('META_WARN',repr(e),flush=True)
+            for rep in reports: rep['metadata']={}
+
+          def fetch_one(rep,page):
+            s=session()
+            root=f"https://public.fxbaogao.com/report-image/{rep['date_path']}/{rep['doc']}-{page}"
+            urls=[root+'.png',root+'.jpg',root+'.webp',root+'.png?x-oss-process=image%2Fformat%2Cwebp',root+'.png?x-oss-process=image%2Fresize%2Cp_90']
+            headers={'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8','Referer':f"https://www.fxbaogao.com/view?id={rep['doc']}"}
+            for u in urls:
+              for a in range(2):
+                try:
+                  rr=s.get(u,headers=headers,timeout=(15,60),allow_redirects=True)
+                  if rr.status_code==200 and len(rr.content)>7000:
+                    with Image.open(BytesIO(rr.content)) as im:
+                      im.load(); w,h=im.size
+                      if w>=600 and h>=800:
+                        return page,rr.content,rr.url,w,h
+                except Exception as e:
+                  if a==1: print('PAGEERR',rep['doc'],page,u,repr(e),flush=True)
+                time.sleep(.3)
+            return page,None,None,None,None
+
+          records=[]
+          for rep in reports:
+            # When metadata is unavailable, probe a safe upper bound in parallel and use the contiguous sequence from page 1.
+            probe_max=rep['expected'] or 100
+            results={}
+            with ThreadPoolExecutor(max_workers=16) as ex:
+              futs=[ex.submit(fetch_one,rep,p) for p in range(1,probe_max+1)]
+              for fut in as_completed(futs):
+                page,raw,url,w,h=fut.result()
+                if raw is not None:
+                  results[page]=(raw,url,w,h)
+                  print('PAGE_OK',rep['doc'],page,len(raw),w,h,url,flush=True)
+                else:
+                  print('PAGE_MISS',rep['doc'],page,flush=True)
+            contiguous=[]
+            for p in range(1,probe_max+1):
+              if p in results: contiguous.append(p)
+              else: break
+            if rep['expected']:
+              if len(contiguous)!=rep['expected']:
+                missing=[p for p in range(1,rep['expected']+1) if p not in results]
+                raise RuntimeError(f"{rep['doc']} missing pages {missing[:20]}; contiguous={len(contiguous)} expected={rep['expected']}")
+            else:
+              if len(contiguous)<15: raise RuntimeError(f"{rep['doc']} only {len(contiguous)} contiguous public pages")
+              rep['expected']=len(contiguous)
+            page_dir=WORK/rep['doc']; page_dir.mkdir(exist_ok=True)
+            jpegs=[]; source_urls=[]
+            for p in range(1,rep['expected']+1):
+              raw,url,w,h=results[p]
+              out=page_dir/f'{p:04d}.jpg'
+              with Image.open(BytesIO(raw)) as im:
+                if im.mode!='RGB': im=im.convert('RGB')
+                im.save(out,'JPEG',quality=94,subsampling=0,optimize=True)
+              jpegs.append(str(out)); source_urls.append(url)
+            pdf_bytes=img2pdf.convert(jpegs)
+            filename=f"{rep['order']:02d}_{rep['broker']}_中升控股_{norm(rep['title'])}_{rep['date']}_{rep['expected']}页.pdf"
+            pdf=OUT/filename; pdf.write_bytes(pdf_bytes)
+            reader=PdfReader(str(pdf),strict=False)
+            pages=len(reader.pages)
+            if pages!=rep['expected']: raise RuntimeError(f'PDF page mismatch {pages} vs {rep["expected"]}')
+            q=subprocess.run(['qpdf','--check',str(pdf)],capture_output=True,text=True)
+            if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+            for label,pn in [('first',1),('last',pages)]:
+              prefix=PREV/f"{rep['order']:02d}_{label}"
+              subprocess.run(['pdftoppm','-f',str(pn),'-singlefile','-jpeg','-r','80',str(pdf),str(prefix)],check=True,capture_output=True)
+              rendered=Path(str(prefix)+'.jpg')
+              if not rendered.exists() or rendered.stat().st_size<5000: raise RuntimeError('render check failed')
+            digest=hashlib.sha256(pdf.read_bytes()).hexdigest()
+            rec={'order':rep['order'],'company':'中升控股','ticker':'00881.HK','broker':rep['broker'],'date':rep['date'],'title':rep['full_title'],'report_type':rep['type'],'filename':filename,'pages':pages,'bytes':pdf.stat().st_size,'sha256':digest,'source_type':'根据无需登录即可浏览的公开完整页图按原页序合成PDF','source_page':f"https://www.fxbaogao.com/detail/{rep['doc']}",'source_viewer':f"https://www.fxbaogao.com/view?id={rep['doc']}",'page_image_first':source_urls[0],'page_image_last':source_urls[-1],'metadata':rep.get('metadata',{})}
+            records.append(rec)
+            print('VERIFIED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          if len(records)!=2: raise RuntimeError('report count != 2')
+          text=['中升控股（00881.HK）券商深度报告包','','共2份公司首次覆盖/深度研究报告。','文件根据无需登录即可逐页浏览的公开完整页图按原顺序合成，未绕过登录、付费或访问控制。','']
+          for r in records:
+            text += [f"{r['order']}. {r['broker']}：《{r['title']}》",f"   日期：{r['date']}；类型：{r['report_type']}；实际页数：{r['pages']}页",f"   文件：{r['filename']}",f"   来源形式：{r['source_type']}",f"   公开报告页面：{r['source_page']}",f"   SHA-256：{r['sha256']}",'']
+          text += ['已核验PDF文件头、页数、qpdf结构、首末页渲染、重复文件和ZIP CRC。','报告版权归原研究机构及作者所有，仅供个人研究参考，不构成投资建议。']
+          (OUT/'报告清单与来源说明.txt').write_text('\n'.join(text),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+          zp=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED,compresslevel=7,allowZip64=True) as z:
+            for p in sorted(OUT.iterdir()): z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zp) as z:
+            if z.testzip(): raise RuntimeError('ZIP CRC failed')
+            if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=2: raise RuntimeError('ZIP PDF count failed')
+          zsha=hashlib.sha256(zp.read_bytes()).hexdigest()
+          summary={'package':zp.name,'bytes':zp.stat().st_size,'sha256':zsha,'report_count':2,'reports':records}
+          Path('zhongsheng_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('FINAL_ZIP_SHA256.txt').write_text(f'{zsha}  {zp.name}\n',encoding='utf-8')
+          print('FINAL',json.dumps(summary,ensure_ascii=False),flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongsheng-broker-deep-reports-20260904-v2
+          path: |
+            中升控股_00881HK_券商深度报告_2份/
+            中升控股_00881HK_券商深度报告_2份.zip
+            zhongsheng_summary.json
+            FINAL_ZIP_SHA256.txt
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
