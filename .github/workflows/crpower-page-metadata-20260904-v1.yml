@@ -1,0 +1,55 @@
+name: Read public CR Power report page metadata
+
+on:
+  push:
+    paths:
+      - '.github/workflows/crpower-page-metadata-20260904-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Save public HTML metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 lxml
+          python - <<'PY'
+          import json,re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'}
+          pages=[
+            'https://www.sdyanbao.com/detail/903179',
+            'https://www.baogaobox.com/reports/250729000069891.html',
+            'https://m.sgpjbg.com/baogao/731167.html',
+            'https://www.microbell.com/repinfodetail_4299532.html'
+          ]
+          for u in pages:
+            print('\nPAGE',u,flush=True)
+            try:
+              r=s.get(u,headers=h,timeout=60)
+              print('META',r.status_code,r.url,r.headers.get('content-type'),len(r.content),flush=True)
+              text=r.text
+              soup=BeautifulSoup(text,'lxml')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+              for tag in soup.find_all(['a','iframe','embed','object','script']):
+                vals=[tag.get(x) for x in ('href','src','data') if tag.get(x)]
+                for v in vals:
+                  full=urljoin(r.url,v)
+                  if any(k in full.lower() for k in ('pdf','report','file','asset','api','static','903179','731167','4299532')):
+                    print('LINK',tag.name,full,flush=True)
+              for marker in ('903179','250729000069891','731167','4299532','.pdf'):
+                m=re.search(re.escape(marker),text,re.I)
+                if m:
+                  print('TEXT',marker,repr(text[max(0,m.start()-500):m.start()+1500]),flush=True)
+            except Exception as e:
+              print('ERROR',repr(e),flush=True)
+          PY
