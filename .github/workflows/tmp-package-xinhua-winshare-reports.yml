@@ -1,0 +1,481 @@
+name: Package Xinhua Winshare annual and latest half-year reports
+
+on:
+  push:
+    branches:
+      - tmp/xinhua-winshare-reports-20260904
+    paths:
+      - '.github/workflows/tmp-package-xinhua-winshare-reports.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF validation tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Download verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          STOCK_CODE = '601811'
+          COMPANY_SHORT = '新华文轩'
+          COMPANY_FULL = '新华文轩出版传媒股份有限公司'
+          COMPANY_EN = 'Xinhua Winshare'
+          PACKAGE_NAME = '新华文轩_601811_2020-2025年报及2026年最新半年报_完整PDF'
+
+          ROOT = Path(PACKAGE_NAME)
+          ANNUAL_DIR = ROOT / '01_年度报告_2020-2025'
+          HALF_DIR = ROOT / '02_最新半年度报告'
+          WORK = Path('_xinhua_winshare_work')
+          RENDERS = WORK / 'renders'
+          for directory in (ANNUAL_DIR, HALF_DIR, WORK, RENDERS):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          html_headers = {
+              'User-Agent': ua,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://money.finance.sina.com.cn/',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://money.finance.sina.com.cn/',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'\s+', '', value or '').lower()
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def fetch(url: str, *, headers: dict[str, str], attempts: int = 7, timeout=(30, 360)) -> requests.Response:
+              errors: list[str] = []
+              for attempt in range(1, attempts + 1):
+                  try:
+                      response = session.get(
+                          url,
+                          headers=headers,
+                          timeout=timeout,
+                          allow_redirects=True,
+                      )
+                      print(
+                          'GET', attempt, response.status_code,
+                          response.headers.get('content-type'), len(response.content),
+                          response.url,
+                          flush=True,
+                      )
+                      if response.status_code == 200 and response.content:
+                          return response
+                      errors.append(f'HTTP {response.status_code}/{len(response.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(min(2 * attempt, 12))
+              raise RuntimeError(f'Unable to fetch {url}: ' + ' | '.join(errors[-8:]))
+
+          def decode_html(response: requests.Response) -> str:
+              for encoding in ('gb18030', 'gbk', 'utf-8'):
+                  try:
+                      text = response.content.decode(encoding)
+                      if any(marker in text for marker in (COMPANY_SHORT, '年度报告', '半年度报告')):
+                          return text
+                  except Exception:
+                      pass
+              response.encoding = response.apparent_encoding or 'utf-8'
+              return response.text
+
+          def parse_listing(page_type: str) -> list[dict[str, str]]:
+              candidates = [
+                  f'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_CODE}/page_type/{page_type}.phtml',
+                  f'https://money.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/{STOCK_CODE}/page_type/{page_type}.phtml',
+              ]
+              last_error = None
+              for url in candidates:
+                  try:
+                      response = fetch(url, headers=html_headers, timeout=(25, 180))
+                      text = decode_html(response)
+                      soup = BeautifulSoup(text, 'html.parser')
+                      rows: list[dict[str, str]] = []
+                      seen: set[tuple[str, str]] = set()
+                      for anchor in soup.find_all('a', href=True):
+                          label = ' '.join(anchor.get_text(' ', strip=True).split())
+                          href = urljoin(response.url, html.unescape(anchor['href']))
+                          if 'vCB_AllBulletinDetail.php' not in href:
+                              continue
+                          if COMPANY_SHORT not in label:
+                              continue
+                          key = (label, href)
+                          if key in seen:
+                              continue
+                          seen.add(key)
+                          rows.append({'title': label, 'detail_url': href})
+                      print('LISTING', page_type, json.dumps(rows, ensure_ascii=False, indent=2), flush=True)
+                      if rows:
+                          return rows
+                  except Exception as exc:
+                      last_error = exc
+                      print('LISTING_ERROR', page_type, url, repr(exc), flush=True)
+              raise RuntimeError(f'No listing entries found for {page_type}: {last_error!r}')
+
+          def extract_pdf_url(detail_url: str) -> str:
+              response = fetch(detail_url, headers=html_headers, timeout=(30, 300))
+              text = decode_html(response)
+              normalized = html.unescape(text).replace('\\/', '/')
+              urls: list[str] = []
+              patterns = (
+                  r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+?\.pdf(?:\?[^\"\'<>\s]*)?',
+                  r'https?://[^\"\'<>\s]+?\.pdf(?:\?[^\"\'<>\s]*)?',
+              )
+              for pattern in patterns:
+                  for match in re.findall(pattern, normalized, flags=re.I):
+                      candidate = html.unescape(match).replace('\\/', '/')
+                      if candidate not in urls:
+                          urls.append(candidate)
+              soup = BeautifulSoup(text, 'html.parser')
+              for anchor in soup.find_all('a', href=True):
+                  href = urljoin(response.url, html.unescape(anchor['href']))
+                  if '.pdf' in href.lower() and href not in urls:
+                      urls.append(href)
+              urls = [url for url in urls if 'file.finance.sina.com.cn' in url or 'sse.com.cn' in url]
+              if not urls:
+                  raise RuntimeError(f'No PDF URL found in detail page: {detail_url}')
+              urls.sort(key=lambda value: ('file.finance.sina.com.cn' not in value, len(value)))
+              print('PDF_URLS', detail_url, json.dumps(urls, ensure_ascii=False), flush=True)
+              return urls[0]
+
+          def annual_score(title: str, year: int, position: int) -> int:
+              n = compact(title)
+              if str(year) not in n or '年度报告' not in n:
+                  return -100000
+              excluded = (
+                  '摘要', 'h股公告', '英文', 'english', '社会责任', '环境、社会',
+                  '审计报告', '董事会', '监事会', '问询', '回复', '取消',
+              )
+              if any(marker in n for marker in excluded):
+                  return -100000
+              score = 10000 - position
+              if COMPANY_SHORT in title:
+                  score += 100
+              if '修订' in title or '更正后' in title or '更新后' in title:
+                  score += 200
+              return score
+
+          def select_annual(rows: list[dict[str, str]], year: int) -> dict[str, str]:
+              ranked = sorted(
+                  ((annual_score(row['title'], year, index), row) for index, row in enumerate(rows)),
+                  key=lambda pair: pair[0],
+                  reverse=True,
+              )
+              if not ranked or ranked[0][0] < 0:
+                  raise RuntimeError(f'Full {year} annual report not found')
+              selected = ranked[0][1]
+              print('SELECT_ANNUAL', year, selected, flush=True)
+              return selected
+
+          def select_half(rows: list[dict[str, str]], year: int) -> dict[str, str]:
+              ranked: list[tuple[int, dict[str, str]]] = []
+              for index, row in enumerate(rows):
+                  title = row['title']
+                  n = compact(title)
+                  if str(year) not in n or '半年度报告' not in n:
+                      continue
+                  if any(marker in n for marker in ('摘要', 'h股公告', '英文', '取消')):
+                      continue
+                  score = 10000 - index
+                  if COMPANY_SHORT in title:
+                      score += 100
+                  ranked.append((score, row))
+              if not ranked:
+                  raise RuntimeError(f'Full {year} half-year report not found')
+              selected = sorted(ranked, key=lambda pair: pair[0], reverse=True)[0][1]
+              print('SELECT_HALF', year, selected, flush=True)
+              return selected
+
+          annual_rows = parse_listing('ndbg')
+          half_rows = parse_listing('zqbg')
+
+          targets: list[dict] = []
+          for year in range(2020, 2026):
+              row = select_annual(annual_rows, year)
+              targets.append({
+                  'year': year,
+                  'type': '年度报告',
+                  'category': 'Annual Report',
+                  'title': row['title'],
+                  'detail_url': row['detail_url'],
+                  'directory': ANNUAL_DIR,
+                  'min_pages': 80,
+              })
+
+          half_year = 2026
+          half_row = select_half(half_rows, half_year)
+          targets.append({
+              'year': half_year,
+              'type': '半年度报告',
+              'category': 'Latest Half-Year Report',
+              'title': half_row['title'],
+              'detail_url': half_row['detail_url'],
+              'directory': HALF_DIR,
+              'min_pages': 60,
+          })
+
+          print('TARGETS', json.dumps(targets, ensure_ascii=False, indent=2, default=str), flush=True)
+
+          records: list[dict] = []
+          seen_hashes: set[str] = set()
+          total_pages = 0
+          total_bytes = 0
+
+          for index, target in enumerate(targets, 1):
+              pdf_url = extract_pdf_url(target['detail_url'])
+              source_urls = [pdf_url]
+              if pdf_url.startswith('http://'):
+                  source_urls.append('https://' + pdf_url[len('http://'):])
+
+              pdf_response = None
+              errors: list[str] = []
+              for source_url in source_urls:
+                  for referer in ('https://money.finance.sina.com.cn/', 'https://www.sse.com.cn/'):
+                      try:
+                          response = fetch(
+                              source_url,
+                              headers={**pdf_headers, 'Referer': referer},
+                              attempts=5,
+                              timeout=(30, 900),
+                          )
+                          if response.content.startswith(b'%PDF-') and len(response.content) > 50_000:
+                              pdf_response = response
+                              break
+                          errors.append(f'{source_url} | invalid PDF {len(response.content)}')
+                      except Exception as exc:
+                          errors.append(f'{source_url} | {exc!r}')
+                  if pdf_response is not None:
+                      break
+              if pdf_response is None:
+                  raise RuntimeError('Unable to download target PDF: ' + ' || '.join(errors[-8:]))
+
+              data = pdf_response.content
+              year = target['year']
+              report_type = target['type']
+              filename = f'{year}_新华文轩_{year}年{report_type}.pdf'
+              destination = target['directory'] / filename
+              destination.write_bytes(data)
+
+              reader = PdfReader(str(destination), strict=False)
+              if reader.is_encrypted and reader.decrypt('') == 0:
+                  raise RuntimeError(f'Encrypted PDF cannot be opened: {filename}')
+              pages = len(reader.pages)
+              if pages < int(target['min_pages']):
+                  raise RuntimeError(f'Unexpectedly short PDF: {filename}, {pages} pages')
+
+              chunks: list[str] = []
+              sample_indices = sorted(set(list(range(min(pages, 30))) + [pages // 2, pages - 1]))
+              for page_index in sample_indices:
+                  try:
+                      chunks.append(reader.pages[page_index].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', filename, page_index + 1, repr(exc), flush=True)
+              text = '\n'.join(chunks)
+              n = compact(text)
+              company_ok = (
+                  COMPANY_SHORT in text
+                  or COMPANY_FULL in text
+                  or compact(COMPANY_EN) in n
+                  or STOCK_CODE in n
+              )
+              if not company_ok:
+                  raise RuntimeError(f'Company identity validation failed: {filename}')
+              if str(year) not in n:
+                  raise RuntimeError(f'Report year validation failed: {filename}')
+              if report_type == '年度报告' and '年度报告' not in n:
+                  raise RuntimeError(f'Annual report marker missing: {filename}')
+              if report_type == '半年度报告' and not ('半年度报告' in n or '中期报告' in n):
+                  raise RuntimeError(f'Half-year report marker missing: {filename}')
+
+              qpdf = subprocess.run(
+                  ['qpdf', '--check', str(destination)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  check=False,
+              )
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf validation failed for {filename}: {qpdf.stderr[-1500:]}')
+              if qpdf.returncode == 3:
+                  print('QPDF_WARNING', filename, qpdf.stderr[-1500:], flush=True)
+
+              for label, page_number in (
+                  ('first', 1),
+                  ('middle', max(1, pages // 2)),
+                  ('last', pages),
+              ):
+                  prefix = RENDERS / f'{index:02d}_{label}'
+                  render = subprocess.run(
+                      [
+                          'pdftoppm', '-f', str(page_number), '-l', str(page_number),
+                          '-singlefile', '-png', '-r', '90', str(destination), str(prefix),
+                      ],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      text=True,
+                      check=False,
+                  )
+                  rendered = prefix.with_suffix('.png')
+                  if render.returncode != 0 or not rendered.exists() or rendered.stat().st_size < 5_000:
+                      raise RuntimeError(
+                          f'Render validation failed for {filename}, page {page_number}: {render.stderr[-1000:]}'
+                      )
+
+              digest = sha256_bytes(data)
+              if digest in seen_hashes:
+                  raise RuntimeError(f'Duplicate report detected: {filename}')
+              seen_hashes.add(digest)
+
+              date_match = re.search(r'/(20\d{2}-\d{2}-\d{2})/', pdf_response.url)
+              disclosure_date = date_match.group(1) if date_match else ''
+              record = {
+                  'file': str(destination.relative_to(ROOT)),
+                  'year': year,
+                  'category': target['category'],
+                  'report_type': report_type,
+                  'original_title': target['title'],
+                  'detail_url': target['detail_url'],
+                  'source_url': pdf_response.url,
+                  'disclosure_date': disclosure_date,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_format': '公开披露完整PDF',
+              }
+              records.append(record)
+              total_pages += pages
+              total_bytes += len(data)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 reports, got {len(records)}')
+          if len(seen_hashes) != 7:
+              raise RuntimeError('Duplicate files detected in final set')
+
+          readme_lines = [
+              '新华文轩出版传媒股份有限公司（601811.SH / 00811.HK）',
+              '2020—2025年年度报告及2026年最新半年度报告资料包',
+              '',
+              '收录口径：',
+              '1. 2020—2025年A股完整年度报告，共6份。',
+              '2. 截至2026-09-04最新披露的2026年A股完整半年度报告，共1份。',
+              '3. 已排除年度报告摘要、半年度报告摘要、H股重复版本、英文版及其他专项报告。',
+              '',
+              f'文件总数：{len(records)}份PDF',
+              f'合计页数：{total_pages}页',
+              f'PDF未压缩总大小：{total_bytes / 1024 / 1024:.2f} MiB',
+              '',
+              '文件清单：',
+          ]
+          for record in records:
+              readme_lines.extend([
+                  f"- {record['file']} | {record['pages']}页 | 披露日期：{record['disclosure_date']}",
+                  f"  原公告标题：{record['original_title']}",
+                  f"  公告详情：{record['detail_url']}",
+                  f"  PDF来源：{record['source_url']}",
+                  f"  SHA-256：{record['sha256']}",
+              ])
+          readme_lines.extend([
+              '',
+              '核验项目：PDF文件头、实际页数、公司名称或证券代码、报告年份和报告类型、qpdf结构检查、首页/中间页/末页渲染、重复文件检查、逐文件SHA-256及ZIP CRC。',
+              '资料仅供研究与学习使用，版权归新华文轩及原信息披露平台所有。',
+          ])
+          (ROOT / '报告清单与核验说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (ROOT / 'manifest.json').write_text(
+              json.dumps({
+                  'company': COMPANY_FULL,
+                  'stock_code_a': STOCK_CODE,
+                  'stock_code_h': '00811',
+                  'prepared_date': '2026-09-04',
+                  'document_count': len(records),
+                  'total_pages': total_pages,
+                  'total_bytes': total_bytes,
+                  'documents': records,
+              }, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['file']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          archive = Path(PACKAGE_NAME + '.zip')
+          with zipfile.ZipFile(
+              archive,
+              'w',
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+              allowZip64=True,
+          ) as bundle:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      bundle.write(path, arcname=str(path.relative_to(ROOT)))
+
+          with zipfile.ZipFile(archive) as bundle:
+              bad = bundle.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC validation failed: {bad}')
+              pdf_members = [name for name in bundle.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 7:
+                  raise RuntimeError(f'Unexpected PDF count in ZIP: {len(pdf_members)}')
+
+          archive_sha = sha256_bytes(archive.read_bytes())
+          print(
+              'FINAL_ZIP', archive.name, archive.stat().st_size,
+              archive_sha, total_pages, total_bytes,
+              flush=True,
+          )
+          PY
+
+          ls -lah *.zip
+          file *.zip
+
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinhua-winshare-reports-20260904
+          path: 新华文轩_601811_2020-2025年报及2026年最新半年报_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
