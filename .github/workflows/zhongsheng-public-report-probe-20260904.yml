@@ -1,0 +1,50 @@
+name: Probe Zhongsheng public report endpoints
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-public-report-probe-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe metadata and selected page images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pillow
+          python - <<'PY'
+          import json,time
+          from io import BytesIO
+          import requests
+          from PIL import Image
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          try:
+            r=s.post('https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth',headers={'User-Agent':ua,'Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/','x-fp':'','x-bot':''},json={'keywords':'中升控股','page':1,'limit':100,'order':0},timeout=(10,30))
+            print('META_STATUS',r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+            print('META_TEXT',r.text[:100000],flush=True)
+          except Exception as e: print('META_ERROR',repr(e),flush=True)
+          tests=[
+            ('4681578','2025/01/26',[1,2,41,42,43]),
+            ('5187055','2025/12/12',[1,2,10,15,20,25,30,35,40,45,50]),
+          ]
+          for doc,date_path,pages in tests:
+            for p in pages:
+              u=f'https://public.fxbaogao.com/report-image/{date_path}/{doc}-{p}.png?x-oss-process=image%2Fformat%2Cwebp'
+              try:
+                rr=s.get(u,headers={'User-Agent':ua,'Accept':'image/avif,image/webp,image/apng,image/*,*/*;q=0.8','Referer':f'https://www.fxbaogao.com/view?id={doc}'},timeout=(10,30),allow_redirects=True)
+                dims=None; fmt=None
+                if rr.status_code==200 and len(rr.content)>1000:
+                  try:
+                    im=Image.open(BytesIO(rr.content)); im.load(); dims=im.size; fmt=im.format
+                  except Exception as e: fmt='decode_error:'+repr(e)
+                print('IMAGE',doc,p,rr.status_code,rr.headers.get('content-type'),len(rr.content),rr.url,fmt,dims,flush=True)
+              except Exception as e: print('IMAGE_ERROR',doc,p,repr(e),flush=True)
+          PY
