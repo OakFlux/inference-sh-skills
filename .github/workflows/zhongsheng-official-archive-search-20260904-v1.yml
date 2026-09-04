@@ -1,0 +1,289 @@
+name: Search official archives for Zhongsheng broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-official-archive-search-20260904-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Search public web and official broker archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import html
+          import json
+          import re
+          import time
+          from collections import deque
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S = requests.Session()
+          S.trust_env = False
+          HEAD = {
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Cache-Control': 'no-cache',
+          }
+
+          QUERIES = [
+              '"中升控股" 研究报告 PDF',
+              '"中升控股" 首次覆盖 PDF',
+              '"中升控股" 公司深度 PDF',
+              '"汽车综合服务龙头，底部反转在即" PDF',
+              '"汽车经销商龙头基本面或见底反转" PDF',
+              '"Zhongsheng Group" "research report" pdf',
+              '"Zhongsheng Group Holdings" "881 HK" pdf',
+              '"中升控股" 招银国际 PDF',
+              '"中升控股" 国元国际 PDF',
+              '"中升控股" 第一上海 PDF',
+              '"中升控股" 建银国际 PDF',
+              '"中升控股" 国泰君安国际 PDF',
+              '"中升控股" 兴证国际 PDF',
+              '"中升控股" 交银国际 PDF',
+              '"中升控股" 海通国际 PDF',
+              '"中升控股" 银河证券 PDF',
+              '"881 HK" 中升控股 2021 research',
+              '"881 HK" Zhongsheng 2022 research',
+              '"00881" "首次覆盖" 研报',
+          ]
+
+          OFFICIAL_DOMAINS = {
+              'cmbi.com.hk', 'hk-official.cmbi.info', 'gyzq.com.hk', 'firstshanghai.com.hk',
+              'ccbi.com.hk', 'ccbintl.com', 'bocomgroup.com', 'research.bocomgroup.com',
+              'gtja.com.hk', 'gtjai.com', 'uobkayhian.com', 'drive.utrade.com.hk',
+              'htisec.com', 'haitongib.com', 'phillip.com.hk', 'china-invs.cn',
+              'chinastock.com.cn', 'csc108.com', 'essence.com.cn', 'xyzq.com.cn',
+              'pdf.dfcfw.com', 'file.iyanbao.com', 'yb.1qh.cn', 'sdyanbao.com',
+              'fxbaogao.com', 'reportify.cn', 'microbell.com',
+          }
+
+          def fetch(url, *, accept='text/html,*/*', timeout=(15, 60), referer=None):
+              headers = {**HEAD, 'Accept': accept}
+              if referer:
+                  headers['Referer'] = referer
+              last = None
+              for attempt in range(3):
+                  try:
+                      r = S.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      return r
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(1 + attempt)
+              raise last
+
+          def clean_url(value):
+              value = html.unescape(unquote(value.strip().strip('"\'<>[](){}')))
+              if value.startswith('//'):
+                  value = 'https:' + value
+              if value.startswith('/url?') or 'google.' in value:
+                  q = parse_qs(urlparse(value).query).get('q')
+                  if q:
+                      value = q[0]
+              if 'duckduckgo.com/l/?' in value:
+                  q = parse_qs(urlparse(value).query).get('uddg')
+                  if q:
+                      value = q[0]
+              return value
+
+          candidates = {}
+          search_logs = []
+
+          def add(url, source, title=''):
+              url = clean_url(url)
+              if not url.startswith(('http://', 'https://')):
+                  return
+              if len(url) > 3000:
+                  return
+              key = url.split('#')[0]
+              rec = candidates.setdefault(key, {'url': key, 'sources': [], 'titles': []})
+              if source not in rec['sources']:
+                  rec['sources'].append(source)
+              title = re.sub(r'\s+', ' ', title).strip()
+              if title and title not in rec['titles']:
+                  rec['titles'].append(title[:500])
+
+          for idx, query in enumerate(QUERIES, 1):
+              endpoints = [
+                  ('bing_rss', 'https://www.bing.com/search?q=' + quote(query) + '&format=rss&count=50'),
+                  ('bing_html', 'https://www.bing.com/search?q=' + quote(query) + '&count=50'),
+                  ('duckduckgo_html', 'https://html.duckduckgo.com/html/?q=' + quote(query)),
+                  ('duckduckgo_lite', 'https://lite.duckduckgo.com/lite/?q=' + quote(query)),
+                  ('yahoo', 'https://search.yahoo.com/search?p=' + quote(query) + '&n=50'),
+              ]
+              for engine, url in endpoints:
+                  try:
+                      r = fetch(url, timeout=(15, 90))
+                      search_logs.append({'query': query, 'engine': engine, 'status': r.status_code, 'bytes': len(r.content), 'final_url': r.url})
+                      text = r.text
+                      soup = BeautifulSoup(text, 'html.parser')
+                      for tag in soup.find_all('a', href=True):
+                          href = clean_url(tag.get('href', ''))
+                          label = tag.get_text(' ', strip=True)
+                          low = (href + ' ' + label).lower()
+                          if any(k in low for k in ('中升控股', 'zhongsheng', '00881', '881-hk', '881_hk', '881 hk', '.pdf', 'report')):
+                              add(href, engine + ':' + query, label)
+                      for match in re.findall(r'https?://[^\s"\'<>]+', text):
+                          low = unquote(match).lower()
+                          if any(k in low for k in ('zhongsheng', '00881', '.pdf', 'report')):
+                              add(match, engine + ':regex:' + query)
+                  except Exception as exc:
+                      search_logs.append({'query': query, 'engine': engine, 'error': repr(exc)})
+              print('QUERY_DONE', idx, query, 'candidates', len(candidates), flush=True)
+
+          # Add known official roots and sitemaps for archival discovery.
+          roots = [
+              'https://www.cmbi.com.hk/sitemap.xml',
+              'https://www.cmbi.com.hk/robots.txt',
+              'https://www.gyzq.com.hk/sitemap.xml',
+              'https://www.gyzq.com.hk/robots.txt',
+              'https://www.firstshanghai.com.hk/sitemap.xml',
+              'https://www.firstshanghai.com.hk/robots.txt',
+              'https://www.ccbi.com.hk/sitemap.xml',
+              'https://www.gtjai.com/sitemap.xml',
+              'https://www.htisec.com/sitemap.xml',
+              'https://www.phillip.com.hk/sitemap.xml',
+          ]
+          for root in roots:
+              try:
+                  r = fetch(root, timeout=(15, 60))
+                  search_logs.append({'root': root, 'status': r.status_code, 'bytes': len(r.content), 'final_url': r.url})
+                  for u in re.findall(r'https?://[^\s<"\']+', r.text):
+                      low = unquote(u).lower()
+                      if any(k in low for k in ('zhongsheng', '00881', '881', 'report', 'research', '.pdf')):
+                          add(u, 'official_root:' + root)
+              except Exception as exc:
+                  search_logs.append({'root': root, 'error': repr(exc)})
+
+          # Prioritize likely relevant URLs; fetch pages and extract direct PDFs one level deep.
+          def relevance(rec):
+              hay = unquote((rec['url'] + ' ' + ' '.join(rec['titles']))).lower()
+              score = 0
+              for term, pts in [
+                  ('中升控股', 80), ('zhongsheng', 80), ('00881', 70), ('881 hk', 60),
+                  ('汽车综合服务龙头', 60), ('基本面或见底反转', 60),
+                  ('.pdf', 35), ('research', 15), ('report', 10),
+              ]:
+                  if term in hay: score += pts
+              host = urlparse(rec['url']).netloc.lower().split(':')[0]
+              if any(host == d or host.endswith('.' + d) for d in OFFICIAL_DOMAINS):
+                  score += 25
+              return score
+
+          ordered = sorted(candidates.values(), key=relevance, reverse=True)
+          page_checks = []
+          max_pages = 240
+          for rec in ordered[:max_pages]:
+              url = rec['url']
+              try:
+                  r = fetch(url, timeout=(15, 90), referer='https://www.bing.com/')
+                  ctype = r.headers.get('content-type', '')
+                  check = {'url': url, 'status': r.status_code, 'ctype': ctype, 'bytes': len(r.content), 'final_url': r.url, 'score': relevance(rec), 'titles': rec['titles']}
+                  if r.content.startswith(b'%PDF-'):
+                      check['is_pdf'] = True
+                      add(r.url, 'resolved_pdf:' + url)
+                  elif 'text/html' in ctype or r.text[:100].lower().find('<html') >= 0:
+                      soup = BeautifulSoup(r.text, 'html.parser')
+                      for tag in soup.find_all(['a','iframe','embed','object','source'], href=True):
+                          href = urljoin(r.url, tag.get('href'))
+                          label = tag.get_text(' ', strip=True)
+                          if '.pdf' in unquote(href).lower() or any(k in (href + ' ' + label).lower() for k in ('download', 'research report', '研报', '研究报告')):
+                              add(href, 'page:' + r.url, label)
+                      for tag in soup.find_all(['iframe','embed','script','source','object'], src=True):
+                          src = urljoin(r.url, tag.get('src'))
+                          if '.pdf' in unquote(src).lower():
+                              add(src, 'page-src:' + r.url)
+                      for match in re.findall(r'https?://[^\s"\'<>]+', r.text):
+                          if '.pdf' in unquote(match).lower():
+                              add(match, 'page-regex:' + r.url)
+                      check['title'] = soup.title.get_text(' ', strip=True)[:500] if soup.title else ''
+                  page_checks.append(check)
+              except Exception as exc:
+                  page_checks.append({'url': url, 'error': repr(exc), 'score': relevance(rec)})
+              if len(page_checks) % 25 == 0:
+                  print('PAGE_CHECKS', len(page_checks), 'all_candidates', len(candidates), flush=True)
+
+          # Validate all direct PDF-looking or PDF-resolved URLs.
+          direct = []
+          for rec in candidates.values():
+              hay = unquote(rec['url']).lower()
+              if '.pdf' in hay or any(s.startswith('resolved_pdf:') for s in rec['sources']):
+                  direct.append(rec)
+          direct = sorted(direct, key=relevance, reverse=True)
+          verified = []
+          seen_hash = set()
+          for rec in direct[:350]:
+              url = rec['url']
+              try:
+                  r = fetch(url, accept='application/pdf,application/octet-stream;q=0.9,*/*;q=0.8', timeout=(20, 180), referer='https://www.bing.com/')
+                  if r.status_code != 200 or not r.content.startswith(b'%PDF-') or len(r.content) < 100000:
+                      continue
+                  import hashlib
+                  digest = hashlib.sha256(r.content).hexdigest()
+                  if digest in seen_hash:
+                      continue
+                  seen_hash.add(digest)
+                  reader = PdfReader(BytesIO(r.content), strict=False)
+                  pages = len(reader.pages)
+                  text_parts=[]
+                  sample_indices=list(range(min(8,pages)))
+                  if pages>8: sample_indices += [pages-1]
+                  for i in sample_indices:
+                      try: text_parts.append(reader.pages[i].extract_text() or '')
+                      except Exception: pass
+                  text='\n'.join(text_parts)
+                  compact=re.sub(r'\s+',' ',text)
+                  identity=any(term.lower() in compact.lower() for term in ('中升控股','Zhongsheng Group','881 HK','00881'))
+                  broker=next((b for b in ('开源证券','中国银河','银河证券','招银国际','国元国际','第一上海','建银国际','国泰君安','兴证国际','交银国际','海通国际','招商证券','中金公司','中信证券','瑞银','花旗') if b.lower() in compact.lower()), None)
+                  verified.append({
+                      'url': r.url, 'source_url': url, 'pages': pages, 'bytes': len(r.content),
+                      'sha256': digest, 'identity': identity, 'broker': broker,
+                      'title_text': compact[:2500], 'sources': rec['sources'], 'titles': rec['titles'],
+                  })
+                  print('VERIFIED_PDF', pages, len(r.content), identity, broker, r.url, flush=True)
+              except Exception as exc:
+                  continue
+
+          result = {
+              'query_count': len(QUERIES),
+              'candidate_count': len(candidates),
+              'direct_count': len(direct),
+              'verified_pdfs': verified,
+              'search_logs': search_logs,
+              'page_checks': page_checks,
+              'top_candidates': sorted(candidates.values(), key=relevance, reverse=True)[:500],
+          }
+          Path('zhongsheng_official_archive_search.json').write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+          Path('summary.txt').write_text(
+              f"candidates={len(candidates)}\ndirect={len(direct)}\nverified={len(verified)}\nidentity={sum(1 for x in verified if x['identity'])}\n",
+              encoding='utf-8'
+          )
+          print('FINAL', json.dumps({'candidates':len(candidates),'direct':len(direct),'verified':len(verified),'identity':sum(1 for x in verified if x['identity'])}, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload search results
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongsheng-official-archive-search-20260904-v1
+          path: |
+            zhongsheng_official_archive_search.json
+            summary.txt
+          if-no-files-found: error
+          retention-days: 7
