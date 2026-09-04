@@ -1,0 +1,82 @@
+name: Inspect Sdyanbao Zhongsheng report download
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-sdyanbao-inspect-20260904-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Inspect page scripts APIs and public file routes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json,re
+          from urllib.parse import urljoin,unquote
+          import requests
+          from bs4 import BeautifulSoup
+
+          RID='917975'
+          PAGE=f'https://www.sdyanbao.com/detail/{RID}'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          base={'User-Agent':UA,'Accept':'text/html,application/xhtml+xml,*/*','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          scripts=[]
+          for u in [PAGE,'https://m.sdyanbao.com/detail/'+RID,'https://www.sdyanbao.com/report/'+RID,'https://www.sdyanbao.com/view/'+RID]:
+            try:
+              r=s.get(u,headers=base,timeout=(15,90),allow_redirects=True)
+              print('\nPAGE',u,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              print('HEADERS',json.dumps(dict(r.headers),ensure_ascii=False),flush=True)
+              print('COOKIES',s.cookies.get_dict(),flush=True)
+              print(r.text[:180000],flush=True)
+              soup=BeautifulSoup(r.text,'html.parser')
+              for tag in soup.find_all('script',src=True):
+                src=urljoin(r.url,tag['src']); scripts.append(src); print('SCRIPT',src,flush=True)
+              for tag in soup.find_all(['a','iframe','embed','object','source','img','button']):
+                attrs={k:tag.get(k) for k in ('href','src','data','onclick','data-url','data-href','data-id') if tag.get(k)}
+                if attrs:
+                  raw=json.dumps(attrs,ensure_ascii=False)
+                  if any(k in unquote(raw.lower()) for k in (RID,'pdf','download','file','report','down','vip')):
+                    print('RESOURCE',tag.name,raw,flush=True)
+              for key in [RID,'__NEXT_DATA__','__NUXT__','pdf','download','fileUrl','pdfUrl','reportUrl','sourceUrl','oss','cos','cdn','getReport','getPdf','downUrl','attachment']:
+                for m in re.finditer(re.escape(key),r.text,re.I):
+                  print('HTMLMATCH',key,repr(r.text[max(0,m.start()-1200):m.start()+3500]),flush=True)
+            except Exception as e: print('PAGE_ERROR',u,repr(e),flush=True)
+
+          for src in sorted(set(scripts)):
+            try:
+              r=s.get(src,headers={**base,'Accept':'*/*','Referer':PAGE},timeout=(15,90),allow_redirects=True)
+              text=r.text
+              print('\nJS',src,r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+              hits=[]
+              for key in ['download','pdf','fileUrl','pdfUrl','reportUrl','sourceUrl','getReport','getPdf','downUrl','attachment','api/','917975','oss','cos','cdn']:
+                for m in re.finditer(re.escape(key),text,re.I): hits.append((m.start(),key))
+              for pos,key in sorted(hits)[:400]:
+                print('JSMATCH',key,repr(text[max(0,pos-1200):pos+4000]),flush=True)
+            except Exception as e: print('JS_ERROR',src,repr(e),flush=True)
+
+          bases=['https://www.sdyanbao.com','https://api.sdyanbao.com','https://m.sdyanbao.com','https://file.sdyanbao.com','https://static.sdyanbao.com','https://cdn.sdyanbao.com']
+          paths=[
+            f'/api/detail/{RID}',f'/api/report/{RID}',f'/api/report/detail?id={RID}',f'/api/detail?id={RID}',
+            f'/api/download/{RID}',f'/api/download?id={RID}',f'/api/report/download?id={RID}',
+            f'/api/report/getDownloadUrl?id={RID}',f'/api/getPdf?id={RID}',f'/api/report/pdf?id={RID}',
+            f'/download/{RID}',f'/download?id={RID}',f'/report/{RID}.pdf',f'/pdf/{RID}.pdf',f'/uploads/{RID}.pdf',
+          ]
+          for b in bases:
+            for p in paths:
+              u=b+p
+              try:
+                r=s.get(u,headers={'User-Agent':UA,'Accept':'application/json,application/pdf,text/plain,*/*','Referer':PAGE},timeout=(8,20),allow_redirects=True)
+                if r.status_code!=404 or len(r.content)>1000:
+                  print('API_FILE',u,r.status_code,r.headers.get('content-type'),r.headers.get('content-disposition'),len(r.content),r.url,r.content[:32],repr(r.text[:3000]) if not r.content.startswith(b'%PDF') else 'PDF',flush=True)
+              except Exception: pass
+          PY
