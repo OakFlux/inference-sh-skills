@@ -1,0 +1,441 @@
+name: Package China Resources Power annual and interim reports
+
+on:
+  push:
+    branches:
+      - tmp/cr-power-reports-20260904
+    paths:
+      - '.github/workflows/tmp-package-cr-power-reports.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf pymupdf
+
+      - name: Discover download verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from dataclasses import dataclass
+          from pathlib import Path
+          from urllib.parse import unquote, urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY_CN = '华润电力'
+          COMPANY_TRAD = '華潤電力'
+          COMPANY_EN = 'China Resources Power Holdings Company Limited'
+          STOCK_CODE = '00836'
+          STOCK_ID = '6732'
+          PREPARED_DATE = '2026-09-04'
+          PACKAGE_NAME = '华润电力_00836_2020-2025年报及最新半年报_完整PDF'
+
+          ROOT = Path(PACKAGE_NAME)
+          ANNUAL_DIR = ROOT / '01_年度报告_2020-2025'
+          CURRENT_DIR = ROOT / '02_2026年最新半年度财务资料'
+          FULL_INTERIM_DIR = ROOT / '03_最新完整中期报告'
+          WORK = Path('_cr_power_work')
+          RENDERS = WORK / 'renders'
+          for directory in (ANNUAL_DIR, CURRENT_DIR, FULL_INTERIM_DIR, WORK, RENDERS):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          search_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/html,*/*',
+              'Accept-Language': 'en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9,zh-TW;q=0.8,zh;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/',
+          }
+
+          @dataclass
+          class HkexRow:
+              release_time: str
+              title: str
+              url: str
+              row_text: str
+
+          def compact(value: object) -> str:
+              return re.sub(r'\s+', '', str(value or '')).lower()
+
+          def sha256_file(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def recursive_strings(value):
+              if isinstance(value, dict):
+                  for child in value.values():
+                      yield from recursive_strings(child)
+              elif isinstance(value, list):
+                  for child in value:
+                      yield from recursive_strings(child)
+              elif isinstance(value, str):
+                  yield value
+
+          def fetch_search(from_date: str, to_date: str, *, lang: str = 'en') -> list[HkexRow]:
+              endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': from_date,
+                  'toDate': to_date,
+                  'title': '',
+                  'searchType': '1',
+                  't1code': '40000',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'rowRange': '500',
+                  'lang': lang,
+              }
+              errors = []
+              for attempt in range(1, 6):
+                  try:
+                      response = session.get(endpoint, params=params, headers=search_headers, timeout=(25, 180), allow_redirects=True)
+                      print('SEARCH', from_date, to_date, lang, attempt, response.status_code, len(response.content), response.url, flush=True)
+                      response.raise_for_status()
+                      payload = response.json()
+                      html_candidates = []
+                      if isinstance(payload, dict) and isinstance(payload.get('result'), str):
+                          html_candidates.append(payload['result'])
+                      html_candidates.extend(recursive_strings(payload))
+                      rows: list[HkexRow] = []
+                      seen: set[tuple[str, str]] = set()
+                      for fragment in html_candidates:
+                          if '<' not in fragment or ('00836' not in fragment and 'CHINA RES POWER' not in fragment and '華潤電力' not in fragment):
+                              continue
+                          fragment = html.unescape(fragment).replace('\\/', '/')
+                          soup = BeautifulSoup(fragment, 'html.parser')
+                          for tr in soup.find_all('tr'):
+                              row_text = ' '.join(tr.stripped_strings)
+                              row_norm = compact(row_text)
+                              if not any(marker in row_norm for marker in ('00836', 'chinarespower', '華潤電力', '华润电力')):
+                                  continue
+                              anchor = None
+                              for a in tr.find_all('a', href=True):
+                                  href = html.unescape(unquote(a['href'])).replace('\\/', '/')
+                                  if '.pdf' in href.lower():
+                                      anchor = a
+                                      break
+                              if anchor is None:
+                                  continue
+                              title = ' '.join(anchor.get_text(' ', strip=True).split())
+                              href = html.unescape(unquote(anchor['href'])).replace('\\/', '/')
+                              url = urljoin('https://www1.hkexnews.hk/', href)
+                              release_match = re.search(r'(\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2})', row_text)
+                              release_time = release_match.group(1) if release_match else ''
+                              key = (title, url)
+                              if key in seen:
+                                  continue
+                              seen.add(key)
+                              rows.append(HkexRow(release_time, title, url, row_text))
+                      if rows:
+                          print('SEARCH_ROWS', json.dumps([row.__dict__ for row in rows], ensure_ascii=False, indent=2), flush=True)
+                          return rows
+                      errors.append('no parsed rows')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(min(attempt * 2, 8))
+              raise RuntimeError(f'HKEX search failed for {from_date}-{to_date}: ' + ' | '.join(errors[-8:]))
+
+          def select_annual(year: int) -> HkexRow:
+              rows = fetch_search(f'{year+1}0301', f'{year+1}0531', lang='en')
+              exact = []
+              for row in rows:
+                  n = compact(row.title)
+                  if str(year) not in n or 'annualreport' not in n:
+                      continue
+                  if any(x in n for x in ('sustainabledevelopment', 'environmental', 'noticeofpublication', 'letterto')):
+                      continue
+                  exact.append(row)
+              if len(exact) != 1:
+                  raise RuntimeError(f'Expected one Annual Report {year}, found {len(exact)}: {[row.__dict__ for row in exact]}')
+              return exact[0]
+
+          def select_full_interim(year: int) -> HkexRow:
+              rows = fetch_search(f'{year}0801', f'{year}1130', lang='en')
+              exact = []
+              for row in rows:
+                  n = compact(row.title)
+                  if str(year) not in n or 'interimreport' not in n:
+                      continue
+                  if any(x in n for x in ('noticeofpublication', 'letterto', 'results')):
+                      continue
+                  exact.append(row)
+              if len(exact) != 1:
+                  raise RuntimeError(f'Expected one Interim Report {year}, found {len(exact)}: {[row.__dict__ for row in exact]}')
+              return exact[0]
+
+          def select_interim_results(year: int) -> HkexRow:
+              rows = fetch_search(f'{year}0801', PREPARED_DATE.replace('-', ''), lang='en')
+              exact = []
+              for row in rows:
+                  n = compact(row.title)
+                  if str(year) not in n or 'interimresults' not in n:
+                      continue
+                  if any(x in n for x in ('subsidiary', 'newenergy')):
+                      continue
+                  exact.append(row)
+              if len(exact) != 1:
+                  raise RuntimeError(f'Expected one interim-results announcement {year}, found {len(exact)}: {[row.__dict__ for row in exact]}')
+              return exact[0]
+
+          def try_find_full_interim_2026() -> HkexRow | None:
+              rows = fetch_search('20260801', PREPARED_DATE.replace('-', ''), lang='en')
+              matches = []
+              for row in rows:
+                  n = compact(row.title)
+                  if '2026' in n and 'interimreport' in n and 'results' not in n:
+                      matches.append(row)
+              if len(matches) > 1:
+                  raise RuntimeError(f'Multiple 2026 full interim reports found: {[row.__dict__ for row in matches]}')
+              return matches[0] if matches else None
+
+          annual_rows = [select_annual(year) for year in range(2020, 2026)]
+          full_2026 = try_find_full_interim_2026()
+          interim_results_2026 = None if full_2026 else select_interim_results(2026)
+          latest_complete_interim = full_2026 or select_full_interim(2025)
+
+          targets = []
+          for index, (year, row) in enumerate(zip(range(2020, 2026), annual_rows), 1):
+              targets.append({
+                  'index': index,
+                  'year': year,
+                  'category': 'Annual Report',
+                  'report_type': '年度报告',
+                  'title': row.title,
+                  'url': row.url,
+                  'release_time': row.release_time,
+                  'directory': ANNUAL_DIR,
+                  'filename': f'{year}_华润电力_{year}年年度报告.pdf',
+                  'min_pages': 100,
+              })
+
+          if interim_results_2026 is not None:
+              targets.append({
+                  'index': 7,
+                  'year': 2026,
+                  'category': 'Latest Half-Year Financial Results',
+                  'report_type': '中期业绩公告',
+                  'title': interim_results_2026.title,
+                  'url': interim_results_2026.url,
+                  'release_time': interim_results_2026.release_time,
+                  'directory': CURRENT_DIR,
+                  'filename': '2026_华润电力_2026年中期业绩公告_截至2026年6月30日.pdf',
+                  'min_pages': 8,
+              })
+
+          targets.append({
+              'index': 8 if interim_results_2026 is not None else 7,
+              'year': 2026 if full_2026 else 2025,
+              'category': 'Latest Full Interim Report',
+              'report_type': '完整中期报告',
+              'title': latest_complete_interim.title,
+              'url': latest_complete_interim.url,
+              'release_time': latest_complete_interim.release_time,
+              'directory': FULL_INTERIM_DIR,
+              'filename': '2026_华润电力_2026年完整中期报告.pdf' if full_2026 else '2025_华润电力_2025年中期报告_截至当前最新完整中报.pdf',
+              'min_pages': 60,
+          })
+
+          print('TARGETS', json.dumps([{k:v for k,v in target.items() if k != 'directory'} for target in targets], ensure_ascii=False, indent=2), flush=True)
+
+          def download_pdf(url: str) -> requests.Response:
+              errors = []
+              for attempt in range(1, 7):
+                  try:
+                      response = session.get(url, headers=pdf_headers, timeout=(30, 900), allow_redirects=True)
+                      print('PDF_GET', attempt, response.status_code, response.headers.get('content-type'), len(response.content), response.url, flush=True)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50_000:
+                          return response
+                      errors.append(f'HTTP {response.status_code}/{len(response.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors[-8:]))
+
+          chinese_years = {
+              2020: ('二零二零', '二〇二〇'), 2021: ('二零二一', '二〇二一'),
+              2022: ('二零二二', '二〇二二'), 2023: ('二零二三', '二〇二三'),
+              2024: ('二零二四', '二〇二四'), 2025: ('二零二五', '二〇二五'),
+              2026: ('二零二六', '二〇二六'),
+          }
+
+          records = []
+          seen_hashes: set[str] = set()
+          total_pages = 0
+          total_bytes = 0
+
+          for target in targets:
+              response = download_pdf(target['url'])
+              destination = target['directory'] / target['filename']
+              destination.write_bytes(response.content)
+
+              reader = PdfReader(str(destination), strict=False)
+              if reader.is_encrypted and reader.decrypt('') == 0:
+                  raise RuntimeError(f'Encrypted PDF cannot be opened: {destination.name}')
+              pages = len(reader.pages)
+              if pages < target['min_pages']:
+                  raise RuntimeError(f'Unexpectedly short PDF: {destination.name}, {pages} pages')
+
+              chunks = []
+              sample_indices = sorted(set(list(range(min(50, pages))) + [pages // 2, pages - 1]))
+              for page_index in sample_indices:
+                  try:
+                      chunks.append(reader.pages[page_index].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', destination.name, page_index + 1, repr(exc), flush=True)
+              text = '\n'.join(chunks)
+              n = compact(text)
+              if not any(compact(marker) in n for marker in (COMPANY_CN, COMPANY_TRAD, COMPANY_EN, '00836')):
+                  raise RuntimeError(f'Company identity validation failed: {destination.name}')
+              year = target['year']
+              if str(year) not in n and not any(compact(marker) in n for marker in chinese_years[year]):
+                  raise RuntimeError(f'Year validation failed: {destination.name}')
+              if target['category'] == 'Annual Report' and not any(marker in n for marker in ('annualreport', compact('年度报告'), compact('年度報告'))):
+                  raise RuntimeError(f'Annual report marker missing: {destination.name}')
+              if target['category'] == 'Latest Full Interim Report' and not any(marker in n for marker in ('interimreport', compact('中期报告'), compact('中期報告'))):
+                  raise RuntimeError(f'Interim report marker missing: {destination.name}')
+              if target['category'] == 'Latest Half-Year Financial Results' and not any(marker in n for marker in ('interimresults', compact('中期业绩'), compact('中期業績'))):
+                  raise RuntimeError(f'Interim results marker missing: {destination.name}')
+
+              qpdf = subprocess.run(['qpdf', '--check', str(destination)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf validation failed: {destination.name}; {qpdf.stderr[-1500:]}')
+
+              document = pymupdf.open(destination)
+              if document.page_count != pages:
+                  raise RuntimeError(f'PDF parser page count mismatch: {destination.name}')
+              for label, page_index in (('first', 0), ('middle', pages // 2), ('last', pages - 1)):
+                  pixmap = document.load_page(page_index).get_pixmap(matrix=pymupdf.Matrix(0.55, 0.55), alpha=False)
+                  if pixmap.width < 150 or pixmap.height < 150:
+                      raise RuntimeError(f'PyMuPDF render failed: {destination.name} page {page_index + 1}')
+                  render_path = RENDERS / f"{target['index']:02d}_{label}.png"
+                  pixmap.save(render_path)
+                  if render_path.stat().st_size < 3_000:
+                      raise RuntimeError(f'Render output too small: {render_path}')
+              document.close()
+
+              digest = sha256_file(destination)
+              if digest in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {destination.name}')
+              seen_hashes.add(digest)
+              record = {
+                  'file': str(destination.relative_to(ROOT)),
+                  'year': year,
+                  'category': target['category'],
+                  'report_type': target['report_type'],
+                  'title': target['title'],
+                  'release_time': target['release_time'],
+                  'source_url': response.url,
+                  'pages': pages,
+                  'bytes': destination.stat().st_size,
+                  'sha256': digest,
+              }
+              records.append(record)
+              total_pages += pages
+              total_bytes += destination.stat().st_size
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          expected_count = 7 if full_2026 else 8
+          if len(records) != expected_count or len(seen_hashes) != expected_count:
+              raise RuntimeError(f'Unexpected final report count: {len(records)}; expected {expected_count}')
+
+          note = ('截至2026-09-04，港交所尚未披露华润电力2026年完整中期报告。因此本包收录2026年中期业绩公告作为最新半年度财务资料，并同时附上2025年完整中期报告。' if not full_2026 else '截至2026-09-04，华润电力2026年完整中期报告已披露并已收录。')
+          readme = [
+              '华润电力控股有限公司（00836.HK）定期报告资料包',
+              f'整理日期：{PREPARED_DATE}', '', '收录内容：',
+              '1. 2020—2025年完整年度报告，共6份。', f'2. {note}',
+              '3. 已排除年度业绩公告、可持续发展报告、股东通知、摘要和重复文件。', '',
+              f'PDF数量：{len(records)}份', f'合计页数：{total_pages}页',
+              f'PDF未压缩总大小：{total_bytes / 1024 / 1024:.2f} MiB', '', '文件清单：',
+          ]
+          for record in records:
+              readme.extend([
+                  f"- {record['file']}",
+                  f"  类型：{record['report_type']}｜年份：{record['year']}｜页数：{record['pages']}｜大小：{record['bytes']} bytes",
+                  f"  港交所披露时间：{record['release_time']}",
+                  f"  原标题：{record['title']}",
+                  f"  官方PDF：{record['source_url']}",
+                  f"  SHA-256：{record['sha256']}",
+              ])
+          readme.extend(['', '核验项目：PDF文件头、公司名称或证券代码、年份、报告类型、实际页数、qpdf结构检查、首页/中间页/末页渲染、重复文件检查、逐文件SHA-256及ZIP CRC。', '资料仅供研究与学习使用，版权归华润电力及原信息披露平台所有。'])
+          (ROOT / '报告清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          manifest = {
+              'company': '华润电力控股有限公司', 'ticker': '00836.HK',
+              'prepared_date': PREPARED_DATE,
+              'latest_complete_interim_year': 2026 if full_2026 else 2025,
+              'latest_current_period_document': '2026完整中期报告' if full_2026 else '2026中期业绩公告',
+              'document_count': len(records), 'total_pages': total_pages,
+              'total_bytes': total_bytes, 'documents': records,
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f"{record['sha256']}  {record['file']}\n" for record in records), encoding='utf-8')
+
+          archive = Path(PACKAGE_NAME + '.zip')
+          with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as bundle:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      bundle.write(path, arcname=str(path.relative_to(ROOT)))
+          with zipfile.ZipFile(archive) as bundle:
+              bad = bundle.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_members = [name for name in bundle.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != len(records):
+                  raise RuntimeError(f'ZIP contains {len(pdf_members)} PDFs, expected {len(records)}')
+          print('FINAL_ZIP', archive.name, archive.stat().st_size, sha256_file(archive), total_pages, total_bytes, flush=True)
+          PY
+
+          ls -lah *.zip
+          file *.zip
+
+      - name: Upload verified archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: cr-power-reports-20260904
+          path: 华润电力_00836_2020-2025年报及最新半年报_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
