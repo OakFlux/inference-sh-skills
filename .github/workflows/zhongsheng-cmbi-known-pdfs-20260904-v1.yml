@@ -1,0 +1,94 @@
+name: Verify known CMBI Zhongsheng research PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-cmbi-known-pdfs-20260904-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Download and inspect public CMBI PDF candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time
+          from io import BytesIO
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          URLS=[
+            'https://www.cmbi.com/upload/202108/20210811613963.pdf',
+            'https://hk-official.cmbi.info/upload/ef838fc5-35b3-4fb1-b869-a999aa7513c8.pdf',
+            'https://hk-official.cmbi.info/upload/1f2db122-e93b-47e6-9a13-a28126cfb36e.pdf',
+            'https://sg.cmbi.com/upload/202107/20210707578203.pdf',
+            'https://www.cmbi.com.hk/upload/202409/20240902966304.pdf',
+          ]
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          out=Path('verified_cmbi_zhongsheng'); out.mkdir(exist_ok=True)
+          records=[]
+          for idx,u in enumerate(URLS,1):
+            last=None
+            for a in range(4):
+              try:
+                r=s.get(u,headers={'User-Agent':UA,'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Referer':'https://www.cmbi.com.hk/'},timeout=(20,180),allow_redirects=True)
+                print('GET',u,r.status_code,r.headers.get('content-type'),len(r.content),r.url,r.content[:8],flush=True)
+                if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>50000:
+                  raw=r.content; break
+                last=RuntimeError(f'bad response {r.status_code} {len(r.content)}')
+              except Exception as e:
+                last=e
+              time.sleep(a+1)
+            else:
+              print('FAILED',u,repr(last),flush=True); continue
+            try:
+              rd=PdfReader(BytesIO(raw),strict=False); pages=len(rd.pages)
+              texts=[]
+              for p in list(range(min(10,pages)))+([pages-1] if pages>10 else []):
+                try: texts.append(rd.pages[p].extract_text() or '')
+                except Exception as e: texts.append('')
+              text=re.sub(r'\s+',' ','\n'.join(texts))
+              identity=any(k.lower() in text.lower() for k in ('Zhongsheng','中升控股','881 HK','00881'))
+              if not identity:
+                print('NOT_ZHONGSHENG',u,pages,text[:1000],flush=True); continue
+              title=''
+              date=''
+              # Save with stable neutral name; later inspect title/date from text.
+              digest=hashlib.sha256(raw).hexdigest()
+              fn=f'{len(records)+1:02d}_CMBI_Zhongsheng_{pages}pages_{digest[:10]}.pdf'
+              path=out/fn; path.write_bytes(raw)
+              q=subprocess.run(['qpdf','--check',str(path)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+              rec={'url':r.url,'source_url':u,'filename':fn,'pages':pages,'bytes':len(raw),'sha256':digest,'identity':identity,'sample':text[:12000]}
+              records.append(rec)
+              print('VERIFIED',json.dumps(rec,ensure_ascii=False),flush=True)
+            except Exception as e:
+              print('PARSE_ERROR',u,repr(e),flush=True)
+          Path('cmbi_zhongsheng_manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('summary.txt').write_text(f'verified={len(records)}\n',encoding='utf-8')
+          print('FINAL_COUNT',len(records),flush=True)
+          PY
+      - name: Upload verified PDFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongsheng-cmbi-known-pdfs-20260904-v1
+          path: |
+            verified_cmbi_zhongsheng/
+            cmbi_zhongsheng_manifest.json
+            summary.txt
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
