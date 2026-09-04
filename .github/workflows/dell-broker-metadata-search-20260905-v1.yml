@@ -1,0 +1,135 @@
+name: Search Dell broker report metadata and public PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-broker-metadata-search-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query public report indexes
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import json,re,time,hashlib
+          from datetime import datetime,timezone
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from pypdf import PdfReader
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          out=Path('output')
+          fxurl='https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          fxheaders={'User-Agent':ua,'Accept':'application/json,text/plain,*/*','Content-Type':'application/json; charset=UTF-8','Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/','x-fp':'','x-bot':''}
+          keywords=['戴尔科技','戴尔','DELL','Dell Technologies']
+          rows={}
+          for kw in keywords:
+              page=1; total=1
+              while page<=total and page<=80:
+                  payload={'keywords':kw,'pageNum':page,'pageSize':20,'order':0}
+                  try:
+                      r=s.post(fxurl,headers=fxheaders,json=payload,timeout=(20,120)); r.raise_for_status(); obj=r.json(); data=obj.get('data') or {}
+                      rs=data.get('dataList') or []; total=int(data.get('pageCount') or 0)
+                      print('FX_PAGE',kw,page,'/',total,'ROWS',len(rs),flush=True)
+                      for x in rs:
+                          rid=str(x.get('docId') or '')
+                          raw=json.dumps(x,ensure_ascii=False)
+                          compact=re.sub(r'\s+','',raw).lower()
+                          if any(n in compact for n in ('戴尔科技','戴爾科技','delltechnologies','dell technology','dellinc','dellgroup')):
+                              rows[rid]=x
+                      if not rs: break
+                  except Exception as e:
+                      print('FX_ERR',kw,page,repr(e),flush=True); break
+                  page+=1
+
+          candidates=[]
+          for rid,x in rows.items():
+              title=re.sub(r'</?em>','',str(x.get('title') or ''),flags=re.I)
+              pages=int(x.get('pageNum') or 0)
+              ts=int(x.get('pubTime') or 0)
+              date=datetime.fromtimestamp(ts,tz=timezone.utc).strftime('%Y-%m-%d') if ts else ''
+              rec={'docId':rid,'title':title,'org':x.get('orgName'),'pages':pages,'date':date,'pdfPath':x.get('pdfPath'),'reportType':x.get('reportType'),'docType':x.get('docType'),'isDeep':x.get('isDeep'),'authors':x.get('authors'),'stocks':x.get('stocks'),'detail':f'https://www.fxbaogao.com/detail/{rid}'}
+              candidates.append(rec)
+          candidates.sort(key=lambda z:(z['date'],z['pages']),reverse=True)
+          print('\nFX_CANDIDATES',len(candidates),json.dumps(candidates,ensure_ascii=False,indent=2),flush=True)
+          (out/'fx_candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Probe any explicit pdfPath and common public hosts without bypassing access controls.
+          verified=[]
+          for rec in candidates:
+              if rec['pages'] and rec['pages']<5: continue
+              paths=[]
+              p=str(rec.get('pdfPath') or '').strip()
+              if p:
+                  if p.startswith('http'): paths.append(p)
+                  else:
+                      for host in ['https://public.fxbaogao.com/','https://report.fxbaogao.com/','https://oss-buy.hufangde.com/']:
+                          paths.append(urljoin(host,p.lstrip('/')))
+              # common path date/docId only as a normal public URL probe
+              if rec['date']:
+                  y,m,d=rec['date'].split('-')
+                  for host in ['https://public.fxbaogao.com/','https://report.fxbaogao.com/']:
+                      for stem in ['report','reports','pdf','report-pdf']:
+                          paths.append(f'{host}{stem}/{y}/{m}/{d}/{rec["docId"]}.pdf')
+              seen=set()
+              for u in paths:
+                  if u in seen: continue
+                  seen.add(u)
+                  try:
+                      rr=s.get(u,headers={'User-Agent':ua,'Accept':'application/pdf,*/*','Referer':rec['detail']},timeout=(15,90),allow_redirects=True)
+                      print('PROBE',rec['docId'],rr.status_code,rr.headers.get('content-type'),len(rr.content),rr.url,flush=True)
+                      if rr.status_code==200 and rr.content.startswith(b'%PDF-') and len(rr.content)>100000:
+                          rd=PdfReader(BytesIO(rr.content),strict=False); np=len(rd.pages)
+                          text='\n'.join((rd.pages[i].extract_text() or '') for i in range(min(np,8)))
+                          identity=any(k.lower() in text.lower() for k in ('Dell Technologies','戴尔科技','戴爾科技','DELL'))
+                          if identity:
+                              fn=f'fx_{rec["docId"]}_{np}p.pdf'; (out/fn).write_bytes(rr.content)
+                              vr={**rec,'url':rr.url,'actualPages':np,'bytes':len(rr.content),'sha256':hashlib.sha256(rr.content).hexdigest(),'file':fn}
+                              verified.append(vr); print('VERIFIED',json.dumps(vr,ensure_ascii=False),flush=True); break
+                  except Exception as e: print('PROBE_ERR',rec['docId'],repr(e),flush=True)
+
+          # Search Eastmoney narrow recent windows for titles mentioning Dell.
+          em=[]
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          for begin,end in [('2023-01-01','2023-12-31'),('2024-01-01','2024-12-31'),('2025-01-01','2025-12-31'),('2026-01-01','2026-09-05')]:
+              for qtype in (0,1,2):
+                  page=1; total=1
+                  while page<=total and page<=300:
+                      params={'pageNo':page,'pageSize':100,'code':'','qType':qtype,'beginTime':begin,'endTime':end,'_':int(time.time()*1000)+page}
+                      try:
+                          r=s.get(endpoint,params=params,headers={'User-Agent':ua,'Accept':'application/json,*/*','Referer':'https://data.eastmoney.com/'},timeout=(15,90)); r.raise_for_status(); obj=r.json(); rs=obj.get('data') or []; total=int(obj.get('TotalPage') or 0)
+                          print('EM_PAGE',begin,qtype,page,'/',total,len(rs),flush=True)
+                          for x in rs:
+                              raw=json.dumps(x,ensure_ascii=False); low=re.sub(r'\s+','',raw).lower()
+                              if any(k in low for k in ('戴尔科技','戴爾科技','delltechnologies','delltechnology','dellinc')):
+                                  em.append(x); print('EM_MATCH',raw,flush=True)
+                          if not rs: break
+                      except Exception as e: print('EM_ERR',begin,qtype,page,repr(e),flush=True); break
+                      page+=1
+          (out/'eastmoney_matches.json').write_text(json.dumps(em,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'verified.json').write_text(json.dumps(verified,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps({'fx_candidates':len(candidates),'verified':len(verified),'eastmoney':len(em)},ensure_ascii=False),flush=True)
+          PY
+
+      - name: Upload search output
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-broker-metadata-search-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
