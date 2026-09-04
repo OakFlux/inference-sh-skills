@@ -1,0 +1,115 @@
+name: Download current and archived DBS Dell research PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-dbs-direct-and-archive-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Retrieve and validate DBS originals
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+          mkdir -p output/previews
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time
+          from io import BytesIO
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session(); s.trust_env=False
+          out=Path('output'); (out/'previews').mkdir(parents=True,exist_ok=True)
+          current='https://www.dbs.com.sg/content/article/pdf/US_clover/DELL_US.pdf'
+          candidates=[('current',current)]
+
+          # Public Internet Archive CDX snapshots, if available.
+          cdx_urls=[
+            'https://web.archive.org/cdx/search/cdx?url=www.dbs.com.sg/content/article/pdf/US_clover/DELL_US.pdf&output=json&filter=statuscode:200&filter=mimetype:application/pdf&filter=collapse:digest&fl=timestamp,original,statuscode,mimetype,digest,length&from=2020&to=2026',
+            'https://web.archive.org/cdx/search/cdx?url=https%3A%2F%2Fwww.dbs.com.sg%2Fcontent%2Farticle%2Fpdf%2FUS_clover%2FDELL_US.pdf&output=json&filter=statuscode:200&filter=collapse:digest&fl=timestamp,original,statuscode,mimetype,digest,length&from=2020&to=2026',
+          ]
+          snapshots=[]
+          for cu in cdx_urls:
+            try:
+              r=s.get(cu,headers={'User-Agent':ua,'Accept':'application/json,*/*'},timeout=(20,120))
+              print('CDX',r.status_code,r.headers.get('content-type'),len(r.content),r.url,repr(r.text[:5000]),flush=True)
+              if r.status_code==200:
+                data=r.json()
+                if isinstance(data,list) and len(data)>1:
+                  head=data[0]
+                  for row in data[1:]:
+                    d=dict(zip(head,row)); snapshots.append(d)
+            except Exception as e: print('CDX_ERROR',repr(e),flush=True)
+          # unique by timestamp and digest, newest first
+          seen=set(); uniq=[]
+          for d in sorted(snapshots,key=lambda x:x.get('timestamp',''),reverse=True):
+            key=(d.get('timestamp'),d.get('digest'))
+            if key in seen: continue
+            seen.add(key); uniq.append(d)
+          print('SNAPSHOTS',json.dumps(uniq,ensure_ascii=False,indent=2),flush=True)
+          for d in uniq[:20]:
+            ts=d.get('timestamp'); orig=d.get('original') or current
+            if ts:
+              candidates.append((f'archive_{ts}',f'https://web.archive.org/web/{ts}id_/{orig}'))
+
+          records=[]; seen_sha=set()
+          for label,url in candidates:
+            try:
+              r=s.get(url,headers={'User-Agent':ua,'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Referer':'https://www.dbs.com.sg/'},timeout=(30,240),allow_redirects=True)
+              print('GET',label,r.status_code,r.headers.get('content-type'),len(r.content),r.url,r.content[:12],flush=True)
+              if r.status_code!=200 or not r.content.startswith(b'%PDF-') or len(r.content)<80000: continue
+              sha=hashlib.sha256(r.content).hexdigest()
+              if sha in seen_sha: print('DUPLICATE',label,sha,flush=True); continue
+              rd=PdfReader(BytesIO(r.content),strict=False); pages=len(rd.pages)
+              texts=[]
+              for i in range(pages):
+                try: texts.append(rd.pages[i].extract_text() or '')
+                except Exception: texts.append('')
+              full=re.sub(r'\s+',' ','\n'.join(texts))
+              identity=('Dell Technologies' in full or re.search(r'\bDELL\b',full,re.I))
+              dbs=('DBS' in full or 'DBS Group Research' in full)
+              if not identity or not dbs:
+                print('REJECT_TEXT',label,pages,identity,dbs,repr(full[:3000]),flush=True); continue
+              # Pull likely dates and title/rating snippets.
+              date_patterns=[
+                r'\b(?:0?[1-9]|[12][0-9]|3[01])\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+20\d{2}\b',
+                r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(?:0?[1-9]|[12][0-9]|3[01]),?\s+20\d{2}\b',
+                r'\b20\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12][0-9]|3[01])\b',
+              ]
+              dates=[]
+              for pat in date_patterns: dates += re.findall(pat,full,re.I)
+              fn=f'DBS_Group_Research_Dell_Technologies_{label}_{pages}页.pdf'
+              p=out/fn; p.write_bytes(r.content)
+              q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','90',str(p),str(out/'previews'/f'{label}_first')],check=True,capture_output=True)
+              subprocess.run(['pdftoppm','-f',str(pages),'-singlefile','-png','-r','90',str(p),str(out/'previews'/f'{label}_last')],check=True,capture_output=True)
+              rec={'label':label,'source':r.url,'filename':fn,'pages':pages,'bytes':len(r.content),'sha256':sha,'dates':dates[:20],'sample':full[:12000]}
+              records.append(rec); seen_sha.add(sha)
+              print('VERIFIED',json.dumps({k:rec[k] for k in ('label','source','filename','pages','bytes','sha256','dates')},ensure_ascii=False),flush=True)
+            except Exception as e: print('GET_ERROR',label,repr(e),flush=True)
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_COUNT',len(records),flush=True)
+          PY
+
+      - name: Upload originals and manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-dbs-direct-and-archive-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
