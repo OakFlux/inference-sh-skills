@@ -1,0 +1,113 @@
+name: Discover Dongjiang Environmental broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dongjiang-environmental-broker-discovery-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Query Eastmoney research API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests, time
+          from pathlib import Path
+
+          out=Path('dongjiang-broker-metadata'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          headers={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            'Referer':'https://data.eastmoney.com/report/002672.html',
+            'Accept':'application/json,text/plain,*/*',
+          }
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          all_rows=[]; diagnostics=[]
+          variants=['002672','SZ002672','002672.SZ','0.002672']
+          for code in variants:
+            for qtype in [0,1,2,3]:
+              for page in range(1,8):
+                params={'pageNo':page,'pageSize':100,'code':code,'qType':qtype,'beginTime':'2003-01-01','endTime':'2026-09-04'}
+                try:
+                  r=s.get(endpoint,params=params,headers=headers,timeout=(20,90))
+                  rec={'params':params,'status':r.status_code,'bytes':len(r.content),'url':r.url}
+                  print('CALL',r.status_code,len(r.content),r.url,flush=True)
+                  data=r.json(); rows=[]
+                  if isinstance(data,dict):
+                    if isinstance(data.get('data'),list): rows=data['data']
+                    elif isinstance(data.get('data'),dict):
+                      for k in ('data','list','items'):
+                        if isinstance(data['data'].get(k),list): rows=data['data'][k]; break
+                    elif isinstance(data.get('result'),list): rows=data['result']
+                    elif isinstance(data.get('result'),dict):
+                      for k in ('data','list','items'):
+                        if isinstance(data['result'].get(k),list): rows=data['result'][k]; break
+                    elif isinstance(data.get('list'),list): rows=data['list']
+                  elif isinstance(data,list): rows=data
+                  rec['row_count']=len(rows); diagnostics.append(rec)
+                  if not rows: break
+                  for row in rows:
+                    if not isinstance(row,dict): continue
+                    text=json.dumps(row,ensure_ascii=False).lower()
+                    if any(x in text for x in ('002672','东江环保','東江環保','dongjiang environmental','00895')):
+                      all_rows.append(row)
+                  if len(rows)<100: break
+                except Exception as exc:
+                  diagnostics.append({'params':params,'error':repr(exc)})
+                  print('ERROR',repr(exc),flush=True); break
+                time.sleep(.2)
+
+          def field(row,*names):
+            for name in names:
+              value=row.get(name)
+              if value not in (None,''): return value
+            return ''
+
+          normalized=[]; seen=set()
+          for row in all_rows:
+            info=str(field(row,'infoCode','infocode','INFO_CODE'))
+            title=str(field(row,'title','articleTitle','reportTitle','REPORT_TITLE')).strip()
+            date=str(field(row,'publishDate','publishDateText','PUBLISH_DATE','date')).strip()
+            org=str(field(row,'orgSName','orgName','ORG_SNAME','ORG_NAME')).strip()
+            author=str(field(row,'researcher','researcherName','RESEARCHER','author')).strip()
+            rating=str(field(row,'emRatingName','ratingName','EM_RATING_NAME','rating')).strip()
+            key=(info,title,date,org)
+            if not info or key in seen: continue
+            seen.add(key)
+            normalized.append({'infoCode':info,'title':title,'date':date,'org':org,'author':author,'rating':rating,'raw':row})
+
+          def score(x):
+            t=x['title']; s=0
+            for kw,pts in [('首次覆盖',150),('深度报告',145),('公司深度',140),('投资价值分析',135),('价值分析',120),('深度研究',120),('专题研究',80),('环保龙头',50),('危废',20),('固废',15),('资源化',15)]:
+              if kw in t: s+=pts
+            for kw in ('一季报点评','三季报点评','半年报点评','中报点评','年报点评','季报点评','业绩点评','事件点评','公告点评','快报点评','点评报告','业绩预告'):
+              if kw in t: s-=220
+            if any(y in x['date'] for y in ('2026','2025','2024','2023')): s+=25
+            elif any(y in x['date'] for y in ('2022','2021','2020')): s+=15
+            elif any(y in x['date'] for y in ('2019','2018','2017')): s+=8
+            return s
+
+          ranked=sorted(normalized,key=lambda x:(score(x),x['date']),reverse=True)
+          (out/'diagnostics.json').write_text(json.dumps(diagnostics,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'all_rows.json').write_text(json.dumps(normalized,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'ranked.json').write_text(json.dumps(ranked,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL',len(normalized),flush=True)
+          for x in ranked[:100]:
+            print('ROW',score(x),json.dumps({k:x[k] for k in ('infoCode','title','date','org','author','rating')},ensure_ascii=False),flush=True)
+          PY
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: dongjiang-broker-metadata
+          path: dongjiang-broker-metadata/
+          if-no-files-found: error
+          retention-days: 7
