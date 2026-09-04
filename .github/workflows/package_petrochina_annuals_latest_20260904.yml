@@ -1,0 +1,243 @@
+name: Package PetroChina 2020-2025 annual reports and latest reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_petrochina_annuals_latest_20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download verify and package official PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '中国石油股份_2020-2025年报及最新季报'
+          out = Path(PACKAGE)
+          out.mkdir(parents=True, exist_ok=True)
+          work = Path('_petrochina_work')
+          render_dir = work / 'renders'
+          render_dir.mkdir(parents=True, exist_ok=True)
+
+          base = 'https://www1.hkexnews.hk'
+          targets = [
+              {
+                  'kind':'annual','year':2020,'filename':'中国石油股份_2020年年度报告.pdf',
+                  'title':'中国石油天然气股份有限公司2020年度报告','disclosure_date':'2021-03-25','min_pages':200,
+                  'url':base+'/listedco/listconews/sehk/2021/0325/2021032501190_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2021,'filename':'中国石油股份_2021年年度报告.pdf',
+                  'title':'中国石油天然气股份有限公司2021年度报告','disclosure_date':'2022-03-31','min_pages':200,
+                  'url':base+'/listedco/listconews/sehk/2022/0331/2022033102555_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2022,'filename':'中国石油股份_2022年年度报告.pdf',
+                  'title':'中国石油天然气股份有限公司2022年度报告','disclosure_date':'2023-03-29','min_pages':200,
+                  'url':base+'/listedco/listconews/sehk/2023/0329/2023032902199_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2023,'filename':'中国石油股份_2023年年度报告.pdf',
+                  'title':'中国石油天然气股份有限公司2023年度报告','disclosure_date':'2024-03-25','min_pages':200,
+                  'url':base+'/listedco/listconews/sehk/2024/0325/2024032501549_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2024,'filename':'中国石油股份_2024年年度报告.pdf',
+                  'title':'中国石油天然气股份有限公司2024年度报告','disclosure_date':'2025-03-30','min_pages':200,
+                  'url':base+'/listedco/listconews/sehk/2025/0330/2025033000193_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2025,'filename':'中国石油股份_2025年年度报告.pdf',
+                  'title':'中国石油天然气股份有限公司2025年度报告','disclosure_date':'2026-03-29','min_pages':200,
+                  'url':base+'/listedco/listconews/sehk/2026/0329/2026032900413_c.pdf',
+              },
+              {
+                  'kind':'q1','year':2026,'filename':'中国石油股份_2026年第一季度报告.pdf',
+                  'title':'二零二六年第一季度报告','disclosure_date':'2026-04-29','min_pages':10,
+                  'url':base+'/listedco/listconews/sehk/2026/0429/2026042901685_c.pdf',
+              },
+              {
+                  'kind':'half_year','year':2026,'filename':'中国石油股份_2026年半年度报告.pdf',
+                  'title':'中国石油天然气股份有限公司2026年半年度报告','disclosure_date':'2026-08-30','min_pages':100,
+                  'url':base+'/listedco/listconews/sehk/2026/0830/2026083000153_c.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer':'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=2038',
+          }
+
+          def download(url: str) -> bytes:
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      r = session.get(url, headers=headers, timeout=(30,600), allow_redirects=True)
+                      print('GET',attempt,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 100_000:
+                          return r.content
+                      last = RuntimeError(f'HTTP {r.status_code}; bytes={len(r.content)}')
+                  except Exception as exc:
+                      last = exc
+                      print('GET_ERROR',attempt,url,repr(exc),flush=True)
+                  time.sleep(min(2*attempt,10))
+              raise RuntimeError(f'Download failed for {url}: {last}')
+
+          def compact_text(reader: PdfReader, limit: int = 16) -> str:
+              parts=[]
+              for page in reader.pages[:min(limit,len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+','', '\n'.join(parts)).lower()
+
+          records=[]
+          hashes=set()
+          for idx,target in enumerate(targets,1):
+              data=download(target['url'])
+              dest=out/target['filename']
+              dest.write_bytes(data)
+
+              reader=PdfReader(str(dest),strict=False)
+              pages=len(reader.pages)
+              if pages < target['min_pages']:
+                  raise RuntimeError(f"{dest.name}: expected at least {target['min_pages']} pages, got {pages}")
+
+              text=compact_text(reader)
+              identity_ok=any(token in text for token in (
+                  '中国石油天然气股份有限公司','中國石油天然氣股份有限公司',
+                  'petrochinacompanylimited','601857','00857'
+              ))
+              year_ok=str(target['year']) in text
+              if not identity_ok:
+                  raise RuntimeError(f'{dest.name}: company identity not found in extracted opening pages')
+              if not year_ok:
+                  print('YEAR_TEXT_WARNING',dest.name,target['year'],flush=True)
+
+              qcheck=subprocess.run(['qpdf','--check',str(dest)],capture_output=True,text=True)
+              if qcheck.returncode not in (0,3):
+                  raise RuntimeError(f'{dest.name}: qpdf check failed: {qcheck.stderr[-1500:]}')
+              if qcheck.returncode == 3:
+                  print('QPDF_WARNING',dest.name,qcheck.stderr[-1000:],flush=True)
+
+              doc=pymupdf.open(str(dest))
+              sample_pages=sorted(set([0,max(0,pages//2),pages-1]))
+              rendered=[]
+              for page_no in sample_pages:
+                  page=doc.load_page(page_no)
+                  pix=page.get_pixmap(matrix=pymupdf.Matrix(1.0,1.0),alpha=False)
+                  render_path=render_dir/f'{idx:02d}_{page_no+1:04d}.png'
+                  pix.save(str(render_path))
+                  if not render_path.exists() or render_path.stat().st_size < 8_000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'{dest.name}: render verification failed at page {page_no+1}')
+                  rendered.append(page_no+1)
+              doc.close()
+
+              digest=hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {dest.name}')
+              hashes.add(digest)
+              rec={
+                  'filename':dest.name,
+                  'kind':target['kind'],
+                  'report_year':target['year'],
+                  'source_title':target['title'],
+                  'disclosure_date':target['disclosure_date'],
+                  'pages':pages,
+                  'bytes':len(data),
+                  'sha256':digest,
+                  'source_url':target['url'],
+                  'source':'香港交易所披露易（HKEXnews）原始PDF',
+                  'identity_text_check':identity_ok,
+                  'year_text_check':year_ok,
+                  'rendered_pages':rendered,
+              }
+              records.append(rec)
+              print('VERIFIED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          annual_years={r['report_year'] for r in records if r['kind']=='annual'}
+          if annual_years != {2020,2021,2022,2023,2024,2025}:
+              raise RuntimeError(f'Annual coverage mismatch: {annual_years}')
+          if len(records)!=8:
+              raise RuntimeError(f'Expected 8 PDFs, got {len(records)}')
+
+          lines=[
+              '中国石油天然气股份有限公司（601857.SH / 00857.HK）',
+              '2020-2025年年度报告及最新期内报告',
+              '',
+              '本压缩包共8份港交所披露易原始PDF。',
+              '2020-2025年度报告均为完整年度报告，不是年度业绩公告或摘要。',
+              '截至2026年9月4日，最新正式季度报告为2026年第一季度报告；公司已于2026年8月30日披露完整2026年半年度报告，因此一并收入。',
+              '',
+          ]
+          for i,r in enumerate(records,1):
+              lines.extend([
+                  f"{i}. {r['filename']}",
+                  f"   原始标题：{r['source_title']}",
+                  f"   披露日期：{r['disclosure_date']}；实际页数：{r['pages']}页；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、公司名称或证券代码、报告年份、实际页数、qpdf结构检查、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+              '年度报告按其覆盖的财政年度命名，不按PDF披露年份命名。',
+          ])
+          (out/'报告清单与来源说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          zip_path=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+              for p in sorted(out.iterdir()):
+                  z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path,'r') as z:
+              bad=z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs)!=8:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'PDFS',len(records),'PAGES',sum(r['pages'] for r in records),flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: petrochina-2020-2025-annuals-latest-final
+          path: 中国石油股份_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
