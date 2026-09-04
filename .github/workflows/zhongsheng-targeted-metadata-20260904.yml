@@ -1,0 +1,68 @@
+name: Targeted Zhongsheng report metadata
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-targeted-metadata-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Query exact report titles
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json,time
+          from pathlib import Path
+          import requests
+
+          API='https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          H={'User-Agent':UA,'Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/','x-fp':'','x-bot':''}
+          s=requests.Session(); s.trust_env=False
+          terms=[
+            '发力汽车后市场的汽车经销商龙头',
+            '汽车经销商龙头基本面或见底反转',
+            '中升控股 海通证券',
+            '中升控股 首次覆盖',
+            '中升控股 公司深度',
+            '中升控股 国泰君安',
+          ]
+          allrows=[]; seen=set()
+          for term in terms:
+            for shape in (
+              {'keywords':term,'page':1,'limit':20,'order':0},
+              {'keywords':term,'pageNum':1,'pageSize':20,'order':0},
+            ):
+              for attempt in range(3):
+                try:
+                  r=s.post(API,headers=H,json=shape,timeout=(15,60))
+                  print('QUERY',json.dumps(shape,ensure_ascii=False),r.status_code,len(r.content),flush=True)
+                  r.raise_for_status(); obj=r.json(); data=obj.get('data') or {}
+                  rows=data.get('dataList') if isinstance(data,dict) else data
+                  rows=rows if isinstance(rows,list) else []
+                  for row in rows:
+                    key=str(row.get('docId') or row.get('id') or json.dumps(row,sort_keys=True,ensure_ascii=False))
+                    if key not in seen: seen.add(key); allrows.append(row)
+                    print('ROW',term,json.dumps(row,ensure_ascii=False),flush=True)
+                  break
+                except Exception as e:
+                  print('ERR',term,attempt,repr(e),flush=True); time.sleep(attempt+1)
+          Path('zhongsheng_targeted_metadata.json').write_text(json.dumps(allrows,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL',len(allrows),flush=True)
+          PY
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongsheng-targeted-metadata-20260904
+          path: zhongsheng_targeted_metadata.json
+          if-no-files-found: error
+          retention-days: 7
