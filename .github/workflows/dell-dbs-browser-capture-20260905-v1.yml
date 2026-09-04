@@ -1,0 +1,160 @@
+name: Capture public DBS Dell PDF through normal browser download
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-dbs-browser-capture-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Capture public download and validate PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet playwright pypdf requests
+          mkdir -p output/previews
+          python - <<'PY'
+          from __future__ import annotations
+          import base64,hashlib,json,re,subprocess,time
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+          from pypdf import PdfReader
+
+          article='https://www.dbs.com.sg/private-banking/aics/archive/templatedata/article/generic/data/en/GR/US/DELL_US.xml'
+          pdf_path='/content/article/pdf/US_clover/DELL_US.pdf'
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          out=Path('output'); (out/'previews').mkdir(parents=True,exist_ok=True)
+          candidates=[]
+
+          with sync_playwright() as p:
+            browser=p.chromium.launch(headless=True,executable_path='/usr/bin/google-chrome',args=['--no-sandbox','--disable-dev-shm-usage'])
+            context=browser.new_context(user_agent=ua,accept_downloads=True)
+            opened=[]
+            context.on('page',lambda pg: opened.append(pg))
+            page=context.new_page()
+            logs=[]
+            page.on('request',lambda req: logs.append({'event':'request','url':req.url,'method':req.method,'type':req.resource_type}))
+            page.on('response',lambda resp: logs.append({'event':'response','url':resp.url,'status':resp.status,'ctype':resp.headers.get('content-type','')}))
+            page.add_init_script("""
+              window.__openedUrls=[];
+              const oldOpen=window.open;
+              window.open=function(...args){ window.__openedUrls.push(args); return oldOpen.apply(this,args); };
+              document.addEventListener('click',e=>{const a=e.target.closest&&e.target.closest('a'); if(a){window.__lastClicked={outer:a.outerHTML,href:a.href};}},true);
+            """)
+            resp=page.goto(article,wait_until='networkidle',timeout=120000)
+            print('ARTICLE',resp.status if resp else None,page.url,page.title(),flush=True)
+            print('COOKIES',json.dumps(context.cookies(),ensure_ascii=False),flush=True)
+
+            # Click both visible download elements while observing popup/download/navigation.
+            loc=page.locator('[data-testid="download"]')
+            print('DOWNLOAD_COUNT',loc.count(),flush=True)
+            for i in range(loc.count()):
+              el=loc.nth(i)
+              try:
+                print('ELEMENT',i,el.evaluate('(e)=>e.outerHTML'),flush=True)
+                before=len(opened)
+                try:
+                  with page.expect_download(timeout=15000) as di:
+                    el.click(force=True,timeout=10000)
+                  dl=di.value
+                  dest=out/f'clicked_{i}_{dl.suggested_filename or "download.pdf"}'
+                  dl.save_as(str(dest)); candidates.append(dest)
+                  print('DOWNLOAD_EVENT',i,dest,dest.stat().st_size,flush=True)
+                except PWTimeout:
+                  print('NO_DOWNLOAD_EVENT',i,flush=True)
+                page.wait_for_timeout(3000)
+                print('OPENED_URLS_JS',i,page.evaluate('window.__openedUrls'),flush=True)
+                print('LAST_CLICKED',i,page.evaluate('window.__lastClicked'),flush=True)
+                print('CONTEXT_PAGES',i,[pg.url for pg in context.pages],flush=True)
+                for pg in context.pages:
+                  if pg is page: continue
+                  try:
+                    pg.wait_for_load_state('domcontentloaded',timeout=20000)
+                  except Exception: pass
+                  print('POPUP',i,pg.url,pg.title(),flush=True)
+                  if '.pdf' in pg.url.lower() or 'article/pdf' in pg.url.lower():
+                    candidates.append(pg.url)
+              except Exception as e: print('CLICK_ERR',i,repr(e),flush=True)
+
+            # Try public path via Playwright request context, page fetch, and browser navigation.
+            absolute=urljoin(article,pdf_path)
+            try:
+              rr=context.request.get(absolute,headers={'Referer':article,'Accept':'application/pdf,*/*'},timeout=120000,fail_on_status_code=False)
+              b=rr.body(); print('CTX_REQUEST',rr.status,rr.headers.get('content-type'),len(b),rr.url,b[:16],flush=True)
+              if b.startswith(b'%PDF-'):
+                f=out/'DBS_context_request.pdf'; f.write_bytes(b); candidates.append(f)
+              else: (out/'context_response.html').write_bytes(b)
+            except Exception as e: print('CTX_REQ_ERR',repr(e),flush=True)
+
+            try:
+              result=page.evaluate("""async (u)=>{
+                const r=await fetch(u,{credentials:'include',headers:{'Accept':'application/pdf,*/*'}});
+                const b=await r.arrayBuffer();
+                let binary=''; const bytes=new Uint8Array(b); const chunk=0x8000;
+                for(let i=0;i<bytes.length;i+=chunk){binary+=String.fromCharCode(...bytes.subarray(i,i+chunk));}
+                return {status:r.status,type:r.headers.get('content-type'),url:r.url,b64:btoa(binary),head:Array.from(bytes.slice(0,16))};
+              }""",absolute)
+              b=base64.b64decode(result.pop('b64')); print('PAGE_FETCH',json.dumps(result),len(b),b[:16],flush=True)
+              if b.startswith(b'%PDF-'):
+                f=out/'DBS_page_fetch.pdf'; f.write_bytes(b); candidates.append(f)
+              else: (out/'page_fetch_response.html').write_bytes(b)
+            except Exception as e: print('PAGE_FETCH_ERR',repr(e),flush=True)
+
+            try:
+              p2=context.new_page(); r2=p2.goto(absolute,wait_until='domcontentloaded',timeout=120000)
+              print('DIRECT_NAV',r2.status if r2 else None,r2.headers.get('content-type') if r2 else None,p2.url,p2.title(),flush=True)
+              try:
+                body=r2.body() if r2 else b''
+                print('DIRECT_BODY',len(body),body[:16],flush=True)
+                if body.startswith(b'%PDF-'):
+                  f=out/'DBS_direct_nav.pdf'; f.write_bytes(body); candidates.append(f)
+                else: (out/'direct_nav_response.html').write_bytes(body)
+              except Exception as e: print('DIRECT_BODY_ERR',repr(e),flush=True)
+            except Exception as e: print('DIRECT_NAV_ERR',repr(e),flush=True)
+
+            (out/'network.json').write_text(json.dumps(logs,ensure_ascii=False,indent=2),encoding='utf-8')
+            browser.close()
+
+          # Validate unique files.
+          records=[];seen=set()
+          for c in candidates:
+            if not isinstance(c,Path) or not c.exists(): continue
+            b=c.read_bytes(); sha=hashlib.sha256(b).hexdigest()
+            if sha in seen: continue
+            try:
+              rd=PdfReader(str(c),strict=False); np=len(rd.pages)
+              full='\n'.join((pg.extract_text() or '') for pg in rd.pages)
+              if 'Dell' not in full and 'DELL' not in full: continue
+              final=out/f'DBS_Group_Research_Dell_Technologies_{np}页.pdf'
+              if c!=final: final.write_bytes(b)
+              q=subprocess.run(['qpdf','--check',str(final)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','90',str(final),str(out/'previews'/'first')],check=True,capture_output=True)
+              subprocess.run(['pdftoppm','-f',str(np),'-singlefile','-png','-r','90',str(final),str(out/'previews'/'last')],check=True,capture_output=True)
+              dates=re.findall(r'\b(?:0?[1-9]|[12][0-9]|3[01])\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+20\d{2}\b',full,re.I)
+              rec={'filename':final.name,'pages':np,'bytes':len(b),'sha256':sha,'dates':dates[:20],'sample':re.sub(r'\s+',' ',full)[:12000]}
+              records.append(rec);seen.add(sha);print('VERIFIED',json.dumps({k:rec[k] for k in ('filename','pages','bytes','sha256','dates')},ensure_ascii=False),flush=True)
+            except Exception as e: print('VALIDATE_ERR',str(c),repr(e),flush=True)
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_COUNT',len(records),flush=True)
+          PY
+
+      - name: Upload capture output
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-dbs-browser-capture-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
