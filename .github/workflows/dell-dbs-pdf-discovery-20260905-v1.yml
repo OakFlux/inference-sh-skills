@@ -1,0 +1,152 @@
+name: Discover official DBS Dell research PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-dbs-pdf-discovery-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect pages and capture official PDF downloads
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 playwright pypdf
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time, hashlib
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
+          urls = [
+              ('DBS_2026-07-14', 'https://www.dbs.com.sg/private-banking/aics/archive/templatedata/article/generic/data/en/GR/US/DELL_US.xml'),
+              ('DBS_2026-05-19', 'https://www.dbs.com.sg/treasures-private-client/aics/investment-strategy/templatedata/article/generic/data/en/GR/US/DELL_US.xml'),
+              ('DBS_2025-06-03', 'https://www.dbs.com.sg/private-banking/aics/investment-strategy/templatedata/article/generic/data/en/GR/062025/250603_dbs_stock_pulse.xml'),
+          ]
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          out=Path('output'); out.mkdir(exist_ok=True)
+          manifest=[]
+
+          # Raw HTML inspection.
+          s=requests.Session(); s.trust_env=False
+          for name,url in urls:
+              try:
+                  r=s.get(url,headers={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,*/*'},timeout=(20,120),allow_redirects=True)
+                  print('\nRAW',name,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                  (out/f'{name}.html').write_bytes(r.content)
+                  text=r.text
+                  for m in re.finditer(r'[^\n]{0,700}(?:Download PDF|downloadPdf|download-pdf|\.pdf|printPdf|pdfUrl)[^\n]{0,1500}',text,re.I):
+                      print('HTML_HIT',name,repr(m.group(0)[:3000]),flush=True)
+                  soup=BeautifulSoup(text,'html.parser')
+                  for tag in soup.find_all(True):
+                      vals=[]
+                      for a in ('href','src','onclick','data-url','data-href','data-download','data-pdf'):
+                          v=tag.get(a)
+                          if v: vals.append((a,str(v)))
+                      for a,v in vals:
+                          if any(k in v.lower() for k in ('pdf','download','print')):
+                              print('ATTR',name,tag.name,a,repr(v),flush=True)
+              except Exception as exc:
+                  print('RAW_ERROR',name,repr(exc),flush=True)
+
+          with sync_playwright() as p:
+              browser=p.chromium.launch(headless=True, executable_path='/usr/bin/google-chrome', args=['--no-sandbox','--disable-dev-shm-usage'])
+              context=browser.new_context(user_agent=ua, accept_downloads=True)
+              for name,url in urls:
+                  page=context.new_page()
+                  network=[]
+                  page.on('response', lambda resp, n=name: network.append({'url':resp.url,'status':resp.status,'type':resp.headers.get('content-type','')}))
+                  try:
+                      page.goto(url, wait_until='networkidle', timeout=120000)
+                      print('\nBROWSER',name,page.url,page.title(),flush=True)
+                      # Dump DOM around any PDF/download text.
+                      loc=page.get_by_text(re.compile(r'Download PDF',re.I))
+                      print('DOWNLOAD_TEXT_COUNT',name,loc.count(),flush=True)
+                      if loc.count():
+                          for i in range(min(loc.count(),5)):
+                              try: print('DOWNLOAD_ELEMENT',name,i,loc.nth(i).evaluate('(e)=>e.outerHTML'),flush=True)
+                              except Exception as e: print('ELEM_ERR',repr(e),flush=True)
+                      # inspect all matching elements and JS globals
+                      matches=page.locator('a,button,[onclick],[data-url],[data-href]')
+                      for i in range(min(matches.count(),3000)):
+                          try:
+                              el=matches.nth(i)
+                              txt=(el.inner_text(timeout=1000) or '').strip()
+                              html=el.evaluate('(e)=>e.outerHTML')
+                              if any(k in (txt+' '+html).lower() for k in ('download pdf','.pdf','download-pdf','downloadpdf')):
+                                  print('DOM_MATCH',name,repr(html[:5000]),flush=True)
+                          except Exception: pass
+                      # Try download action.
+                      downloaded=False
+                      for selector in [
+                          'text=/Download PDF/i',
+                          'a:has-text("Download PDF")',
+                          'button:has-text("Download PDF")',
+                          '[title*="PDF" i]',
+                      ]:
+                          try:
+                              cand=page.locator(selector).first
+                              if cand.count()==0 or not cand.is_visible(timeout=2000): continue
+                              try:
+                                  with page.expect_download(timeout=30000) as di:
+                                      cand.click(timeout=10000, force=True)
+                                  dl=di.value
+                                  fn=dl.suggested_filename or f'{name}.pdf'
+                                  dest=out/f'{name}_{fn}'
+                                  dl.save_as(str(dest))
+                                  print('DOWNLOADED',name,selector,fn,dest.stat().st_size,flush=True)
+                                  downloaded=True
+                                  break
+                              except PlaywrightTimeoutError:
+                                  print('NO_DOWNLOAD_EVENT',name,selector,'url_after',page.url,flush=True)
+                          except Exception as exc:
+                              print('CLICK_ERROR',name,selector,repr(exc),flush=True)
+                      page.wait_for_timeout(5000)
+                      # Record PDF responses and potential links.
+                      for rec in network:
+                          if 'pdf' in rec['type'].lower() or '.pdf' in rec['url'].lower() or 'download' in rec['url'].lower():
+                              print('NETWORK_PDFISH',name,json.dumps(rec,ensure_ascii=False),flush=True)
+                      # Browser-rendered snapshot only for diagnosis, not to be treated as original.
+                      snap=out/f'{name}_rendered_snapshot.pdf'
+                      page.pdf(path=str(snap),format='A4',print_background=True,margin={'top':'12mm','bottom':'12mm','left':'10mm','right':'10mm'})
+                      print('SNAPSHOT',name,snap.stat().st_size,flush=True)
+                  except Exception as exc:
+                      print('BROWSER_ERROR',name,repr(exc),flush=True)
+                  finally:
+                      page.close()
+              browser.close()
+
+          # Validate every actual PDF discovered.
+          for f in sorted(out.glob('*.pdf')):
+              try:
+                  b=f.read_bytes(); rd=PdfReader(str(f),strict=False); pages=len(rd.pages)
+                  text='\n'.join((rd.pages[i].extract_text() or '') for i in range(min(pages,8)))
+                  rec={'file':f.name,'bytes':len(b),'pages':pages,'sha256':hashlib.sha256(b).hexdigest(),'identity':('Dell' in text or 'DELL' in text),'snapshot':('snapshot' in f.name)}
+                  manifest.append(rec); print('PDF_VALID',json.dumps(rec,ensure_ascii=False),flush=True)
+              except Exception as exc:
+                  print('PDF_INVALID',f.name,repr(exc),flush=True)
+          (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload discovery output
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-dbs-pdf-discovery-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
