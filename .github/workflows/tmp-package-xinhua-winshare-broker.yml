@@ -1,0 +1,361 @@
+name: Package verified Xinhua Winshare deep research reports
+
+on:
+  push:
+    branches:
+      - tmp/xinhua-winshare-broker-20260904
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import fitz
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE_NAME = '新华文轩_券商深度报告_2份_完整PDF'
+          ROOT = Path(PACKAGE_NAME)
+          WORK = Path('_xinhua_winshare_broker_work')
+          RENDERS = WORK / 'renders'
+          ROOT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'broker': '川财证券',
+                  'publish_date': '2019-11-20',
+                  'report_date_on_cover': '2019-11-14',
+                  'title': '人口红利拉动需求，资源整合保障品质',
+                  'report_type': '公司深度（首次覆盖）',
+                  'researchers': '欧阳宇剑、郭晓东',
+                  'pages': 24,
+                  'bytes': 1732189,
+                  'sha256': '6833f15399e29842477f3b5c5c71d6425ee63d358a9f93eda1aea328bed4cb92',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP201911201370910194_1.pdf',
+                  'info_code': 'AP201911201370910194',
+                  'broker_markers': ['川财证券', '川财研究所', 'cczq.com'],
+                  'title_markers': ['人口红利拉动需求', '资源整合保障品质'],
+                  'type_markers': ['公司深度', '首次覆盖'],
+              },
+              {
+                  'broker': '西南证券',
+                  'publish_date': '2019-08-14',
+                  'report_date_on_cover': '2019-08-14',
+                  'title': '顺势而动，互联网+探索出版新局面',
+                  'report_type': '公司研究报告',
+                  'researchers': '刘言、张闻宇',
+                  'pages': 20,
+                  'bytes': 1834433,
+                  'sha256': '50d68a78c9d76c41bd12d9588599979010fa672144ab00cc13f7fb2772c955b5',
+                  'url': 'https://pdf.dfcfw.com/pdf/H3_AP201908141343783897_1.pdf',
+                  'info_code': 'AP201908141343783897',
+                  'broker_markers': ['西南证券', '西南证券研究发展中心', 'swsc.com.cn'],
+                  'title_markers': ['顺势而动', '互联网+探索出版新局面'],
+                  'type_markers': ['公司研究报告', '证券研究报告'],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'\s+', '', value or '').lower()
+
+          def hash_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def fetch_pdf(url: str) -> requests.Response:
+              errors: list[str] = []
+              for attempt in range(1, 6):
+                  try:
+                      response = session.get(
+                          url,
+                          headers=headers,
+                          timeout=(25, 300),
+                          allow_redirects=True,
+                      )
+                      print(
+                          'GET', attempt, response.status_code,
+                          response.headers.get('content-type'),
+                          len(response.content), response.url,
+                          flush=True,
+                      )
+                      if (
+                          response.status_code == 200
+                          and response.content.startswith(b'%PDF-')
+                          and len(response.content) > 100_000
+                      ):
+                          return response
+                      errors.append(f'HTTP {response.status_code}/{len(response.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(min(attempt * 2, 8))
+              raise RuntimeError('下载失败：' + ' | '.join(errors[-5:]))
+
+          records: list[dict] = []
+          pdf_paths: list[Path] = []
+          seen_hashes: set[str] = set()
+          total_pages = 0
+          total_bytes = 0
+
+          for index, report in enumerate(reports, 1):
+              response = fetch_pdf(report['url'])
+              data = response.content
+              digest = hash_bytes(data)
+              if digest != report['sha256']:
+                  raise RuntimeError(
+                      f"{report['broker']} 文件哈希变化：{digest} != {report['sha256']}"
+                  )
+              if len(data) != report['bytes']:
+                  raise RuntimeError(
+                      f"{report['broker']} 文件大小变化：{len(data)} != {report['bytes']}"
+                  )
+              if digest in seen_hashes:
+                  raise RuntimeError('检测到重复PDF')
+              seen_hashes.add(digest)
+
+              filename = (
+                  f"{index:02d}_{report['broker']}_{report['publish_date']}_"
+                  f"{report['title']}.pdf"
+              )
+              path = ROOT / filename
+              path.write_bytes(data)
+
+              reader = PdfReader(str(path), strict=False)
+              if reader.is_encrypted and reader.decrypt('') == 0:
+                  raise RuntimeError(f'PDF 无法解密：{filename}')
+              pages = len(reader.pages)
+              if pages != report['pages']:
+                  raise RuntimeError(
+                      f"页数不一致：{filename}，{pages} != {report['pages']}"
+                  )
+
+              text_chunks: list[str] = []
+              sample_indices = sorted(
+                  set(list(range(min(12, pages))) + [pages // 2, pages - 1])
+              )
+              for page_index in sample_indices:
+                  try:
+                      text_chunks.append(reader.pages[page_index].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', filename, page_index + 1, repr(exc), flush=True)
+              text = '\n'.join(text_chunks)
+              normalized = compact(text)
+
+              if not any(
+                  compact(marker) in normalized
+                  for marker in ('新华文轩', '新华文轩出版传媒股份有限公司', '601811', '00811')
+              ):
+                  raise RuntimeError(f'公司标识缺失：{filename}')
+              if not any(
+                  compact(marker) in normalized for marker in report['broker_markers']
+              ):
+                  raise RuntimeError(f'券商标识缺失：{filename}')
+              for marker in report['title_markers']:
+                  if compact(marker) not in normalized:
+                      raise RuntimeError(f'标题特征“{marker}”缺失：{filename}')
+              for marker in report['type_markers']:
+                  if compact(marker) not in normalized:
+                      raise RuntimeError(f'报告类型特征“{marker}”缺失：{filename}')
+
+              qpdf = subprocess.run(
+                  ['qpdf', '--check', str(path)],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  check=False,
+              )
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(
+                      f'qpdf结构检查失败：{filename}；{qpdf.stderr[-1200:]}'
+                  )
+              if qpdf.returncode == 3:
+                  print('QPDF_WARNING', filename, qpdf.stderr[-1200:], flush=True)
+
+              document = fitz.open(path)
+              if document.page_count != pages:
+                  raise RuntimeError(f'PDF解析器页数不一致：{filename}')
+              for page_index in sorted({0, pages // 2, pages - 1}):
+                  pixmap = document.load_page(page_index).get_pixmap(
+                      matrix=fitz.Matrix(0.55, 0.55),
+                      alpha=False,
+                  )
+                  if pixmap.width < 150 or pixmap.height < 150:
+                      raise RuntimeError(
+                          f'PyMuPDF渲染失败：{filename} 第{page_index + 1}页'
+                      )
+              document.close()
+
+              prefix = RENDERS / f'check_{index:02d}'
+              poppler = subprocess.run(
+                  [
+                      'pdftoppm', '-f', '1', '-l', '1', '-singlefile',
+                      '-png', '-r', '90', str(path), str(prefix),
+                  ],
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  text=True,
+                  check=False,
+              )
+              rendered = prefix.with_suffix('.png')
+              if (
+                  poppler.returncode != 0
+                  or not rendered.exists()
+                  or rendered.stat().st_size < 5_000
+              ):
+                  raise RuntimeError(
+                      f'Poppler渲染失败：{filename}；{poppler.stderr[-1200:]}'
+                  )
+
+              record = {
+                  'broker': report['broker'],
+                  'publish_date': report['publish_date'],
+                  'report_date_on_cover': report['report_date_on_cover'],
+                  'title': report['title'],
+                  'report_type': report['report_type'],
+                  'researchers': report['researchers'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'info_code': report['info_code'],
+                  'source_url': response.url,
+                  'file': filename,
+              }
+              records.append(record)
+              pdf_paths.append(path)
+              total_pages += pages
+              total_bytes += len(data)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 2 or len(seen_hashes) != 2:
+              raise RuntimeError('最终报告数量异常')
+          if total_pages != 44:
+              raise RuntimeError(f'总页数异常：{total_pages}')
+
+          manifest = {
+              'company': '新华文轩出版传媒股份有限公司',
+              'stock_code_a': '601811.SH',
+              'stock_code_h': '00811.HK',
+              'prepared_date': '2026-09-04',
+              'selection_note': (
+                  '公开研报目录中，2019年以后大多数公司报告仅4-7页，属于业绩点评。'
+                  '本包只收录两份明确标注为公司深度或长篇公司研究的完整PDF，'
+                  '不使用短篇点评凑足三份。'
+              ),
+              'document_count': len(records),
+              'total_pages': total_pages,
+              'total_bytes': total_bytes,
+              'documents': records,
+          }
+          (ROOT / 'manifest.json').write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['file']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          readme = [
+              '新华文轩出版传媒股份有限公司（601811.SH / 00811.HK）券商深度报告资料包',
+              '整理日期：2026-09-04',
+              '',
+              '筛选说明',
+              '1. 公开研报目录中，2019年以后针对新华文轩的公司报告大多只有4-7页，属于年报、中报或季报点评。',
+              '2. 本包仅收录两份篇幅完整、报告类型明确为“公司深度”或长篇“公司研究报告”的PDF。',
+              '3. 未使用短篇业绩点评补足至三份。',
+              '',
+              '文件清单',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f"{index}. {record['broker']}｜公开发布日期：{record['publish_date']}｜{record['pages']}页",
+                  f"   报告：{record['title']}",
+                  f"   类型：{record['report_type']}",
+                  f"   研究人员：{record['researchers']}",
+                  f"   封面报告日期：{record['report_date_on_cover']}",
+                  f"   文件：{record['file']}",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          readme.extend([
+              '完整性检查',
+              f'- 共2份PDF，合计{total_pages}页，未压缩总大小{total_bytes / 1024 / 1024:.2f} MiB。',
+              '- 已核对PDF文件头、公司名称及601811代码、券商、标题、报告类型和实际页数。',
+              '- 每份PDF均通过qpdf结构检查、PyMuPDF首页/中间页/末页渲染及Poppler首页渲染。',
+              '- 已完成逐文件SHA-256、重复文件检查及ZIP CRC完整性测试。',
+              '',
+              '资料仅供个人研究与学习使用，版权归原券商及相关权利人所有。',
+          ])
+          (ROOT / 'README_来源与校验.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          archive = Path(PACKAGE_NAME + '.zip')
+          with zipfile.ZipFile(
+              archive,
+              'w',
+              compression=zipfile.ZIP_DEFLATED,
+              compresslevel=9,
+              allowZip64=True,
+          ) as bundle:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      bundle.write(path, arcname=str(path.relative_to(ROOT)))
+
+          with zipfile.ZipFile(archive) as bundle:
+              bad = bundle.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC校验失败：{bad}')
+              pdf_members = [name for name in bundle.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_members) != 2:
+                  raise RuntimeError(f'ZIP内PDF数量异常：{len(pdf_members)}')
+
+          archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+          print('FINAL_ZIP', archive.name, archive.stat().st_size, archive_sha, flush=True)
+          print('TOTAL_PAGES', total_pages, flush=True)
+          print('TOTAL_BYTES', total_bytes, flush=True)
+          PY
+
+      - name: Upload verified ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: xinhua-winshare-broker-deep-reports-20260904
+          path: 新华文轩_券商深度报告_2份_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
