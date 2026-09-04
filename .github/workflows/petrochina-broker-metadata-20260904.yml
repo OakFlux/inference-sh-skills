@@ -1,0 +1,126 @@
+name: Discover PetroChina broker report metadata
+
+on:
+  push:
+    paths:
+      - '.github/workflows/petrochina-broker-metadata-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Query Eastmoney research API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests, time
+          from pathlib import Path
+
+          out=Path('petrochina-broker-metadata'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          headers={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            'Referer':'https://data.eastmoney.com/report/601857.html',
+            'Accept':'application/json,text/plain,*/*',
+          }
+          endpoint='https://reportapi.eastmoney.com/report/list'
+          all_rows=[]; diagnostics=[]
+          variants=['601857','SH601857','601857.SH','1.601857']
+          for code in variants:
+            for qtype in [0,1,2,3]:
+              for page in range(1,8):
+                params={
+                  'pageNo':page,'pageSize':100,'code':code,'qType':qtype,
+                  'beginTime':'2007-01-01','endTime':'2026-09-04',
+                }
+                try:
+                  r=s.get(endpoint,params=params,headers=headers,timeout=(20,90))
+                  print('CALL',r.status_code,len(r.content),r.url,flush=True)
+                  rec={'params':params,'status':r.status_code,'bytes':len(r.content),'url':r.url}
+                  data=r.json()
+                  rec['top_type']=type(data).__name__
+                  rows=[]
+                  if isinstance(data,dict):
+                    # Eastmoney has used both list-at-data and nested result.data shapes.
+                    if isinstance(data.get('data'),list): rows=data['data']
+                    elif isinstance(data.get('data'),dict):
+                      for k in ('data','list','items'):
+                        if isinstance(data['data'].get(k),list): rows=data['data'][k]; break
+                    elif isinstance(data.get('result'),list): rows=data['result']
+                    elif isinstance(data.get('result'),dict):
+                      for k in ('data','list','items'):
+                        if isinstance(data['result'].get(k),list): rows=data['result'][k]; break
+                    elif isinstance(data.get('list'),list): rows=data['list']
+                  elif isinstance(data,list): rows=data
+                  rec['row_count']=len(rows)
+                  diagnostics.append(rec)
+                  if not rows: break
+                  for row in rows:
+                    if not isinstance(row,dict): continue
+                    text=json.dumps(row,ensure_ascii=False).lower()
+                    if '601857' in text or '中国石油' in text or 'petrochina' in text:
+                      all_rows.append(row)
+                  if len(rows)<100: break
+                except Exception as exc:
+                  diagnostics.append({'params':params,'error':repr(exc)})
+                  print('ERROR',repr(exc),flush=True)
+                  break
+                time.sleep(.2)
+
+          # Deduplicate on infoCode/title/date/institution.
+          ded=[]; seen=set()
+          for row in all_rows:
+            key=(str(row.get('infoCode') or row.get('infocode') or row.get('INFO_CODE') or ''),
+                 str(row.get('title') or row.get('articleTitle') or row.get('REPORT_TITLE') or ''),
+                 str(row.get('publishDate') or row.get('publishDateText') or row.get('PUBLISH_DATE') or ''),
+                 str(row.get('orgSName') or row.get('orgName') or row.get('ORG_SNAME') or ''))
+            if key in seen: continue
+            seen.add(key); ded.append(row)
+          all_rows=ded
+
+          def field(row,*names):
+            for name in names:
+              value=row.get(name)
+              if value not in (None,''): return value
+            return ''
+
+          normalized=[]
+          for row in all_rows:
+            info=str(field(row,'infoCode','infocode','INFO_CODE'))
+            title=str(field(row,'title','articleTitle','reportTitle','REPORT_TITLE'))
+            date=str(field(row,'publishDate','publishDateText','PUBLISH_DATE','date'))
+            org=str(field(row,'orgSName','orgName','ORG_SNAME','ORG_NAME'))
+            author=str(field(row,'researcher','researcherName','RESEARCHER','author'))
+            rating=str(field(row,'emRatingName','ratingName','EM_RATING_NAME','rating'))
+            normalized.append({'infoCode':info,'title':title,'date':date,'org':org,'author':author,'rating':rating,'raw':row})
+
+          # Rank likely deep/initiating reports.
+          def score(x):
+            t=x['title']
+            s=0
+            for kw,pts in [('首次覆盖',100),('深度',95),('投资价值分析',90),('价值分析',80),('大且稳',75),('龙头',15),('专题',20)]:
+              if kw in t: s+=pts
+            if any(y in x['date'] for y in ('2026','2025','2024','2023','2022')): s+=10
+            return s
+          ranked=sorted(normalized,key=lambda x:(score(x),x['date']),reverse=True)
+          (out/'diagnostics.json').write_text(json.dumps(diagnostics,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'all_rows.json').write_text(json.dumps(normalized,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'ranked.json').write_text(json.dumps(ranked,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL',len(normalized),flush=True)
+          for x in ranked[:100]:
+            print('ROW',json.dumps({k:x[k] for k in ('infoCode','title','date','org','author','rating')},ensure_ascii=False),flush=True)
+          PY
+
+      - name: Upload metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: petrochina-broker-metadata
+          path: petrochina-broker-metadata/
+          if-no-files-found: error
+          retention-days: 7
