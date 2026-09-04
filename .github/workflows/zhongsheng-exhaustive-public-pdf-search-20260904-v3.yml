@@ -1,0 +1,564 @@
+name: Exhaustive public PDF search for Zhongsheng broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-exhaustive-public-pdf-search-20260904-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - name: Install search and PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Search public indexes, validate complete PDFs and package results
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from io import BytesIO
+          from pathlib import Path
+          from typing import Any
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY_CN = '中升控股'
+          COMPANY_EN = 'Zhongsheng Group Holdings'
+          TICKER = '00881.HK'
+          OUT = Path('中升控股_00881HK_券商深度报告_公开完整PDF')
+          OUT.mkdir(exist_ok=True)
+          RAW = Path('_raw_candidates')
+          RAW.mkdir(exist_ok=True)
+          PREV = Path('_preview_checks')
+          PREV.mkdir(exist_ok=True)
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Cache-Control': 'no-cache',
+              'Pragma': 'no-cache',
+          })
+
+          queries = [
+              '"中升控股" "公司深度" PDF',
+              '"中升控股" "首次覆盖" PDF',
+              '"中升控股" "深度报告" PDF',
+              '"中升控股" 00881 研报 pdf',
+              '"汽车经销商龙头基本面或见底反转" pdf',
+              '"汽车综合服务龙头，底部反转在即" pdf',
+              '"发力汽车后市场的汽车经销商龙头" pdf',
+              '"Zhongsheng Group" initiation report pdf',
+              '"Zhongsheng Group Holdings" equity research pdf',
+              'site:pdf.dfcfw.com 中升控股',
+              'site:file.iyanbao.com 中升控股 pdf',
+              'site:sdyanbao.com 中升控股 深度',
+              'site:reportify.cn 中升控股 深度',
+              'site:vzkoo.com 中升控股 研报',
+              'site:microbell.com 中升控股 研报',
+              'site:fxbaogao.com 中升控股 首次覆盖',
+          ]
+
+          search_rows: list[dict[str, Any]] = []
+          page_urls: set[str] = set()
+          pdf_candidates: set[str] = set()
+          candidate_context: dict[str, list[str]] = {}
+          metadata_by_url: dict[str, dict[str, Any]] = {}
+          errors: list[str] = []
+
+          relevant_hosts = (
+              'sdyanbao.com', 'fxbaogao.com', 'reportify.cn', 'vzkoo.com',
+              'microbell.com', 'iyanbao.com', 'dfcfw.com', 'eastmoney.com',
+              'cnstock.com', 'stockstar.com', '10jqka.com.cn', 'hexun.com',
+              'sina.com.cn', 'qq.com', 'utrade.com.hk', 'bocomgroup.com',
+              'htisec.com', 'gtja.com', 'chinastock.com.cn', 'kysec.cn',
+              'pdf', 'research', 'report',
+          )
+
+          def add_context(url: str, context: str) -> None:
+              if not url:
+                  return
+              candidate_context.setdefault(url, [])
+              if context and context not in candidate_context[url]:
+                  candidate_context[url].append(context[:1000])
+
+          def clean_url(value: str, base: str | None = None) -> str | None:
+              if not value:
+                  return None
+              value = html.unescape(value.strip().strip('"\''))
+              if value.startswith('//'):
+                  value = 'https:' + value
+              if base:
+                  value = urllib.parse.urljoin(base, value)
+              if value.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+                  return None
+              try:
+                  parsed = urllib.parse.urlparse(value)
+              except Exception:
+                  return None
+              if parsed.scheme not in ('http', 'https'):
+                  return None
+              qs = urllib.parse.parse_qs(parsed.query)
+              for key in ('uddg', 'url', 'u', 'target', 'redirect', 'redirect_url', 'file', 'download'):
+                  vals = qs.get(key)
+                  if vals:
+                      nested = urllib.parse.unquote(vals[0])
+                      if nested.startswith(('http://', 'https://')):
+                          value = nested
+                          break
+              return value.replace('&amp;', '&')
+
+          def looks_like_pdf(url: str) -> bool:
+              low = urllib.parse.unquote(url).lower()
+              return (
+                  '.pdf' in low
+                  or '/download' in low
+                  or 'downurl' in low
+                  or 'downloadfile' in low
+                  or '/file/' in low
+                  or 'attachment' in low
+              )
+
+          def register_url(url: str | None, context: str = '', source_meta: dict[str, Any] | None = None) -> None:
+              if not url:
+                  return
+              url = clean_url(url) or ''
+              if not url:
+                  return
+              add_context(url, context)
+              if source_meta:
+                  metadata_by_url[url] = source_meta
+              if looks_like_pdf(url):
+                  pdf_candidates.add(url)
+              else:
+                  host = urllib.parse.urlparse(url).netloc.lower()
+                  if any(h in host for h in relevant_hosts):
+                      page_urls.add(url)
+
+          def get(url: str, *, accept: str = '*/*', referer: str | None = None, timeout=(15, 60)) -> requests.Response:
+              headers = {'Accept': accept}
+              if referer:
+                  headers['Referer'] = referer
+              last: Exception | None = None
+              for attempt in range(3):
+                  try:
+                      return session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(1.2 * (attempt + 1))
+              assert last is not None
+              raise last
+
+          def extract_urls(text: str, base: str, context: str, source_meta: dict[str, Any] | None = None) -> None:
+              soup = BeautifulSoup(text, 'html.parser')
+              for tag in soup.find_all(['a', 'iframe', 'embed', 'object', 'source', 'script', 'img']):
+                  for attr in ('href', 'src', 'data'):
+                      value = tag.get(attr)
+                      if isinstance(value, str):
+                          register_url(clean_url(value, base), context, source_meta)
+              patterns = [
+                  r'https?://[^\s"\'<>\\]+',
+                  r'(?:(?:https?:)?//)?[A-Za-z0-9._-]+(?:\.[A-Za-z]{2,})+(?:/[^\s"\'<>\\]*)?\.pdf(?:\?[^\s"\'<>\\]*)?',
+              ]
+              for pat in patterns:
+                  for match in re.finditer(pat, text, re.I):
+                      register_url(clean_url(match.group(0), base), context, source_meta)
+              for info in set(re.findall(r'AP\d{15,24}', text, re.I)):
+                  for prefix in ('H3', 'H2', 'H1'):
+                      register_url(f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf', context, source_meta)
+
+          # 1) General search engines. Use both direct HTML and Jina public text rendering.
+          engines = [
+              ('bing', 'https://www.bing.com/search?q={q}&count=50'),
+              ('bing-cn', 'https://cn.bing.com/search?q={q}&count=50'),
+              ('ddg', 'https://html.duckduckgo.com/html/?q={q}'),
+              ('baidu', 'https://www.baidu.com/s?wd={q}&rn=50'),
+          ]
+          for query in queries:
+              for engine, template in engines:
+                  url = template.format(q=urllib.parse.quote_plus(query))
+                  for fetch_url in (url, 'https://r.jina.ai/http://' + url.removeprefix('https://').removeprefix('http://')):
+                      try:
+                          r = get(fetch_url, accept='text/html,text/plain,*/*', timeout=(15, 75))
+                          row = {'engine': engine, 'query': query, 'url': fetch_url, 'status': r.status_code, 'content_type': r.headers.get('content-type'), 'bytes': len(r.content), 'final_url': r.url}
+                          search_rows.append(row)
+                          print('SEARCH', json.dumps(row, ensure_ascii=False), flush=True)
+                          if r.status_code == 200 and len(r.content) > 200:
+                              extract_urls(r.text, r.url, f'{engine}: {query}')
+                      except Exception as exc:
+                          errors.append(f'SEARCH {engine} {query}: {exc!r}')
+
+          # 2) FxBaogao public metadata searches; capture every company deep/first-coverage candidate.
+          fx_api = 'https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          fx_headers = {
+              'User-Agent': UA,
+              'Accept': 'application/json,text/plain,*/*',
+              'Content-Type': 'application/json;charset=UTF-8',
+              'Origin': 'https://www.fxbaogao.com',
+              'Referer': 'https://www.fxbaogao.com/',
+              'x-fp': '', 'x-bot': '',
+          }
+          fx_keywords = [
+              '中升控股', '中升控股 公司深度', '中升控股 首次覆盖',
+              '汽车经销商龙头基本面或见底反转',
+              '汽车综合服务龙头 底部反转在即',
+              '发力汽车后市场的汽车经销商龙头',
+              'Zhongsheng Group',
+          ]
+          fx_rows: dict[str, dict[str, Any]] = {}
+          for kw in fx_keywords:
+              for payload in (
+                  {'keywords': kw, 'page': 1, 'limit': 100, 'order': 0},
+                  {'keywords': kw, 'pageNum': 1, 'pageSize': 100, 'order': 0},
+                  {'keywords': kw, 'currPage': 1, 'limit': 100, 'order': 0},
+              ):
+                  try:
+                      r = session.post(fx_api, headers=fx_headers, json=payload, timeout=(15, 75))
+                      print('FX', kw, payload, r.status_code, len(r.content), flush=True)
+                      if r.status_code != 200:
+                          continue
+                      obj = r.json()
+                      data = obj.get('data') or {}
+                      rows = data.get('dataList') if isinstance(data, dict) else data
+                      if not isinstance(rows, list):
+                          continue
+                      for row in rows:
+                          doc = str(row.get('docId') or row.get('id') or '')
+                          if not doc:
+                              continue
+                          raw = re.sub(r'<[^>]+>', '', json.dumps(row, ensure_ascii=False))
+                          if not any(x.lower() in raw.lower() for x in ('中升控股', '00881', 'zhongsheng')):
+                              continue
+                          fx_rows[doc] = row
+                  except Exception as exc:
+                      errors.append(f'FX {kw}: {exc!r}')
+
+          for doc, row in fx_rows.items():
+              title = re.sub(r'<[^>]+>', '', str(row.get('title') or ''))
+              org = str(row.get('orgName') or '')
+              pages = int(row.get('pageNum') or 0) if str(row.get('pageNum') or '').isdigit() else 0
+              meta = {'source': 'fxbaogao', 'doc_id': doc, 'title': title, 'broker': org, 'pages': pages, 'row': row}
+              detail = f'https://www.fxbaogao.com/detail/{doc}'
+              viewer = f'https://www.fxbaogao.com/view?id={doc}'
+              register_url(detail, f'FxBaogao {org} {title}', meta)
+              register_url(viewer, f'FxBaogao {org} {title}', meta)
+              path = str(row.get('pdfPath') or '').strip()
+              if path:
+                  if path.startswith('http'):
+                      register_url(path, f'FxBaogao {org} {title}', meta)
+                  else:
+                      rel = path.lstrip('/')
+                      for host in ('https://public.fxbaogao.com/', 'https://report.fxbaogao.com/', 'https://dr.fxbaogao.com/', 'https://oss-buy.hufangde.com/'):
+                          register_url(host + rel, f'FxBaogao {org} {title}', meta)
+              print('FX_META', json.dumps(meta, ensure_ascii=False)[:5000], flush=True)
+
+          # 3) Exhaustive Eastmoney date-window scan, including every page.
+          windows = [
+              ('2019-03-20', '2019-04-05'),
+              ('2024-11-01', '2024-12-15'),
+              ('2025-01-15', '2025-02-10'),
+              ('2025-08-25', '2025-09-15'),
+              ('2025-12-01', '2025-12-31'),
+          ]
+          em_hits: dict[str, dict[str, Any]] = {}
+          for begin, end in windows:
+              for qtype in (0, 1, 2):
+                  page = 1
+                  total = 1
+                  while page <= total and page <= 200:
+                      try:
+                          params = {'pageNo': page, 'pageSize': 100, 'code': '', 'qType': qtype, 'beginTime': begin, 'endTime': end, '_': int(time.time() * 1000) + page}
+                          r = get('https://reportapi.eastmoney.com/report/list?' + urllib.parse.urlencode(params), accept='application/json,text/plain,*/*', referer='https://data.eastmoney.com/report/', timeout=(15, 75))
+                          if r.status_code != 200:
+                              break
+                          obj = r.json()
+                          rows = obj.get('data') or []
+                          total = int(obj.get('TotalPage') or 0)
+                          print('EM_PAGE', begin, end, qtype, page, total, len(rows), flush=True)
+                          if not isinstance(rows, list) or not rows:
+                              break
+                          for row in rows:
+                              raw = json.dumps(row, ensure_ascii=False)
+                              if any(x.lower() in raw.lower() for x in ('中升控股', 'zhongsheng', '00881', '881 hk')):
+                                  info = str(row.get('infoCode') or '')
+                                  if info:
+                                      em_hits[info] = row
+                          page += 1
+                      except Exception as exc:
+                          errors.append(f'EM {begin} {end} {qtype} {page}: {exc!r}')
+                          break
+
+          for info, row in em_hits.items():
+              meta = {'source': 'eastmoney', 'info_code': info, 'title': row.get('title'), 'broker': row.get('orgSName') or row.get('orgName'), 'pages': row.get('attachPages'), 'row': row}
+              for prefix in ('H3', 'H2', 'H1'):
+                  register_url(f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf', f"Eastmoney {meta['broker']} {meta['title']}", meta)
+              print('EM_HIT', json.dumps(meta, ensure_ascii=False), flush=True)
+
+          # 4) Crawl public result/detail pages and extract embedded file links/AP codes.
+          known_pages = {
+              'https://www.fxbaogao.com/detail/4681578',
+              'https://www.fxbaogao.com/detail/5187055',
+              'https://www.sdyanbao.com/search?keyword=' + urllib.parse.quote('中升控股'),
+              'https://www.sdyanbao.com/search?keywords=' + urllib.parse.quote('中升控股'),
+              'https://reportify.cn/search?q=' + urllib.parse.quote('中升控股'),
+              'https://www.vzkoo.com/search?keyword=' + urllib.parse.quote('中升控股'),
+              'https://www.microbell.com/search?keyword=' + urllib.parse.quote('中升控股'),
+          }
+          page_urls.update(known_pages)
+
+          def fetch_page(url: str) -> tuple[str, int, str, str, int]:
+              try:
+                  r = get(url, accept='text/html,application/xhtml+xml,application/json,text/plain,*/*', timeout=(15, 75))
+                  return url, r.status_code, r.url, r.text, len(r.content)
+              except Exception as exc:
+                  return url, 0, url, repr(exc), 0
+
+          first_wave = list(page_urls)[:500]
+          with ThreadPoolExecutor(max_workers=10) as executor:
+              futures = [executor.submit(fetch_page, u) for u in first_wave]
+              for future in as_completed(futures):
+                  url, status, final_url, text, size = future.result()
+                  print('PAGE', status, size, url, final_url, flush=True)
+                  if status == 200 and size > 100:
+                      meta = metadata_by_url.get(url)
+                      extract_urls(text, final_url, 'crawled from ' + url, meta)
+
+          # A second small wave follows newly discovered relevant pages only.
+          second_wave = [u for u in page_urls if u not in first_wave][:300]
+          with ThreadPoolExecutor(max_workers=10) as executor:
+              futures = [executor.submit(fetch_page, u) for u in second_wave]
+              for future in as_completed(futures):
+                  url, status, final_url, text, size = future.result()
+                  print('PAGE2', status, size, url, final_url, flush=True)
+                  if status == 200 and size > 100:
+                      meta = metadata_by_url.get(url)
+                      extract_urls(text, final_url, 'crawled from ' + url, meta)
+
+          # 5) Probe all candidate files. Accept only complete PDFs >= 15 pages and company identity.
+          def probe_pdf(url: str) -> dict[str, Any]:
+              context = candidate_context.get(url, [])
+              meta = metadata_by_url.get(url) or {}
+              try:
+                  r = get(url, accept='application/pdf,application/octet-stream;q=0.9,*/*;q=0.8', referer=(meta.get('source_page') or 'https://www.google.com/'), timeout=(20, 150))
+                  ctype = r.headers.get('content-type', '')
+                  result: dict[str, Any] = {
+                      'url': url, 'status': r.status_code, 'final_url': r.url,
+                      'content_type': ctype, 'bytes': len(r.content),
+                      'context': context, 'metadata': meta,
+                  }
+                  if r.status_code != 200 or not r.content.startswith(b'%PDF-') or len(r.content) < 100_000:
+                      return result
+                  reader = PdfReader(BytesIO(r.content), strict=False)
+                  pages = len(reader.pages)
+                  result['pages'] = pages
+                  if pages < 15:
+                      result['rejected'] = 'fewer than 15 pages'
+                      return result
+                  sample_parts = []
+                  indices = list(range(min(8, pages)))
+                  if pages > 8:
+                      indices.extend([pages // 2, pages - 1])
+                  for index in sorted(set(indices)):
+                      try:
+                          sample_parts.append(reader.pages[index].extract_text() or '')
+                      except Exception:
+                          pass
+                  sample = re.sub(r'\s+', ' ', '\n'.join(sample_parts))
+                  context_text = ' '.join(context) + ' ' + json.dumps(meta, ensure_ascii=False)
+                  identity = any(term.lower() in sample.lower() for term in ('中升控股', 'zhongsheng group', '00881', '881 hk'))
+                  metadata_identity = any(term.lower() in context_text.lower() for term in ('中升控股', 'zhongsheng group', '00881'))
+                  result['identity_in_pdf'] = identity
+                  result['identity_in_metadata'] = metadata_identity
+                  result['sample'] = sample[:6000]
+                  if not identity and not metadata_identity:
+                      result['rejected'] = 'company identity not established'
+                      return result
+                  result['sha256'] = hashlib.sha256(r.content).hexdigest()
+                  result['pdf_bytes'] = r.content
+                  return result
+              except Exception as exc:
+                  return {'url': url, 'error': repr(exc), 'context': context, 'metadata': meta}
+
+          all_candidate_urls = sorted(pdf_candidates)
+          print('PDF_CANDIDATE_COUNT', len(all_candidate_urls), flush=True)
+          probe_results: list[dict[str, Any]] = []
+          with ThreadPoolExecutor(max_workers=10) as executor:
+              futures = {executor.submit(probe_pdf, u): u for u in all_candidate_urls[:1200]}
+              for future in as_completed(futures):
+                  result = future.result()
+                  probe_results.append({k: v for k, v in result.items() if k != 'pdf_bytes'})
+                  print('PROBE', json.dumps({k: v for k, v in result.items() if k not in ('pdf_bytes', 'sample', 'metadata')}, ensure_ascii=False)[:5000], flush=True)
+                  if 'pdf_bytes' in result:
+                      name = result['sha256'] + '.pdf'
+                      (RAW / name).write_bytes(result['pdf_bytes'])
+                      result['raw_path'] = str(RAW / name)
+
+          accepted = []
+          seen_hashes = set()
+          for result in probe_results:
+              sha = result.get('sha256')
+              if not sha or sha in seen_hashes or result.get('rejected'):
+                  continue
+              raw_path = RAW / f'{sha}.pdf'
+              if not raw_path.exists():
+                  continue
+              seen_hashes.add(sha)
+              meta = result.get('metadata') or {}
+              context = ' '.join(result.get('context') or [])
+              broker = str(meta.get('broker') or '')
+              title = str(meta.get('title') or '')
+              if not title:
+                  # Derive a readable label from the strongest search context.
+                  title = next((c for c in result.get('context') or [] if '中升控股' in c or 'Zhongsheng' in c), '中升控股券商深度研究报告')[:150]
+              if not broker:
+                  for name in ('开源证券', '中国银河', '银河证券', '国泰君安', '海通证券', '国泰海通', '招商证券', '中信证券', '兴业证券', '兴证国际', '交银国际', '建银国际', '中金公司', '华泰证券', '国信证券'):
+                      if name in context or name in title:
+                          broker = name
+                          break
+              accepted.append({**result, 'broker': broker or '券商机构待核对', 'title': title, 'raw_path': str(raw_path)})
+
+          # Prefer explicit company-deep/first-coverage reports, then newer/larger, and diversify brokers.
+          def score(item: dict[str, Any]) -> tuple[int, int]:
+              text = (item.get('title') or '') + ' ' + ' '.join(item.get('context') or [])
+              points = 0
+              if any(x in text for x in ('首次覆盖', '公司深度', '深度报告', 'Initiation', 'initiation')):
+                  points += 500
+              if item.get('identity_in_pdf'):
+                  points += 300
+              points += min(int(item.get('pages') or 0), 100)
+              return points, int(item.get('pages') or 0)
+
+          accepted.sort(key=score, reverse=True)
+          selected = []
+          used_brokers = set()
+          for item in accepted:
+              broker = item['broker']
+              if broker in used_brokers and len(selected) < 2:
+                  continue
+              selected.append(item)
+              used_brokers.add(broker)
+              if len(selected) >= 3:
+                  break
+          if len(selected) < min(3, len(accepted)):
+              for item in accepted:
+                  if item not in selected:
+                      selected.append(item)
+                      if len(selected) >= 3:
+                          break
+
+          def safe_name(value: str) -> str:
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', value).strip('_')[:100]
+
+          records = []
+          for idx, item in enumerate(selected, 1):
+              pages = int(item['pages'])
+              filename = f'{idx:02d}_{safe_name(item["broker"])}_中升控股_{safe_name(item["title"])}_{pages}页.pdf'
+              target = OUT / filename
+              target.write_bytes(Path(item['raw_path']).read_bytes())
+              q = subprocess.run(['qpdf', '--check', str(target)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf validation failed: {filename}: {q.stderr}')
+              for label, page in (('first', 1), ('last', pages)):
+                  prefix = PREV / f'{idx:02d}_{label}'
+                  subprocess.run(['pdftoppm', '-f', str(page), '-singlefile', '-jpeg', '-r', '80', str(target), str(prefix)], check=True, capture_output=True)
+                  preview = Path(str(prefix) + '.jpg')
+                  if not preview.exists() or preview.stat().st_size < 3000:
+                      raise RuntimeError(f'render validation failed: {filename} page {page}')
+              records.append({
+                  'order': idx, 'company': COMPANY_CN, 'ticker': TICKER,
+                  'broker': item['broker'], 'title': item['title'], 'pages': pages,
+                  'filename': filename, 'bytes': target.stat().st_size,
+                  'sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
+                  'source_url': item['final_url'], 'discovery_url': item['url'],
+                  'identity_in_pdf': item.get('identity_in_pdf'),
+                  'context': item.get('context'),
+              })
+
+          diagnostics = {
+              'search_rows': search_rows,
+              'fx_metadata': list(fx_rows.values()),
+              'eastmoney_hits': list(em_hits.values()),
+              'page_url_count': len(page_urls),
+              'pdf_candidate_count': len(pdf_candidates),
+              'probe_results': probe_results,
+              'accepted_count': len(accepted),
+              'selected_records': records,
+              'errors': errors,
+          }
+          Path('zhongsheng_exhaustive_search_diagnostics.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if records:
+              lines = [
+                  f'{COMPANY_CN}（{TICKER}）券商深度报告包', '',
+                  f'本包收录 {len(records)} 份无需登录即可直接取得、并通过完整性核验的公开PDF。',
+                  '筛选标准：PDF不少于15页，能够确认中升控股/00881.HK身份，且PDF结构与首末页渲染正常。', '',
+              ]
+              for r in records:
+                  lines += [
+                      f"{r['order']}. {r['broker']}：《{r['title']}》",
+                      f"   页数：{r['pages']}页；文件：{r['filename']}",
+                      f"   公开来源：{r['source_url']}",
+                      f"   SHA-256：{r['sha256']}", '',
+                  ]
+              lines += ['报告版权归原研究机构及作者所有，仅供个人研究参考，不构成投资建议。']
+              (OUT / '报告清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+              (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+              (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+              zip_path = Path(f'中升控股_00881HK_券商深度报告_{len(records)}份_公开完整PDF.zip')
+              with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=7, allowZip64=True) as zf:
+                  for path in sorted(OUT.iterdir()):
+                      zf.write(path, arcname=f'{OUT.name}/{path.name}')
+              with zipfile.ZipFile(zip_path) as zf:
+                  bad = zf.testzip()
+                  if bad:
+                      raise RuntimeError(f'ZIP CRC failed: {bad}')
+              summary = {'zip': zip_path.name, 'bytes': zip_path.stat().st_size, 'sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(), 'records': records}
+              Path('zhongsheng_package_summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('FINAL_PACKAGE', json.dumps(summary, ensure_ascii=False), flush=True)
+          else:
+              Path('NO_COMPLETE_PUBLIC_PDF_FOUND.txt').write_text(
+                  '本轮扩展检索未发现可公开直接下载且不少于15页的完整中升控股券商深度报告。\n'
+                  '已检查搜索引擎、FxBaogao公开元数据与附件路径、东方财富报告接口、券商/研报镜像页面及嵌入链接。\n'
+                  '预览件、短篇点评、登录或付费后才能获取的文件均未收录。\n',
+                  encoding='utf-8'
+              )
+              print('FINAL_NO_PACKAGE', flush=True)
+          PY
+
+      - name: Upload verified reports or diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongsheng-exhaustive-search-20260904-v3
+          path: |
+            中升控股_00881HK_券商深度报告_公开完整PDF/
+            中升控股_00881HK_券商深度报告_*份_公开完整PDF.zip
+            zhongsheng_package_summary.json
+            zhongsheng_exhaustive_search_diagnostics.json
+            NO_COMPLETE_PUBLIC_PDF_FOUND.txt
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
