@@ -1,0 +1,408 @@
+name: Package Dongjiang Environmental annual and latest reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package-dongjiang-annuals-latest-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Discover download validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '东江环保_2020-2025年报及最新季报'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+          WORK = Path('_dongjiang_annuals_work')
+          RENDERS = WORK / 'renders'
+          WORK.mkdir(exist_ok=True)
+          RENDERS.mkdir(exist_ok=True)
+
+          BASE = 'https://www1.hkexnews.hk'
+          SEARCH = BASE + '/search/titlesearch.xhtml'
+          SERVLET = BASE + '/search/titleSearchServlet.do'
+          STOCK_ID = '52672'   # 00895 Dongjiang Environmental
+          STOCK_CODE_H = '00895'
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          common_headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': SEARCH + '?category=0&lang=ZH&market=SEHK&stockId=' + STOCK_ID,
+          }
+
+          def clean(value: object) -> str:
+              text = html.unescape(str(value or ''))
+              text = re.sub(r'<[^>]+>', ' ', text)
+              return re.sub(r'\s+', ' ', text).strip()
+
+          def query_period(start: str, end: str, lang: str) -> list[dict]:
+              form = {
+                  'lang': lang,
+                  'category': '0',
+                  'market': 'SEHK',
+                  'searchType': '0',
+                  'documentType': '-1',
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'stockId': STOCK_ID,
+                  'from': start,
+                  'to': end,
+                  'MB-Daterange': '0',
+                  'title': '',
+              }
+              post = session.post(SEARCH, data=form, headers=common_headers, timeout=(30, 150), allow_redirects=True)
+              print('POST', lang, start, end, post.status_code, len(post.content), post.url, flush=True)
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': start,
+                  'toDate': end,
+                  'title': '',
+                  'searchType': '0',
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'rowRange': '9999',
+                  'lang': lang,
+              }
+              last = None
+              for attempt in range(1, 6):
+                  try:
+                      response = session.get(
+                          SERVLET,
+                          params=params,
+                          headers={**common_headers, 'Accept':'application/json,text/plain,*/*'},
+                          timeout=(30, 180),
+                          allow_redirects=True,
+                      )
+                      print('API', attempt, lang, start, end, response.status_code, len(response.content), response.url, flush=True)
+                      response.raise_for_status()
+                      outer = response.json()
+                      result = outer.get('result', []) if isinstance(outer, dict) else outer
+                      rows = json.loads(result) if isinstance(result, str) else result
+                      if not isinstance(rows, list):
+                          rows = []
+                      parsed = []
+                      for row in rows:
+                          if not isinstance(row, dict):
+                              continue
+                          code = clean(row.get('STOCK_CODE'))
+                          name = clean(row.get('STOCK_NAME'))
+                          if STOCK_CODE_H not in code.replace(' ', '') and 'DONGJIANG' not in name.upper() and '東江環保' not in name and '东江环保' not in name:
+                              continue
+                          link = str(row.get('FILE_LINK') or '').strip()
+                          if not link or '.pdf' not in link.lower():
+                              continue
+                          parsed.append({
+                              'lang': lang,
+                              'date_time': clean(row.get('DATE_TIME')),
+                              'stock_code': code,
+                              'stock_name': name,
+                              'title': clean(row.get('TITLE')),
+                              'long_text': clean(row.get('LONG_TEXT')),
+                              'file_link': link,
+                              'file_info': clean(row.get('FILE_INFO')),
+                              'file_type': clean(row.get('FILE_TYPE')),
+                              'source_url': urljoin(BASE + '/', link),
+                          })
+                      return parsed
+                  except Exception as exc:
+                      last = exc
+                      print('API_ERROR', attempt, lang, start, end, repr(exc), flush=True)
+                      time.sleep(min(attempt * 2, 8))
+              raise RuntimeError(f'HKEX query failed {lang} {start}-{end}: {last}')
+
+          rows: list[dict] = []
+          for publication_year in range(2021, 2027):
+              start = f'{publication_year}0101'
+              end = '20260904' if publication_year == 2026 else f'{publication_year}1231'
+              for lang in ('ZH', 'EN'):
+                  rows.extend(query_period(start, end, lang))
+                  time.sleep(0.25)
+
+          deduped = []
+          seen = set()
+          for row in rows:
+              key = row['source_url'].split('?')[0]
+              if key in seen:
+                  continue
+              seen.add(key)
+              deduped.append(row)
+          rows = deduped
+          (WORK / 'hkex_rows.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('HKEX_ROWS', len(rows), flush=True)
+          for row in rows:
+              text = (row['title'] + ' ' + row['long_text']).lower()
+              if any(term in text for term in ('annual report','interim report','quarterly report','年報','年报','年度報告','年度报告','中期報告','中期报告','半年度報告','半年度报告','第一季度')):
+                  print('CANDIDATE', json.dumps(row, ensure_ascii=False), flush=True)
+
+          def combined(row: dict) -> str:
+              return clean(row['title'] + ' ' + row['long_text']).lower()
+
+          def annual_candidates(year: int) -> list[dict]:
+              candidates = []
+              for row in rows:
+                  text = combined(row)
+                  if str(year) not in text:
+                      continue
+                  if not any(term in text for term in ('annual report','年度報告','年度报告','年報','年报')):
+                      continue
+                  if any(term in text for term in ('annual results','年度業績','年度业绩','全年業績','全年业绩','summary','摘要','esg','environmental, social','環境、社會','环境、社会','notification','通知信函','circular','通函')):
+                      continue
+                  score = 0
+                  if row['lang'] == 'ZH': score += 70
+                  if row['source_url'].lower().endswith('_c.pdf'): score += 30
+                  if any(term in row['long_text'].lower() for term in ('[年報]','[年报]','[annual report]','financial statements')): score += 120
+                  if row['title'] in (f'{year}年度報告', f'{year}年度报告', f'{year}年報', f'{year}年报', f'ANNUAL REPORT {year}', f'{year} ANNUAL REPORT'): score += 60
+                  if '東江環保股份有限公司' in row['title'] or '东江环保股份有限公司' in row['title']: score += 10
+                  candidates.append({**row, 'score':score})
+              return sorted(candidates, key=lambda x:(x['score'], x['date_time']), reverse=True)
+
+          def q1_candidates(year: int) -> list[dict]:
+              candidates = []
+              for row in rows:
+                  text = combined(row)
+                  if str(year) not in text:
+                      continue
+                  if not any(term in text for term in ('first quarterly report','第一季度報告','第一季度报告')):
+                      continue
+                  if any(term in text for term in ('摘要','summary','通知','notification')):
+                      continue
+                  score = 0
+                  if row['lang'] == 'ZH': score += 70
+                  if row['source_url'].lower().endswith('_c.pdf'): score += 30
+                  if any(term in row['long_text'].lower() for term in ('quarterly results','季度業績','季度业绩')): score += 80
+                  if 'inside information' in text or '內幕消息' in text or '内幕消息' in text: score += 20
+                  candidates.append({**row, 'score':score})
+              return sorted(candidates, key=lambda x:(x['score'], x['date_time']), reverse=True)
+
+          def interim_candidates(year: int) -> list[dict]:
+              candidates = []
+              for row in rows:
+                  text = combined(row)
+                  if str(year) not in text:
+                      continue
+                  if not any(term in text for term in ('interim report','中期報告','中期报告','半年度報告','半年度报告')):
+                      continue
+                  if any(term in text for term in ('interim results','中期業績','中期业绩','results announcement','業績公告','业绩公告','summary','摘要','通知','notification')):
+                      continue
+                  score = 0
+                  if row['lang'] == 'ZH': score += 70
+                  if row['source_url'].lower().endswith('_c.pdf'): score += 30
+                  if any(term in row['long_text'].lower() for term in ('[中期/半年度報告]','[中期/半年度报告]','[interim/half-year report]','financial statements')): score += 130
+                  if row['title'] in (f'{year}中期報告', f'{year}中期报告', f'{year}半年度報告', f'{year}半年度报告', f'INTERIM REPORT {year}', f'{year} INTERIM REPORT'): score += 60
+                  candidates.append({**row, 'score':score})
+              return sorted(candidates, key=lambda x:(x['score'], x['date_time']), reverse=True)
+
+          def fetch_pdf(url: str) -> bytes:
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      response = session.get(
+                          url,
+                          headers={
+                              **common_headers,
+                              'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                          },
+                          timeout=(30, 600),
+                          allow_redirects=True,
+                      )
+                      print('PDF_GET', attempt, response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 100_000:
+                          return response.content
+                      last = RuntimeError(f'HTTP {response.status_code}; bytes={len(response.content)}')
+                  except Exception as exc:
+                      last = exc
+                      print('PDF_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'Download failed for {url}: {last}')
+
+          def compact_pdf_text(reader: PdfReader, limit: int = 16) -> str:
+              parts = []
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(parts)).lower()
+
+          def validate_and_save(candidates: list[dict], filename: str, kind: str, year: int, min_pages: int) -> dict:
+              failures = []
+              for index, candidate in enumerate(candidates, 1):
+                  temp = WORK / f'{kind}_{year}_{index}.pdf'
+                  try:
+                      data = fetch_pdf(candidate['source_url'])
+                      temp.write_bytes(data)
+                      reader = PdfReader(str(temp), strict=False)
+                      pages = len(reader.pages)
+                      if pages < min_pages:
+                          raise RuntimeError(f'too short: {pages} pages; minimum={min_pages}')
+                      text = compact_pdf_text(reader)
+                      identity_ok = any(token in text for token in (
+                          '东江环保','東江環保','dongjiangenvironmental','002672','00895'
+                      ))
+                      if not identity_ok:
+                          raise RuntimeError('company identity not found in opening pages')
+                      if str(year) not in text and str(year) not in combined(candidate):
+                          raise RuntimeError('reporting year not confirmed')
+
+                      qcheck = subprocess.run(['qpdf','--check',str(temp)], capture_output=True, text=True)
+                      if qcheck.returncode not in (0,3):
+                          raise RuntimeError('qpdf check failed: ' + qcheck.stderr[-1500:])
+                      if qcheck.returncode == 3:
+                          print('QPDF_WARNING', filename, qcheck.stderr[-1200:], flush=True)
+
+                      doc = pymupdf.open(str(temp))
+                      sample_pages = sorted(set([0, max(0, pages // 2), pages - 1]))
+                      rendered_pages = []
+                      for page_no in sample_pages:
+                          page = doc.load_page(page_no)
+                          pix = page.get_pixmap(matrix=pymupdf.Matrix(1.0,1.0), alpha=False)
+                          render_path = RENDERS / f'{kind}_{year}_{page_no+1:04d}.png'
+                          pix.save(str(render_path))
+                          if not render_path.exists() or render_path.stat().st_size < 7_000 or pix.width < 400 or pix.height < 400:
+                              raise RuntimeError(f'render verification failed at page {page_no+1}')
+                          rendered_pages.append(page_no + 1)
+                      doc.close()
+
+                      destination = OUT / filename
+                      destination.write_bytes(data)
+                      digest = hashlib.sha256(data).hexdigest()
+                      record = {
+                          'filename': filename,
+                          'kind': kind,
+                          'report_year': year,
+                          'source_title': candidate['title'],
+                          'disclosure_time': candidate['date_time'],
+                          'language_query': candidate['lang'],
+                          'pages': pages,
+                          'bytes': len(data),
+                          'sha256': digest,
+                          'source_url': candidate['source_url'],
+                          'source': '香港交易所披露易（HKEXnews）原始PDF',
+                          'rendered_pages': rendered_pages,
+                      }
+                      print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+                      return record
+                  except Exception as exc:
+                      failure = {'title':candidate.get('title'),'url':candidate.get('source_url'),'error':repr(exc)}
+                      failures.append(failure)
+                      print('CANDIDATE_FAILURE', kind, year, json.dumps(failure, ensure_ascii=False), flush=True)
+              raise RuntimeError(f'No valid {kind} report for {year}: {json.dumps(failures, ensure_ascii=False)}')
+
+          records = []
+          for year in range(2020, 2026):
+              candidates = annual_candidates(year)
+              print('ANNUAL_SELECTION', year, json.dumps(candidates[:10], ensure_ascii=False, indent=2), flush=True)
+              if not candidates:
+                  raise RuntimeError(f'No annual report candidates for {year}')
+              records.append(validate_and_save(candidates, f'东江环保_{year}年年度报告.pdf', 'annual', year, 150))
+
+          q1 = q1_candidates(2026)
+          print('Q1_SELECTION', json.dumps(q1[:10], ensure_ascii=False, indent=2), flush=True)
+          if not q1:
+              raise RuntimeError('No 2026 first-quarter report candidate')
+          records.append(validate_and_save(q1, '东江环保_2026年第一季度报告.pdf', 'q1', 2026, 8))
+
+          interim = interim_candidates(2026)
+          print('INTERIM_SELECTION', json.dumps(interim[:10], ensure_ascii=False, indent=2), flush=True)
+          if not interim:
+              raise RuntimeError('No 2026 interim report candidate')
+          records.append(validate_and_save(interim, '东江环保_2026年半年度报告.pdf', 'interim', 2026, 80))
+
+          annual_years = {record['report_year'] for record in records if record['kind'] == 'annual'}
+          if annual_years != {2020,2021,2022,2023,2024,2025}:
+              raise RuntimeError(f'Annual coverage mismatch: {annual_years}')
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 reports, got {len(records)}')
+          if len({record['sha256'] for record in records}) != len(records):
+              raise RuntimeError('Duplicate PDF hash detected')
+
+          lines = [
+              '东江环保股份有限公司（002672.SZ / 00895.HK）',
+              '2020-2025年年度报告及最新期内报告',
+              '',
+              '本包共8份香港交易所披露易原始PDF。',
+              '2020-2025年度文件均为完整年度报告，不是业绩公告、摘要或媒体转载。',
+              '截至2026年9月4日，最新正式季度报告为2026年第一季度报告；公司于2026年9月4日披露完整2026年中期报告，因此一并收入。',
+              '',
+          ]
+          for number, record in enumerate(records, 1):
+              lines.extend([
+                  f"{number}. {record['filename']}",
+                  f"   港交所标题：{record['source_title']}",
+                  f"   披露时间：{record['disclosure_time']}；实际页数：{record['pages']}页；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、公司名称或证券代码、报告年份、实际页数、qpdf结构检查、首页/中间页/末页渲染、SHA-256和ZIP CRC。',
+              '年度报告按其覆盖的财政年度命名，而不是按PDF披露年份命名。',
+          ])
+          (OUT / '报告清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 8:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dongjiang-2020-2025-annuals-latest-final
+          path: 东江环保_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
