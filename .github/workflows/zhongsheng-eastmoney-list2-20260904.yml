@@ -1,0 +1,103 @@
+name: Query Eastmoney Zhongsheng stock reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-eastmoney-list2-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Resolve identifiers and query report APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          import json,re,time
+          from io import BytesIO
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S=requests.Session(); S.trust_env=False
+          H={'User-Agent':UA,'Accept':'application/json,text/plain,*/*','Referer':'https://data.eastmoney.com/report/stock.jshtml'}
+
+          for word in ['中升控股','00881','881','Zhongsheng']:
+            u='https://searchapi.eastmoney.com/api/suggest/get'
+            params={'input':word,'type':'14','count':'50','token':'D43BF722C8E33F8719E1E6A4E8C89DC'}
+            try:
+              r=S.get(u,params=params,headers=H,timeout=(15,60))
+              print('LOOKUP',word,r.status_code,len(r.content),r.url,repr(r.text[:20000]),flush=True)
+            except Exception as e: print('LOOKUP_ERROR',word,repr(e),flush=True)
+
+          variants=['00881','881','116.00881','116.881','HK00881','HK0881','00881.HK','0881.HK','881.HK','105.00881','106.00881','107.00881','ZSHGY','中升控股','*']
+          endpoint='https://reportapi.eastmoney.com/report/list2'
+          allrows={}
+          for code in variants:
+            payload={'pageSize':500,'pageNo':1,'p':1,'pageNum':1,'pageNumber':1,'beginTime':'2017-01-01','endTime':'2026-09-04','code':code,'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''}
+            try:
+              r=S.post(endpoint,json=payload,headers={**H,'Content-Type':'application/json'},timeout=(20,120))
+              print('\nLIST2',code,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              print('HEAD',repr(r.text[:1000]),flush=True)
+              r.raise_for_status(); obj=r.json(); rows=obj.get('data') or []
+              print('META',code,'ROWS',len(rows),{k:obj.get(k) for k in ('hits','size','TotalPage','pageNo')},flush=True)
+              for row in rows:
+                raw=json.dumps(row,ensure_ascii=False)
+                low=re.sub(r'\s+','',raw).lower()
+                if code!='*' or any(x in low for x in ('中升控股','zhongsheng','00881','881hk')):
+                  key=str(row.get('infoCode') or raw)
+                  allrows[key]=row
+                  print('ROW',code,raw,flush=True)
+            except Exception as e: print('LIST2_ERROR',code,repr(e),flush=True)
+
+          # Also scan narrow date windows in GET /list in case HK reports are returned there.
+          for begin,end in [('2019-03-20','2019-04-05'),('2024-11-20','2024-12-05'),('2025-01-20','2025-02-05'),('2025-12-05','2025-12-20')]:
+            for qtype in (0,1,2):
+              params={'pageNo':1,'pageSize':500,'code':'','qType':qtype,'beginTime':begin,'endTime':end,'_':int(time.time()*1000)}
+              try:
+                r=S.get('https://reportapi.eastmoney.com/report/list',params=params,headers=H,timeout=(15,90)); r.raise_for_status(); obj=r.json(); rows=obj.get('data') or []
+                print('GETLIST',begin,end,qtype,'ROWS',len(rows),'PAGES',obj.get('TotalPage'),flush=True)
+                for row in rows:
+                  raw=json.dumps(row,ensure_ascii=False)
+                  low=re.sub(r'\s+','',raw).lower()
+                  if any(x in low for x in ('中升控股','zhongsheng','00881','881hk')):
+                    key=str(row.get('infoCode') or raw); allrows[key]=row; print('GET_ROW',raw,flush=True)
+              except Exception as e: print('GET_ERROR',begin,end,qtype,repr(e),flush=True)
+
+          valid=[]
+          for key,row in allrows.items():
+            info=str(row.get('infoCode') or '')
+            if not info.startswith('AP'): continue
+            for prefix in ('H3','H2','H1'):
+              u=f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf'
+              try:
+                r=S.get(u,headers={'User-Agent':UA,'Accept':'application/pdf,*/*','Referer':'https://data.eastmoney.com/'},timeout=(15,120),allow_redirects=True)
+                print('PDFTRY',info,prefix,r.status_code,r.headers.get('content-type'),len(r.content),r.url,r.content[:8],flush=True)
+                if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>100000:
+                  rd=PdfReader(BytesIO(r.content),strict=False); pages=len(rd.pages)
+                  text=''
+                  for i in range(min(4,pages)):
+                    try: text+=(rd.pages[i].extract_text() or '')+'\n'
+                    except Exception: pass
+                  rec={'infoCode':info,'title':row.get('title'),'date':row.get('publishDate'),'org':row.get('orgSName') or row.get('orgName'),'pages':pages,'bytes':len(r.content),'url':r.url,'identity':any(x.lower() in text.lower() for x in ('中升控股','Zhongsheng','881 HK','00881')),'row':row}
+                  valid.append(rec); print('VALID',json.dumps(rec,ensure_ascii=False),flush=True); break
+              except Exception as e: print('PDF_ERROR',info,prefix,repr(e),flush=True)
+          result={'rows':list(allrows.values()),'valid':valid}
+          Path('zhongsheng_eastmoney.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps({'row_count':len(allrows),'valid_count':len(valid)},ensure_ascii=False),flush=True)
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongsheng-eastmoney-20260904
+          path: zhongsheng_eastmoney.json
+          if-no-files-found: error
+          retention-days: 7
