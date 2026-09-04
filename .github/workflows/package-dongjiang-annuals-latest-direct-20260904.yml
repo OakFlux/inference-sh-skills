@@ -1,0 +1,235 @@
+name: Package Dongjiang Environmental reports from verified HKEX links
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package-dongjiang-annuals-latest-direct-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download verify and package official PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '东江环保_2020-2025年报及最新季报'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+          WORK = Path('_dongjiang_direct_work')
+          RENDERS = WORK / 'renders'
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          reports = [
+              {
+                  'kind':'annual','year':2020,'filename':'东江环保_2020年年度报告.pdf',
+                  'source_title':'2020年報','disclosure_time':'28/04/2021 06:20','min_pages':150,
+                  'url':'https://www1.hkexnews.hk/listedco/listconews/sehk/2021/0428/2021042800062_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2021,'filename':'东江环保_2021年年度报告.pdf',
+                  'source_title':'2021年報','disclosure_time':'26/04/2022 20:18','min_pages':150,
+                  'url':'https://www1.hkexnews.hk/listedco/listconews/sehk/2022/0426/2022042602309_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2022,'filename':'东江环保_2022年年度报告.pdf',
+                  'source_title':'2022年報','disclosure_time':'27/04/2023 19:23','min_pages':150,
+                  'url':'https://www1.hkexnews.hk/listedco/listconews/sehk/2023/0427/2023042703856_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2023,'filename':'东江环保_2023年年度报告.pdf',
+                  'source_title':'2023年報','disclosure_time':'26/04/2024 19:37','min_pages':150,
+                  'url':'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0426/2024042603556_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2024,'filename':'东江环保_2024年年度报告.pdf',
+                  'source_title':'2024年報','disclosure_time':'25/04/2025 19:50','min_pages':150,
+                  'url':'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0425/2025042503114_c.pdf',
+              },
+              {
+                  'kind':'annual','year':2025,'filename':'东江环保_2025年年度报告.pdf',
+                  'source_title':'2025年報','disclosure_time':'27/04/2026 19:27','min_pages':150,
+                  'url':'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0427/2026042702559_c.pdf',
+              },
+              {
+                  'kind':'q1','year':2026,'filename':'东江环保_2026年第一季度报告.pdf',
+                  'source_title':'內幕消息 2026年第一季度報告','disclosure_time':'27/04/2026 18:48','min_pages':8,
+                  'url':'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0427/2026042702265_c.pdf',
+              },
+              {
+                  'kind':'interim','year':2026,'filename':'东江环保_2026年半年度报告.pdf',
+                  'source_title':'2026中期報告','disclosure_time':'04/09/2026 17:13','min_pages':80,
+                  'url':'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0904/2026090401150_c.pdf',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer':'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=ZH&market=SEHK&stockId=52672',
+          }
+
+          def download(url: str) -> bytes:
+              last = None
+              for attempt in range(1, 7):
+                  try:
+                      response = session.get(url, headers=headers, timeout=(30,600), allow_redirects=True)
+                      print('GET', attempt, response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                      if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 100_000:
+                          return response.content
+                      last = RuntimeError(f'HTTP {response.status_code}; bytes={len(response.content)}')
+                  except Exception as exc:
+                      last = exc
+                      print('GET_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'Download failed for {url}: {last}')
+
+          def extract_opening_text(reader: PdfReader, limit: int = 16) -> str:
+              parts = []
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(parts)).lower()
+
+          records = []
+          hashes = set()
+          for index, report in enumerate(reports, 1):
+              data = download(report['url'])
+              destination = OUT / report['filename']
+              destination.write_bytes(data)
+
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages < report['min_pages']:
+                  raise RuntimeError(f"{destination.name}: only {pages} pages; minimum={report['min_pages']}")
+
+              text = extract_opening_text(reader)
+              if not any(token in text for token in ('东江环保','東江環保','dongjiangenvironmental','002672','00895')):
+                  raise RuntimeError(f'{destination.name}: company identity not found in opening pages')
+              if str(report['year']) not in text:
+                  print('YEAR_TEXT_WARNING', destination.name, report['year'], flush=True)
+
+              qcheck = subprocess.run(['qpdf','--check',str(destination)], capture_output=True, text=True)
+              if qcheck.returncode not in (0,3):
+                  raise RuntimeError(f'{destination.name}: qpdf failed: {qcheck.stderr[-1500:]}')
+              if qcheck.returncode == 3:
+                  print('QPDF_WARNING', destination.name, qcheck.stderr[-1200:], flush=True)
+
+              doc = pymupdf.open(str(destination))
+              sample_pages = sorted(set([0, max(0, pages // 2), pages - 1]))
+              rendered_pages = []
+              for page_no in sample_pages:
+                  page = doc.load_page(page_no)
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(1.0,1.0), alpha=False)
+                  render_path = RENDERS / f'{index:02d}_{page_no+1:04d}.png'
+                  pix.save(str(render_path))
+                  if not render_path.exists() or render_path.stat().st_size < 7_000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'{destination.name}: render failed at page {page_no+1}')
+                  rendered_pages.append(page_no + 1)
+              doc.close()
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'Duplicate PDF: {destination.name}')
+              hashes.add(digest)
+              record = {
+                  'filename': report['filename'],
+                  'kind': report['kind'],
+                  'report_year': report['year'],
+                  'source_title': report['source_title'],
+                  'disclosure_time': report['disclosure_time'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': report['url'],
+                  'source': '香港交易所披露易（HKEXnews）原始PDF',
+                  'rendered_pages': rendered_pages,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if {r['report_year'] for r in records if r['kind']=='annual'} != {2020,2021,2022,2023,2024,2025}:
+              raise RuntimeError('Annual coverage mismatch')
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 reports, got {len(records)}')
+
+          lines = [
+              '东江环保股份有限公司（002672.SZ / 00895.HK）',
+              '2020-2025年年度报告及最新期内报告',
+              '',
+              '本包共8份香港交易所披露易原始PDF。',
+              '2020-2025年度文件均为完整年度报告，不是年度业绩公告、摘要或ESG报告。',
+              '截至2026年9月4日，最新正式季度报告为2026年第一季度报告；公司已于2026年9月4日披露完整2026年中期报告，因此一并收入。',
+              '',
+          ]
+          for number, record in enumerate(records, 1):
+              lines.extend([
+                  f"{number}. {record['filename']}",
+                  f"   港交所标题：{record['source_title']}",
+                  f"   披露时间：{record['disclosure_time']}；实际页数：{record['pages']}页；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、公司名称或证券代码、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+              '年度报告按其覆盖的财政年度命名，不按PDF披露年份命名。',
+          ])
+          (OUT / '报告清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdf_names = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 8:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdf_names)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dongjiang-2020-2025-annuals-latest-direct-final
+          path: 东江环保_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
