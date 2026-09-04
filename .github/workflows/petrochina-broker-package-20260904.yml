@@ -1,0 +1,220 @@
+name: Package PetroChina deep broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/petrochina-broker-package-20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE='中国石油股份_券商深度报告_3份_完整PDF'
+          out=Path(PACKAGE); out.mkdir(exist_ok=True)
+          work=Path('_petrochina_broker_work'); work.mkdir(exist_ok=True)
+          render_dir=work/'renders'; render_dir.mkdir(exist_ok=True)
+
+          candidates=[
+            {
+              'priority':1,'info':'AP202405051632451971','date':'2024-05-05','broker':'信达证券',
+              'authors':'左前明、刘奕麟','title':'首次覆盖报告：油气龙头与炼化巨擘，盈利稳健与价值增长兼具的央企中坚',
+              'filename':'01_信达证券_首次覆盖_油气龙头与炼化巨擘_20240505.pdf','min_pages':25,
+            },
+            {
+              'priority':2,'info':'AP202212291581456044','date':'2022-12-29','broker':'民生证券',
+              'authors':'周泰、王姗姗','title':'深度报告：源浚流长，根深叶茂',
+              'filename':'02_民生证券_深度报告_源浚流长根深叶茂_20221229.pdf','min_pages':25,
+            },
+            {
+              'priority':3,'info':'AP202212111580994984','date':'2022-12-11','broker':'国金证券',
+              'authors':'许隽逸、陈律楼','title':'大且稳的支柱型央企！',
+              'filename':'03_国金证券_大且稳的支柱型央企_20221211.pdf','min_pages':30,
+            },
+            {
+              'priority':4,'info':'AP202506131690215271','date':'2025-06-13','broker':'中银证券',
+              'authors':'徐中良、余嫄嫄','title':'油气新能源深度耦合，可持续发展能力提升',
+              'filename':'备选_中银证券_油气新能源深度耦合_20250613.pdf','min_pages':20,
+            },
+            {
+              'priority':5,'info':'AP201901241288269923','date':'2019-01-24','broker':'民生证券',
+              'authors':'杨侃、李晓辉','title':'超大型石油公司之一，四大主业构成石化行业航母',
+              'filename':'备选_民生证券_四大主业构成石化行业航母_20190124.pdf','min_pages':20,
+            },
+          ]
+
+          session=requests.Session(); session.trust_env=False
+          headers={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7',
+            'Referer':'https://data.eastmoney.com/report/601857.html',
+          }
+
+          def get_pdf(info):
+            urls=[
+              f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?download=1.pdf',
+              f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf?download=1.pdf',
+            ]
+            errors=[]
+            for url in urls:
+              for attempt in range(1,5):
+                try:
+                  r=session.get(url,headers=headers,timeout=(30,360),allow_redirects=True)
+                  print('PDF_GET',info,attempt,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+                  if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>150000:
+                    return r.content,str(r.url)
+                  errors.append(f'{url}: HTTP {r.status_code}, {len(r.content)} bytes')
+                except Exception as exc:
+                  errors.append(f'{url}: {type(exc).__name__}: {exc}')
+                  print('PDF_ERROR',info,attempt,url,repr(exc),flush=True)
+                time.sleep(min(attempt*2,8))
+            raise RuntimeError('download failed: '+' | '.join(errors[-8:]))
+
+          def compact_text(reader,limit=12):
+            parts=[]
+            for page in reader.pages[:min(limit,len(reader.pages))]:
+              try: parts.append(page.extract_text() or '')
+              except Exception: pass
+            return re.sub(r'\s+','', '\n'.join(parts)).lower()
+
+          validated=[]
+          failures=[]
+          for idx,c in enumerate(candidates,1):
+            temp=work/f'candidate_{idx}.pdf'
+            try:
+              data,source_url=get_pdf(c['info'])
+              temp.write_bytes(data)
+              reader=PdfReader(str(temp),strict=False)
+              pages=len(reader.pages)
+              if pages<c['min_pages']:
+                raise RuntimeError(f'only {pages} pages, required {c["min_pages"]}')
+              text=compact_text(reader)
+              if not any(x in text for x in ('中国石油','中國石油','petrochina','601857','00857')):
+                raise RuntimeError('company identity not found in opening pages')
+              q=subprocess.run(['qpdf','--check',str(temp)],capture_output=True,text=True)
+              if q.returncode not in (0,3):
+                raise RuntimeError('qpdf check failed: '+q.stderr[-1200:])
+              if q.returncode==3:
+                print('QPDF_WARNING',c['info'],q.stderr[-1000:],flush=True)
+
+              doc=pymupdf.open(str(temp))
+              sample=sorted(set([0,max(0,pages//2),pages-1]))
+              rendered=[]
+              for pno in sample:
+                page=doc.load_page(pno)
+                pix=page.get_pixmap(matrix=pymupdf.Matrix(1.0,1.0),alpha=False)
+                rp=render_dir/f'{idx:02d}_{pno+1:03d}.png'
+                pix.save(str(rp))
+                if not rp.exists() or rp.stat().st_size<6000 or pix.width<400 or pix.height<400:
+                  raise RuntimeError(f'render verification failed on page {pno+1}')
+                rendered.append(pno+1)
+              doc.close()
+
+              digest=hashlib.sha256(data).hexdigest()
+              validated.append({**c,'pages':pages,'bytes':len(data),'sha256':digest,'source_url':source_url,'temp':str(temp),'rendered_pages':rendered})
+              print('VALIDATED',json.dumps({k:validated[-1][k] for k in ('priority','broker','title','date','pages','bytes','source_url')},ensure_ascii=False),flush=True)
+            except Exception as exc:
+              failures.append({**c,'error':repr(exc)})
+              print('CANDIDATE_FAILED',json.dumps(failures[-1],ensure_ascii=False),flush=True)
+
+          validated.sort(key=lambda x:x['priority'])
+          selected=validated[:3]
+          if len(selected)<3:
+            raise RuntimeError(f'Only {len(selected)} valid reports; failures={failures}')
+
+          records=[]
+          hashes=set()
+          for order,item in enumerate(selected,1):
+            filename=item['filename']
+            if filename.startswith('备选_'):
+              filename=f'{order:02d}_'+filename[len('备选_'):]
+            elif not filename.startswith(f'{order:02d}_'):
+              filename=re.sub(r'^\d{2}_',f'{order:02d}_',filename)
+            data=Path(item['temp']).read_bytes()
+            if item['sha256'] in hashes: raise RuntimeError('duplicate PDF hash')
+            hashes.add(item['sha256'])
+            dest=out/filename
+            dest.write_bytes(data)
+            rec={
+              'filename':filename,'broker':item['broker'],'title':item['title'],'date':item['date'],
+              'authors':item['authors'],'pages':item['pages'],'bytes':item['bytes'],'sha256':item['sha256'],
+              'source_url':item['source_url'],'eastmoney_info_code':item['info'],
+              'source':'东方财富研究报告PDF镜像（原始券商报告版式）','rendered_pages':item['rendered_pages'],
+            }
+            records.append(rec)
+
+          lines=[
+            '中国石油股份（601857.SH / 00857.HK）券商深度报告',
+            '',
+            '本包含3份完整PDF，优先选择明确标注为首次覆盖、深度报告或长篇公司价值研究的文件。',
+            '未收入仅数页的季报/年报点评。',
+            '',
+          ]
+          for i,r in enumerate(records,1):
+            lines += [
+              f"{i}. {r['broker']}：《{r['title']}》",
+              f"   日期：{r['date']}；作者：{r['authors']}；实际页数：{r['pages']}页；大小：{r['bytes']/1048576:.2f} MB",
+              f"   PDF来源：{r['source_url']}",
+              f"   SHA-256：{r['sha256']}",
+              '',
+            ]
+          lines += [
+            '完整性核验：PDF文件头、公司名称或证券代码、实际页数、qpdf结构检查、首页/中间页/末页渲染、SHA-256和ZIP CRC。',
+            '报告中的评级、盈利预测和估值均对应其发布时点，不代表当前投资建议。',
+          ]
+          (out/'报告清单与来源说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          zip_path=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+            for p in sorted(out.iterdir()): z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path,'r') as z:
+            bad=z.testzip()
+            if bad: raise RuntimeError('ZIP CRC failed: '+bad)
+            pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+            if len(pdfs)!=3: raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs')
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'PDFS',len(records),'PAGES',sum(r['pages'] for r in records),flush=True)
+          print('MANIFEST',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: petrochina-broker-deep-reports-final
+          path: 中国石油股份_券商深度报告_3份_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
