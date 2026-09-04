@@ -1,0 +1,243 @@
+name: Collect public CR Power broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/crpower-broker-reports-20260904-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Search, download and verify public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          mkdir -p crpower_reports
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, html, json, os, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse, parse_qs, unquote
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUT = Path('crpower_reports')
+          OUT.mkdir(exist_ok=True)
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36'
+          S = requests.Session(); S.trust_env = False
+          S.headers.update({'User-Agent': UA, 'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+          diagnostics=[]; records=[]; pdfs=[]; seen_info=set(); seen_sha=set(); seen_url=set()
+
+          def log(kind, **kw):
+              diagnostics.append({'kind':kind, **kw})
+              print(kind, json.dumps(kw, ensure_ascii=False)[:4000], flush=True)
+
+          def clean_name(s:str)->str:
+              s=re.sub(r'[\\/:*?"<>|\r\n\t]+','_',s or '')
+              s=re.sub(r'\s+',' ',s).strip(' ._')
+              return s[:150] or 'report'
+
+          def pdf_identity(path:Path):
+              try:
+                  rd=PdfReader(str(path), strict=False)
+                  n=len(rd.pages)
+                  samples=[]
+                  idxs=list(range(min(n,5)))
+                  if n>5: idxs += [n//2, max(0,n-2)]
+                  for i in sorted(set(idxs)):
+                      try: samples.append(rd.pages[i].extract_text() or '')
+                      except Exception: pass
+                  text='\n'.join(samples)
+                  compact=re.sub(r'\s+','',text).lower()
+                  ident=any(k in compact for k in ['华润电力','華潤電力','chinaresourcespower','crpower','00836.hk','0836.hk'])
+                  broker=any(k in compact for k in ['证券研究报告','證券研究報告','researchreport','证券股份有限公司','证券有限公司','國際證券','国际证券'])
+                  return n, ident, broker, text[:2500]
+              except Exception as e:
+                  return 0,False,False,repr(e)
+
+          def save_pdf(url:str, meta:dict|None=None, referer:str|None=None):
+              url=html.unescape(url).replace('\\u0026','&')
+              url=url.strip(' \'"<>),;')
+              if not url.startswith('http') or url in seen_url: return
+              seen_url.add(url)
+              try:
+                  h={'User-Agent':UA,'Accept':'application/pdf,*/*'}
+                  if referer: h['Referer']=referer
+                  r=S.get(url,headers=h,timeout=(20,180),allow_redirects=True)
+                  ctype=(r.headers.get('content-type') or '').lower()
+                  log('PDFTRY',url=url,status=r.status_code,ctype=ctype,bytes=len(r.content),final=r.url)
+                  if r.status_code!=200 or not r.content.startswith(b'%PDF-') or len(r.content)<15000: return
+                  sha=hashlib.sha256(r.content).hexdigest()
+                  if sha in seen_sha: return
+                  seen_sha.add(sha)
+                  tmp=OUT/f'_tmp_{sha[:12]}.pdf'; tmp.write_bytes(r.content)
+                  pages,ident,broker,sample=pdf_identity(tmp)
+                  if not ident or pages<2:
+                      tmp.unlink(missing_ok=True); return
+                  meta=meta or {}
+                  date=str(meta.get('publishDate') or meta.get('date') or '')[:10]
+                  org=str(meta.get('orgSName') or meta.get('orgName') or meta.get('broker') or '未知券商')
+                  title=str(meta.get('title') or Path(urlparse(r.url).path).stem or '华润电力研究报告')
+                  filename=clean_name(f'{date}_{org}_{title}')+'.pdf'
+                  dest=OUT/filename
+                  k=2
+                  while dest.exists():
+                      dest=OUT/(clean_name(f'{date}_{org}_{title}_{k}')+'.pdf'); k+=1
+                  tmp.rename(dest)
+                  item={
+                    'filename':dest.name,'title':title,'broker':org,'date':date,'pages':pages,
+                    'bytes':len(r.content),'url':r.url,'source_url':url,'sha256':sha,
+                    'identity_verified':ident,'broker_like':broker,'sample':sample[:1200],
+                    'meta':meta
+                  }
+                  pdfs.append(item); log('SAVED',**{k:item[k] for k in ('filename','pages','bytes','broker','date','title','url')})
+              except Exception as e: log('PDFERR',url=url,error=repr(e))
+
+          # 1) Eastmoney securities lookup.
+          for term in ['华润电力','華潤電力','China Resources Power','00836','0836']:
+              try:
+                  u='https://searchapi.eastmoney.com/api/suggest/get'
+                  r=S.get(u,params={'input':term,'type':14,'count':50},headers={'User-Agent':UA,'Referer':'https://data.eastmoney.com/'},timeout=60)
+                  log('LOOKUP',term=term,status=r.status_code,text=r.text[:8000])
+              except Exception as e: log('LOOKUPERR',term=term,error=repr(e))
+
+          # 2) Eastmoney public report APIs. GET /list is the current public endpoint; POST /list2 is retained as fallback.
+          codes=['00836','0836','00836.HK','0836.HK','HK00836','116.00836','116.0836','华润电力']
+          for code in codes:
+              for page in range(1,8):
+                  params={
+                    'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                    'beginTime':'2000-01-01','endTime':'2030-01-01','pageNo':str(page),'fields':'','qType':'0',
+                    'orgCode':'','code':code,'rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)
+                  }
+                  try:
+                      r=S.get('https://reportapi.eastmoney.com/report/list',params=params,headers={'User-Agent':UA,'Referer':'https://data.eastmoney.com/report/stock.jshtml'},timeout=(20,120))
+                      log('EMGET',code=code,page=page,status=r.status_code,bytes=len(r.content),head=r.text[:500])
+                      obj=r.json(); rows=obj.get('data') or []
+                  except Exception as e:
+                      log('EMGETERR',code=code,page=page,error=repr(e)); rows=[]
+                  if not rows:
+                      if page==1: pass
+                      break
+                  for row in rows:
+                      raw=json.dumps(row,ensure_ascii=False)
+                      if not any(k.lower() in re.sub(r'\s+','',raw).lower() for k in ['华润电力','華潤電力','china resources power','00836','0836']):
+                          continue
+                      info=str(row.get('infoCode') or row.get('encodeUrl') or '')
+                      if info and info not in seen_info:
+                          seen_info.add(info); records.append(row); log('EMROW',row=row)
+                          for prefix in ['H3','H2','H1']:
+                              save_pdf(f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf',row,'https://data.eastmoney.com/')
+              # list2 fallback
+              payload={
+                'pageSize':500,'pageNo':1,'p':1,'pageNum':1,'pageNumber':1,
+                'beginTime':'2000-01-01','endTime':'2030-01-01','code':code,
+                'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''
+              }
+              try:
+                  r=S.post('https://reportapi.eastmoney.com/report/list2',json=payload,headers={'User-Agent':UA,'Referer':'https://data.eastmoney.com/report/stock.jshtml','Content-Type':'application/json'},timeout=(20,120))
+                  log('EMPOST',code=code,status=r.status_code,bytes=len(r.content),head=r.text[:500])
+                  obj=r.json(); rows=obj.get('data') or []
+                  for row in rows:
+                      raw=json.dumps(row,ensure_ascii=False)
+                      if not any(k.lower() in re.sub(r'\s+','',raw).lower() for k in ['华润电力','華潤電力','china resources power','00836','0836']): continue
+                      info=str(row.get('infoCode') or row.get('encodeUrl') or '')
+                      if info and info not in seen_info:
+                          seen_info.add(info); records.append(row); log('EMROW2',row=row)
+                          for prefix in ['H3','H2','H1']:
+                              save_pdf(f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf',row,'https://data.eastmoney.com/')
+              except Exception as e: log('EMPOSTERR',code=code,error=repr(e))
+
+          # 3) Public search indexes. We only follow openly exposed links; no login or paywall bypass.
+          queries=[
+            '"华润电力" "公司深度报告" PDF',
+            '"华润电力" "首次覆盖" PDF',
+            '"华润电力" "深度报告" 券商 PDF',
+            '"华润电力" 0836 证券研究报告 PDF',
+            '"优质火电构筑深厚底蕴" PDF',
+            '"华润电力" site:pdf.dfcfw.com/pdf',
+            '"China Resources Power" broker research PDF'
+          ]
+          pages_to_crawl=[]
+          for q in queries:
+              try:
+                  r=S.get('https://www.bing.com/search',params={'q':q,'format':'rss','count':'50'},headers={'User-Agent':UA},timeout=90)
+                  log('BING',query=q,status=r.status_code,bytes=len(r.content),head=r.text[:300])
+                  soup=BeautifulSoup(r.text,'xml')
+                  for it in soup.find_all('item'):
+                      link=(it.link.text if it.link else '').strip()
+                      title=(it.title.text if it.title else '').strip()
+                      if link: pages_to_crawl.append((link,{'title':title,'broker':'公开索引'}))
+              except Exception as e: log('BINGERR',query=q,error=repr(e))
+              try:
+                  r=S.get('https://html.duckduckgo.com/html/',params={'q':q},headers={'User-Agent':UA},timeout=90)
+                  log('DDG',query=q,status=r.status_code,bytes=len(r.content),head=r.text[:300])
+                  soup=BeautifulSoup(r.text,'html.parser')
+                  for a in soup.select('a.result__a'):
+                      link=a.get('href',''); title=a.get_text(' ',strip=True)
+                      if 'uddg=' in link:
+                          try: link=unquote(parse_qs(urlparse(link).query).get('uddg',[''])[0])
+                          except Exception: pass
+                      if link: pages_to_crawl.append((link,{'title':title,'broker':'公开索引'}))
+              except Exception as e: log('DDGERR',query=q,error=repr(e))
+
+          # Seed known public index pages, which may expose the original direct PDF URL in HTML.
+          pages_to_crawl += [
+            ('https://www.vzkoo.com/read/202507240eac68b98879d945f5b6f020.html',{'title':'优质火电构筑深厚底蕴，绿电差异化竞争强化优势','broker':'招商证券','date':'2025-07-20'}),
+            ('https://www.microbell.com/repinfodetail_4299532.html',{'title':'优质火电构筑深厚底蕴，绿电差异化竞争强化优势','broker':'招商证券','date':'2025-07-20'}),
+            ('https://m.sgpjbg.com/baogao/731167.html',{'title':'优质火电构筑深厚底蕴，绿电差异化竞争强化优势','broker':'招商证券','date':'2025-07-20'})
+          ]
+
+          uniq=[]; seenp=set()
+          for u,m in pages_to_crawl:
+              if not u.startswith('http') or u in seenp: continue
+              seenp.add(u); uniq.append((u,m))
+          for u,m in uniq[:160]:
+              if re.search(r'\.pdf(?:$|[?#])',u,re.I):
+                  save_pdf(u,m,u); continue
+              try:
+                  r=S.get(u,headers={'User-Agent':UA,'Referer':'https://www.bing.com/'},timeout=(15,75),allow_redirects=True)
+                  log('CRAWL',url=u,status=r.status_code,ctype=r.headers.get('content-type'),bytes=len(r.content),final=r.url)
+                  if r.status_code!=200: continue
+                  if r.content.startswith(b'%PDF-'):
+                      save_pdf(r.url,m,u); continue
+                  if 'html' not in (r.headers.get('content-type') or '').lower() and len(r.content)>500000: continue
+                  txt=r.text
+                  candidates=set()
+                  for x in re.findall(r'https?://[^\s\'"<>]+?\.pdf(?:\?[^\s\'"<>]*)?',html.unescape(txt),flags=re.I): candidates.add(x)
+                  soup=BeautifulSoup(txt,'html.parser')
+                  for a in soup.find_all(['a','iframe','embed','object']):
+                      for attr in ['href','src','data']:
+                          x=a.get(attr)
+                          if x and ('.pdf' in x.lower() or 'pdf.dfcfw.com' in x.lower()): candidates.add(urljoin(r.url,x))
+                  for x in list(candidates)[:25]: save_pdf(x,m,r.url)
+              except Exception as e: log('CRAWLERR',url=u,error=repr(e))
+
+          # Sort more comprehensive/deep reports first.
+          def score(x):
+              t=x.get('title','')
+              return (100 if any(k in t for k in ['深度','首次覆盖','首次']) else 0) + x.get('pages',0)
+          pdfs.sort(key=score, reverse=True)
+          manifest={
+            'company':'华润电力控股有限公司','ticker':'00836.HK','generated_at':time.strftime('%Y-%m-%d %H:%M:%S UTC',time.gmtime()),
+            'eastmoney_records':records,'pdfs':pdfs,'diagnostics_count':len(diagnostics)
+          }
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'diagnostics.json').write_text(json.dumps(diagnostics,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps({'records':len(records),'pdfs':len(pdfs),'files':[{'filename':x['filename'],'pages':x['pages'],'broker':x['broker'],'title':x['title']} for x in pdfs]},ensure_ascii=False),flush=True)
+          PY
+      - name: Upload verified reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: crpower-broker-reports-20260904
+          path: crpower_reports/
+          if-no-files-found: error
+          retention-days: 3
