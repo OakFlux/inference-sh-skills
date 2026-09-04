@@ -1,0 +1,101 @@
+name: Catalog Zhongsheng broker report candidates v3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongsheng-candidate-catalog-20260904-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  catalog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Query public metadata and save compact catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from pathlib import Path
+          import requests
+
+          API='https://api.fxbaogao.com/mofoun/report/searchReport/searchNoAuth'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S=requests.Session(); S.trust_env=False
+          H={'User-Agent':UA,'Accept':'application/json,text/plain,*/*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/','x-fp':'','x-bot':''}
+          queries=[
+            '中升控股','中升控股 深度','中升控股 首次覆盖','中升控股 公司研究',
+            '中升集团 汽车经销商','汽车综合服务龙头 底部反转在即',
+            '发力汽车后市场的汽车经销商龙头','汽车经销商龙头基本面或见底反转',
+            '中升控股 海通证券','中升控股 国泰君安','中升控股 银河证券',
+            '中升控股 开源证券','中升控股 招商证券','中升控股 中金公司',
+          ]
+          rows={}
+          diagnostics=[]
+          def post(payload):
+            last=None
+            for a in range(4):
+              try:
+                r=S.post(API,headers=H,json=payload,timeout=(15,60)); r.raise_for_status(); return r.json(),len(r.content)
+              except Exception as e:
+                last=e; time.sleep(a+1)
+            raise last
+          for q in queries:
+            for payload in [
+              {'keywords':q,'pageNum':1,'pageSize':100,'order':0},
+              {'keywords':q,'page':1,'limit':100,'order':0},
+              {'keywords':q,'currPage':1,'limit':100,'order':0},
+            ]:
+              try:
+                obj,n=post(payload); data=obj.get('data') or {}; items=data.get('dataList') if isinstance(data,dict) else data
+                items=items if isinstance(items,list) else []
+                diagnostics.append({'query':q,'payload':payload,'bytes':n,'count':len(items),'total':data.get('count') if isinstance(data,dict) else None,'pageCount':data.get('pageCount') if isinstance(data,dict) else None})
+                for row in items:
+                  raw=json.dumps(row,ensure_ascii=False)
+                  plain=re.sub(r'<[^>]+>','',raw)
+                  if '中升控股' not in plain and '00881' not in plain and '0881.HK' not in plain and '881 HK' not in plain:
+                    continue
+                  key=str(row.get('docId') or row.get('id') or hash(raw))
+                  rows[key]=row
+              except Exception as e:
+                diagnostics.append({'query':q,'payload':payload,'error':repr(e)})
+          compact=[]
+          for key,row in rows.items():
+            compact.append({
+              'docId':row.get('docId') or row.get('id'),
+              'title':re.sub(r'<[^>]+>','',str(row.get('title') or '')),
+              'orgName':row.get('orgName'),
+              'authors':row.get('authors'),
+              'pageNum':row.get('pageNum'),
+              'pubTime':row.get('pubTime'),
+              'pubTimeStr':row.get('pubTimeStr'),
+              'pdfPath':row.get('pdfPath'),
+              'docType':row.get('docType'),
+              'reportType':row.get('reportType'),
+              'isDeep':row.get('isDeep'),
+              'stocks':row.get('stocks'),
+              'fileUrl':row.get('fileUrl'),
+              'coverPrefix':row.get('coverPrefix'),
+              'isThird':row.get('isThird'),
+              'thirdName':row.get('thirdName'),
+            })
+          compact.sort(key=lambda x:(int(x.get('pageNum') or 0),int(x.get('pubTime') or 0)),reverse=True)
+          result={'candidates':compact,'diagnostics':diagnostics}
+          Path('zhongsheng_candidate_catalog.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CANDIDATE_COUNT',len(compact),flush=True)
+          for x in compact:
+            print(json.dumps(x,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload compact catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongsheng-candidate-catalog-20260904-v3
+          path: zhongsheng_candidate_catalog.json
+          if-no-files-found: error
+          retention-days: 7
