@@ -1,0 +1,183 @@
+name: Package China Resources Power reports v3
+
+on:
+  push:
+    branches: [tmp/cr-power-reports-20260904]
+    paths: ['.github/workflows/tmp-package-cr-power-reports-v3.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import pymupdf, requests
+          from pypdf import PdfReader
+
+          CODE='00836'; STOCK_ID='6732'; ASOF='2026-09-04'
+          PACKAGE='华润电力_00836_2020-2025年报及最新半年报_完整PDF'
+          root=Path(PACKAGE); annual_dir=root/'01_年度报告_2020-2025'; current_dir=root/'02_2026年最新半年度财务资料'; interim_dir=root/'03_最新完整中期报告'; work=Path('_work'); renders=work/'renders'
+          for d in (annual_dir,current_dir,interim_dir,work,renders): d.mkdir(parents=True,exist_ok=True)
+
+          s=requests.Session(); s.trust_env=False
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          sh={'User-Agent':ua,'Accept':'application/json,text/html,*/*','Accept-Language':'zh-TW,zh;q=0.9,en;q=0.7','Referer':'https://www1.hkexnews.hk/search/titlesearch.xhtml','X-Requested-With':'XMLHttpRequest'}
+          ph={'User-Agent':ua,'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Accept-Language':'zh-TW,zh;q=0.9,en;q=0.7','Referer':'https://www1.hkexnews.hk/'}
+
+          def compact(x): return re.sub(r'\s+','',str(x or '')).lower()
+          years={2020:('2020','二零二零','二〇二〇'),2021:('2021','二零二一','二〇二一'),2022:('2022','二零二二','二〇二二'),2023:('2023','二零二三','二〇二三'),2024:('2024','二零二四','二〇二四'),2025:('2025','二零二五','二〇二五'),2026:('2026','二零二六','二〇二六')}
+          def has_year(text,year):
+              n=compact(text); return any(compact(v) in n for v in years[year])
+          def sha(path):
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for block in iter(lambda:f.read(1024*1024),b''): h.update(block)
+              return h.hexdigest()
+
+          def hkex_rows(start,end):
+              url='https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              params={'sortDir':'0','sortByOptions':'DateTime','category':'0','market':'SEHK','stockId':STOCK_ID,'documentType':'-1','fromDate':start,'toDate':end,'title':'','searchType':'1','t1code':'-2','t2Gcode':'-2','t2code':'-2','rowRange':'500','lang':'zh'}
+              errors=[]
+              for attempt in range(1,6):
+                  try:
+                      r=s.get(url,params=params,headers=sh,timeout=(25,180)); print('SEARCH',start,end,attempt,r.status_code,len(r.content),flush=True); r.raise_for_status()
+                      outer=r.json(); raw=outer.get('result','[]'); rows=json.loads(raw) if isinstance(raw,str) else raw
+                      rows=[x for x in rows if str(x.get('STOCK_CODE','')).replace('<br/>','').strip()==CODE]
+                      print('MATCHING_ROWS',start,end,json.dumps(rows,ensure_ascii=False),flush=True)
+                      return rows
+                  except Exception as e:
+                      errors.append(repr(e)); time.sleep(min(2*attempt,8))
+              raise RuntimeError('HKEX search failed: '+' | '.join(errors))
+
+          def one_annual(year):
+              rows=hkex_rows(f'{year+1}0301',f'{year+1}0531'); found=[]
+              for row in rows:
+                  title=str(row.get('TITLE','')); tn=compact(title); ln=compact(row.get('LONG_TEXT',''))
+                  report_marker=('年報' in tn or '年度報告' in tn or '年度报告' in tn or ('[年報]' in ln and has_year(title,year)))
+                  bad_title=any(x in tn for x in ('可持續發展','环境','環境','通知','函件','摘要','業績公佈','业绩公布'))
+                  if has_year(title,year) and report_marker and not bad_title and str(row.get('FILE_TYPE','')).upper()=='PDF': found.append(row)
+              if len(found)!=1: raise RuntimeError(f'Annual {year} selection={json.dumps(found,ensure_ascii=False)}')
+              return found[0]
+
+          def full_interim(year,end=None):
+              rows=hkex_rows(f'{year}0801',end or f'{year}1130'); found=[]
+              for row in rows:
+                  title=str(row.get('TITLE','')); tn=compact(title); ln=compact(row.get('LONG_TEXT',''))
+                  marker=('中期報告' in tn or '中期报告' in tn or 'interimreport' in tn or ('[中期' in ln and '報告]' in ln and has_year(title,year)))
+                  bad=any(x in tn for x in ('業績','业绩','通知','函件'))
+                  if has_year(title,year) and marker and not bad and str(row.get('FILE_TYPE','')).upper()=='PDF': found.append(row)
+              if len(found)>1: raise RuntimeError(f'Multiple full interim {year}: {json.dumps(found,ensure_ascii=False)}')
+              return found[0] if found else None
+
+          def interim_results(year):
+              rows=hkex_rows(f'{year}0801',ASOF.replace('-','')); found=[]
+              for row in rows:
+                  title=str(row.get('TITLE','')); n=compact(title+str(row.get('LONG_TEXT','')))
+                  if has_year(title,year) and any(x in n for x in ('中期業績','中期业绩','interimresults')) and str(row.get('FILE_TYPE','')).upper()=='PDF': found.append(row)
+              if len(found)!=1: raise RuntimeError(f'Interim results {year} selection={json.dumps(found,ensure_ascii=False)}')
+              return found[0]
+
+          annuals=[one_annual(y) for y in range(2020,2026)]
+          full26=full_interim(2026,ASOF.replace('-',''))
+          results26=None if full26 else interim_results(2026)
+          latest_full=full26 or full_interim(2025)
+          if latest_full is None: raise RuntimeError('No complete interim report found')
+
+          def u(row): return urljoin('https://www1.hkexnews.hk/',str(row['FILE_LINK']))
+          targets=[]
+          for i,(y,row) in enumerate(zip(range(2020,2026),annuals),1): targets.append({'i':i,'year':y,'category':'Annual Report','type':'年度报告','row':row,'dir':annual_dir,'name':f'{y}_华润电力_{y}年年度报告.pdf','min':100})
+          if results26: targets.append({'i':7,'year':2026,'category':'Latest Half-Year Financial Results','type':'中期业绩公告','row':results26,'dir':current_dir,'name':'2026_华润电力_2026年中期业绩公告_截至2026年6月30日.pdf','min':8})
+          targets.append({'i':8 if results26 else 7,'year':2026 if full26 else 2025,'category':'Latest Full Interim Report','type':'完整中期报告','row':latest_full,'dir':interim_dir,'name':'2026_华润电力_2026年完整中期报告.pdf' if full26 else '2025_华润电力_2025年中期报告_截至当前最新完整中报.pdf','min':60})
+          print('TARGETS',json.dumps([{'year':t['year'],'type':t['type'],'title':t['row'].get('TITLE'),'url':u(t['row'])} for t in targets],ensure_ascii=False,indent=2),flush=True)
+
+          def get_pdf(url):
+              errors=[]
+              for attempt in range(1,7):
+                  try:
+                      r=s.get(url,headers=ph,timeout=(30,900),allow_redirects=True); print('PDF_GET',attempt,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                      if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>50000: return r
+                      errors.append(f'{r.status_code}/{len(r.content)}')
+                  except Exception as e: errors.append(repr(e))
+                  time.sleep(min(attempt*2,10))
+              raise RuntimeError('PDF failed: '+' | '.join(errors[-8:]))
+
+          records=[]; hashes=set(); total_pages=0; total_bytes=0
+          for t in targets:
+              r=get_pdf(u(t['row'])); path=t['dir']/t['name']; path.write_bytes(r.content)
+              reader=PdfReader(str(path),strict=False)
+              if reader.is_encrypted and reader.decrypt('')==0: raise RuntimeError(f'Encrypted {path.name}')
+              pages=len(reader.pages)
+              if pages<t['min']: raise RuntimeError(f'Short PDF {path.name}: {pages}')
+              samples=[]
+              for pno in sorted(set(list(range(min(55,pages)))+[pages//2,pages-1])):
+                  try: samples.append(reader.pages[pno].extract_text() or '')
+                  except Exception as e: print('TEXT_WARNING',path.name,pno+1,repr(e),flush=True)
+              text='\n'.join(samples); n=compact(text)
+              company_ok=any(compact(m) in n for m in ('华润电力','華潤電力','China Resources Power',CODE))
+              if not company_ok: raise RuntimeError(f'Company marker missing {path.name}')
+              if not has_year(text,t['year']): raise RuntimeError(f'Year marker missing {path.name}')
+              q=subprocess.run(['qpdf','--check',str(path)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(f'qpdf failed {path.name}: {q.stderr[-1000:]}')
+              doc=pymupdf.open(path)
+              if doc.page_count!=pages: raise RuntimeError(f'Page mismatch {path.name}')
+              for label,pno in (('first',0),('middle',pages//2),('last',pages-1)):
+                  pix=doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(.55,.55),alpha=False); out=renders/f"{t['i']:02d}_{label}.png"; pix.save(out)
+                  if out.stat().st_size<3000: raise RuntimeError(f'Render failed {path.name}')
+              doc.close()
+              digest=sha(path)
+              if digest in hashes: raise RuntimeError(f'Duplicate {path.name}')
+              hashes.add(digest)
+              rec={'file':str(path.relative_to(root)),'year':t['year'],'category':t['category'],'report_type':t['type'],'title':t['row'].get('TITLE'),'release_time':t['row'].get('DATE_TIME'),'source_url':r.url,'pages':pages,'bytes':path.stat().st_size,'sha256':digest}
+              records.append(rec); total_pages+=pages; total_bytes+=path.stat().st_size; print('VERIFIED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          expected=7 if full26 else 8
+          if len(records)!=expected or len(hashes)!=expected: raise RuntimeError(f'Count {len(records)} != {expected}')
+          note='已收录2026年完整中期报告。' if full26 else '截至2026-09-04，港交所尚未披露2026年完整中期报告；本包收录2026年中期业绩公告作为最新半年度财务资料，并附2025年最新完整中期报告。'
+          lines=['华润电力控股有限公司（00836.HK）定期报告资料包',f'整理日期：{ASOF}','','收录口径：','1. 2020—2025年完整年度报告，共6份。',f'2. {note}','3. 已排除年度业绩公告、可持续发展报告、通知函件和重复文件。','',f'PDF数量：{len(records)}份',f'合计页数：{total_pages}页',f'PDF未压缩总大小：{total_bytes/1024/1024:.2f} MiB','','文件清单：']
+          for x in records: lines += [f"- {x['file']}｜{x['pages']}页｜港交所披露时间：{x['release_time']}",f"  原标题：{x['title']}",f"  官方PDF：{x['source_url']}",f"  SHA-256：{x['sha256']}"]
+          lines += ['','核验项目：PDF文件头、公司名称或证券代码、年份、实际页数、qpdf结构、首页/中间页/末页渲染、重复文件、逐文件SHA-256和ZIP CRC。','资料仅供研究与学习使用，版权归华润电力及原披露主体所有。']
+          (root/'报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          manifest={'company':'华润电力控股有限公司','ticker':'00836.HK','prepared_date':ASOF,'document_count':len(records),'latest_complete_interim_year':2026 if full26 else 2025,'latest_current_period_document':'2026完整中期报告' if full26 else '2026中期业绩公告','total_pages':total_pages,'total_bytes':total_bytes,'documents':records}
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (root/'SHA256SUMS.txt').write_text(''.join(f"{x['sha256']}  {x['file']}\n" for x in records),encoding='utf-8')
+          archive=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file(): z.write(p,arcname=str(p.relative_to(root)))
+          with zipfile.ZipFile(archive) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError(f'ZIP CRC failed {bad}')
+              if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=len(records): raise RuntimeError('ZIP count mismatch')
+          print('FINAL_ZIP',archive.name,archive.stat().st_size,sha(archive),total_pages,total_bytes,flush=True)
+          PY
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: cr-power-reports-v3-20260904
+          path: 华润电力_00836_2020-2025年报及最新半年报_完整PDF.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
