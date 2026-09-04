@@ -1,0 +1,154 @@
+name: Discover PetroChina HKEX filings 2020-2026
+
+on:
+  push:
+    paths:
+      - '.github/workflows/petrochina_hkex_discovery_20260904.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+
+      - name: Query HKEX title search
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from pathlib import Path
+          import requests
+
+          OUT = Path('petrochina-hkex-discovery')
+          OUT.mkdir(exist_ok=True)
+          BASE = 'https://www1.hkexnews.hk'
+          SEARCH = BASE + '/search/titlesearch.xhtml'
+          SERVLET = BASE + '/search/titleSearchServlet.do'
+          STOCK_ID = '2038'
+
+          s = requests.Session()
+          s.trust_env = False
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          headers = {
+              'User-Agent': ua,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': SEARCH + '?category=0&market=SEHK&stockId=' + STOCK_ID,
+          }
+
+          def clean(v):
+              v = re.sub(r'<[^>]+>', ' ', str(v or ''))
+              return re.sub(r'\s+', ' ', v).strip()
+
+          def query(start, end, lang):
+              form = {
+                  'lang': lang,
+                  'category': '0',
+                  'market': 'SEHK',
+                  'searchType': '0',
+                  'documentType': '-1',
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'stockId': STOCK_ID,
+                  'from': start,
+                  'to': end,
+                  'MB-Daterange': '0',
+                  'title': '',
+              }
+              p = s.post(SEARCH, data=form, headers=headers, timeout=(30,120), allow_redirects=True)
+              print('POST', lang, start, end, p.status_code, len(p.content), p.url, flush=True)
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': start,
+                  'toDate': end,
+                  'title': '',
+                  'searchType': '0',
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'rowRange': '9999',
+                  'lang': lang,
+              }
+              r = s.get(SERVLET, params=params, headers={**headers,'Accept':'application/json,text/plain,*/*'}, timeout=(30,180), allow_redirects=True)
+              print('GET', lang, start, end, r.status_code, len(r.content), r.url, r.text[:120], flush=True)
+              r.raise_for_status()
+              outer = r.json()
+              result = outer.get('result', []) if isinstance(outer, dict) else outer
+              rows = json.loads(result) if isinstance(result, str) else result
+              if not isinstance(rows, list):
+                  rows = []
+              parsed=[]
+              for row in rows:
+                  if not isinstance(row, dict): continue
+                  code = clean(row.get('STOCK_CODE'))
+                  name = clean(row.get('STOCK_NAME'))
+                  if '00857' not in code.replace(' ','') and 'PETROCHINA' not in name.upper() and '中國石油' not in name and '中国石油' not in name:
+                      continue
+                  parsed.append({
+                      'lang':lang,
+                      'date_time':clean(row.get('DATE_TIME')),
+                      'stock_code':code,
+                      'stock_name':name,
+                      'title':clean(row.get('TITLE')),
+                      'long_text':clean(row.get('LONG_TEXT')),
+                      'file_link':str(row.get('FILE_LINK') or '').strip(),
+                      'file_type':clean(row.get('FILE_TYPE')),
+                      'file_size':clean(row.get('FILE_SIZE')),
+                      'raw':row,
+                  })
+              return parsed
+
+          rows=[]
+          for pub_year in range(2021,2027):
+              start=f'{pub_year}0101'
+              end='20260904' if pub_year==2026 else f'{pub_year}1231'
+              for lang in ('EN','ZH'):
+                  try:
+                      got=query(start,end,lang)
+                      rows.extend(got)
+                      print('COUNT',pub_year,lang,len(got),flush=True)
+                      for x in got:
+                          text=(x['title']+' '+x['long_text']).lower()
+                          if any(k in text for k in ('annual report','interim report','quarterly report','annual results','interim results','年報','年报','季度報告','季度报告','半年度報告','半年度报告','中期報告','中期报告')):
+                              print('HIT',json.dumps({k:x[k] for k in ('lang','date_time','title','long_text','file_link','file_size')},ensure_ascii=False),flush=True)
+                  except Exception as exc:
+                      print('QUERY_ERROR',pub_year,lang,repr(exc),flush=True)
+                  time.sleep(.3)
+
+          # de-duplicate by file link + title
+          ded=[]; seen=set()
+          for x in rows:
+              key=(x['file_link'],x['title'],x['lang'])
+              if key in seen: continue
+              seen.add(key); ded.append(x)
+          rows=ded
+          (OUT/'rows.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          relevant=[]
+          for x in rows:
+              text=(x['title']+' '+x['long_text']).lower()
+              if any(k in text for k in ('annual report','interim report','quarterly report','annual results','interim results','first quarterly','third quarterly','年報','年报','季度報告','季度报告','第一季度','第三季度','半年度報告','半年度报告','中期報告','中期报告','中期業績','中期业绩')):
+                  relevant.append(x)
+          (OUT/'relevant.json').write_text(json.dumps(relevant,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('TOTAL',len(rows),'RELEVANT',len(relevant),flush=True)
+          PY
+
+      - name: Upload discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: petrochina-hkex-discovery-20260904
+          path: petrochina-hkex-discovery/
+          if-no-files-found: error
+          retention-days: 7
