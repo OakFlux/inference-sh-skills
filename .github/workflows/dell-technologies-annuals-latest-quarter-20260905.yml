@@ -1,0 +1,424 @@
+name: Package Dell Technologies FY2020-FY2025 annual reports and latest quarter
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-technologies-annuals-latest-quarter-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf
+
+      - name: Download validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '戴尔科技_2020-2025财年年报及最新季报'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+          WORK = Path('_dell_reports_work')
+          RENDERS = WORK / 'renders'
+          WORK.mkdir(exist_ok=True)
+          RENDERS.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.7',
+              'Referer': 'https://investors.delltechnologies.com/',
+          }
+
+          filing_specs = [
+              {
+                  'kind': '10-K', 'fy': 2020, 'filename': '01_戴尔科技_FY2020年报_10-K_截至2020-01-31.pdf',
+                  'accession': '0001571996-20-000017', 'period': 'January 31, 2020', 'min_pages': 150,
+                  'detail_url': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-20-000017',
+                  'filed': '2020-03-27',
+              },
+              {
+                  'kind': '10-K', 'fy': 2021, 'filename': '02_戴尔科技_FY2021年报_10-K_截至2021-01-29.pdf',
+                  'accession': '0001571996-21-000007', 'period': 'January 29, 2021', 'min_pages': 150,
+                  'detail_url': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-21-000007',
+                  'filed': '2021-03-26',
+              },
+              {
+                  'kind': '10-K', 'fy': 2022, 'filename': '03_戴尔科技_FY2022年报_10-K_截至2022-01-28.pdf',
+                  'accession': '0001571996-22-000009', 'period': 'January 28, 2022', 'min_pages': 150,
+                  'detail_url': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-22-000009',
+                  'filed': '2022-03-24',
+              },
+              {
+                  'kind': '10-K', 'fy': 2023, 'filename': '04_戴尔科技_FY2023年报_10-K_截至2023-02-03.pdf',
+                  'accession': '0001571996-23-000007', 'period': 'February 3, 2023', 'min_pages': 140,
+                  'detail_url': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-23-000007',
+                  'filed': '2023-03-30',
+              },
+              {
+                  'kind': '10-K', 'fy': 2024, 'filename': '05_戴尔科技_FY2024年报_10-K_截至2024-02-02.pdf',
+                  'accession': '0001571996-24-000036', 'period': 'February 2, 2024', 'min_pages': 140,
+                  'detail_url': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-24-000036',
+                  'filed': '2024-03-25',
+              },
+              {
+                  'kind': '10-K', 'fy': 2025, 'filename': '06_戴尔科技_FY2025年报_10-K_截至2025-01-31.pdf',
+                  'accession': '0001571996-25-000034', 'period': 'January 31, 2025', 'min_pages': 140,
+                  'detail_url': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-25-000034',
+                  'filed': '2025-03-25',
+              },
+              {
+                  'kind': '10-Q', 'fy': 2027, 'quarter': 'Q1',
+                  'filename': '07_最新正式季报_戴尔科技_FY2027_Q1_10-Q_截至2026-05-01.pdf',
+                  'accession': '0001571996-26-000030', 'period': 'May 1, 2026', 'min_pages': 80,
+                  'detail_url': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-q/0001571996-26-000030',
+                  'filed': '2026-06-09',
+              },
+          ]
+
+          def request(url: str, *, accept: str = 'text/html,*/*', attempts: int = 6, timeout=(30, 300)) -> requests.Response:
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      response = session.get(
+                          url,
+                          headers={**headers, 'Accept': accept},
+                          timeout=timeout,
+                          allow_redirects=True,
+                      )
+                      print('GET', attempt, response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                      if response.status_code == 200:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      print('GET_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'Unable to fetch {url}: {last}')
+
+          def extract_pdf_url(detail_url: str, accession: str) -> str:
+              response = request(detail_url, accept='text/html,application/xhtml+xml,*/*')
+              soup = BeautifulSoup(response.text, 'lxml')
+              candidates = []
+              for anchor in soup.find_all('a', href=True):
+                  text = ' '.join(anchor.get_text(' ', strip=True).split()).lower()
+                  href = urljoin(str(response.url), anchor['href'])
+                  if 'download pdf' in text:
+                      candidates.insert(0, href)
+                  elif href.lower().endswith('.pdf') or '/static-files/' in href:
+                      candidates.append(href)
+              # Filing-list fallback: Dell's filing table exposes an accession-labelled PDF link.
+              if not candidates:
+                  listing = request(
+                      'https://investors.delltechnologies.com/financial-information/sec-filings?items_per_page=100&items_per_page_toggle=1',
+                      accept='text/html,application/xhtml+xml,*/*',
+                  )
+                  lsoup = BeautifulSoup(listing.text, 'lxml')
+                  for anchor in lsoup.find_all('a', href=True):
+                      text = ' '.join(anchor.get_text(' ', strip=True).split())
+                      href = urljoin(str(listing.url), anchor['href'])
+                      if accession in text and '.pdf' in text.lower():
+                          candidates.append(href)
+              if not candidates:
+                  raise RuntimeError(f'No PDF link found on {detail_url}')
+              print('PDF_LINK_CANDIDATES', accession, json.dumps(candidates, ensure_ascii=False), flush=True)
+              return candidates[0]
+
+          def download_pdf(url: str) -> bytes:
+              response = request(url, accept='application/pdf,application/octet-stream;q=0.9,*/*;q=0.8', timeout=(30, 600))
+              data = response.content
+              if not data.startswith(b'%PDF-') or len(data) < 100_000:
+                  raise RuntimeError(f'Not a valid PDF: {url}; bytes={len(data)}; type={response.headers.get("content-type")}')
+              return data
+
+          def compact_text(reader: PdfReader, limit: int = 16) -> str:
+              parts = []
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(parts)).lower()
+
+          def validate_pdf(path: Path, *, kind: str, fy: int, period: str, min_pages: int, render_prefix: str) -> tuple[int, list[int]]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{path.name}: only {pages} pages; minimum {min_pages}')
+              text = compact_text(reader)
+              if not any(token in text for token in ('delltechnologiesinc', 'delltechnologies')):
+                  raise RuntimeError(f'{path.name}: Dell Technologies identity not found')
+              if kind.lower() not in text:
+                  raise RuntimeError(f'{path.name}: form type {kind} not confirmed')
+              year_text = str(fy)
+              if year_text not in text and period.replace(' ', '').lower() not in text:
+                  print('PERIOD_WARNING', path.name, fy, period, flush=True)
+
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf check failed: {check.stderr[-1500:]}')
+              if check.returncode == 3:
+                  print('QPDF_WARNING', path.name, check.stderr[-1000:], flush=True)
+
+              doc = pymupdf.open(str(path))
+              sample = sorted(set([0, max(0, pages // 2), pages - 1]))
+              rendered = []
+              for pno in sample:
+                  page = doc.load_page(pno)
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  image_path = RENDERS / f'{render_prefix}_{pno+1:04d}.png'
+                  pix.save(str(image_path))
+                  if not image_path.exists() or image_path.stat().st_size < 5_000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'{path.name}: render verification failed on page {pno+1}')
+                  rendered.append(pno + 1)
+              doc.close()
+              return pages, rendered
+
+          records = []
+          hashes = set()
+          for index, spec in enumerate(filing_specs, 1):
+              pdf_url = extract_pdf_url(spec['detail_url'], spec['accession'])
+              data = download_pdf(pdf_url)
+              path = OUT / spec['filename']
+              path.write_bytes(data)
+              pages, rendered = validate_pdf(
+                  path,
+                  kind=spec['kind'],
+                  fy=spec['fy'],
+                  period=spec['period'],
+                  min_pages=spec['min_pages'],
+                  render_prefix=f'filing_{index:02d}',
+              )
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {path.name}')
+              hashes.add(digest)
+              record = {
+                  'filename': spec['filename'],
+                  'document_type': spec['kind'],
+                  'fiscal_year': spec['fy'],
+                  'quarter': spec.get('quarter'),
+                  'period_end': spec['period'],
+                  'filing_date': spec['filed'],
+                  'accession_number': spec['accession'],
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': pdf_url,
+                  'filing_detail_url': spec['detail_url'],
+                  'source': 'Dell Technologies Investor Relations / SEC filing PDF',
+                  'rendered_pages': rendered,
+              }
+              records.append(record)
+              print('VERIFIED_FILING', json.dumps(record, ensure_ascii=False), flush=True)
+
+          # Dell released FY2027 Q2 results on 2026-09-01, but the formal Q2 10-Q was not yet filed.
+          # Include the newer official quarterly earnings materials as clearly labelled supplements.
+          q2_pages = [
+              'https://investors.delltechnologies.com/',
+              'https://investors.delltechnologies.com/investor-overview',
+              'https://investors.delltechnologies.com/financial-information/quarterly-results',
+          ]
+          q2_candidates = []
+          for page_url in q2_pages:
+              try:
+                  response = request(page_url, accept='text/html,application/xhtml+xml,*/*', attempts=3)
+                  soup = BeautifulSoup(response.text, 'lxml')
+                  for anchor in soup.find_all('a', href=True):
+                      label = ' '.join(anchor.get_text(' ', strip=True).split())
+                      if label.lower() not in ('press release', 'performance review', 'financial tables'):
+                          continue
+                      href = urljoin(str(response.url), anchor['href'])
+                      ancestor = anchor
+                      context_parts = []
+                      for _ in range(7):
+                          ancestor = ancestor.parent
+                          if ancestor is None:
+                              break
+                          context_parts.append(' '.join(ancestor.get_text(' ', strip=True).split())[:1500])
+                      context = ' '.join(context_parts)
+                      q2_candidates.append({'label': label, 'url': href, 'context': context, 'page': str(response.url)})
+              except Exception as exc:
+                  print('Q2_PAGE_WARNING', page_url, repr(exc), flush=True)
+
+          # Preserve order and deduplicate.
+          unique_q2 = []
+          seen_q2 = set()
+          for candidate in q2_candidates:
+              key = (candidate['label'].lower(), candidate['url'])
+              if key not in seen_q2:
+                  seen_q2.add(key)
+                  unique_q2.append(candidate)
+          q2_candidates = unique_q2
+          print('Q2_LINK_CANDIDATES', json.dumps(q2_candidates, ensure_ascii=False, indent=2)[:30000], flush=True)
+
+          desired = {
+              'press release': ('08_最新业绩资料_戴尔科技_FY2027_Q2_新闻稿_截至2026-07-31.pdf', 3),
+              'financial tables': ('09_最新业绩资料_戴尔科技_FY2027_Q2_财务表格_截至2026-07-31.pdf', 2),
+              'performance review': ('10_最新业绩资料_戴尔科技_FY2027_Q2_业绩回顾_截至2026-07-31.pdf', 5),
+          }
+          q2_selected = {}
+          for candidate in q2_candidates:
+              key = candidate['label'].lower()
+              if key not in desired or key in q2_selected:
+                  continue
+              # Strong preference for links whose surrounding block explicitly identifies Q2 2027.
+              context_norm = re.sub(r'\s+', '', candidate['context']).lower()
+              if any(token in context_norm for token in ('q22027', 'secondquarterfiscal2027', 'fiscalyear2027secondquarter')):
+                  q2_selected[key] = candidate
+
+          # Fallback: inspect downloadable candidates and keep only PDFs that identify FY2027 Q2.
+          if len(q2_selected) < len(desired):
+              for candidate in q2_candidates:
+                  key = candidate['label'].lower()
+                  if key not in desired or key in q2_selected:
+                      continue
+                  try:
+                      data = download_pdf(candidate['url'])
+                      temp = WORK / f'q2_probe_{key.replace(" ", "_")}.pdf'
+                      temp.write_bytes(data)
+                      reader = PdfReader(str(temp), strict=False)
+                      text = compact_text(reader, limit=8)
+                      if any(token in text for token in ('secondquarterfiscal2027', 'q2fy27', 'july31,2026', 'july31,2026')):
+                          candidate['preloaded_data'] = data
+                          q2_selected[key] = candidate
+                  except Exception as exc:
+                      print('Q2_PROBE_WARNING', candidate['label'], candidate['url'], repr(exc), flush=True)
+
+          for key, (filename, min_pages) in desired.items():
+              candidate = q2_selected.get(key)
+              if candidate is None:
+                  print('Q2_DOCUMENT_NOT_FOUND', key, flush=True)
+                  continue
+              data = candidate.get('preloaded_data') or download_pdf(candidate['url'])
+              path = OUT / filename
+              path.write_bytes(data)
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{path.name}: only {pages} pages')
+              text = compact_text(reader, limit=10)
+              if not any(token in text for token in ('delltechnologies', 'delltechnologiesinc')):
+                  raise RuntimeError(f'{path.name}: Dell identity not found')
+              if not any(token in text for token in ('secondquarterfiscal2027', 'q2fy27', 'july31,2026')):
+                  raise RuntimeError(f'{path.name}: FY2027 Q2 period not confirmed')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf check failed')
+              doc = pymupdf.open(str(path))
+              sample = sorted(set([0, max(0, pages // 2), pages - 1]))
+              rendered = []
+              for pno in sample:
+                  pix = doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  image_path = RENDERS / f'q2_{key.replace(" ", "_")}_{pno+1:04d}.png'
+                  pix.save(str(image_path))
+                  if not image_path.exists() or image_path.stat().st_size < 5_000:
+                      raise RuntimeError(f'{path.name}: render verification failed')
+                  rendered.append(pno + 1)
+              doc.close()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {path.name}')
+              hashes.add(digest)
+              record = {
+                  'filename': filename,
+                  'document_type': f'FY2027 Q2 {candidate["label"]}',
+                  'fiscal_year': 2027,
+                  'quarter': 'Q2',
+                  'period_end': 'July 31, 2026',
+                  'release_date': '2026-09-01',
+                  'formal_10q_status': 'Q2 10-Q not yet filed as of 2026-09-05; this is official earnings material',
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source_url': candidate['url'],
+                  'source_page': candidate['page'],
+                  'source': 'Dell Technologies Investor Relations official quarterly earnings material',
+                  'rendered_pages': rendered,
+              }
+              records.append(record)
+              print('VERIFIED_Q2', json.dumps(record, ensure_ascii=False), flush=True)
+
+          annuals = [r for r in records if r['document_type'] == '10-K']
+          formal_quarters = [r for r in records if r['document_type'] == '10-Q']
+          if {r['fiscal_year'] for r in annuals} != {2020, 2021, 2022, 2023, 2024, 2025}:
+              raise RuntimeError('Annual report coverage mismatch')
+          if len(formal_quarters) != 1:
+              raise RuntimeError('Latest formal 10-Q missing')
+
+          lines = [
+              '戴尔科技（Dell Technologies Inc., NYSE: DELL）',
+              'FY2020-FY2025年度报告及最新季度资料',
+              '',
+              '年度口径说明：戴尔财年为截至最接近1月31日的星期五止52或53周期间。本包按公司正式Fiscal Year标签收录FY2020至FY2025六份Form 10-K。',
+              '截至2026年9月5日，最新已向SEC提交的正式季度报告是FY2027 Q1 Form 10-Q（报告期截至2026年5月1日，2026年6月9日提交）。',
+              '公司已于2026年9月1日发布更新的FY2027 Q2业绩资料（报告期截至2026年7月31日）；由于Q2正式10-Q尚未提交，相关官方新闻稿、财务表格和业绩回顾如能从官网获取，作为明确标注的补充文件收入。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f"{index}. {record['filename']}",
+                  f"   类型：{record['document_type']}；财年：FY{record['fiscal_year']}；季度：{record.get('quarter') or '-'}；报告期末：{record['period_end']}",
+                  f"   提交/发布日期：{record.get('filing_date') or record.get('release_date') or '-'}；页数：{record['pages']}页；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、Dell Technologies名称、Form类型或季度期间、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256、ZIP CRC。',
+              '文件均为英文原始披露材料，未进行翻译或内容改写。',
+          ])
+          (OUT / '报告清单与口径说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdf_count = len([name for name in archive.namelist() if name.lower().endswith('.pdf')])
+              if pdf_count != len(records):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(records)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-technologies-fy2020-fy2025-annuals-latest-quarter-final
+          path: 戴尔科技_2020-2025财年年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
