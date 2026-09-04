@@ -1,0 +1,151 @@
+name: Search First Shanghai public archive for Dell research
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-firstshanghai-public-archive-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Search official archive and validate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          mkdir -p output/previews
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib,json,re,subprocess,time
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          BASE='https://www.mystockhk.com'
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S=requests.Session(); S.trust_env=False
+          H={'User-Agent':UA,'Accept':'text/html,application/xhtml+xml,*/*','Accept-Language':'zh-TW,zh;q=0.9,en;q=0.8'}
+          out=Path('output'); (out/'previews').mkdir(parents=True,exist_ok=True)
+          pages=[]
+
+          # Official search form variants.
+          endpoint=BASE+'/searchInfo.aspx?NodeID=81'
+          variants=[
+            {'StartDate':'2023-01-01','EndDate':'2026-09-05','strIndustry':'0','stockCode':'DELL','NodeID':'81'},
+            {'StartDate':'2023-01-01','EndDate':'2026-09-05','strIndustry':'0','stockCode':'DELL.US','NodeID':'81'},
+            {'StartDate':'2023-01-01','EndDate':'2026-09-05','strIndustry':'0','stockCode':'戴爾','NodeID':'81'},
+            {'StartDate':'2023-01-01','EndDate':'2026-09-05','strIndustry':'0','stockCode':'戴尔','NodeID':'81'},
+          ]
+          for v in variants:
+            try:
+              r=S.post(endpoint,headers=H,data=v,timeout=(20,120),allow_redirects=True)
+              if not r.encoding or r.encoding.lower()=='iso-8859-1': r.encoding=r.apparent_encoding or 'utf-8'
+              hit=bool(re.search(r'戴[爾尔].{0,20}(?:DELL|Dell)|(?:DELL|Dell).{0,50}戴[爾尔]|Dell Technologies',r.text,re.I|re.S))
+              print('SEARCH',v['stockCode'],r.status_code,len(r.content),r.url,'HIT',hit,flush=True)
+              (out/f'search_{re.sub(r"[^A-Za-z0-9]+","_",v["stockCode"])}.html').write_text(r.text,encoding='utf-8')
+              pages.append((r.url,r.text,'search_'+v['stockCode']))
+            except Exception as e: print('SEARCH_ERR',v['stockCode'],repr(e),flush=True)
+
+          # Crawl official daily archive pages in parallel batches; stop only after all pages.
+          # 608 pages historically, with 8 entries/page. This is bounded and public.
+          from concurrent.futures import ThreadPoolExecutor,as_completed
+          def fetch_page(p):
+            ss=requests.Session(); ss.trust_env=False
+            u=f'{BASE}/category.aspx?NodeID=81&page={p}'
+            try:
+              r=ss.get(u,headers=H,timeout=(10,45),allow_redirects=True)
+              if not r.encoding or r.encoding.lower()=='iso-8859-1': r.encoding=r.apparent_encoding or 'utf-8'
+              return p,r.status_code,r.url,r.text
+            except Exception as e: return p,0,u,''
+          hits=[]
+          with ThreadPoolExecutor(max_workers=20) as ex:
+            futs=[ex.submit(fetch_page,p) for p in range(1,651)]
+            for i,fut in enumerate(as_completed(futs),1):
+              p,status,u,text=fut.result()
+              if status==200 and re.search(r'戴[爾尔]|Dell Technologies|\bDELL(?:\.US)?\b',text,re.I):
+                print('ARCHIVE_HIT_PAGE',p,len(text),u,flush=True); hits.append((u,text,f'archive_{p}'))
+              if i%100==0: print('CRAWL_PROGRESS',i,flush=True)
+          pages.extend(hits)
+
+          # Extract each matching dl block's attached PDF.
+          pdf_candidates=[]
+          metadata=[]
+          for page_url,text,origin in pages:
+            soup=BeautifulSoup(text,'html.parser')
+            for dl in soup.find_all('dl'):
+              block=dl.get_text(' ',strip=True)
+              if not re.search(r'戴[爾尔]|Dell Technologies|\bDELL(?:\.US)?\b',block,re.I): continue
+              date=(dl.find('dt').get_text(' ',strip=True) if dl.find('dt') else '')
+              links=[urljoin(page_url,a.get('href')) for a in dl.find_all('a',href=True) if '.pdf' in a.get('href','').lower()]
+              rec={'origin':origin,'page_url':page_url,'date':date,'block':block,'links':links}
+              metadata.append(rec); print('BLOCK',json.dumps(rec,ensure_ascii=False),flush=True)
+              for u in links: pdf_candidates.append((u,rec))
+          # In case search page does not use dl, map nearby title text to all PDF anchors in result area.
+          for page_url,text,origin in pages:
+            if not re.search(r'戴[爾尔]|Dell Technologies|\bDELL(?:\.US)?\b',text,re.I): continue
+            soup=BeautifulSoup(text,'html.parser')
+            for a in soup.find_all('a',href=True):
+              href=a.get('href','')
+              if '.pdf' not in href.lower(): continue
+              parent=a.find_parent(['dl','li','div','tr'])
+              block=parent.get_text(' ',strip=True) if parent else ''
+              if re.search(r'戴[爾尔]|Dell Technologies|\bDELL(?:\.US)?\b',block,re.I):
+                rec={'origin':origin,'page_url':page_url,'date':'','block':block,'links':[urljoin(page_url,href)]}
+                pdf_candidates.append((urljoin(page_url,href),rec))
+
+          ded=[];seen=set()
+          for u,rec in pdf_candidates:
+            if u not in seen: seen.add(u); ded.append((u,rec))
+          print('PDF_CANDIDATE_COUNT',len(ded),flush=True)
+          verified=[]; seen_sha=set()
+          for idx,(u,rec) in enumerate(ded,1):
+            try:
+              r=S.get(u,headers={'User-Agent':UA,'Accept':'application/pdf,*/*','Referer':rec['page_url']},timeout=(20,180),allow_redirects=True)
+              print('GET',idx,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              if r.status_code!=200 or not r.content.startswith(b'%PDF-') or len(r.content)<80000: continue
+              sha=hashlib.sha256(r.content).hexdigest()
+              if sha in seen_sha: continue
+              rd=PdfReader(BytesIO(r.content),strict=False); np=len(rd.pages)
+              texts=[]
+              for p in rd.pages:
+                try: texts.append(p.extract_text() or '')
+                except Exception: texts.append('')
+              full=re.sub(r'\s+',' ','\n'.join(texts))
+              if not re.search(r'戴[爾尔]|Dell Technologies|\bDELL(?:\.US)?\b',full,re.I): continue
+              # Require at least one substantive Dell section, not a bare ticker list.
+              mentions=len(re.findall(r'戴[爾尔]|Dell Technologies|\bDELL(?:\.US)?\b',full,re.I))
+              if mentions<2: continue
+              safe_date=re.sub(r'[^0-9-]','',rec.get('date','')) or '日期待核'
+              fn=f'第一上海_戴尔科技相关公司研究_{safe_date}_{np}页_{idx}.pdf'
+              p=out/fn; p.write_bytes(r.content)
+              q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','90',str(p),str(out/'previews'/f'{idx}_first')],check=True,capture_output=True)
+              subprocess.run(['pdftoppm','-f',str(np),'-singlefile','-png','-r','90',str(p),str(out/'previews'/f'{idx}_last')],check=True,capture_output=True)
+              vr={'filename':fn,'source':r.url,'pages':np,'bytes':len(r.content),'sha256':sha,'mentions':mentions,'archive_block':rec['block'],'sample':full[:12000]}
+              verified.append(vr); seen_sha.add(sha); print('VERIFIED',json.dumps({k:vr[k] for k in ('filename','source','pages','bytes','sha256','mentions','archive_block')},ensure_ascii=False),flush=True)
+            except Exception as e: print('GET_ERR',u,repr(e),flush=True)
+          (out/'metadata.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(verified,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_COUNT',len(verified),flush=True)
+          PY
+
+      - name: Upload verified archive documents
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-firstshanghai-public-archive-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
