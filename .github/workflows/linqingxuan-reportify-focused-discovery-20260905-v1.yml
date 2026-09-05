@@ -1,0 +1,126 @@
+name: Focused Reportify discovery for Lin Qingxuan reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/linqingxuan-reportify-focused-discovery-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Inspect report HTML, Jina mirror, Next data and public endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import html,json,re
+          from pathlib import Path
+          from urllib.parse import quote,urljoin,unquote
+          import requests
+          from bs4 import BeautifulSoup
+
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session();s.trust_env=False
+          headers={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,application/json,text/plain,*/*','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          known_id='1242481900132634624'
+          urls=[
+            f'https://reportify.cn/reports/{known_id}',
+            'https://reportify.cn/companies/HK%3A02657/documents',
+            'https://reportify.cn/reports?search=%E6%9E%97%E6%B8%85%E8%BD%A9',
+            'https://reportify.cn/reports?q=%E6%9E%97%E6%B8%85%E8%BD%A9',
+            'https://r.jina.ai/http://reportify.cn/companies/HK%3A02657/documents',
+            'https://r.jina.ai/https://reportify.cn/companies/HK%3A02657/documents',
+            f'https://r.jina.ai/http://reportify.cn/reports/{known_id}',
+            f'https://r.jina.ai/https://reportify.cn/reports/{known_id}',
+          ]
+          title_phrases=[
+            '林清轩','山茶花精华油打造第一心智','以小见大、势能向上的精华油心智品牌',
+            '从“人货场”拆解林清轩的成功之路','从人货场拆解林清轩的成功之路',
+            '东方甄萃山茶花，高端润肤林清轩','以油养肤快速破圈前景广阔',
+          ]
+          all_text=[];all_ids=set();all_urls=set();build_ids=set();scripts=set()
+          for i,u in enumerate(urls,1):
+            try:
+              r=s.get(u,headers=headers,timeout=(20,150),allow_redirects=True)
+              text=r.text
+              print('\nFETCH',i,u,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              Path(f'output/page_{i}.txt').write_text(text,encoding='utf-8',errors='replace')
+              all_text.append((r.url,text))
+              for m in re.findall(r'(?<!\d)\d{17,20}(?!\d)',text):
+                all_ids.add(m)
+              for m in re.findall(r'https?://[^"\'<>\s\\]+',text,re.I):
+                m=html.unescape(m).replace('\\u0026','&').replace('\\/','/')
+                if any(k in unquote(m.lower()) for k in ('reportify','pdf','download','file','document','attachment','source','oss','cos','cdn')):
+                  all_urls.add(m)
+              for m in re.findall(r'/_next/static/([^/]+)/',text):build_ids.add(m)
+              soup=BeautifulSoup(text,'html.parser')
+              for tag in soup.find_all('script',src=True):scripts.add(urljoin(r.url,tag['src']))
+              for phrase in title_phrases:
+                for match in list(re.finditer(re.escape(phrase),text,re.I))[:10]:
+                  print('PHRASE_CTX',i,phrase,repr(text[max(0,match.start()-1500):match.start()+5000]),flush=True)
+              for key in ['pdf','download','fileUrl','sourceUrl','originUrl','originalUrl','documentUrl','attachment','reportId','companyCode','HK:02657','02657']:
+                for match in list(re.finditer(re.escape(key),text,re.I))[:30]:
+                  print('KEY_CTX',i,key,repr(text[max(0,match.start()-1000):match.start()+3500]),flush=True)
+            except Exception as e:print('FETCH_ERR',i,u,repr(e),flush=True)
+
+          print('\nIDS',json.dumps(sorted(all_ids),ensure_ascii=False),flush=True)
+          print('URLS',json.dumps(sorted(all_urls),ensure_ascii=False,indent=2),flush=True)
+          print('BUILDS',json.dumps(sorted(build_ids)),flush=True)
+          print('SCRIPTS',json.dumps(sorted(scripts),ensure_ascii=False,indent=2),flush=True)
+
+          # Fetch JS and extract endpoint templates / report routes.
+          js_hits=[]
+          for i,u in enumerate(sorted(scripts),1):
+            try:
+              r=s.get(u,headers={**headers,'Accept':'*/*','Referer':'https://reportify.cn/'},timeout=(15,120))
+              text=r.text
+              print('\nJS',i,r.status_code,len(r.content),r.url,flush=True)
+              for key in ['/api/','reports/','documents','company','search','sourceUrl','fileUrl','download','attachment','pdf']:
+                for m in list(re.finditer(re.escape(key),text,re.I))[:50]:
+                  ctx=text[max(0,m.start()-800):m.start()+2200]
+                  if 'report' in ctx.lower() or 'document' in ctx.lower():
+                    js_hits.append({'url':r.url,'key':key,'context':ctx})
+                    print('JS_CTX',key,repr(ctx),flush=True)
+            except Exception as e:print('JS_ERR',u,repr(e),flush=True)
+          Path('output/js_hits.json').write_text(json.dumps(js_hits,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Try likely public JSON endpoints. Only log non-404 or useful responses.
+          endpoints=[]
+          bases=['https://reportify.cn','https://api.reportify.cn']
+          paths=[
+            f'/api/reports/{known_id}',f'/api/report/{known_id}',f'/api/v1/reports/{known_id}',
+            f'/api/reports/{known_id}/detail',f'/api/report/detail?id={known_id}',
+            '/api/reports?company_code=HK%3A02657','/api/reports?company=HK%3A02657',
+            '/api/documents?company_code=HK%3A02657','/api/companies/HK%3A02657/documents',
+            '/api/search?q=%E6%9E%97%E6%B8%85%E8%BD%A9','/api/reports?search=%E6%9E%97%E6%B8%85%E8%BD%A9',
+          ]
+          for base in bases:
+            for path in paths:
+              u=base+path
+              try:
+                r=s.get(u,headers={**headers,'Accept':'application/json,text/plain,*/*','Referer':'https://reportify.cn/'},timeout=(10,45),allow_redirects=True)
+                if r.status_code!=404 or len(r.content)>500:
+                  rec={'url':u,'final':r.url,'status':r.status_code,'type':r.headers.get('content-type'),'bytes':len(r.content),'body':r.text[:20000]}
+                  endpoints.append(rec);print('ENDPOINT',json.dumps(rec,ensure_ascii=False),flush=True)
+              except Exception:pass
+          Path('output/endpoints.json').write_text(json.dumps(endpoints,ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('output/ids.json').write_text(json.dumps(sorted(all_ids),ensure_ascii=False,indent=2),encoding='utf-8')
+          Path('output/urls.json').write_text(json.dumps(sorted(all_urls),ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: linqingxuan-reportify-focused-discovery-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 5
+          compression-level: 6
