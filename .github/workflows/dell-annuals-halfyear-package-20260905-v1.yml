@@ -1,0 +1,381 @@
+name: Package Dell FY2020-FY2025 annual reports and latest half-year results
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-annuals-halfyear-package-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Download, validate, and package official Dell reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          SESSION = requests.Session()
+          SESSION.trust_env = False
+          HTML_HEADERS = {
+              'User-Agent': UA,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Cache-Control': 'no-cache',
+          }
+          PDF_HEADERS = {
+              'User-Agent': UA,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+          }
+
+          root = Path('Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year')
+          annual_dir = root / 'Annual_Reports_FY2020-FY2025'
+          half_dir = root / 'Latest_Half-Year_FY2027_Q2'
+          preview_dir = Path('_previews')
+          annual_dir.mkdir(parents=True, exist_ok=True)
+          half_dir.mkdir(parents=True, exist_ok=True)
+          preview_dir.mkdir(exist_ok=True)
+
+          annuals = [
+              {
+                  'fy': 'FY2020',
+                  'filing_date': '2020-03-27',
+                  'period_end': '2020-01-31',
+                  'page': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-20-000017',
+                  'accession': '0001571996-20-000017',
+              },
+              {
+                  'fy': 'FY2021',
+                  'filing_date': '2021-03-26',
+                  'period_end': '2021-01-29',
+                  'page': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-21-000007',
+                  'accession': '0001571996-21-000007',
+              },
+              {
+                  'fy': 'FY2022',
+                  'filing_date': '2022-03-24',
+                  'period_end': '2022-01-28',
+                  'page': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-22-000009',
+                  'accession': '0001571996-22-000009',
+              },
+              {
+                  'fy': 'FY2023',
+                  'filing_date': '2023-03-30',
+                  'period_end': '2023-02-03',
+                  'page': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-23-000007',
+                  'accession': '0001571996-23-000007',
+              },
+              {
+                  'fy': 'FY2024',
+                  'filing_date': '2024-03-25',
+                  'period_end': '2024-02-02',
+                  'page': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-24-000036',
+                  'accession': '0001571996-24-000036',
+              },
+              {
+                  'fy': 'FY2025',
+                  'filing_date': '2025-03-25',
+                  'period_end': '2025-01-31',
+                  'page': 'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-25-000034',
+                  'accession': '0001571996-25-000034',
+              },
+          ]
+
+          def get(url: str, *, headers: dict | None = None, referer: str | None = None, attempts: int = 5) -> requests.Response:
+              h = dict(headers or HTML_HEADERS)
+              if referer:
+                  h['Referer'] = referer
+              last = None
+              for attempt in range(attempts):
+                  try:
+                      r = SESSION.get(url, headers=h, timeout=(25, 240), allow_redirects=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code} at {r.url}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(f'Failed to fetch {url}: {last!r}')
+
+          def discover_pdf(page_url: str, *, text_hint: str | None = None) -> tuple[str, str]:
+              r = get(page_url, headers=HTML_HEADERS)
+              text = r.text
+              soup = BeautifulSoup(text, 'html.parser')
+              candidates: list[tuple[int, str, str]] = []
+              for a in soup.find_all('a', href=True):
+                  href = urljoin(r.url, a['href'])
+                  label = ' '.join(a.get_text(' ', strip=True).split())
+                  low = (label + ' ' + href).lower()
+                  score = 0
+                  if text_hint and text_hint.lower() in label.lower():
+                      score += 100
+                  if 'download pdf' in label.lower():
+                      score += 80
+                  if href.lower().endswith('.pdf'):
+                      score += 60
+                  if '/static-files/' in href.lower():
+                      score += 40
+                  if 'pdf' in low:
+                      score += 10
+                  if score:
+                      candidates.append((score, href, label))
+              # Drupal pages also embed static-file URLs in JSON scripts.
+              for m in re.finditer(r'(?:https?://[^"\'<>\s]+)?/static-files/[0-9a-f-]{30,}', text, re.I):
+                  href = urljoin(r.url, m.group(0))
+                  candidates.append((35, href, 'embedded static-file'))
+              if not candidates:
+                  raise RuntimeError(f'No PDF candidate found at {page_url}')
+              candidates.sort(key=lambda x: x[0], reverse=True)
+              for score, href, label in candidates:
+                  try:
+                      pr = get(href, headers=PDF_HEADERS, referer=r.url, attempts=3)
+                      if pr.content.startswith(b'%PDF-') and len(pr.content) > 50_000:
+                          return pr.url, label
+                  except Exception as exc:
+                      print('DISCOVER_CANDIDATE_ERROR', page_url, href, repr(exc), flush=True)
+              raise RuntimeError(f'PDF candidates existed but none returned a PDF: {page_url}')
+
+          def validate_pdf(data: bytes, *, required_patterns: list[str], min_pages: int = 1) -> tuple[int, str]:
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError('not a PDF')
+              reader = PdfReader(BytesIO(data), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'only {pages} pages')
+              texts = []
+              sample_indexes = list(range(min(8, pages)))
+              if pages > 8:
+                  sample_indexes.extend([pages // 2, pages - 1])
+              seen = set()
+              for idx in sample_indexes:
+                  if idx in seen or idx < 0 or idx >= pages:
+                      continue
+                  seen.add(idx)
+                  try:
+                      texts.append(reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      texts.append('')
+              sample = re.sub(r'\s+', ' ', '\n'.join(texts))
+              for pat in required_patterns:
+                  if not re.search(pat, sample, re.I):
+                      raise RuntimeError(f'missing identity pattern: {pat}')
+              return pages, sample
+
+          manifest: list[dict] = []
+          seen_sha: set[str] = set()
+
+          # Annual reports.
+          for entry in annuals:
+              pdf_url, link_label = discover_pdf(entry['page'])
+              r = get(pdf_url, headers=PDF_HEADERS, referer=entry['page'])
+              data = r.content
+              pages, sample = validate_pdf(
+                  data,
+                  required_patterns=[r'Dell Technologies', r'Form\s+10-K', entry['period_end'].replace('-', r'[-/ ]')],
+                  min_pages=100,
+              )
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in seen_sha:
+                  raise RuntimeError(f'Duplicate annual report for {entry["fy"]}')
+              seen_sha.add(sha)
+              filename = f'Dell_Technologies_{entry["fy"]}_Annual_Report_Form_10-K_period_ended_{entry["period_end"]}_{pages}p.pdf'
+              path = annual_dir / filename
+              path.write_bytes(data)
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(q.stderr)
+              subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '72', str(path), str(preview_dir / f'{entry["fy"]}_first')], check=True, capture_output=True)
+              subprocess.run(['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '72', str(path), str(preview_dir / f'{entry["fy"]}_last')], check=True, capture_output=True)
+              rec = {
+                  'category': 'annual_report',
+                  'fiscal_year': entry['fy'],
+                  'period_end': entry['period_end'],
+                  'filing_date': entry['filing_date'],
+                  'form': '10-K',
+                  'accession': entry['accession'],
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'filing_page': entry['page'],
+                  'source_pdf': r.url,
+                  'source_link_label': link_label,
+              }
+              manifest.append(rec)
+              print('ANNUAL_VERIFIED', json.dumps(rec, ensure_ascii=False), flush=True)
+
+          # Latest half-year equivalent: Dell FY2027 Q2 official earnings materials, covering six months ended 2026-07-31.
+          q2_pages = [
+              'https://investors.delltechnologies.com/events/event-details/dell-technologies-fiscal-year-2027-second-quarter-results',
+              'https://investors.delltechnologies.com/financial-information/quarterly-results',
+              'https://investors.delltechnologies.com/',
+          ]
+          q2_materials = [
+              {
+                  'kind': 'Press_Release',
+                  'hint': 'Press Release',
+                  'min_pages': 3,
+              },
+              {
+                  'kind': 'Financial_Tables',
+                  'hint': 'Financial Tables',
+                  'min_pages': 3,
+              },
+          ]
+
+          for mat in q2_materials:
+              discovered = None
+              errors = []
+              for page_url in q2_pages:
+                  try:
+                      discovered = (*discover_pdf(page_url, text_hint=mat['hint']), page_url)
+                      break
+                  except Exception as exc:
+                      errors.append(f'{page_url}: {exc!r}')
+              if not discovered:
+                  raise RuntimeError(f'Could not discover FY2027 Q2 {mat["kind"]}: {errors}')
+              pdf_url, link_label, source_page = discovered
+              r = get(pdf_url, headers=PDF_HEADERS, referer=source_page)
+              data = r.content
+              pages, sample = validate_pdf(
+                  data,
+                  required_patterns=[r'Dell Technologies', r'(Second Quarter|Q2)', r'(Fiscal\s+2027|FY27|2027)', r'(Six Months|six-month|July\s+31,?\s+2026)'],
+                  min_pages=mat['min_pages'],
+              )
+              sha = hashlib.sha256(data).hexdigest()
+              if sha in seen_sha:
+                  # Some page implementations may point Press Release and Financial Tables at the same file.
+                  print('HALF_YEAR_DUPLICATE', mat['kind'], sha, flush=True)
+                  continue
+              seen_sha.add(sha)
+              filename = f'Dell_Technologies_FY2027_Q2_{mat["kind"]}_six_months_ended_2026-07-31_{pages}p.pdf'
+              path = half_dir / filename
+              path.write_bytes(data)
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(q.stderr)
+              subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '72', str(path), str(preview_dir / f'FY2027_Q2_{mat["kind"]}_first')], check=True, capture_output=True)
+              subprocess.run(['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '72', str(path), str(preview_dir / f'FY2027_Q2_{mat["kind"]}_last')], check=True, capture_output=True)
+              rec = {
+                  'category': 'latest_half_year_equivalent',
+                  'fiscal_period': 'FY2027 Q2 / six months ended 2026-07-31',
+                  'publication_date': '2026-09-01',
+                  'document_type': mat['kind'],
+                  'filename': filename,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': sha,
+                  'source_page': source_page,
+                  'source_pdf': r.url,
+                  'source_link_label': link_label,
+              }
+              manifest.append(rec)
+              print('HALF_YEAR_VERIFIED', json.dumps(rec, ensure_ascii=False), flush=True)
+
+          annual_count = sum(1 for x in manifest if x['category'] == 'annual_report')
+          half_count = sum(1 for x in manifest if x['category'] == 'latest_half_year_equivalent')
+          if annual_count != 6:
+              raise RuntimeError(f'Expected 6 annual reports, got {annual_count}')
+          if half_count < 1:
+              raise RuntimeError('No latest half-year material passed validation')
+
+          readme = [
+              'Dell Technologies (NYSE: DELL) official financial report package',
+              '',
+              'Contents:',
+              '1. Fiscal 2020 through Fiscal 2025 annual reports on Form 10-K (six official original PDFs).',
+              '2. Latest half-year-equivalent disclosure: FY2027 second-quarter official materials published September 1, 2026, covering the six months ended July 31, 2026.',
+              '',
+              'Fiscal-year note:',
+              'Dell Technologies uses a 52- or 53-week fiscal year ending on the Friday nearest January 31. The FY labels in this package follow Dell reporting terminology rather than calendar-year naming.',
+              '',
+              'Half-year note:',
+              'U.S. issuers do not normally publish a separately titled statutory half-year report. Dell reports the first six months through its second-quarter earnings materials and subsequently files Form 10-Q. As of September 5, 2026, the newly released FY2027 Q2 materials are the latest public six-month disclosure.',
+              '',
+              'Validation performed:',
+              '- PDF signature and file-size checks',
+              '- Page-count and company/form identity checks',
+              '- qpdf structural validation',
+              '- First-page and last-page rendering',
+              '- SHA-256 and duplicate-file checks',
+              '- ZIP CRC validation',
+              '',
+              'Sources: Dell Technologies Investor Relations and Dell SEC filing pages.',
+              'Documents are supplied for research reference; copyright remains with Dell Technologies and the relevant filing publishers.',
+              '',
+              'File inventory:',
+          ]
+          for i, rec in enumerate(manifest, 1):
+              label = rec.get('fiscal_year') or rec.get('fiscal_period')
+              readme.extend([
+                  f'{i}. {label} | {rec["filename"]}',
+                  f'   Pages: {rec["pages"]}; Size: {rec["bytes"]} bytes',
+                  f'   Source PDF: {rec["source_pdf"]}',
+                  f'   SHA-256: {rec["sha256"]}',
+              ])
+          (root / 'README_Report_List_and_Verification.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest), encoding='utf-8')
+
+          zip_path = Path('Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for path in sorted(root.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, arcname=str(path))
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(manifest):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)} vs {len(manifest)}')
+
+          summary = {
+              'annual_report_count': annual_count,
+              'half_year_document_count': half_count,
+              'total_pdf_count': len(manifest),
+              'zip_name': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              'documents': manifest,
+          }
+          Path('summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL', json.dumps(summary, ensure_ascii=False), flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-annuals-halfyear-package-20260905-v1
+          path: |
+            Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year/
+            Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year.zip
+            summary.json
+            _previews/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
