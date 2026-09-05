@@ -1,0 +1,309 @@
+name: Package three official Mirae Asset Dell reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-miraeasset-fast-package-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Locate exact Dell rows, download and validate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import quote_from_bytes
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY_CN = '戴尔科技'
+          COMPANY_EN = 'Dell Technologies'
+          TICKER = 'DELL.US'
+          ROOT = Path('戴尔科技_DELL_US_券商公司研究报告_3份_官方原始PDF')
+          ROOT.mkdir(exist_ok=True)
+          PREVIEWS = Path('_previews')
+          PREVIEWS.mkdir(exist_ok=True)
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': UA,
+              'Accept': 'text/html,application/xhtml+xml,*/*',
+              'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+          }
+
+          # These official archive pages are known to contain the target rows.
+          listing_urls = [
+              # FY3Q26, 2025-11-27
+              'https://trading.securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=1&direction=0&listType=1&searchEndDay=27&searchEndMonth=11&searchEndYear=2025&searchStartDay=27&searchStartMonth=11&searchStartYear=2024&searchType=2&startId=09nap~&startPage=1',
+              # FY2Q26, 2025-08-29
+              'https://securities.miraeasset.com/bbs/board/message/list.do?categoryId=1521&curPage=101&direction=0&listType=1&searchEndDay=23&searchEndMonth=01&searchEndYear=2026&searchStartDay=23&searchStartMonth=01&searchStartYear=2025&searchType=2&startId=09nAD~&startPage=101',
+              # FY1Q26, 2025-05-30
+              'https://trading.securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=79&direction=1&listType=1&searchEndDay=26&searchEndMonth=01&searchEndYear=2026&searchStartDay=26&searchStartMonth=01&searchStartYear=2025&searchType=2&startId=09mxB~&startPage=71',
+              # FY4Q25, 2025-02-28
+              'https://securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=3&direction=1&listType=1&searchEndDay=14&searchEndMonth=03&searchEndYear=2025&searchStartDay=14&searchStartMonth=03&searchStartYear=2024&searchType=2&startId=zzzzz~&startPage=1',
+              # FY3Q25, 2024-11-27
+              'https://securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=10&direction=1&listType=1&searchEndDay=14&searchEndMonth=01&searchEndYear=2025&searchStartDay=15&searchStartMonth=01&searchStartYear=2024&searchType=2&startId=zzzzz~&startPage=1',
+          ]
+
+          def decode_html(response: requests.Response) -> str:
+              for enc in ('euc-kr', 'cp949', 'utf-8'):
+                  try:
+                      text = response.content.decode(enc)
+                      if '델 테크놀로지스' in text or 'DELL US' in text:
+                          return text
+                  except UnicodeDecodeError:
+                      pass
+              return response.content.decode('euc-kr', errors='replace')
+
+          def fetch(url: str, *, referer: str | None = None) -> requests.Response:
+              h = dict(headers)
+              if referer:
+                  h['Referer'] = referer
+              last = None
+              for attempt in range(5):
+                  try:
+                      r = session.get(url, headers=h, timeout=(25, 180), allow_redirects=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as exc:
+                      last = exc
+              raise RuntimeError(f'Failed to fetch {url}: {last!r}')
+
+          rows: dict[str, dict] = {}
+          for idx, url in enumerate(listing_urls, 1):
+              try:
+                  r = fetch(url)
+                  text = decode_html(r)
+                  print('LISTING', idx, r.status_code, len(r.content), r.url, 'DELL=', '델 테크놀로지스' in text, flush=True)
+                  soup = BeautifulSoup(text, 'html.parser')
+                  for tr in soup.find_all('tr'):
+                      block = ' '.join(tr.get_text(' ', strip=True).split())
+                      if not re.search(r'델\s*테크놀로지스|Dell Technologies|\bDELL\s+US\b', block, re.I):
+                          continue
+                      html = str(tr)
+                      m = re.search(r"downConfirm\('([^']+/bbs/download/\d+\.pdf\?attachmentId=\d+)'", html, re.I)
+                      if not m:
+                          m = re.search(r'(https?://[^\s\'\"]+/bbs/download/\d+\.pdf\?attachmentId=\d+)', html, re.I)
+                      if not m:
+                          print('ROW_WITHOUT_PDF', block, html[:3000], flush=True)
+                          continue
+                      pdf_url = m.group(1).replace('&amp;', '&')
+                      cells = [' '.join(td.get_text(' ', strip=True).split()) for td in tr.find_all('td')]
+                      date = cells[0] if cells and re.fullmatch(r'20\d{2}-\d{2}-\d{2}', cells[0]) else ''
+                      subject = ''
+                      subject_el = tr.select_one('.subject')
+                      if subject_el:
+                          subject = ' '.join(subject_el.get_text(' ', strip=True).split())
+                      analyst = cells[-1] if len(cells) >= 2 else ''
+                      attachment_id = re.search(r'attachmentId=(\d+)', pdf_url).group(1)
+                      rec = {
+                          'date': date,
+                          'subject_ko': subject or block,
+                          'analyst': analyst,
+                          'listing_url': r.url,
+                          'pdf_url': pdf_url,
+                          'attachment_id': attachment_id,
+                      }
+                      rows[attachment_id] = rec
+                      print('FOUND_ROW', json.dumps(rec, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('LISTING_ERROR', idx, repr(exc), flush=True)
+
+          # If pages moved, use the site's normal public title search as a fallback.
+          if len(rows) < 3:
+              base = 'https://trading.securities.miraeasset.com/bbs/board/message/list.do'
+              search_text = quote_from_bytes('델 테크놀로지스'.encode('euc-kr'))
+              fallback_urls = [
+                  f'{base}?categoryId=1800&selectedId=1800&searchType=2&searchText={search_text}&searchStartYear=2024&searchStartMonth=01&searchStartDay=01&searchEndYear=2026&searchEndMonth=09&searchEndDay=05&curPage={p}&startPage=1'
+                  for p in range(1, 8)
+              ]
+              for url in fallback_urls:
+                  try:
+                      r = fetch(url)
+                      text = decode_html(r)
+                      soup = BeautifulSoup(text, 'html.parser')
+                      for tr in soup.find_all('tr'):
+                          block = ' '.join(tr.get_text(' ', strip=True).split())
+                          if not re.search(r'델\s*테크놀로지스|\bDELL\s+US\b', block, re.I):
+                              continue
+                          html = str(tr)
+                          m = re.search(r"downConfirm\('([^']+/bbs/download/\d+\.pdf\?attachmentId=\d+)'", html, re.I)
+                          if not m:
+                              continue
+                          pdf_url = m.group(1).replace('&amp;', '&')
+                          cells = [' '.join(td.get_text(' ', strip=True).split()) for td in tr.find_all('td')]
+                          date = cells[0] if cells and re.fullmatch(r'20\d{2}-\d{2}-\d{2}', cells[0]) else ''
+                          subject_el = tr.select_one('.subject')
+                          subject = ' '.join(subject_el.get_text(' ', strip=True).split()) if subject_el else block
+                          analyst = cells[-1] if len(cells) >= 2 else ''
+                          attachment_id = re.search(r'attachmentId=(\d+)', pdf_url).group(1)
+                          rows[attachment_id] = {
+                              'date': date,
+                              'subject_ko': subject,
+                              'analyst': analyst,
+                              'listing_url': r.url,
+                              'pdf_url': pdf_url,
+                              'attachment_id': attachment_id,
+                          }
+                  except Exception as exc:
+                      print('FALLBACK_ERROR', repr(exc), flush=True)
+
+          if not rows:
+              raise RuntimeError('No Dell report rows were found in the public official archive.')
+
+          title_cn_map = {
+              '2025-11-27': 'FY3Q26回顾：AI表现超预期',
+              '2025-08-29': 'FY2Q26回顾：AI推动营收激增',
+              '2025-05-30': 'FY1Q26回顾：AI需求激增但营业利润承压',
+              '2025-02-28': 'FY4Q25回顾：AI超预期及股东回报提升',
+              '2024-11-27': 'FY3Q25回顾：AI服务器需求与盈利进展',
+          }
+
+          verified = []
+          seen_sha = set()
+          for rec in sorted(rows.values(), key=lambda x: x['date'], reverse=True):
+              if len(verified) >= 3:
+                  break
+              try:
+                  r = fetch(rec['pdf_url'], referer=rec['listing_url'])
+                  b = r.content
+                  print('PDF_GET', rec['date'], r.status_code, r.headers.get('content-type'), len(b), r.url, b[:12], flush=True)
+                  if not b.startswith(b'%PDF-') or len(b) < 80_000:
+                      print('REJECT_NOT_PDF', rec['date'], repr(b[:200]), flush=True)
+                      continue
+                  sha = hashlib.sha256(b).hexdigest()
+                  if sha in seen_sha:
+                      continue
+                  reader = PdfReader(BytesIO(b), strict=False)
+                  pages = len(reader.pages)
+                  texts = []
+                  for page in reader.pages:
+                      try:
+                          texts.append(page.extract_text() or '')
+                      except Exception:
+                          texts.append('')
+                  full = re.sub(r'\s+', ' ', '\n'.join(texts))
+                  identity = bool(re.search(r'델\s*테크놀로지스|Dell Technologies|\bDELL\s+US\b|NYSE\s*:\s*DELL', full, re.I))
+                  if not identity:
+                      print('REJECT_IDENTITY', rec['date'], pages, repr(full[:3000]), flush=True)
+                      continue
+                  title_cn = title_cn_map.get(rec['date'], '公司研究报告')
+                  filename = f"{rec['date']}_未来资产证券_{COMPANY_CN}_{title_cn}_{pages}页.pdf"
+                  path = ROOT / filename
+                  path.write_bytes(b)
+                  q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+                  if q.returncode not in (0, 3):
+                      raise RuntimeError(q.stderr)
+                  subprocess.run(['pdftoppm', '-f', '1', '-singlefile', '-png', '-r', '100', str(path), str(PREVIEWS / f'{len(verified)+1:02d}_first')], check=True, capture_output=True)
+                  subprocess.run(['pdftoppm', '-f', str(pages), '-singlefile', '-png', '-r', '100', str(path), str(PREVIEWS / f'{len(verified)+1:02d}_last')], check=True, capture_output=True)
+                  out_rec = {
+                      **rec,
+                      'institution_cn': '未来资产证券',
+                      'institution_en': 'Mirae Asset Securities',
+                      'company': COMPANY_CN,
+                      'ticker': TICKER,
+                      'title_cn': title_cn,
+                      'filename': filename,
+                      'pages': pages,
+                      'bytes': len(b),
+                      'sha256': sha,
+                      'source_pdf': r.url,
+                      'sample': full[:6000],
+                  }
+                  verified.append(out_rec)
+                  seen_sha.add(sha)
+                  print('VERIFIED', json.dumps({k: out_rec[k] for k in ('date','subject_ko','analyst','title_cn','filename','pages','bytes','sha256')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  print('PDF_ERROR', rec.get('date'), repr(exc), flush=True)
+
+          if len(verified) < 2:
+              raise RuntimeError(f'Only {len(verified)} complete Dell PDFs passed validation; at least 2 are required.')
+
+          # Write user-facing inventory and technical manifest.
+          lines = [
+              f'{COMPANY_CN}（{TICKER}）券商公司研究报告包',
+              '',
+              f'共收录{len(verified)}份未来资产证券官网公开发布的原始PDF。',
+              '报告为季度公司研究/跟踪报告，均围绕AI服务器、基础设施解决方案、盈利与需求趋势展开。',
+              '',
+          ]
+          for i, rec in enumerate(verified, 1):
+              lines.extend([
+                  f"{i}. {rec['date']}｜未来资产证券｜{rec['title_cn']}",
+                  f"   原文题名：{rec['subject_ko']}",
+                  f"   分析师：{rec['analyst']}；实际页数：{rec['pages']}页",
+                  f"   文件：{rec['filename']}",
+                  f"   官方列表页：{rec['listing_url']}",
+                  f"   官方PDF：{rec['source_pdf']}",
+                  f"   SHA-256：{rec['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：PDF文件头、实际页数、公司名称/证券代码、qpdf结构检查、首页与末页渲染、重复文件及SHA-256。',
+              '说明：未收入网页摘要、预览页、登录/付费受限文件或自行生成的网页打印件。',
+              '资料仅供研究参考，版权归原研究机构及作者所有，不构成投资建议。',
+          ])
+          (ROOT / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          manifest_public = [{k:v for k,v in rec.items() if k != 'sample'} for rec in verified]
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest_public, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f"{rec['sha256']}  {rec['filename']}\n" for rec in verified), encoding='utf-8')
+
+          zip_path = Path(f'{ROOT.name}.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for path in sorted(ROOT.iterdir()):
+                  zf.write(path, arcname=f'{ROOT.name}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(verified):
+                  raise RuntimeError('ZIP PDF count mismatch')
+          zip_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          summary = {
+              'report_count': len(verified),
+              'zip_name': zip_path.name,
+              'zip_bytes': zip_path.stat().st_size,
+              'zip_sha256': zip_sha,
+              'reports': [{k:v for k,v in rec.items() if k != 'sample'} for rec in verified],
+          }
+          Path('summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('FINAL', json.dumps({'count':len(verified),'zip':zip_path.name,'bytes':zip_path.stat().st_size,'sha256':zip_sha}, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-miraeasset-final-package-20260905-v1
+          path: |
+            戴尔科技_DELL_US_券商公司研究报告_3份_官方原始PDF/
+            戴尔科技_DELL_US_券商公司研究报告_3份_官方原始PDF.zip
+            summary.json
+            _previews/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
