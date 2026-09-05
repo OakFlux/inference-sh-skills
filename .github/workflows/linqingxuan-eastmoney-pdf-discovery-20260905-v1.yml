@@ -1,0 +1,341 @@
+name: Discover and package Lin Qingxuan broker PDFs from public indexes
+
+on:
+  push:
+    paths:
+      - '.github/workflows/linqingxuan-eastmoney-pdf-discovery-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Query public report APIs, validate complete PDFs, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from pypdf import PdfReader
+
+          UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          SESSION = requests.Session()
+          SESSION.trust_env = False
+          OUT = Path('output')
+          REPORT_DIR = OUT / 'verified_reports'
+          PREVIEW_DIR = OUT / 'previews'
+          OUT.mkdir(exist_ok=True)
+          REPORT_DIR.mkdir(exist_ok=True)
+          PREVIEW_DIR.mkdir(exist_ok=True)
+
+          company_terms = ['林清轩', '林清軒', 'LINQINGXUAN']
+          ticker_terms = ['02657', '2657.HK', '02657.HK']
+          title_terms = [
+              '东方甄萃山茶花', '高端润肤林清轩', '人货场', '成功之路',
+              '精华油心智品牌', '以油养肤', '快速破圈', '高端国货护肤',
+              '东方植萃锚定高端定位', '细分赛道突围',
+          ]
+          known_dates = {'2025-12-30', '2026-01-07', '2026-01-16', '2026-03-02', '2026-03-09', '2026-05-13', '2026-06-24'}
+
+          api_headers = {
+              'User-Agent': UA,
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Origin': 'https://data.eastmoney.com',
+          }
+          pdf_headers = {
+              'User-Agent': UA,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://data.eastmoney.com/',
+          }
+
+          diagnostics = {'lookups': [], 'api_calls': [], 'matched_rows': [], 'pdf_attempts': [], 'verified': []}
+
+          def compact(value: object) -> str:
+              return re.sub(r'\s+', '', json.dumps(value, ensure_ascii=False)).lower()
+
+          def relevant(row: dict) -> bool:
+              low = compact(row)
+              return any(x.lower() in low for x in company_terms + ticker_terms + title_terms)
+
+          def get_json(url: str, params: dict | None = None, method='GET', payload: dict | None = None):
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      if method == 'POST':
+                          r = SESSION.post(url, params=params, json=payload, headers={**api_headers, 'Content-Type': 'application/json'}, timeout=(20, 120))
+                      else:
+                          r = SESSION.get(url, params=params, headers=api_headers, timeout=(20, 120))
+                      if r.status_code == 200:
+                          return r.json(), r.url, len(r.content)
+                      last = RuntimeError(f'HTTP {r.status_code}: {r.text[:300]!r}')
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1.5 * attempt)
+              raise RuntimeError(f'API failed: {url}: {last!r}')
+
+          # Security identifier lookups.
+          for term in ['林清轩', '02657', '2657', 'LINQINGXUAN']:
+              url = 'https://searchapi.eastmoney.com/api/suggest/get'
+              try:
+                  obj, final_url, nbytes = get_json(url, params={'input': term, 'type': 14, 'count': 50})
+                  rec = {'term': term, 'url': final_url, 'bytes': nbytes, 'response': obj}
+                  diagnostics['lookups'].append(rec)
+                  print('LOOKUP', json.dumps(rec, ensure_ascii=False)[:12000], flush=True)
+              except Exception as exc:
+                  diagnostics['lookups'].append({'term': term, 'error': repr(exc)})
+                  print('LOOKUP_ERROR', term, repr(exc), flush=True)
+
+          rows: dict[str, dict] = {}
+
+          # Eastmoney list2 POST endpoint using likely code variants.
+          list2 = 'https://reportapi.eastmoney.com/report/list2'
+          code_variants = ['02657', '2657', '02657.HK', '2657.HK', '116.02657', '116.2657', '林清轩', '*']
+          for code in code_variants:
+              payload = {
+                  'pageSize': 500, 'pageNo': 1, 'p': 1, 'pageNum': 1, 'pageNumber': 1,
+                  'beginTime': '2025-06-01', 'endTime': '2026-09-05', 'code': code,
+                  'industryCode': '*', 'rating': None, 'ratingChange': None,
+                  'orgCode': None, 'rcode': '',
+              }
+              try:
+                  obj, final_url, nbytes = get_json(list2, method='POST', payload=payload)
+                  data = obj.get('data') if isinstance(obj, dict) else []
+                  if not isinstance(data, list):
+                      data = []
+                  meta = {'endpoint': 'list2', 'code': code, 'url': final_url, 'bytes': nbytes, 'rows': len(data), 'hits': obj.get('hits') if isinstance(obj, dict) else None}
+                  diagnostics['api_calls'].append(meta)
+                  print('LIST2', json.dumps(meta, ensure_ascii=False), flush=True)
+                  for row in data:
+                      if relevant(row):
+                          key = str(row.get('infoCode') or row.get('infocode') or hashlib.sha1(json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest())
+                          rows[key] = row
+                          print('LIST2_MATCH', json.dumps(row, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  diagnostics['api_calls'].append({'endpoint': 'list2', 'code': code, 'error': repr(exc)})
+                  print('LIST2_ERROR', code, repr(exc), flush=True)
+
+          # Narrow windows reduce total pages while covering all known reports.
+          list1 = 'https://reportapi.eastmoney.com/report/list'
+          windows = [
+              ('2025-12-15', '2026-01-25'),
+              ('2026-02-20', '2026-03-18'),
+              ('2026-05-01', '2026-07-05'),
+          ]
+
+          def fetch_list_page(begin: str, end: str, qtype: int, page: int):
+              obj, final_url, nbytes = get_json(list1, params={
+                  'pageNo': page, 'pageSize': 100, 'code': '', 'qType': qtype,
+                  'beginTime': begin, 'endTime': end, '_': int(time.time() * 1000) + page + qtype * 1000,
+              })
+              data = obj.get('data') if isinstance(obj, dict) else []
+              if not isinstance(data, list):
+                  data = []
+              pages = int(obj.get('TotalPage') or obj.get('totalPage') or obj.get('pages') or 0) if isinstance(obj, dict) else 0
+              return page, data, pages, final_url, nbytes
+
+          for begin, end in windows:
+              for qtype in (0, 1, 2):
+                  try:
+                      page, first_rows, total_pages, final_url, nbytes = fetch_list_page(begin, end, qtype, 1)
+                      meta = {'endpoint': 'list', 'window': [begin, end], 'qtype': qtype, 'page': 1, 'pages': total_pages, 'rows': len(first_rows), 'url': final_url, 'bytes': nbytes}
+                      diagnostics['api_calls'].append(meta)
+                      print('LIST_PAGE', json.dumps(meta, ensure_ascii=False), flush=True)
+                      all_page_rows = list(first_rows)
+                      if total_pages > 1:
+                          with ThreadPoolExecutor(max_workers=14) as executor:
+                              futures = [executor.submit(fetch_list_page, begin, end, qtype, p) for p in range(2, min(total_pages, 400) + 1)]
+                              for future in as_completed(futures):
+                                  p, page_rows, _, page_url, page_bytes = future.result()
+                                  all_page_rows.extend(page_rows)
+                                  print('LIST_PAGE', begin, end, qtype, p, len(page_rows), flush=True)
+                      for row in all_page_rows:
+                          if relevant(row):
+                              key = str(row.get('infoCode') or row.get('infocode') or hashlib.sha1(json.dumps(row, sort_keys=True, ensure_ascii=False).encode()).hexdigest())
+                              rows[key] = row
+                              print('LIST_MATCH', json.dumps(row, ensure_ascii=False), flush=True)
+                  except Exception as exc:
+                      diagnostics['api_calls'].append({'endpoint': 'list', 'window': [begin, end], 'qtype': qtype, 'error': repr(exc)})
+                      print('LIST_ERROR', begin, end, qtype, repr(exc), flush=True)
+
+          diagnostics['matched_rows'] = list(rows.values())
+          print('MATCHED_ROW_COUNT', len(rows), flush=True)
+
+          # Extract any URL-looking fields in addition to the standard dfcfw URL pattern.
+          def candidate_urls(info_code: str, row: dict) -> list[str]:
+              candidates = []
+              if info_code.startswith('AP'):
+                  candidates.extend([
+                      f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H1_{info_code}_1.pdf',
+                  ])
+              raw = json.dumps(row, ensure_ascii=False)
+              for match in re.findall(r'https?://[^"\'<>\s\\]+', raw, flags=re.I):
+                  match = match.replace('\\/', '/').replace('&amp;', '&')
+                  if any(k in match.lower() for k in ('.pdf', 'download', 'attach', 'file')):
+                      candidates.append(match)
+              for field in ('pdfUrl', 'pdfURL', 'attachUrl', 'attachURL', 'downloadUrl', 'fileUrl', 'url'):
+                  value = row.get(field)
+                  if isinstance(value, str) and value:
+                      candidates.append(urljoin('https://reportapi.eastmoney.com/', value))
+              unique = []
+              seen = set()
+              for item in candidates:
+                  if item not in seen:
+                      seen.add(item)
+                      unique.append(item)
+              return unique
+
+          def download_pdf(url: str, referer: str = 'https://data.eastmoney.com/'):
+              last = None
+              for attempt in range(1, 5):
+                  try:
+                      r = SESSION.get(url, headers={**pdf_headers, 'Referer': referer}, timeout=(25, 180), allow_redirects=True)
+                      rec = {'requested': url, 'final': r.url, 'status': r.status_code, 'content_type': r.headers.get('content-type'), 'bytes': len(r.content), 'head': r.content[:16].hex()}
+                      diagnostics['pdf_attempts'].append(rec)
+                      print('PDF_ATTEMPT', json.dumps(rec, ensure_ascii=False), flush=True)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 100_000:
+                          return r.content, r.url
+                      last = RuntimeError(f"HTTP={r.status_code} type={r.headers.get('content-type')} bytes={len(r.content)}")
+                  except Exception as exc:
+                      last = exc
+                  time.sleep(1.5 * attempt)
+              return None, repr(last)
+
+          def extract_text(reader: PdfReader) -> str:
+              texts = []
+              for page in reader.pages:
+                  try:
+                      texts.append(page.extract_text() or '')
+                  except Exception:
+                      texts.append('')
+              return re.sub(r'\s+', ' ', '\n'.join(texts))
+
+          verified = []
+          seen_sha = set()
+          for key, row in rows.items():
+              info_code = str(row.get('infoCode') or row.get('infocode') or key)
+              for url in candidate_urls(info_code, row):
+                  content, final_url = download_pdf(url)
+                  if content is None:
+                      continue
+                  sha = hashlib.sha256(content).hexdigest()
+                  if sha in seen_sha:
+                      continue
+                  try:
+                      reader = PdfReader(BytesIO(content), strict=False)
+                      pages = len(reader.pages)
+                      if pages < 12:
+                          print('PDF_REJECT_SHORT', info_code, pages, final_url, flush=True)
+                          continue
+                      text = extract_text(reader)
+                      compact_text = re.sub(r'\s+', '', text).lower()
+                      identity = any(term.lower() in compact_text for term in company_terms) and any(t.replace('.', '').lower() in compact_text.replace('.', '') for t in ['02657', '2657HK', '2657.HK'])
+                      if not identity:
+                          print('PDF_REJECT_IDENTITY', info_code, pages, repr(text[:2000]), flush=True)
+                          continue
+                      title = str(row.get('title') or row.get('reportName') or row.get('reportTitle') or '')
+                      institution = str(row.get('orgSName') or row.get('orgName') or row.get('organization') or '券商研究')
+                      date = str(row.get('publishDate') or row.get('publishTime') or row.get('date') or '')[:10]
+                      if date and not re.fullmatch(r'20\d{2}-\d{2}-\d{2}', date):
+                          m = re.search(r'20\d{2}-\d{2}-\d{2}', date)
+                          date = m.group(0) if m else '日期待核'
+                      safe_title = re.sub(r'[\\/:*?"<>|\s，、；：]+', '_', title).strip('_')[:100] or '林清轩公司深度报告'
+                      safe_inst = re.sub(r'[\\/:*?"<>|\s]+', '_', institution).strip('_')[:40] or '券商研究'
+                      filename = f'{date}_{safe_inst}_林清轩_{safe_title}_{pages}页.pdf'
+                      path = REPORT_DIR / filename
+                      path.write_bytes(content)
+                      q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+                      if q.returncode not in (0, 3):
+                          path.unlink(missing_ok=True)
+                          continue
+                      for label, page_no in [('first', 1), ('last', pages)]:
+                          prefix = PREVIEW_DIR / f'{len(verified)+1:02d}_{label}'
+                          subprocess.run(['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '80', str(path), str(prefix)], check=True, capture_output=True)
+                      rec = {
+                          'infoCode': info_code, 'institution': institution, 'date': date, 'title': title,
+                          'pages': pages, 'bytes': len(content), 'sha256': sha, 'filename': filename,
+                          'source_pdf': final_url, 'metadata': row,
+                      }
+                      verified.append(rec)
+                      diagnostics['verified'].append(rec)
+                      seen_sha.add(sha)
+                      print('VERIFIED', json.dumps({k: rec[k] for k in ('institution','date','title','pages','bytes','sha256','source_pdf')}, ensure_ascii=False), flush=True)
+                      break
+                  except Exception as exc:
+                      print('PDF_VALIDATE_ERROR', info_code, url, repr(exc), flush=True)
+
+          # Sort by deep-report signals, then page count and recency; retain up to 3.
+          def score(rec: dict):
+              title = rec['title']
+              deep = sum(k in title for k in ('深度', '首次覆盖', '投资价值', '成功之路', '快速破圈', '高端润肤'))
+              return (deep, rec['pages'], rec['date'])
+
+          verified.sort(key=score, reverse=True)
+          selected = verified[:3]
+          selected_names = {r['filename'] for r in selected}
+          for path in REPORT_DIR.glob('*.pdf'):
+              if path.name not in selected_names:
+                  path.unlink()
+
+          (OUT / 'diagnostics.json').write_text(json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'selected.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'verified_count.txt').write_text(str(len(selected)), encoding='utf-8')
+
+          if selected:
+              lines = ['林清轩（02657.HK）券商深度报告包', '', f'本包收录{len(selected)}份可公开直接下载且通过完整性校验的PDF。', '']
+              for i, rec in enumerate(selected, 1):
+                  lines += [
+                      f"{i}. {rec['institution']}｜{rec['date']}｜《{rec['title']}》",
+                      f"   实际页数：{rec['pages']}页；文件：{rec['filename']}",
+                      f"   原始PDF：{rec['source_pdf']}", f"   SHA-256：{rec['sha256']}", '',
+                  ]
+              lines += ['核验项目：PDF文件头、实际页数、公司及证券代码、qpdf结构、首页与末页渲染、重复文件、SHA-256及ZIP CRC。']
+              (REPORT_DIR / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+              (REPORT_DIR / 'manifest.json').write_text(json.dumps(selected, ensure_ascii=False, indent=2), encoding='utf-8')
+              (REPORT_DIR / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in selected), encoding='utf-8')
+              zip_path = OUT / f'林清轩_02657HK_券商深度报告_{len(selected)}份_公开完整PDF.zip'
+              with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+                  for path in sorted(REPORT_DIR.iterdir()):
+                      zf.write(path, arcname=f'林清轩_02657HK_券商深度报告/{path.name}')
+              with zipfile.ZipFile(zip_path) as zf:
+                  bad = zf.testzip()
+                  pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+                  if bad or len(pdfs) != len(selected):
+                      raise RuntimeError(f'ZIP validation failed: bad={bad}, pdfs={len(pdfs)}')
+              summary = {'count': len(selected), 'zip_name': zip_path.name, 'zip_bytes': zip_path.stat().st_size, 'zip_sha256': hashlib.sha256(zip_path.read_bytes()).hexdigest(), 'reports': selected}
+              (OUT / 'summary.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('FINAL_PACKAGE', json.dumps(summary, ensure_ascii=False), flush=True)
+          else:
+              print('FINAL_PACKAGE_NONE', flush=True)
+          PY
+
+      - name: Upload discovery output
+        uses: actions/upload-artifact@v4
+        with:
+          name: linqingxuan-eastmoney-pdf-discovery-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
