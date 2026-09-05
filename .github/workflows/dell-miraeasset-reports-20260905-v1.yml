@@ -1,0 +1,219 @@
+name: Retrieve Dell reports from Mirae Asset Securities public archive
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-miraeasset-reports-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Find Dell entries and download official attachments
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf charset-normalizer
+          mkdir -p output/previews
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S=requests.Session(); S.trust_env=False
+          H={'User-Agent':UA,'Accept':'text/html,application/xhtml+xml,*/*','Accept-Language':'ko-KR,ko;q=0.9,en;q=0.8'}
+          out=Path('output'); (out/'previews').mkdir(parents=True,exist_ok=True)
+          urls=[
+            # 2025-11-27 FY3Q26
+            'https://securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=12&direction=1&listType=1&searchEndDay=19&searchEndMonth=01&searchEndYear=2026&searchStartDay=19&searchStartMonth=01&searchStartYear=2025&searchType=2&startId=09nnD~&startPage=11',
+            # 2025-08-29 FY2Q26
+            'https://securities.miraeasset.com/bbs/board/message/list.do?categoryId=1521&curPage=101&direction=0&listType=1&searchEndDay=23&searchEndMonth=01&searchEndYear=2026&searchStartDay=23&searchStartMonth=01&searchStartYear=2025&searchType=2&startId=09nAD~&startPage=101',
+            # 2025-05-30 FY1Q26
+            'https://trading.securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=103&direction=1&listType=1&searchEndDay=26&searchEndMonth=03&searchEndYear=2026&searchStartDay=26&searchStartMonth=03&searchStartYear=2025&searchType=2&startId=09mre~&startPage=101',
+            # 2025-02-28 FY4Q25
+            'https://securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=3&direction=1&listType=1&searchEndDay=14&searchEndMonth=03&searchEndYear=2025&searchStartDay=14&searchStartMonth=03&searchStartYear=2024&searchType=2&startId=zzzzz~&startPage=1',
+            # 2024-11-27 FY3Q25
+            'https://securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=10&direction=1&listType=1&searchEndDay=14&searchEndMonth=01&searchEndYear=2025&searchStartDay=15&searchStartMonth=01&searchStartYear=2024&searchType=2&startId=zzzzz~&startPage=1',
+          ]
+          pages=[]
+          for idx,u in enumerate(urls,1):
+            try:
+              r=S.get(u,headers=H,timeout=(20,120),allow_redirects=True)
+              # Korean pages may omit/incorrectly label encoding.
+              raw=r.content
+              decoded=None; enc_used=None
+              for enc in [r.encoding,'utf-8','euc-kr','cp949']:
+                if not enc: continue
+                try:
+                  t=raw.decode(enc,errors='strict')
+                  if '델 테크놀로지스' in t or 'DELL US' in t:
+                    decoded=t; enc_used=enc; break
+                  if decoded is None: decoded=t; enc_used=enc
+                except Exception: pass
+              if decoded is None: decoded=raw.decode('utf-8',errors='replace'); enc_used='utf-8-replace'
+              print('\nPAGE',idx,r.status_code,r.headers.get('content-type'),len(raw),r.url,'ENC',enc_used,'DELL',('델 테크놀로지스' in decoded),flush=True)
+              (out/f'page_{idx}.html').write_text(decoded,encoding='utf-8')
+              pages.append((r.url,decoded,idx))
+            except Exception as e: print('PAGE_ERR',idx,repr(e),flush=True)
+
+          entries=[]; candidate_urls=[]
+          for page_url,text,page_idx in pages:
+            soup=BeautifulSoup(text,'html.parser')
+            # Any row/block containing Dell.
+            nodes=[]
+            for s in soup.find_all(string=re.compile(r'델\s*테크놀로지스|DELL\s*US',re.I)):
+              cur=s.parent
+              for _ in range(8):
+                if cur is None: break
+                block=cur.get_text(' ',strip=True)
+                links=cur.find_all('a',href=True)
+                if len(block)>20 and links:
+                  nodes.append(cur); break
+                cur=cur.parent
+            # De-duplicate nodes by string representation.
+            seen_node=set()
+            for node in nodes:
+              sig=str(node)[:10000]
+              if sig in seen_node: continue
+              seen_node.add(sig)
+              block=node.get_text(' ',strip=True)
+              attrs=[]
+              for tag in node.find_all(True):
+                for attr in ('href','src','onclick','data-url','data-href','data-seq','data-id','value'):
+                  val=tag.get(attr)
+                  if val: attrs.append({'tag':tag.name,'attr':attr,'value':str(val)})
+              rec={'page':page_idx,'page_url':page_url,'block':block,'attrs':attrs,'html':str(node)[:30000]}
+              entries.append(rec)
+              print('ENTRY',json.dumps({'page':page_idx,'block':block,'attrs':attrs},ensure_ascii=False),flush=True)
+              for a in node.find_all('a',href=True):
+                href=a['href']
+                if href and not href.startswith(('javascript:','#')):
+                  candidate_urls.append((urljoin(page_url,href),rec))
+              # Extract URLs and IDs from onclick.
+              for tag in node.find_all(True):
+                onclick=str(tag.get('onclick') or '')
+                for cand in re.findall(r"['\"]([^'\"]+(?:\.pdf|download|file|message|view|read)[^'\"]*)['\"]",onclick,re.I):
+                  candidate_urls.append((urljoin(page_url,cand),rec))
+            # Also locate any Dell-bearing table/list rows directly.
+            for container in soup.find_all(['tr','li','div']):
+              block=container.get_text(' ',strip=True)
+              if not re.search(r'델\s*테크놀로지스|DELL\s*US',block,re.I): continue
+              for a in container.find_all('a',href=True):
+                href=a['href']
+                if href and not href.startswith(('javascript:','#')):
+                  candidate_urls.append((urljoin(page_url,href),{'page':page_idx,'page_url':page_url,'block':block,'attrs':[]}))
+
+          # Visit detail links, collect official file/download endpoints.
+          ded=[];seen=set()
+          for u,rec in candidate_urls:
+            if u not in seen: seen.add(u); ded.append((u,rec))
+          print('INITIAL_URLS',json.dumps([u for u,_ in ded],ensure_ascii=False,indent=2),flush=True)
+          second=[]
+          for u,rec in ded:
+            try:
+              r=S.get(u,headers={**H,'Referer':rec['page_url']},timeout=(20,120),allow_redirects=True)
+              print('VISIT',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              if r.content.startswith(b'%PDF-'):
+                second.append((r.url,rec,r.content)); continue
+              raw=r.content
+              text=None
+              for enc in [r.encoding,'utf-8','euc-kr','cp949']:
+                if not enc: continue
+                try:
+                  t=raw.decode(enc,errors='strict')
+                  if '첨부' in t or '.pdf' in t.lower() or '다운로드' in t or 'download' in t.lower(): text=t; break
+                  if text is None: text=t
+                except Exception: pass
+              if text is None: text=raw.decode('utf-8',errors='replace')
+              soup=BeautifulSoup(text,'html.parser')
+              print('DETAIL_TITLE',soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+              for tag in soup.find_all(True):
+                vals=[]
+                for attr in ('href','src','onclick','data-url','data-href','data-file','data-seq','value'):
+                  val=tag.get(attr)
+                  if val: vals.append((attr,str(val)))
+                for attr,val in vals:
+                  if any(k in val.lower() for k in ('pdf','download','filedown','attach','bbs/board/message')):
+                    print('DETAIL_ATTR',tag.name,attr,repr(val),flush=True)
+                    for cand in re.findall(r'https?://[^"\'<>\s]+|/[^"\'<>\s]+|[A-Za-z0-9_./?=&%-]+\.pdf(?:\?[^"\'<>\s]*)?',val,re.I):
+                      second.append((urljoin(r.url,cand),rec,None))
+              # All hrefs that look like file endpoints or carry file-related icons/text.
+              for a in soup.find_all('a',href=True):
+                label=a.get_text(' ',strip=True)
+                href=a['href']
+                hay=(label+' '+href+' '+str(a.get('onclick') or '')).lower()
+                if any(k in hay for k in ('첨부','pdf','download','file','다운')):
+                  second.append((urljoin(r.url,href),rec,None))
+              (out/f'detail_{hashlib.md5(u.encode()).hexdigest()}.html').write_text(text,encoding='utf-8')
+            except Exception as e: print('VISIT_ERR',u,repr(e),flush=True)
+
+          # Include endpoint candidates inferred from attributes/forms only if they are normal public links.
+          final_cands=[];seen2=set()
+          for u,rec,content in second:
+            u=u.replace('&amp;','&')
+            if u in seen2: continue
+            seen2.add(u); final_cands.append((u,rec,content))
+          print('FINAL_URLS',json.dumps([u for u,_,_ in final_cands],ensure_ascii=False,indent=2),flush=True)
+
+          verified=[]; seen_sha=set()
+          for idx,(u,rec,preset) in enumerate(final_cands,1):
+            try:
+              if preset is None:
+                r=S.get(u,headers={'User-Agent':UA,'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Referer':rec['page_url']},timeout=(20,180),allow_redirects=True)
+                b=r.content; final_url=r.url; status=r.status_code; ctype=r.headers.get('content-type')
+              else:
+                b=preset; final_url=u; status=200; ctype='application/pdf'
+              print('FILE_TRY',idx,status,ctype,len(b),final_url,b[:12],flush=True)
+              if status!=200 or not b.startswith(b'%PDF-') or len(b)<50000: continue
+              sha=hashlib.sha256(b).hexdigest()
+              if sha in seen_sha: continue
+              rd=PdfReader(BytesIO(b),strict=False); np=len(rd.pages)
+              full=''
+              for pg in rd.pages:
+                try: full+=(pg.extract_text() or '')+'\n'
+                except Exception: pass
+              compact=re.sub(r'\s+',' ',full)
+              identity=bool(re.search(r'델\s*테크놀로지스|Dell Technologies|\bDELL\s+US\b',compact,re.I))
+              if not identity:
+                print('REJECT_IDENTITY',idx,np,repr(compact[:2000]),flush=True); continue
+              # Detect report date and title from actual PDF.
+              dates=re.findall(r'\b20\d{2}[./-]\s*\d{1,2}[./-]\s*\d{1,2}\b',compact)
+              dates += re.findall(r'\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+20\d{2}\b',compact,re.I)
+              title_match=re.search(r'(FY\dQ\d{2,4}\s*(?:Review|리뷰)[^\n]{0,100}|AI[^\n]{0,100})',full,re.I)
+              title=(title_match.group(1).strip() if title_match else rec['block'][:160])
+              fn=f'未来资产证券_戴尔科技_{idx:02d}_{np}页.pdf'
+              p=out/fn; p.write_bytes(b)
+              q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','90',str(p),str(out/'previews'/f'{idx}_first')],check=True,capture_output=True)
+              subprocess.run(['pdftoppm','-f',str(np),'-singlefile','-png','-r','90',str(p),str(out/'previews'/f'{idx}_last')],check=True,capture_output=True)
+              vr={'filename':fn,'source':final_url,'pages':np,'bytes':len(b),'sha256':sha,'dates':dates[:20],'title':title,'listing_block':rec['block'],'sample':compact[:10000]}
+              verified.append(vr);seen_sha.add(sha)
+              print('VERIFIED',json.dumps({k:vr[k] for k in ('filename','source','pages','bytes','sha256','dates','title','listing_block')},ensure_ascii=False),flush=True)
+            except Exception as e: print('FILE_ERR',u,repr(e),flush=True)
+          (out/'entries.json').write_text(json.dumps(entries,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(verified,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_COUNT',len(verified),flush=True)
+          PY
+
+      - name: Upload verified reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-miraeasset-reports-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
