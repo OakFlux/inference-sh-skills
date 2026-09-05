@@ -1,0 +1,37 @@
+name: Package Guangshen Railway broker deep reports
+
+on:
+  push:
+    branches:
+      - chatgpt-china-gas-broker-reports-20260905
+    paths:
+      - '.github/workflows/package-guangshen-broker-reports-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Download, validate and package reports
+        run: python scripts/package_guangshen_broker_reports_20260905.py
+      - name: Upload ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guangshen-railway-broker-reports-20260905
+          path: |
+            Guangshen_Railway_Broker_Deep_Reports_3_PDFs.zip
+            广深铁路_券商深度报告_3份.zip
+            PACKAGE_SHA256.txt
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
