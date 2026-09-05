@@ -1,0 +1,235 @@
+name: Package Dell FY2020-FY2025 annual reports and FY2027 Q2 six-month results v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-annuals-halfyear-package-20260905-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf playwright
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib, json, re, subprocess, time, zipfile
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S=requests.Session(); S.trust_env=False
+          H={'User-Agent':UA,'Accept':'text/html,application/xhtml+xml,application/pdf,*/*','Accept-Language':'en-US,en;q=0.9'}
+          HP={'User-Agent':UA,'Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Accept-Language':'en-US,en;q=0.9'}
+
+          ROOT=Path('Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year')
+          AD=ROOT/'Annual_Reports_FY2020-FY2025'; HD=ROOT/'Latest_Half-Year_FY2027_Q2'
+          PRE=Path('_previews')
+          AD.mkdir(parents=True,exist_ok=True); HD.mkdir(parents=True,exist_ok=True); PRE.mkdir(exist_ok=True)
+
+          filings=[
+            ('FY2020','2020-01-31','2020-03-27','0001571996-20-000017','cff5c8fc-e2a6-4d62-9a54-5ad279baa2f5'),
+            ('FY2021','2021-01-29','2021-03-26','0001571996-21-000007','9c2f9497-eaa6-4adc-bca8-de9681bfe420'),
+            ('FY2022','2022-01-28','2022-03-24','0001571996-22-000009','e8323060-4838-4901-b341-e6798bd367fb'),
+            ('FY2023','2023-02-03','2023-03-30','0001571996-23-000007','07a36fb6-fa9c-4942-a0bd-9a2289f47f66'),
+            ('FY2024','2024-02-02','2024-03-25','0001571996-24-000036',None),
+            ('FY2025','2025-01-31','2025-03-25','0001571996-25-000034','aff2706d-dcfd-4595-9076-f7f031140524'),
+          ]
+
+          def get(url, *, referer=None, pdf=False, attempts=3, timeout=(20,120)):
+            h=dict(HP if pdf else H)
+            if referer: h['Referer']=referer
+            last=None
+            for a in range(attempts):
+              try:
+                r=S.get(url,headers=h,timeout=timeout,allow_redirects=True)
+                if r.status_code==200: return r
+                last=RuntimeError(f'HTTP {r.status_code} {r.url}')
+              except Exception as e: last=e
+              time.sleep(a+1)
+            raise RuntimeError(f'{url}: {last!r}')
+
+          def validate(data, patterns, min_pages):
+            if not data.startswith(b'%PDF-'): raise RuntimeError('not PDF')
+            rd=PdfReader(BytesIO(data),strict=False); n=len(rd.pages)
+            if n<min_pages: raise RuntimeError(f'only {n} pages')
+            idx=list(range(min(12,n)))
+            if n>12: idx += [n//2,n-1]
+            text=''
+            for i in dict.fromkeys(idx):
+              try: text+=(rd.pages[i].extract_text() or '')+'\n'
+              except Exception: pass
+            text=re.sub(r'\s+',' ',text)
+            for p in patterns:
+              if not re.search(p,text,re.I): raise RuntimeError(f'missing {p}; sample={text[:1000]!r}')
+            return n,text
+
+          def discover_filing_pdf(accession):
+            page=f'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/{accession}'
+            r=get(page,attempts=2,timeout=(15,60))
+            soup=BeautifulSoup(r.text,'html.parser')
+            c=[]
+            for a in soup.find_all('a',href=True):
+              u=urljoin(r.url,a['href']); label=' '.join(a.get_text(' ',strip=True).split())
+              score=(100 if 'download pdf' in label.lower() else 0)+(60 if '/static-files/' in u else 0)+(30 if '.pdf' in u.lower() else 0)
+              if score: c.append((score,u))
+            for m in re.finditer(r'(?:https?://[^"\'<>\s]+)?/static-files/[0-9a-f-]{30,}',r.text,re.I): c.append((50,urljoin(r.url,m.group(0))))
+            for _,u in sorted(c,reverse=True):
+              try:
+                rr=get(u,referer=r.url,pdf=True,attempts=2,timeout=(20,90))
+                if rr.content.startswith(b'%PDF-') and len(rr.content)>100000: return rr.url,rr.content,'Dell Investor Relations'
+              except Exception as e: print('DISCOVER_FAIL',accession,u,repr(e),flush=True)
+            raise RuntimeError('no filing PDF')
+
+          manifest=[]; seen=set()
+          for fy,period,filing_date,accession,uuid in filings:
+            sources=[]
+            filing_page=f'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/{accession}'
+            if uuid: sources.append((f'https://investors.delltechnologies.com/static-files/{uuid}','Dell Investor Relations'))
+            # AnnualReports fallback is a public mirror of the filed annual report.
+            year=fy[-4:]
+            sources.append((f'https://www.annualreports.com/HostedData/AnnualReportArchive/d/NYSE_DELL_{year}.pdf','AnnualReports mirror of Dell filing'))
+            data=None; final_url=None; source_name=None; errors=[]
+            for u,sname in sources:
+              try:
+                r=get(u,referer=filing_page,pdf=True,attempts=3,timeout=(20,150))
+                n,_=validate(r.content,[r'Dell Technologies',r'Form\s+10-K'],90)
+                data=r.content; final_url=r.url; source_name=sname; break
+              except Exception as e: errors.append(f'{u}: {e!r}')
+            if data is None:
+              try:
+                final_url,data,source_name=discover_filing_pdf(accession)
+                n,_=validate(data,[r'Dell Technologies',r'Form\s+10-K'],90)
+              except Exception as e:
+                raise RuntimeError(f'{fy} failed: {errors}; discover={e!r}')
+            sha=hashlib.sha256(data).hexdigest()
+            if sha in seen: raise RuntimeError(f'duplicate {fy}')
+            seen.add(sha)
+            fn=f'Dell_Technologies_{fy}_Annual_Report_Form_10-K_period_ended_{period}_{n}p.pdf'
+            p=AD/fn; p.write_bytes(data)
+            q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+            if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+            subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','70',str(p),str(PRE/f'{fy}_first')],check=True,capture_output=True)
+            subprocess.run(['pdftoppm','-f',str(n),'-singlefile','-png','-r','70',str(p),str(PRE/f'{fy}_last')],check=True,capture_output=True)
+            rec={'category':'annual_report','fiscal_year':fy,'period_end':period,'filing_date':filing_date,'form':'10-K','accession':accession,'filename':fn,'pages':n,'bytes':len(data),'sha256':sha,'filing_page':filing_page,'source_pdf':final_url,'download_source':source_name}
+            manifest.append(rec); print('ANNUAL',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          # Discover current FY2027 Q2 documents from official Dell IR pages.
+          pages=[
+            'https://investors.delltechnologies.com/events/event-details/dell-technologies-fiscal-year-2027-second-quarter-results',
+            'https://investors.delltechnologies.com/financial-information/quarterly-results',
+            'https://investors.delltechnologies.com/',
+          ]
+          candidates=[]
+          for page in pages:
+            try:
+              r=get(page,attempts=3,timeout=(15,90)); soup=BeautifulSoup(r.text,'html.parser')
+              # Prefer document links near Q2 2027 / event title; all current event documents are acceptable candidates.
+              for a in soup.find_all('a',href=True):
+                label=' '.join(a.get_text(' ',strip=True).split()); u=urljoin(r.url,a['href'])
+                if re.search(r'Press Release|Financial Tables|Performance Review',label,re.I):
+                  candidates.append((label,u,r.url))
+              for m in re.finditer(r'(?:https?://[^"\'<>\s]+)?/static-files/[0-9a-f-]{30,}',r.text,re.I):
+                candidates.append(('embedded document',urljoin(r.url,m.group(0)),r.url))
+              print('Q2_PAGE',page,'candidates',len(candidates),flush=True)
+            except Exception as e: print('Q2_PAGE_FAIL',page,repr(e),flush=True)
+
+          # Try candidates and keep only PDFs that explicitly contain FY2027 and six-month data.
+          half_verified=[]; cand_seen=set()
+          for label,u,ref in candidates:
+            if u in cand_seen: continue
+            cand_seen.add(u)
+            try:
+              rr=get(u,referer=ref,pdf=True,attempts=2,timeout=(20,120)); b=rr.content
+              n,text=validate(b,[r'Dell Technologies',r'(Fiscal\s+2027|FY27|2027)',r'(Six Months|six-month|July\s+31,?\s+2026)'],2)
+              sha=hashlib.sha256(b).hexdigest()
+              if sha in seen: continue
+              seen.add(sha)
+              kind='Press_Release' if re.search('Press Release',label,re.I) else ('Financial_Tables' if re.search('Financial Tables',label,re.I) else 'Performance_Review')
+              fn=f'Dell_Technologies_FY2027_Q2_{kind}_six_months_ended_2026-07-31_{n}p.pdf'
+              p=HD/fn;p.write_bytes(b)
+              q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(q.stderr)
+              rec={'category':'latest_half_year_equivalent','fiscal_period':'FY2027 Q2 / six months ended 2026-07-31','publication_date':'2026-09-01','document_type':kind,'filename':fn,'pages':n,'bytes':len(b),'sha256':sha,'source_page':ref,'source_pdf':rr.url}
+              manifest.append(rec);half_verified.append(rec)
+              subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','70',str(p),str(PRE/f'Q2_{kind}_first')],check=True,capture_output=True)
+              subprocess.run(['pdftoppm','-f',str(n),'-singlefile','-png','-r','70',str(p),str(PRE/f'Q2_{kind}_last')],check=True,capture_output=True)
+              print('HALF',json.dumps(rec,ensure_ascii=False),flush=True)
+              if len(half_verified)>=3: break
+            except Exception as e: print('Q2_CAND_FAIL',label,u,repr(e),flush=True)
+
+          # Fallback: print the official SEC 8-K earnings exhibit to PDF if Dell's PDF CDN is unavailable.
+          if not half_verified:
+            from playwright.sync_api import sync_playwright
+            sec='https://www.sec.gov/Archives/edgar/data/1571996/000157199626000039/exhibit991earnings8kq2fy27.htm'
+            out=HD/'Dell_Technologies_FY2027_Q2_Official_SEC_8-K_Exhibit_99.1_six_months_ended_2026-07-31.pdf'
+            with sync_playwright() as pw:
+              browser=pw.chromium.launch(headless=True,executable_path='/usr/bin/google-chrome',args=['--no-sandbox','--disable-dev-shm-usage'])
+              pg=browser.new_page(user_agent=UA)
+              pg.goto(sec,wait_until='networkidle',timeout=120000)
+              pg.pdf(path=str(out),format='A4',print_background=True,margin={'top':'10mm','bottom':'10mm','left':'9mm','right':'9mm'})
+              browser.close()
+            b=out.read_bytes();n,text=validate(b,[r'Dell Technologies',r'(Fiscal\s+2027|FY27|2027)',r'(Six Months|July\s+31,?\s+2026)'],2)
+            sha=hashlib.sha256(b).hexdigest()
+            rec={'category':'latest_half_year_equivalent','fiscal_period':'FY2027 Q2 / six months ended 2026-07-31','publication_date':'2026-09-01','document_type':'SEC 8-K Exhibit 99.1 rendered from official HTML','filename':out.name,'pages':n,'bytes':len(b),'sha256':sha,'source_page':sec,'source_pdf':None}
+            manifest.append(rec);half_verified.append(rec);seen.add(sha)
+            print('HALF_FALLBACK',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          annual_count=sum(x['category']=='annual_report' for x in manifest)
+          half_count=sum(x['category']=='latest_half_year_equivalent' for x in manifest)
+          if annual_count!=6 or half_count<1: raise RuntimeError(f'counts annual={annual_count} half={half_count}')
+
+          lines=[
+            'Dell Technologies (NYSE: DELL) financial report package','',
+            f'Annual reports: {annual_count} official Form 10-K reports, FY2020 through FY2025.',
+            f'Latest half-year-equivalent documents: {half_count}, covering the six months ended July 31, 2026 (FY2027 Q2), published September 1, 2026.','',
+            'Dell fiscal-year labels are used. Dell follows a 52/53-week fiscal year ending on the Friday nearest January 31.','',
+            'A U.S. issuer does not normally issue a separately titled statutory half-year report. The FY2027 Q2 materials are Dell’s latest official six-month disclosure as of September 5, 2026.','',
+            'Validation: PDF header, page count, Dell/Form identity, qpdf structure, first/last page rendering, SHA-256, duplicate detection, and ZIP CRC.','',
+            'Inventory:'
+          ]
+          for i,x in enumerate(manifest,1):
+            lines += [f'{i}. {x.get("fiscal_year") or x.get("fiscal_period")} | {x["filename"]}',f'   Pages: {x["pages"]}; Source: {x.get("source_pdf") or x.get("source_page")}',f'   SHA-256: {x["sha256"]}']
+          (ROOT/'README_Report_List_and_Verification.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest),encoding='utf-8')
+
+          z=Path('Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year.zip')
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as f:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file(): f.write(p,arcname=str(p))
+          with zipfile.ZipFile(z) as f:
+            bad=f.testzip(); pdfs=[n for n in f.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=len(manifest): raise RuntimeError(f'ZIP bad={bad} pdfs={len(pdfs)} manifest={len(manifest)}')
+          summary={'annual_report_count':annual_count,'half_year_document_count':half_count,'total_pdf_count':len(manifest),'zip_name':z.name,'zip_bytes':z.stat().st_size,'zip_sha256':hashlib.sha256(z.read_bytes()).hexdigest(),'documents':manifest}
+          Path('summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps(summary,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-annuals-halfyear-package-20260905-v2
+          path: |
+            Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year/
+            Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year.zip
+            summary.json
+            _previews/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
