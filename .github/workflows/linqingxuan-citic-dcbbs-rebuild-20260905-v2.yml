@@ -1,0 +1,71 @@
+name: Rebuild full CITIC Lin Qingxuan report v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/linqingxuan-citic-dcbbs-rebuild-20260905-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download 23 public GIF pages, rebuild and validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+          python - <<'PY'
+          import hashlib,io,json,subprocess
+          from pathlib import Path
+          import img2pdf,requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          base='https://www.dcbbs.com/fileroot1/2023-8/7/c070bb1f-ab25-4cda-b6d8-853edcdaebad/c070bb1f-ab25-4cda-b6d8-853edcdaebad{page}.gif'
+          referer='https://m.dcbbs.com/p-183560.html'
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session();s.trust_env=False
+          work=Path('work');work.mkdir(exist_ok=True)
+          jpgs=[];page_hashes=[]
+          for page in range(1,24):
+            u=base.format(page=page)
+            r=s.get(u,headers={'User-Agent':ua,'Accept':'image/*,*/*','Referer':referer},timeout=(15,90),allow_redirects=True)
+            print('GET',page,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+            if r.status_code!=200 or len(r.content)<30000:raise RuntimeError(f'bad page {page}')
+            image=Image.open(io.BytesIO(r.content));image.load()
+            if image.size!=(920,1302):raise RuntimeError(f'bad dimensions page {page}: {image.size}')
+            h=hashlib.sha256(r.content).hexdigest()
+            if h in page_hashes:raise RuntimeError(f'duplicate page {page}')
+            page_hashes.append(h)
+            target=work/f'{page:03d}.jpg';image.convert('RGB').save(target,'JPEG',quality=95,subsampling=0,optimize=True,dpi=(150,150));jpgs.append(target)
+          out=Path('中信证券_林清轩_聚焦红山茶花以油护肤先行者_20220130_23页_完整公开影像版.pdf')
+          out.write_bytes(img2pdf.convert([str(p) for p in jpgs],layout_fun=img2pdf.get_fixed_dpi_layout_fun((150,150))))
+          reader=PdfReader(str(out),strict=False)
+          if len(reader.pages)!=23:raise RuntimeError('PDF page count mismatch')
+          q=subprocess.run(['qpdf','--check',str(out)],capture_output=True,text=True)
+          if q.returncode not in (0,3):raise RuntimeError(q.stderr)
+          for label,p in [('first',1),('last',23)]:
+            subprocess.run(['pdftoppm','-f',str(p),'-singlefile','-png','-r','90',str(out),f'preview_{label}'],check=True,capture_output=True)
+          meta={'institution':'中信证券','date':'2022-01-30','title':'林清轩：聚焦红山茶花，以油护肤先行者','pages':23,'bytes':out.stat().st_size,'sha256':hashlib.sha256(out.read_bytes()).hexdigest(),'source_page':referer,'source_format':'由公开逐页影像重建完整PDF'}
+          Path('metadata.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('VERIFIED',json.dumps(meta,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: linqingxuan-citic-report-20260905-v2
+          path: |
+            中信证券_林清轩_聚焦红山茶花以油护肤先行者_20220130_23页_完整公开影像版.pdf
+            metadata.json
+            preview_first.png
+            preview_last.png
+          if-no-files-found: error
+          retention-days: 10
+          compression-level: 0
