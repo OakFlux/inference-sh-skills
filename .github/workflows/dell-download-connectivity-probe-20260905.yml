@@ -1,0 +1,30 @@
+name: Probe Dell and SEC download connectivity
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-download-connectivity-probe-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe URLs
+        shell: bash
+        run: |
+          set -x
+          date -u
+          for url in \
+            'https://investors.delltechnologies.com/static-files/cff5c8fc-e2a6-4d62-9a54-5ad279baa2f5' \
+            'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/0001571996-20-000017' \
+            'https://www.sec.gov/Archives/edgar/data/1571996/000157199620000017/0001571996-20-000017-index.html'; do
+            echo "=== $url"
+            curl -L -A 'OpenAI research assistant contact research@example.com' --connect-timeout 8 --max-time 20 -sS -o /tmp/probe.bin -w 'status=%{http_code} type=%{content_type} bytes=%{size_download} time=%{time_total} final=%{url_effective}\n' "$url" || true
+            head -c 24 /tmp/probe.bin | xxd || true
+          done
+          date -u
