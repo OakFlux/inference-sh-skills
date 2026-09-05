@@ -1,0 +1,130 @@
+name: Fast package Dell FY2020-FY2025 annuals and latest six-month report
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-annuals-halfyear-package-20260905-v3-fast.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Build verified package from public filing PDFs and SEC exhibit
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf playwright
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib,json,re,subprocess,zipfile
+          from io import BytesIO
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+          from playwright.sync_api import sync_playwright
+
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          S=requests.Session();S.trust_env=False
+          ROOT=Path('Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year')
+          AD=ROOT/'Annual_Reports_FY2020-FY2025';HD=ROOT/'Latest_Half-Year_FY2027_Q2'
+          PRE=Path('_previews')
+          AD.mkdir(parents=True,exist_ok=True);HD.mkdir(parents=True,exist_ok=True);PRE.mkdir(exist_ok=True)
+          info=[
+            ('FY2020','2020','2020-01-31','2020-03-27','0001571996-20-000017'),
+            ('FY2021','2021','2021-01-29','2021-03-26','0001571996-21-000007'),
+            ('FY2022','2022','2022-01-28','2022-03-24','0001571996-22-000009'),
+            ('FY2023','2023','2023-02-03','2023-03-30','0001571996-23-000007'),
+            ('FY2024','2024','2024-02-02','2024-03-25','0001571996-24-000036'),
+            ('FY2025','2025','2025-01-31','2025-03-25','0001571996-25-000034'),
+          ]
+          manifest=[];seen=set()
+
+          def pdf_info(b,min_pages=2):
+            if not b.startswith(b'%PDF-'): raise RuntimeError('not PDF')
+            rd=PdfReader(BytesIO(b),strict=False);n=len(rd.pages)
+            if n<min_pages: raise RuntimeError(f'{n} pages')
+            text=''
+            idx=list(range(min(10,n)))+[n//2,n-1]
+            for i in dict.fromkeys(idx):
+              try:text+=(rd.pages[i].extract_text() or '')+'\n'
+              except:pass
+            return n,re.sub(r'\s+',' ',text)
+
+          for fy,yr,period,fd,acc in info:
+            u=f'https://www.annualreports.com/HostedData/AnnualReportArchive/d/NYSE_DELL_{yr}.pdf'
+            r=S.get(u,headers={'User-Agent':UA,'Accept':'application/pdf,*/*','Referer':'https://www.annualreports.com/'},timeout=(20,120),allow_redirects=True)
+            r.raise_for_status();b=r.content;n,text=pdf_info(b,90)
+            if not re.search(r'Dell Technologies',text,re.I) or not re.search(r'Form\s+10-K',text,re.I):raise RuntimeError(f'{fy} identity failure')
+            sha=hashlib.sha256(b).hexdigest()
+            if sha in seen:raise RuntimeError(f'duplicate {fy}')
+            seen.add(sha)
+            fn=f'Dell_Technologies_{fy}_Annual_Report_Form_10-K_period_ended_{period}_{n}p.pdf'
+            p=AD/fn;p.write_bytes(b)
+            q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+            if q.returncode not in (0,3):raise RuntimeError(q.stderr)
+            subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','60',str(p),str(PRE/f'{fy}_first')],check=True,capture_output=True)
+            subprocess.run(['pdftoppm','-f',str(n),'-singlefile','-png','-r','60',str(p),str(PRE/f'{fy}_last')],check=True,capture_output=True)
+            rec={'category':'annual_report','fiscal_year':fy,'period_end':period,'filing_date':fd,'form':'10-K','accession':acc,'filename':fn,'pages':n,'bytes':len(b),'sha256':sha,'official_filing_page':f'https://investors.delltechnologies.com/sec-filings/sec-filing/10-k/{acc}','download_source':r.url,'source_note':'Public PDF mirror of the filed Dell annual report'}
+            manifest.append(rec);print('ANNUAL',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          # Render official SEC-filed earnings exhibit 99.1, which contains the six-month tables.
+          sec='https://www.sec.gov/Archives/edgar/data/1571996/000157199626000039/exhibit991earnings8kq2fy27.htm'
+          q2=HD/'Dell_Technologies_FY2027_Q2_Official_SEC_8-K_Exhibit_99.1_six_months_ended_2026-07-31.pdf'
+          with sync_playwright() as pw:
+            browser=pw.chromium.launch(headless=True,executable_path='/usr/bin/google-chrome',args=['--no-sandbox','--disable-dev-shm-usage'])
+            page=browser.new_page(user_agent=UA,viewport={'width':1440,'height':1200})
+            page.goto(sec,wait_until='domcontentloaded',timeout=120000)
+            page.wait_for_timeout(1500)
+            page.pdf(path=str(q2),format='A4',print_background=True,prefer_css_page_size=True,margin={'top':'8mm','bottom':'8mm','left':'7mm','right':'7mm'})
+            browser.close()
+          b=q2.read_bytes();n,text=pdf_info(b,2)
+          for pat in [r'Dell Technologies',r'(Fiscal\s+2027|FY27|2027)',r'(Six Months|July\s+31,?\s+2026)']:
+            if not re.search(pat,text,re.I):raise RuntimeError(f'Q2 missing {pat}')
+          sha=hashlib.sha256(b).hexdigest();seen.add(sha)
+          q=subprocess.run(['qpdf','--check',str(q2)],capture_output=True,text=True)
+          if q.returncode not in (0,3):raise RuntimeError(q.stderr)
+          subprocess.run(['pdftoppm','-f','1','-singlefile','-png','-r','60',str(q2),str(PRE/'Q2_first')],check=True,capture_output=True)
+          subprocess.run(['pdftoppm','-f',str(n),'-singlefile','-png','-r','60',str(q2),str(PRE/'Q2_last')],check=True,capture_output=True)
+          rec={'category':'latest_half_year_equivalent','fiscal_period':'FY2027 Q2 / six months ended 2026-07-31','publication_date':'2026-09-01','document_type':'Official SEC Form 8-K Exhibit 99.1, rendered from filed HTML','filename':q2.name,'pages':n,'bytes':len(b),'sha256':sha,'official_source':sec}
+          manifest.append(rec);print('HALF',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          lines=['Dell Technologies (NYSE: DELL) official financial report package','',
+          'Includes FY2020-FY2025 annual reports (six Form 10-K PDFs) and the latest official six-month disclosure for FY2027 Q2, covering the six months ended July 31, 2026.','',
+          'Dell fiscal-year labels are used. A U.S. issuer generally has no separately titled statutory half-year report; the second-quarter filing and earnings exhibit provide the cumulative six-month figures.','',
+          'Annual PDFs are public mirrors of the filed Dell annual reports, linked to their Dell Investor Relations/SEC accession records. The latest half-year PDF was rendered directly from Dell’s official SEC-filed Exhibit 99.1 HTML.','',
+          'Checks: PDF header, page count, company/form identity, qpdf structure, first/last-page rendering, duplicate detection, SHA-256 and ZIP CRC.','', 'Inventory:']
+          for i,x in enumerate(manifest,1):
+            lines += [f'{i}. {x.get("fiscal_year") or x.get("fiscal_period")} | {x["filename"]} | {x["pages"]} pages',f'   SHA-256: {x["sha256"]}']
+          (ROOT/'README_Report_List_and_Verification.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (ROOT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest),encoding='utf-8')
+          z=Path('Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year.zip')
+          with zipfile.ZipFile(z,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as f:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file():f.write(p,arcname=str(p))
+          with zipfile.ZipFile(z) as f:
+            bad=f.testzip();pdfs=[n for n in f.namelist() if n.lower().endswith('.pdf')]
+            if bad or len(pdfs)!=7:raise RuntimeError(f'bad={bad} pdf_count={len(pdfs)}')
+          summary={'annual_report_count':6,'half_year_document_count':1,'total_pdf_count':7,'zip_name':z.name,'zip_bytes':z.stat().st_size,'zip_sha256':hashlib.sha256(z.read_bytes()).hexdigest(),'documents':manifest}
+          Path('summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL',json.dumps(summary,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-annuals-halfyear-package-20260905-v3-fast
+          path: |
+            Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year/
+            Dell_Technologies_FY2020-FY2025_Annual_Reports_and_Latest_Half-Year.zip
+            summary.json
+            _previews/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
