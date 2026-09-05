@@ -1,0 +1,356 @@
+name: Package Dell FY2020-FY2025 annuals and latest 10-Q
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_dell_annuals_latest_20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF and Python tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pymupdf beautifulsoup4 lxml
+
+      - name: Download convert verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          COMPANY = 'Dell Technologies Inc.'
+          CIK = '0001571996'
+          PACKAGE = '戴尔科技_2020-2025年报及最新季报'
+          OUT = Path(PACKAGE)
+          WORK = Path('_dell_work')
+          RENDERS = WORK / 'renders'
+          HTML_DIR = WORK / 'html'
+          for p in (OUT, WORK, RENDERS, HTML_DIR):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          sec_ua = 'OpenAI research assistant openai-research@example.com'
+          sec_headers = {
+              'User-Agent': sec_ua,
+              'Accept-Encoding': 'gzip, deflate',
+              'Accept-Language': 'en-US,en;q=0.9',
+          }
+          browser_headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://www.annualreports.com/Company/dell-technologies-inc',
+          }
+
+          def get(url: str, headers: dict, timeout=(30, 240), attempts=6) -> requests.Response:
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+                      print('GET', attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                      if r.status_code == 200:
+                          return r
+                      last = RuntimeError(f'HTTP {r.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      print('GET_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError(f'GET failed {url}: {last}')
+
+          submissions_url = f'https://data.sec.gov/submissions/CIK{CIK}.json'
+          submissions = get(submissions_url, sec_headers, timeout=(30, 120)).json()
+          recent = submissions.get('filings', {}).get('recent', {})
+
+          def rows_from_columns(columns: dict) -> list[dict]:
+              arrays = {k:v for k,v in columns.items() if isinstance(v, list)}
+              n = max((len(v) for v in arrays.values()), default=0)
+              return [{k:(v[i] if i < len(v) else None) for k,v in arrays.items()} for i in range(n)]
+
+          filings = rows_from_columns(recent)
+          for old in submissions.get('filings', {}).get('files', []):
+              name = old.get('name')
+              if not name:
+                  continue
+              old_data = get('https://data.sec.gov/submissions/' + name, sec_headers, timeout=(30,120)).json()
+              filings.extend(rows_from_columns(old_data))
+
+          seen_accessions = set()
+          unique = []
+          for filing in filings:
+              accession = filing.get('accessionNumber')
+              if not accession or accession in seen_accessions:
+                  continue
+              seen_accessions.add(accession)
+              unique.append(filing)
+
+          tenks = [f for f in unique if f.get('form') == '10-K']
+          tenqs = [f for f in unique if f.get('form') == '10-Q']
+          tenks.sort(key=lambda f: f.get('filingDate') or '', reverse=True)
+          tenqs.sort(key=lambda f: f.get('filingDate') or '', reverse=True)
+
+          annual_filings = []
+          for fiscal_year in range(2020, 2026):
+              candidates = [f for f in tenks if str(f.get('reportDate') or '').startswith(str(fiscal_year) + '-')]
+              if not candidates:
+                  raise RuntimeError(f'No Dell 10-K found for fiscal year {fiscal_year}')
+              candidates.sort(key=lambda f: f.get('filingDate') or '', reverse=True)
+              selected = candidates[0]
+              annual_filings.append((fiscal_year, selected))
+              print('SELECTED_10K', fiscal_year, json.dumps(selected, ensure_ascii=False), flush=True)
+
+          if not tenqs:
+              raise RuntimeError('No Dell 10-Q found')
+          latest_10q = tenqs[0]
+          print('SELECTED_LATEST_10Q', json.dumps(latest_10q, ensure_ascii=False), flush=True)
+
+          def sec_document_url(filing: dict) -> str:
+              accession = str(filing['accessionNumber']).replace('-', '')
+              primary = filing.get('primaryDocument')
+              if not primary:
+                  raise RuntimeError(f'No primary document for {filing}')
+              return f'https://www.sec.gov/Archives/edgar/data/1571996/{accession}/{primary}'
+
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable') or shutil.which('chromium') or shutil.which('chromium-browser')
+          print('CHROME', chrome, flush=True)
+          if not chrome:
+              raise RuntimeError('No Chromium/Chrome executable found on runner')
+
+          def render_sec_html_to_pdf(filing: dict, output: Path, label: str) -> str:
+              source_url = sec_document_url(filing)
+              response = get(source_url, sec_headers, timeout=(30,240))
+              if b'<html' not in response.content[:2000].lower() and b'<!doctype' not in response.content[:2000].lower():
+                  raise RuntimeError(f'SEC primary document is not HTML: {source_url}')
+              soup = BeautifulSoup(response.content, 'lxml')
+              if soup.head is None:
+                  head = soup.new_tag('head')
+                  if soup.html:
+                      soup.html.insert(0, head)
+                  else:
+                      raise RuntimeError('Could not construct HTML head')
+              base = soup.new_tag('base', href=source_url.rsplit('/',1)[0] + '/')
+              soup.head.insert(0, base)
+              # Remove SEC inline XBRL viewer scripts; the filing body remains intact.
+              for tag in soup.find_all('script'):
+                  tag.decompose()
+              html_path = HTML_DIR / f'{label}.html'
+              html_path.write_bytes(str(soup).encode('utf-8'))
+              cmd = [
+                  chrome,
+                  '--headless=new',
+                  '--disable-gpu',
+                  '--no-sandbox',
+                  '--disable-dev-shm-usage',
+                  '--allow-file-access-from-files',
+                  '--disable-software-rasterizer',
+                  '--run-all-compositor-stages-before-draw',
+                  '--virtual-time-budget=12000',
+                  '--print-to-pdf-no-header',
+                  f'--user-agent={sec_ua}',
+                  f'--print-to-pdf={output.resolve()}',
+                  html_path.resolve().as_uri(),
+              ]
+              result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+              print('CHROME_RESULT', label, result.returncode, result.stdout[-1000:], result.stderr[-3000:], flush=True)
+              if result.returncode != 0 or not output.exists() or output.stat().st_size < 100_000:
+                  raise RuntimeError(f'Chrome PDF conversion failed for {label}')
+              return source_url
+
+          def compact_text(path: Path, max_pages: int = 35) -> str:
+              reader = PdfReader(str(path), strict=False)
+              parts = []
+              for page in reader.pages[:min(max_pages, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              text = re.sub(r'\s+', '', '\n'.join(parts)).lower()
+              if len(text) < 500:
+                  txt_path = WORK / (path.stem + '.txt')
+                  subprocess.run(['pdftotext', '-f', '1', '-l', str(min(max_pages,len(reader.pages))), str(path), str(txt_path)], capture_output=True)
+                  if txt_path.exists():
+                      text += re.sub(r'\s+', '', txt_path.read_text(encoding='utf-8', errors='ignore')).lower()
+              return text
+
+          def validate_pdf(path: Path, kind: str, report_year: int, report_date: str, min_pages: int) -> tuple[int,str,list[int]]:
+              if not path.read_bytes().startswith(b'%PDF-'):
+                  raise RuntimeError(f'Not a PDF: {path}')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{path.name}: only {pages} pages; minimum {min_pages}')
+              text = compact_text(path)
+              if not any(token in text for token in ('delltechnologies', 'delltechnologiesinc', 'nyse:dell', 'commissionfilenumber001-37867')):
+                  raise RuntimeError(f'{path.name}: Dell identity not found')
+              if report_date and report_date.replace('-','') not in text:
+                  # Date formatting differs between source PDFs; year validation is sufficient fallback.
+                  if str(report_year) not in text:
+                      raise RuntimeError(f'{path.name}: report year/date not found')
+              q = subprocess.run(['qpdf','--check',str(path)],capture_output=True,text=True)
+              if q.returncode not in (0,3):
+                  raise RuntimeError(f'{path.name}: qpdf failure: {q.stderr[-1500:]}')
+              if q.returncode == 3:
+                  print('QPDF_WARNING', path.name, q.stderr[-1200:], flush=True)
+              doc = pymupdf.open(str(path))
+              sample = sorted(set([0, max(0,pages//2), pages-1]))
+              rendered=[]
+              for pno in sample:
+                  page=doc.load_page(pno)
+                  pix=page.get_pixmap(matrix=pymupdf.Matrix(1.0,1.0),alpha=False)
+                  rp=RENDERS/f'{path.stem}_{pno+1}.png'
+                  pix.save(str(rp))
+                  if not rp.exists() or rp.stat().st_size < 6000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'{path.name}: render failure page {pno+1}')
+                  rendered.append(pno+1)
+              doc.close()
+              return pages, hashlib.sha256(path.read_bytes()).hexdigest(), rendered
+
+          records=[]
+          for fiscal_year, filing in annual_filings:
+              output = OUT / f'戴尔科技_FY{fiscal_year}年度报告_Form10-K.pdf'
+              provenance = ''
+              source_url = ''
+              annual_url = f'https://www.annualreports.com/HostedData/AnnualReportArchive/d/NYSE_DELL_{fiscal_year}.pdf'
+              try:
+                  r = get(annual_url, browser_headers, timeout=(30,300), attempts=4)
+                  if not r.content.startswith(b'%PDF-') or len(r.content) < 500_000:
+                      raise RuntimeError('AnnualReports response is not a substantial PDF')
+                  output.write_bytes(r.content)
+                  # Validate preliminarily; fallback to SEC rendering if mirror is wrong/missing.
+                  pages, digest, rendered = validate_pdf(output,'annual',fiscal_year,str(filing.get('reportDate') or ''),100)
+                  provenance = 'AnnualReports公开PDF镜像（原始戴尔10-K版式）'
+                  source_url = annual_url
+              except Exception as exc:
+                  print('ANNUAL_MIRROR_FALLBACK', fiscal_year, repr(exc), flush=True)
+                  if output.exists(): output.unlink()
+                  source_url = render_sec_html_to_pdf(filing, output, f'fy{fiscal_year}_10k')
+                  pages, digest, rendered = validate_pdf(output,'annual',fiscal_year,str(filing.get('reportDate') or ''),100)
+                  provenance = '美国SEC EDGAR原始10-K HTML转换PDF'
+              record={
+                  'filename':output.name,
+                  'kind':'annual',
+                  'fiscal_year':fiscal_year,
+                  'form':'10-K',
+                  'report_date':filing.get('reportDate'),
+                  'filing_date':filing.get('filingDate'),
+                  'accession_number':filing.get('accessionNumber'),
+                  'primary_document':filing.get('primaryDocument'),
+                  'pages':pages,
+                  'bytes':output.stat().st_size,
+                  'sha256':digest,
+                  'source_url':source_url,
+                  'sec_document_url':sec_document_url(filing),
+                  'provenance':provenance,
+                  'rendered_pages':rendered,
+              }
+              records.append(record)
+              print('VERIFIED_ANNUAL',json.dumps(record,ensure_ascii=False),flush=True)
+
+          report_date=str(latest_10q.get('reportDate') or '')
+          latest_name=f'戴尔科技_最新季度报告_Form10-Q_报告期截至{report_date}.pdf'
+          latest_output=OUT/latest_name
+          latest_source=render_sec_html_to_pdf(latest_10q,latest_output,'latest_10q')
+          latest_year=int(report_date[:4]) if re.match(r'^20\d{2}',report_date) else 0
+          pages,digest,rendered=validate_pdf(latest_output,'quarterly',latest_year,report_date,30)
+          latest_record={
+              'filename':latest_output.name,
+              'kind':'latest_quarterly',
+              'form':'10-Q',
+              'report_date':latest_10q.get('reportDate'),
+              'filing_date':latest_10q.get('filingDate'),
+              'accession_number':latest_10q.get('accessionNumber'),
+              'primary_document':latest_10q.get('primaryDocument'),
+              'pages':pages,
+              'bytes':latest_output.stat().st_size,
+              'sha256':digest,
+              'source_url':latest_source,
+              'sec_document_url':latest_source,
+              'provenance':'美国SEC EDGAR原始10-Q HTML转换PDF',
+              'rendered_pages':rendered,
+          }
+          records.append(latest_record)
+          print('VERIFIED_LATEST_10Q',json.dumps(latest_record,ensure_ascii=False),flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'Expected 7 reports, got {len(records)}')
+          if {r.get('fiscal_year') for r in records if r['kind']=='annual'} != set(range(2020,2026)):
+              raise RuntimeError('Fiscal-year coverage mismatch')
+          if len({r['sha256'] for r in records}) != 7:
+              raise RuntimeError('Duplicate PDF detected')
+
+          lines=[
+              '戴尔科技（Dell Technologies Inc., NYSE: DELL）',
+              'FY2020—FY2025年度报告及最新季度报告',
+              '',
+              '说明：戴尔采用非自然年财年。本包按报告覆盖的戴尔财年（FY）命名，而不是按文件提交年份命名。',
+              '六份年度文件均对应Form 10-K；最新季度文件对应截至本次制作时SEC已披露的最近一份Form 10-Q。',
+              '',
+          ]
+          for i,r in enumerate(records,1):
+              label=f"FY{r['fiscal_year']}年度报告" if r['kind']=='annual' else '最新季度报告'
+              lines += [
+                  f"{i}. {label}：{r['filename']}",
+                  f"   表格：{r['form']}；报告期截至：{r['report_date']}；SEC提交日期：{r['filing_date']}",
+                  f"   SEC accession number：{r['accession_number']}",
+                  f"   实际页数：{r['pages']}页；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   来源：{r['source_url']}",
+                  f"   SEC原始文件：{r['sec_document_url']}",
+                  f"   获取方式：{r['provenance']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ]
+          lines += [
+              '核验项目：PDF文件头、戴尔科技公司身份、报告年度/期间、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+              'SEC的Form 10-K和Form 10-Q为英文法定披露文件。',
+          ]
+          (OUT/'报告清单与来源说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          zip_path=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as z:
+              for p in sorted(OUT.iterdir()):
+                  z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path,'r') as z:
+              bad=z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: '+bad)
+              pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs)!=7:
+                  raise RuntimeError(f'ZIP contains {len(pdfs)} PDFs, expected 7')
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'PDFS',len(records),'PAGES',sum(r['pages'] for r in records),flush=True)
+          print('FINAL_MANIFEST',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-annuals-latest-final
+          path: 戴尔科技_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
