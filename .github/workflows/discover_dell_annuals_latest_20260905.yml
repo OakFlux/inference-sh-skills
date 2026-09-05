@@ -1,0 +1,125 @@
+name: Discover Dell annual reports and latest 10-Q 20260905
+
+on:
+  push:
+    paths:
+      - '.github/workflows/discover_dell_annuals_latest_20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf beautifulsoup4 lxml
+
+      - name: Discover SEC filings and PDF sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          out=Path('dell-discovery'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          sec_headers={
+              'User-Agent':'OpenAI research assistant openai-research@example.com',
+              'Accept-Encoding':'gzip, deflate',
+              'Host':'data.sec.gov',
+          }
+          sec_url='https://data.sec.gov/submissions/CIK0001571996.json'
+          r=s.get(sec_url,headers=sec_headers,timeout=(30,120))
+          print('SEC_SUBMISSIONS',r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+          r.raise_for_status()
+          data=r.json()
+          (out/'submissions.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+          recent=data.get('filings',{}).get('recent',{})
+          rows=[]
+          n=len(recent.get('accessionNumber',[]))
+          for i in range(n):
+              row={k:(v[i] if isinstance(v,list) and i<len(v) else None) for k,v in recent.items()}
+              if row.get('form') in ('10-K','10-Q'):
+                  rows.append(row)
+          print('RECENT_10K_10Q_COUNT',len(rows),flush=True)
+          for row in rows[:40]: print('SEC_ROW',json.dumps(row,ensure_ascii=False),flush=True)
+          (out/'recent_10k_10q.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Pull older submissions files when needed.
+          older=[]
+          for f in data.get('filings',{}).get('files',[]):
+              name=f.get('name')
+              if not name: continue
+              u='https://data.sec.gov/submissions/'+name
+              rr=s.get(u,headers=sec_headers,timeout=(30,120))
+              print('SEC_OLDER',name,rr.status_code,len(rr.content),flush=True)
+              if rr.status_code==200:
+                  obj=rr.json(); older.append({'name':name,'data':obj})
+                  forms=obj.get('form',[])
+                  for i,form in enumerate(forms):
+                      if form in ('10-K','10-Q'):
+                          row={k:(v[i] if isinstance(v,list) and i<len(v) else None) for k,v in obj.items()}
+                          rows.append(row)
+              time.sleep(.1)
+          (out/'older.json').write_text(json.dumps(older,ensure_ascii=False,indent=2),encoding='utf-8')
+          all_unique=[]; seen=set()
+          for row in rows:
+              acc=row.get('accessionNumber')
+              if not acc or acc in seen: continue
+              seen.add(acc); all_unique.append(row)
+          all_unique.sort(key=lambda x:x.get('filingDate') or '',reverse=True)
+          (out/'all_10k_10q.json').write_text(json.dumps(all_unique,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('ALL_10K_10Q')
+          for row in all_unique[:80]: print(json.dumps(row,ensure_ascii=False),flush=True)
+
+          # Probe AnnualReports PDF mirrors for fiscal 2020-2025.
+          probes=[]
+          pdf_headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept':'application/pdf,*/*','Referer':'https://www.annualreports.com/Company/dell-technologies-inc'}
+          for year in range(2020,2026):
+              candidates=[
+                  f'https://www.annualreports.com/HostedData/AnnualReportArchive/d/NYSE_DELL_{year}.pdf',
+                  f'https://www.annualreports.com/HostedData/AnnualReports/PDF/NYSE_DELL_{year}.pdf',
+              ]
+              for u in candidates:
+                  rec={'year':year,'url':u}
+                  try:
+                      rr=s.get(u,headers=pdf_headers,timeout=(30,180),allow_redirects=True)
+                      rec.update({'status':rr.status_code,'bytes':len(rr.content),'final_url':str(rr.url),'content_type':rr.headers.get('content-type')})
+                      if rr.status_code==200 and rr.content.startswith(b'%PDF-'):
+                          p=out/f'annualreports_{year}.pdf'; p.write_bytes(rr.content)
+                          reader=PdfReader(str(p),strict=False)
+                          rec['pages']=len(reader.pages)
+                          text=''
+                          for pg in reader.pages[:min(8,len(reader.pages))]:
+                              try:text+='\n'+(pg.extract_text() or '')
+                              except Exception:pass
+                          compact=re.sub(r'\s+','',text).lower()
+                          rec['identity_ok']=any(x in compact for x in ('delltechnologies','dellinc','nyse:dell','1571996'))
+                          rec['year_ok']=str(year) in compact
+                          print('ANNUAL_PDF',json.dumps(rec,ensure_ascii=False),flush=True)
+                          break
+                      else:
+                          print('ANNUAL_PROBE_FAIL',json.dumps(rec,ensure_ascii=False),flush=True)
+                  except Exception as exc:
+                      rec['error']=repr(exc); print('ANNUAL_PROBE_ERROR',json.dumps(rec,ensure_ascii=False),flush=True)
+                  probes.append(rec)
+              else:
+                  continue
+              probes.append(rec)
+          (out/'annual_pdf_probes.json').write_text(json.dumps(probes,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+      - name: Upload discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-discovery-20260905
+          path: dell-discovery/
+          if-no-files-found: error
+          retention-days: 7
