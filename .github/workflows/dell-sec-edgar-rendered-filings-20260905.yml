@@ -1,0 +1,335 @@
+name: Package Dell filings from SEC EDGAR as verified PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-sec-edgar-rendered-filings-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf
+          google-chrome --version || google-chrome-stable --version
+
+      - name: Fetch SEC filings render PDFs validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, urlparse
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '戴尔科技_2020-2025财年年报及最新季报'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+          WORK = Path('_dell_sec_render_work')
+          SOURCES = WORK / 'sources'
+          RENDERS = WORK / 'renders'
+          SOURCES.mkdir(parents=True, exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          SEC_BASE = 'https://www.sec.gov'
+          CIK = '1571996'
+          CONTACT_UA = 'OpenAI Research Assistant research-contact@example.com Dell filing archival task'
+          BROWSER_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36 OpenAIResearch/1.0'
+
+          specs = [
+              {'kind':'10-K','fy':2020,'period':'2020-01-31','filed':'2020-03-27','accession':'0001571996-20-000017','filename':'01_戴尔科技_FY2020年报_10-K_截至2020-01-31.pdf','min_pages':120},
+              {'kind':'10-K','fy':2021,'period':'2021-01-29','filed':'2021-03-26','accession':'0001571996-21-000007','filename':'02_戴尔科技_FY2021年报_10-K_截至2021-01-29.pdf','min_pages':120},
+              {'kind':'10-K','fy':2022,'period':'2022-01-28','filed':'2022-03-24','accession':'0001571996-22-000009','filename':'03_戴尔科技_FY2022年报_10-K_截至2022-01-28.pdf','min_pages':120},
+              {'kind':'10-K','fy':2023,'period':'2023-02-03','filed':'2023-03-30','accession':'0001571996-23-000007','filename':'04_戴尔科技_FY2023年报_10-K_截至2023-02-03.pdf','min_pages':120},
+              {'kind':'10-K','fy':2024,'period':'2024-02-02','filed':'2024-03-25','accession':'0001571996-24-000036','filename':'05_戴尔科技_FY2024年报_10-K_截至2024-02-02.pdf','min_pages':120},
+              {'kind':'10-K','fy':2025,'period':'2025-01-31','filed':'2025-03-25','accession':'0001571996-25-000034','filename':'06_戴尔科技_FY2025年报_10-K_截至2025-01-31.pdf','min_pages':120},
+              {'kind':'10-Q','fy':2027,'quarter':'Q1','period':'2026-05-01','filed':'2026-06-09','accession':'0001571996-26-000030','filename':'07_最新正式季报_戴尔科技_FY2027_Q1_10-Q_截至2026-05-01.pdf','min_pages':55},
+          ]
+
+          q2_supplement = {
+              'kind':'EX-99.1','fy':2027,'quarter':'Q2','period':'2026-07-31','filed':'2026-09-01',
+              'accession':'0001571996-26-000039',
+              'filename':'08_最新业绩补充_戴尔科技_FY2027_Q2_8-K附件99.1_截至2026-07-31.pdf',
+              'min_pages':3,
+          }
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': CONTACT_UA,
+              'Accept-Encoding': 'gzip, deflate',
+              'Host': 'www.sec.gov',
+              'Accept-Language': 'en-US,en;q=0.9',
+          })
+
+          def accession_compact(accession: str) -> str:
+              return accession.replace('-', '')
+
+          def index_url(accession: str) -> str:
+              compact = accession_compact(accession)
+              return f'{SEC_BASE}/Archives/edgar/data/{CIK}/{compact}/{accession}-index.html'
+
+          def get(url: str, attempts: int = 6, timeout=(20, 120)) -> requests.Response:
+              last = None
+              for attempt in range(1, attempts + 1):
+                  try:
+                      response = session.get(url, timeout=timeout, allow_redirects=True)
+                      print('SEC_GET', attempt, response.status_code, len(response.content), response.url, response.headers.get('content-type'), flush=True)
+                      if response.status_code == 200:
+                          return response
+                      last = RuntimeError(f'HTTP {response.status_code}')
+                  except Exception as exc:
+                      last = exc
+                      print('SEC_GET_ERROR', attempt, url, repr(exc), flush=True)
+                  time.sleep(min(attempt * 1.5, 8))
+              raise RuntimeError(f'Unable to retrieve {url}: {last}')
+
+          def discover_document(spec: dict) -> tuple[str, str]:
+              idx = index_url(spec['accession'])
+              response = get(idx)
+              soup = BeautifulSoup(response.text, 'lxml')
+              matches = []
+              for row in soup.select('table.tableFile tr'):
+                  cells = row.find_all('td')
+                  if len(cells) < 4:
+                      continue
+                  doc_type = ' '.join(cells[3].get_text(' ', strip=True).split()).upper()
+                  anchor = cells[2].find('a', href=True)
+                  if anchor is None:
+                      continue
+                  document_name = ' '.join(anchor.get_text(' ', strip=True).split())
+                  href = urljoin(str(response.url), anchor['href'])
+                  target = spec['kind'].upper()
+                  if target in ('10-K','10-Q') and doc_type == target:
+                      matches.append((href, document_name, doc_type))
+                  elif target == 'EX-99.1' and doc_type in ('EX-99.1','EX-99','99.1'):
+                      matches.append((href, document_name, doc_type))
+              if not matches:
+                  # Flexible fallback: inspect all document rows for target text.
+                  for row in soup.select('table.tableFile tr'):
+                      text = ' '.join(row.get_text(' ', strip=True).split()).upper()
+                      anchor = row.find('a', href=True)
+                      if anchor and spec['kind'].upper() in text:
+                          matches.append((urljoin(str(response.url), anchor['href']), anchor.get_text(' ', strip=True), spec['kind'].upper()))
+              if not matches:
+                  raise RuntimeError(f"No {spec['kind']} document found in {idx}")
+              selected = matches[0]
+              print('SEC_DOCUMENT', spec['accession'], json.dumps({'url':selected[0],'name':selected[1],'type':selected[2]}, ensure_ascii=False), flush=True)
+              return selected[0], selected[1]
+
+          def prepare_local_html(document_url: str, label: str) -> Path:
+              response = get(document_url, attempts=5, timeout=(20, 180))
+              content_type = response.headers.get('content-type','').lower()
+              if 'html' not in content_type and not response.content.lstrip().startswith((b'<!DOCTYPE', b'<html', b'<?xml')):
+                  raise RuntimeError(f'Primary document is not HTML: {document_url}, {content_type}')
+              text = response.content.decode(response.encoding or 'utf-8', errors='replace')
+              base_href = document_url.rsplit('/',1)[0] + '/'
+              base_tag = f'<base href="{base_href}">'
+              if re.search(r'<head\b[^>]*>', text, re.I):
+                  text = re.sub(r'(<head\b[^>]*>)', r'\1' + base_tag, text, count=1, flags=re.I)
+              else:
+                  text = base_tag + text
+              # Hide interactive inline-XBRL controls that can cover printed content.
+              hide_css = '<style>ix\:header, ix-header, #ixvHeader, .ixv-header, .navbar, .modal-backdrop {display:none !important;} body{background:white !important;}</style>'
+              if re.search(r'</head>', text, re.I):
+                  text = re.sub(r'</head>', hide_css + '</head>', text, count=1, flags=re.I)
+              else:
+                  text = hide_css + text
+              path = SOURCES / f'{label}.html'
+              path.write_text(text, encoding='utf-8')
+              return path
+
+          chrome = shutil.which('google-chrome') or shutil.which('google-chrome-stable')
+          if not chrome:
+              raise RuntimeError('Google Chrome not available on runner')
+
+          def print_pdf(local_html: Path, output_pdf: Path) -> None:
+              profile = WORK / ('chrome-profile-' + output_pdf.stem[:30])
+              profile.mkdir(exist_ok=True)
+              file_url = local_html.resolve().as_uri()
+              command = [
+                  chrome,
+                  '--headless=new',
+                  '--no-sandbox',
+                  '--disable-gpu',
+                  '--disable-dev-shm-usage',
+                  '--disable-software-rasterizer',
+                  '--disable-extensions',
+                  '--disable-background-networking',
+                  '--allow-file-access-from-files',
+                  '--run-all-compositor-stages-before-draw',
+                  '--virtual-time-budget=12000',
+                  '--print-to-pdf-no-header',
+                  f'--user-data-dir={profile.resolve()}',
+                  f'--user-agent={BROWSER_UA}',
+                  f'--print-to-pdf={output_pdf.resolve()}',
+                  file_url,
+              ]
+              print('CHROME_COMMAND', json.dumps(command), flush=True)
+              result = subprocess.run(command, capture_output=True, text=True, timeout=240)
+              print('CHROME_EXIT', result.returncode, result.stdout[-2000:], result.stderr[-4000:], flush=True)
+              if result.returncode != 0 or not output_pdf.exists() or output_pdf.stat().st_size < 100_000:
+                  raise RuntimeError(f'Chrome PDF generation failed for {local_html}: rc={result.returncode}, stderr={result.stderr[-2000:]}')
+
+          def compact_text(reader: PdfReader, limit: int = 20) -> str:
+              parts = []
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(parts)).lower()
+
+          def validate(path: Path, spec: dict, render_prefix: str) -> tuple[int, list[int]]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'{path.name}: only {pages} pages; minimum {spec["min_pages"]}')
+              text = compact_text(reader)
+              if not any(token in text for token in ('delltechnologiesinc', 'delltechnologies')):
+                  raise RuntimeError(f'{path.name}: Dell Technologies identity not found')
+              target = spec['kind'].lower()
+              if target in ('10-k','10-q') and target not in text:
+                  raise RuntimeError(f'{path.name}: form type {spec["kind"]} not found')
+              if spec['kind'] == 'EX-99.1' and not any(token in text for token in ('secondquarterfiscal2027','july31,2026','q2fy27')):
+                  raise RuntimeError(f'{path.name}: FY2027 Q2 period not found')
+              check = subprocess.run(['qpdf','--check',str(path)], capture_output=True, text=True)
+              if check.returncode not in (0,3):
+                  raise RuntimeError(f'{path.name}: qpdf failure: {check.stderr[-1500:]}')
+              if check.returncode == 3:
+                  print('QPDF_WARNING', path.name, check.stderr[-1200:], flush=True)
+              doc = pymupdf.open(str(path))
+              sample = sorted(set([0, max(0, pages//2), pages-1]))
+              rendered = []
+              for pno in sample:
+                  pix = doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1,1), alpha=False)
+                  image_path = RENDERS / f'{render_prefix}_{pno+1:04d}.png'
+                  pix.save(str(image_path))
+                  if not image_path.exists() or image_path.stat().st_size < 5000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'{path.name}: render failed page {pno+1}')
+                  rendered.append(pno+1)
+              doc.close()
+              return pages, rendered
+
+          records = []
+          hashes = set()
+
+          def process(spec: dict, index: int) -> dict:
+              document_url, document_name = discover_document(spec)
+              local_html = prepare_local_html(document_url, f'{index:02d}_{spec["accession"]}')
+              pdf_path = OUT / spec['filename']
+              print_pdf(local_html, pdf_path)
+              pages, rendered = validate(pdf_path, spec, f'{index:02d}')
+              data = pdf_path.read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'Duplicate PDF hash: {pdf_path.name}')
+              hashes.add(digest)
+              record = {
+                  'filename': spec['filename'],
+                  'document_type': spec['kind'],
+                  'fiscal_year': spec['fy'],
+                  'quarter': spec.get('quarter'),
+                  'period_end': spec['period'],
+                  'filing_date': spec['filed'],
+                  'accession_number': spec['accession'],
+                  'primary_document': document_name,
+                  'primary_document_url': document_url,
+                  'filing_index_url': index_url(spec['accession']),
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+                  'source': 'U.S. SEC EDGAR official filing, rendered to PDF without content alteration',
+                  'rendered_pages': rendered,
+              }
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+              return record
+
+          for idx, spec in enumerate(specs, 1):
+              records.append(process(spec, idx))
+              time.sleep(0.2)
+
+          q2_included = False
+          try:
+              records.append(process(q2_supplement, len(records)+1))
+              q2_included = True
+          except Exception as exc:
+              print('Q2_SUPPLEMENT_WARNING', repr(exc), flush=True)
+
+          if {r['fiscal_year'] for r in records if r['document_type']=='10-K'} != {2020,2021,2022,2023,2024,2025}:
+              raise RuntimeError('Annual coverage mismatch')
+          if len([r for r in records if r['document_type']=='10-Q']) != 1:
+              raise RuntimeError('Latest formal 10-Q missing')
+
+          lines = [
+              '戴尔科技（Dell Technologies Inc., NYSE: DELL）',
+              'FY2020-FY2025年度报告及最新季度资料',
+              '',
+              '年度口径：按戴尔正式Fiscal Year标签收录FY2020至FY2025六份Form 10-K，而不是按文件披露年份命名。',
+              '截至2026年9月5日，最新向SEC提交的正式季度报告为FY2027 Q1 Form 10-Q，报告期截至2026年5月1日，提交日期为2026年6月9日。',
+              '戴尔于2026年9月1日发布FY2027 Q2业绩，并以Form 8-K附件99.1披露。该附件如成功获取，则作为“最新业绩补充”收入，但不冒充Form 10-Q。',
+              '本包PDF由美国SEC EDGAR官方HTML申报文件原样渲染生成，正文内容未翻译、删节或改写。',
+              '',
+          ]
+          for number, record in enumerate(records, 1):
+              lines.extend([
+                  f"{number}. {record['filename']}",
+                  f"   类型：{record['document_type']}；财年：FY{record['fiscal_year']}；季度：{record.get('quarter') or '-'}；报告期末：{record['period_end']}",
+                  f"   提交日期：{record['filing_date']}；实际页数：{record['pages']}页；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   SEC文件：{record['primary_document_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              f"FY2027 Q2附件99.1收入状态：{'已收入' if q2_included else '未收入；正式Q1 10-Q仍已完整收入'}。",
+              '核验项目：SEC accession与Form类型、Dell Technologies名称、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+          ])
+          (OUT/'报告清单与口径说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdf_count = len([name for name in archive.namelist() if name.lower().endswith('.pdf')])
+              if pdf_count != len(records):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {pdf_count} vs {len(records)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(r['pages'] for r in records), 'Q2_INCLUDED', q2_included, flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-sec-edgar-fy2020-fy2025-annuals-latest-quarter-final
+          path: 戴尔科技_2020-2025财年年报及最新季报.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
