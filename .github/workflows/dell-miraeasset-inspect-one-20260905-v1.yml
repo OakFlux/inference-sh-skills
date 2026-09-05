@@ -1,0 +1,73 @@
+name: Inspect one Mirae Asset Dell listing page
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-miraeasset-inspect-one-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Save listing HTML and Dell block
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          mkdir -p output
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          u='https://trading.securities.miraeasset.com/bbs/board/message/list.do?categoryId=1800&curPage=1&direction=0&listType=1&searchEndDay=27&searchEndMonth=11&searchEndYear=2025&searchStartDay=27&searchStartMonth=11&searchStartYear=2024&searchType=2&startId=09nap~&startPage=1'
+          s=requests.Session();s.trust_env=False
+          r=s.get(u,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,*/*','Accept-Language':'ko-KR,ko;q=0.9'},timeout=(20,90))
+          raw=r.content
+          chosen=None
+          for enc in ['utf-8','euc-kr','cp949',r.encoding]:
+            if not enc: continue
+            try:
+              t=raw.decode(enc)
+              if '델 테크놀로지스' in t: chosen=(t,enc);break
+            except Exception: pass
+          if not chosen: chosen=(raw.decode('utf-8','replace'),'utf-8-replace')
+          text,enc=chosen
+          print('PAGE',r.status_code,r.headers.get('content-type'),len(raw),r.url,enc,flush=True)
+          Path('output/page.html').write_text(text,encoding='utf-8')
+          soup=BeautifulSoup(text,'html.parser')
+          records=[]
+          for string in soup.find_all(string=re.compile(r'델\s*테크놀로지스|DELL\s*US',re.I)):
+            print('STRING',repr(string),flush=True)
+            cur=string.parent
+            for level in range(10):
+              if cur is None: break
+              obj={'level':level,'tag':cur.name,'attrs':dict(cur.attrs),'text':cur.get_text(' ',strip=True),'html':str(cur)}
+              records.append(obj)
+              print('ANCESTOR',level,cur.name,json.dumps(dict(cur.attrs),ensure_ascii=False),repr(cur.get_text(' ',strip=True)[:1000]),flush=True)
+              print(str(cur)[:12000],flush=True)
+              cur=cur.parent
+          Path('output/records.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          # dump all scripts/forms and JS snippets containing download/message/view
+          snippets=[]
+          for tag in soup.find_all(['script','form']):
+            st=str(tag)
+            if any(k in st.lower() for k in ('message','download','attach','file')):
+              snippets.append(st)
+              print('SCRIPT_FORM',st[:20000],flush=True)
+          Path('output/snippets.txt').write_text('\n\n---\n\n'.join(snippets),encoding='utf-8')
+          PY
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-miraeasset-inspect-one-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
+          compression-level: 6
