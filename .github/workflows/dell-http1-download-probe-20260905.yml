@@ -1,0 +1,36 @@
+name: Probe Dell HTTP1 downloads
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-http1-download-probe-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe HTTP1 and requests
+        shell: bash
+        run: |
+          set -x
+          url='https://investors.delltechnologies.com/static-files/cff5c8fc-e2a6-4d62-9a54-5ad279baa2f5'
+          rm -f /tmp/http1.bin /tmp/request.bin
+          curl --http1.1 -L -A 'Mozilla/5.0 Chrome/151' --connect-timeout 8 --max-time 30 -sS -o /tmp/http1.bin -w 'curl_status=%{http_code} type=%{content_type} bytes=%{size_download} time=%{time_total}\n' "$url" || true
+          test -f /tmp/http1.bin && head -c 24 /tmp/http1.bin | xxd || true
+          python - <<'PY'
+          import requests,time
+          u='https://investors.delltechnologies.com/static-files/cff5c8fc-e2a6-4d62-9a54-5ad279baa2f5'
+          s=requests.Session(); s.trust_env=False
+          t=time.time()
+          try:
+              r=s.get(u,headers={'User-Agent':'Mozilla/5.0 Chrome/151','Accept':'application/pdf,*/*','Connection':'close'},timeout=(8,30),allow_redirects=True)
+              print('requests',r.status_code,len(r.content),r.headers.get('content-type'),time.time()-t,r.url,r.content[:24])
+              open('/tmp/request.bin','wb').write(r.content)
+          except Exception as e:
+              print('requests_error',repr(e),time.time()-t)
+          PY
