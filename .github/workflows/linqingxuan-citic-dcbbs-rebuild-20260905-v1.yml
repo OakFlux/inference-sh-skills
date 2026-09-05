@@ -1,0 +1,127 @@
+name: Rebuild public CITIC Lin Qingxuan report from page images
+
+on:
+  push:
+    paths:
+      - '.github/workflows/linqingxuan-citic-dcbbs-rebuild-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download all public page images, rebuild and validate PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pillow img2pdf pypdf
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib,io,json,re,subprocess
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import img2pdf,requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          page_url='https://m.dcbbs.com/p-183560.html'
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session();s.trust_env=False
+          h={'User-Agent':ua,'Accept':'text/html,application/xhtml+xml,*/*','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          r=s.get(page_url,headers=h,timeout=(20,120),allow_redirects=True);r.raise_for_status()
+          text=r.text
+          print('PAGE',r.status_code,len(r.content),r.url,flush=True)
+          soup=BeautifulSoup(text,'html.parser')
+          candidates=[]
+          for img in soup.find_all('img',src=True):
+            u=urljoin(r.url,img['src'])
+            label=' '.join([img.get('alt',''),img.get('title',''),img.get('src','')])
+            if '183560' in u or '183560' in label or re.search(r'第\s*\d+\s*页',label):
+              candidates.append(u)
+          for m in re.findall(r'https?://[^"\'<>\s\\]+',text):
+            if '183560' in m and any(ext in m.lower() for ext in ('.jpg','.jpeg','.png','.webp')): candidates.append(m)
+          unique=[];seen=set()
+          for u in candidates:
+            u=u.replace('&amp;','&')
+            if u not in seen:seen.add(u);unique.append(u)
+          print('IMAGE_CANDIDATES',len(unique),json.dumps(unique,ensure_ascii=False,indent=2),flush=True)
+
+          # Prefer URLs carrying explicit page numbers; otherwise inspect every candidate.
+          records=[]
+          for idx,u in enumerate(unique,1):
+            try:
+              rr=s.get(u,headers={'User-Agent':ua,'Accept':'image/*,*/*','Referer':r.url},timeout=(15,90),allow_redirects=True)
+              if rr.status_code!=200 or len(rr.content)<10000:continue
+              im=Image.open(io.BytesIO(rr.content));im.load()
+              if im.width<500 or im.height<700:continue
+              # Infer page number from URL/alt-adjacent sequence. If absent, use discovery order.
+              nums=[int(x) for x in re.findall(r'(?:page|p|_|-|/)(\d{1,3})(?=\D|$)',u,re.I)]
+              pageno=nums[-1] if nums and 1<=nums[-1]<=100 else idx
+              records.append({'pageno':pageno,'url':rr.url,'bytes':rr.content,'size':im.size})
+              print('VALID_IMAGE',pageno,rr.url,len(rr.content),im.size,flush=True)
+            except Exception as e:print('IMAGE_ERR',u,repr(e),flush=True)
+
+          # If HTML only exposes first few pages, derive neighboring URLs from the first valid URL.
+          bypage={rec['pageno']:rec for rec in records}
+          if len(bypage)<23 and records:
+            samples=[rec['url'] for rec in records]
+            patterns=[]
+            for sample in samples:
+              for pattern in [r'(?P<pre>[_/-])(?P<n>\d{1,3})(?P<post>\.(?:jpg|jpeg|png|webp)(?:\?.*)?$)',r'(?P<pre>page(?:_|-|/)?)(?P<n>\d{1,3})(?P<post>\.(?:jpg|jpeg|png|webp)(?:\?.*)?$)']:
+                m=re.search(pattern,sample,re.I)
+                if m:
+                  patterns.append((sample,m.start('n'),m.end('n')))
+            for sample,a,b in patterns:
+              temp={}
+              for p in range(1,24):
+                u=sample[:a]+str(p)+sample[b:]
+                try:
+                  rr=s.get(u,headers={'User-Agent':ua,'Accept':'image/*,*/*','Referer':r.url},timeout=(10,60),allow_redirects=True)
+                  if rr.status_code!=200 or len(rr.content)<10000:break
+                  im=Image.open(io.BytesIO(rr.content));im.load()
+                  if im.width<500 or im.height<700:break
+                  temp[p]={'pageno':p,'url':rr.url,'bytes':rr.content,'size':im.size}
+                except Exception:break
+              if len(temp)==23:
+                bypage=temp;break
+
+          if len(bypage)!=23 or sorted(bypage)!=list(range(1,24)):
+            raise RuntimeError(f'Expected complete 23-page sequence, got pages={sorted(bypage)}')
+          hashes=[hashlib.sha256(bypage[p]['bytes']).hexdigest() for p in range(1,24)]
+          if len(set(hashes))!=23:raise RuntimeError('duplicate page images')
+          work=Path('work');work.mkdir(exist_ok=True)
+          jpgs=[]
+          for p in range(1,24):
+            im=Image.open(io.BytesIO(bypage[p]['bytes'])).convert('RGB')
+            target=work/f'{p:03d}.jpg';im.save(target,'JPEG',quality=95,subsampling=0,optimize=True,dpi=(150,150));jpgs.append(target)
+          out=Path('中信证券_林清轩_聚焦红山茶花以油护肤先行者_20220130_23页_完整公开影像版.pdf')
+          out.write_bytes(img2pdf.convert([str(x) for x in jpgs],layout_fun=img2pdf.get_fixed_dpi_layout_fun((150,150))))
+          reader=PdfReader(str(out),strict=False)
+          if len(reader.pages)!=23:raise RuntimeError('PDF page mismatch')
+          q=subprocess.run(['qpdf','--check',str(out)],capture_output=True,text=True)
+          if q.returncode not in (0,3):raise RuntimeError(q.stderr)
+          for label,p in [('first',1),('last',23)]:
+            subprocess.run(['pdftoppm','-f',str(p),'-singlefile','-png','-r','90',str(out),f'preview_{label}'],check=True,capture_output=True)
+          meta={'institution':'中信证券','date':'2022-01-30','title':'林清轩：聚焦红山茶花，以油护肤先行者','pages':23,'bytes':out.stat().st_size,'sha256':hashlib.sha256(out.read_bytes()).hexdigest(),'source_page':r.url,'source_format':'由公开逐页影像重建完整PDF'}
+          Path('metadata.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('VERIFIED',json.dumps(meta,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload rebuilt report
+        uses: actions/upload-artifact@v4
+        with:
+          name: linqingxuan-citic-report-20260905-v1
+          path: |
+            中信证券_林清轩_聚焦红山茶花以油护肤先行者_20220130_23页_完整公开影像版.pdf
+            metadata.json
+            preview_first.png
+            preview_last.png
+          if-no-files-found: error
+          retention-days: 10
+          compression-level: 0
