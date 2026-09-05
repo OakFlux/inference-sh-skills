@@ -1,0 +1,123 @@
+name: Final retry clean Dell FY2025 PDF
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-clean-fy2025-final-retry-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf
+          google-chrome --version || google-chrome-stable --version
+
+      - name: Fetch render and validate FY2025
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import base64, hashlib, json, re, shutil, subprocess, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import pymupdf, requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          raw_url='https://www.sec.gov/Archives/edgar/data/1571996/000157199625000034/dell-20250131.htm'
+          filename='06_戴尔科技_FY2025年报_10-K_截至2025-01-31.pdf'
+          out=Path('piece'); out.mkdir(exist_ok=True)
+          work=Path('work'); work.mkdir(exist_ok=True)
+          renders=work/'renders'; renders.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'OpenAI Research Assistant research-contact@example.com Dell filing archival task','Accept-Encoding':'gzip, deflate','Accept-Language':'en-US,en;q=0.9'})
+
+          def get(url,attempts=6,timeout=(20,180)):
+            last=None
+            for attempt in range(1,attempts+1):
+              try:
+                r=s.get(url,timeout=timeout,allow_redirects=True)
+                print('GET',attempt,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+                if r.status_code==200:return r
+                last=RuntimeError(f'HTTP {r.status_code}')
+              except Exception as exc:
+                last=exc; print('GET_ERROR',attempt,url,repr(exc),flush=True)
+              time.sleep(min(4*attempt,20))
+            raise RuntimeError(f'Unable to retrieve {url}: {last}')
+
+          response=get(raw_url)
+          html_text=response.content.decode('utf-8',errors='replace')
+          soup=BeautifulSoup(html_text,'lxml')
+          for tag in soup.find_all(['script','iframe','object','embed','noscript']):tag.decompose()
+          for tag in soup.find_all('link',href=True):tag.decompose()
+          for image in soup.find_all('img',src=True):
+            src=str(image.get('src') or '').strip()
+            if not src or src.startswith('data:'):continue
+            try:
+              ir=get(urljoin(raw_url,src),attempts=3,timeout=(10,60))
+              image['src']=f'data:{ir.headers.get("content-type") or "image/png"};base64,{base64.b64encode(ir.content).decode("ascii")}'
+            except Exception as exc:
+              print('IMAGE_WARNING',src,repr(exc),flush=True); image.decompose()
+          if soup.head is None:
+            head=soup.new_tag('head')
+            if soup.html:soup.html.insert(0,head)
+            else:soup.insert(0,head)
+          for old in soup.head.find_all('meta',attrs={'charset':True}):old.decompose()
+          meta=soup.new_tag('meta'); meta['charset']='utf-8'; soup.head.insert(0,meta)
+          style=soup.new_tag('style'); style.string='''@page{size:Letter;margin:.45in}html,body{background:white!important;color:black!important}ix\\:header,ix-header,#ixvHeader,.ixv-header,.navbar,.modal-backdrop{display:none!important}img{max-width:100%!important;height:auto!important}table{max-width:100%!important;break-inside:auto}tr{break-inside:avoid}'''; soup.head.append(style)
+          local=work/'filing.html'; local.write_text(str(soup),encoding='utf-8')
+          chrome=shutil.which('google-chrome') or shutil.which('google-chrome-stable')
+          pdf=out/filename; profile=work/'profile'; profile.mkdir(exist_ok=True)
+          cmd=[chrome,'--headless=new','--no-sandbox','--disable-gpu','--disable-dev-shm-usage','--disable-extensions','--disable-background-networking','--disable-component-update','--disable-sync','--disable-default-apps','--no-first-run','--allow-file-access-from-files','--run-all-compositor-stages-before-draw','--virtual-time-budget=2500','--no-pdf-header-footer',f'--user-data-dir={profile.resolve()}',f'--print-to-pdf={pdf.resolve()}',local.resolve().as_uri()]
+          result=subprocess.run(cmd,capture_output=True,text=True,timeout=180)
+          print('CHROME_EXIT',result.returncode,result.stderr[-2500:],flush=True)
+          if result.returncode!=0 or not pdf.exists() or pdf.stat().st_size<100000:raise RuntimeError('Chrome PDF generation failed')
+
+          reader=PdfReader(str(pdf),strict=False); pages=len(reader.pages)
+          if pages<90:raise RuntimeError(f'Only {pages} pages')
+          extracted=[]
+          for page in reader.pages[:min(24,pages)]:
+            try:extracted.append(page.extract_text() or '')
+            except Exception:pass
+          joined='\n'.join(extracted); compact=re.sub(r'\s+','',joined).lower()
+          if not any(x in compact for x in ('delltechnologiesinc','delltechnologies')):raise RuntimeError('Dell identity not found')
+          if '10-k' not in compact:raise RuntimeError('10-K form type not found')
+          if 'â' in joined or 'Â' in joined:raise RuntimeError('Mojibake detected')
+          q=subprocess.run(['qpdf','--check',str(pdf)],capture_output=True,text=True)
+          if q.returncode not in (0,3):raise RuntimeError('qpdf failed: '+q.stderr[-1200:])
+
+          doc=pymupdf.open(str(pdf))
+          middle=pages//2
+          middle_candidates=[middle]
+          for delta in range(1,11):middle_candidates.extend([middle-delta,middle+delta])
+          middle_page=next((p for p in middle_candidates if 0<=p<pages and len(doc.load_page(p).get_text('text').strip())>100),middle)
+          sample=sorted(set([0,middle_page,pages-1])); rendered=[]
+          for pno in sample:
+            page=doc.load_page(pno); pix=page.get_pixmap(matrix=pymupdf.Matrix(1,1),alpha=False)
+            rp=renders/f'{pno+1:04d}.png'; pix.save(str(rp))
+            if not rp.exists() or pix.width<400 or pix.height<400:raise RuntimeError(f'Render failed page {pno+1}')
+            rendered.append(pno+1)
+          doc.close()
+          data=pdf.read_bytes()
+          metadata={'id':'fy2025','order':6,'filename':filename,'document_type':'10-K','fiscal_year':2025,'quarter':None,'period_end':'2025-01-31','filing_date':'2025-03-25','accession_number':'0001571996-25-000034','primary_document':'dell-20250131.htm','primary_document_url':raw_url,'filing_index_url':'https://www.sec.gov/Archives/edgar/data/1571996/000157199625000034/0001571996-25-000034-index.html','pages':pages,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'source':'U.S. SEC EDGAR official filing, rendered to clean PDF without textual alteration','rendered_pages':rendered}
+          (out/'fy2025.json').write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('VERIFIED',json.dumps(metadata,ensure_ascii=False),flush=True)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dell-clean-v3-final-fy2025
+          path: piece/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
