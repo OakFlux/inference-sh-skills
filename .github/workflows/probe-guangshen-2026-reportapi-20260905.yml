@@ -1,0 +1,30 @@
+name: Probe Guangshen 2026 report API
+
+on:
+  push:
+    branches:
+      - chatgpt-china-gas-broker-reports-20260905
+    paths:
+      - '.github/workflows/probe-guangshen-2026-reportapi-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/probe_guangshen_2026_reportapi_20260905.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guangshen-2026-reportapi-probe-20260905
+          path: |
+            guangshen-2026-reportapi-results.json
+            guangshen-2026-*.pdf
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
