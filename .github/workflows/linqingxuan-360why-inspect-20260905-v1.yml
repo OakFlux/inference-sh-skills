@@ -1,0 +1,61 @@
+name: Inspect 360why Lin Qingxuan report page
+
+on:
+  push:
+    paths:
+      - '.github/workflows/linqingxuan-360why-inspect-20260905-v1.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Fetch page and enumerate file resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          mkdir -p output
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          from urllib.parse import urljoin,unquote
+          import requests
+          from bs4 import BeautifulSoup
+          u='https://www.360why.com/bg/34b307000089491.html'
+          s=requests.Session();s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept':'text/html,application/xhtml+xml,*/*','Accept-Language':'zh-CN,zh;q=0.9'}
+          r=s.get(u,headers=h,timeout=(20,120),allow_redirects=True)
+          print('PAGE',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+          text=r.text;Path('output/page.html').write_text(text,encoding='utf-8',errors='replace')
+          print('HEAD',repr(text[:5000]),flush=True)
+          soup=BeautifulSoup(text,'html.parser')
+          resources=[]
+          for tag in soup.find_all(True):
+            for attr in ('href','src','data','onclick','content','value'):
+              v=tag.get(attr)
+              if not v:continue
+              full=urljoin(r.url,v) if attr in ('href','src','data') else v
+              hay=unquote(str(full).lower())
+              if any(k in hay for k in ('pdf','download','file','report','34b307','089491','api','oss','cos','cdn','storage')):
+                rec={'tag':tag.name,'attr':attr,'value':full,'text':' '.join(tag.get_text(' ',strip=True).split())[:500]}
+                resources.append(rec);print('RESOURCE',json.dumps(rec,ensure_ascii=False),flush=True)
+          patterns=[r'https?://[^"\'<>\s\\]+',r'[^"\']{0,300}(?:pdf|download|file|report|34b307|089491|api)[^"\']{0,1200}']
+          for pat in patterns:
+            for m in re.finditer(pat,text,re.I):
+              val=m.group(0)
+              if any(k in unquote(val.lower()) for k in ('pdf','download','file','report','34b307','089491','api','oss','cos','cdn')):
+                print('MATCH',repr(val[:3000]),flush=True)
+          Path('output/resources.json').write_text(json.dumps(resources,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload output
+        uses: actions/upload-artifact@v4
+        with:
+          name: linqingxuan-360why-inspect-20260905-v1
+          path: output/
+          if-no-files-found: error
+          retention-days: 3
