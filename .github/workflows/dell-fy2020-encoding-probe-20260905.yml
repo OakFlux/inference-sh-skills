@@ -1,0 +1,37 @@
+name: Probe Dell FY2020 SEC HTML encoding
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-fy2020-encoding-probe-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: python -m pip install --quiet requests charset-normalizer beautifulsoup4 lxml
+      - name: Probe encoding
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests,re
+          from charset_normalizer import from_bytes
+          u='https://www.sec.gov/Archives/edgar/data/1571996/000157199620000017/delltechnologiesfy2010k.htm'
+          s=requests.Session();s.trust_env=False
+          r=s.get(u,headers={'User-Agent':'OpenAI Research Assistant research-contact@example.com'},timeout=60)
+          print('status',r.status_code,'bytes',len(r.content),'content-type',r.headers.get('content-type'),'requests_encoding',r.encoding,'apparent',r.apparent_encoding)
+          print('charset-normalizer',from_bytes(r.content).best().encoding if from_bytes(r.content).best() else None)
+          print('first-bytes',repr(r.content[:1000]))
+          head=r.content[:10000]
+          for enc in ['utf-8','windows-1252','latin-1']:
+              try:
+                  txt=head.decode(enc,errors='replace')
+                  print('ENC',enc,repr(txt[:1500]))
+                  print('META',re.findall(r'(?i)(?:charset\s*=\s*["\']?[^"\'>\s]+|encoding\s*=\s*["\'][^"\']+)',txt[:5000]))
+              except Exception as e:print('ERR',enc,e)
+          PY
