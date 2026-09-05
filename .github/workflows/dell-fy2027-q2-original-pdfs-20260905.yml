@@ -1,0 +1,89 @@
+name: Download original Dell FY2027 Q2 PDFs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/dell-fy2027-q2-original-pdfs-20260905.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  get:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Download and validate original Q2 files
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+          mkdir -p output
+          python - <<'PY'
+          import hashlib,json,re,subprocess
+          from io import BytesIO
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          page_url='https://investors.delltechnologies.com/events/event-details/dell-technologies-fiscal-year-2027-second-quarter-results'
+          ua='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'
+          s=requests.Session();s.trust_env=False
+          r=s.get(page_url,headers={'User-Agent':ua,'Accept':'text/html,*/*','Cache-Control':'no-cache'},timeout=(20,90),allow_redirects=True)
+          print('PAGE',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True);r.raise_for_status()
+          Path('output/page.html').write_bytes(r.content)
+          soup=BeautifulSoup(r.text,'html.parser')
+          links=[]
+          for a in soup.find_all('a',href=True):
+            label=' '.join(a.get_text(' ',strip=True).split())
+            u=urljoin(r.url,a['href'])
+            if re.search(r'Press Release|Financial Tables|Performance Review',label,re.I):
+              links.append((label,u))
+              print('LINK',label,u,flush=True)
+          # Capture embedded static-files if labels are rendered separately.
+          for m in re.finditer(r'(?:https?://[^"\'<>\s]+)?/static-files/[0-9a-f-]{30,}',r.text,re.I):
+            u=urljoin(r.url,m.group(0));links.append(('embedded',u));print('EMBED',u,flush=True)
+          out=[];seen=set()
+          for label,u in links:
+            if u in seen:continue
+            seen.add(u)
+            try:
+              rr=s.get(u,headers={'User-Agent':ua,'Accept':'application/pdf,*/*','Referer':r.url},timeout=(20,120),allow_redirects=True)
+              b=rr.content
+              print('GET',label,rr.status_code,rr.headers.get('content-type'),len(b),rr.url,b[:10],flush=True)
+              if rr.status_code!=200 or not b.startswith(b'%PDF-') or len(b)<50000:continue
+              rd=PdfReader(BytesIO(b),strict=False);n=len(rd.pages)
+              text=''
+              for i in range(min(20,n)):
+                try:text+=(rd.pages[i].extract_text() or '')+'\n'
+                except:pass
+              text=re.sub(r'\s+',' ',text)
+              if not re.search(r'Dell Technologies',text,re.I) or not re.search(r'(Fiscal\s+2027|FY27|2027)',text,re.I):continue
+              # Press release and financial tables must contain cumulative six-month figures.
+              is_half=bool(re.search(r'(Six Months|July\s+31,?\s+2026)',text,re.I))
+              kind='Press_Release' if re.search('Press Release',label,re.I) else ('Financial_Tables' if re.search('Financial Tables',label,re.I) else ('Performance_Review' if re.search('Performance Review',label,re.I) else 'Document'))
+              if kind in ('Press_Release','Financial_Tables') and not is_half:continue
+              fn=f'Dell_Technologies_FY2027_Q2_{kind}_{n}p.pdf'
+              p=Path('output')/fn;p.write_bytes(b)
+              q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+              if q.returncode not in (0,3):p.unlink();continue
+              rec={'label':label,'kind':kind,'filename':fn,'pages':n,'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest(),'source':rr.url,'contains_six_months':is_half}
+              out.append(rec);print('VERIFIED',json.dumps(rec,ensure_ascii=False),flush=True)
+            except Exception as e:print('ERR',label,u,repr(e),flush=True)
+          Path('output/manifest.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_COUNT',len(out),flush=True)
+          if not any(x['kind']=='Press_Release' for x in out):raise RuntimeError('No original FY2027 Q2 press-release PDF')
+          PY
+      - name: Upload originals
+        uses: actions/upload-artifact@v4
+        with:
+          name: dell-fy2027-q2-original-pdfs-20260905
+          path: output/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
