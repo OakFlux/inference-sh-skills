@@ -1,0 +1,451 @@
+name: Package Harbin Electric broker research reports 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/harbin-electric-broker-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '哈尔滨电气_券商研究报告_完整PDF'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+          work = Path('_harbin_electric_work')
+          work.mkdir(exist_ok=True)
+          renders = work / 'renders'
+          renders.mkdir(exist_ok=True)
+
+          # Known publicly mirrored original broker PDFs. The API discovery below
+          # is used to locate additional long-form reports, especially the 2024
+          # Guoyuan International deep report.
+          hardcoded = [
+              {
+                  'info': 'AP202507101706279445',
+                  'date': '2025-07-09',
+                  'broker': '华泰证券',
+                  'authors': '黄波、王玎',
+                  'rating': '买入（首次覆盖）',
+                  'title': '传统装机提振，设备龙头价值重估',
+                  'declared_type': '公司首次覆盖/深度报告',
+                  'priority': 1,
+              },
+              {
+                  'info': 'AP202504161657279317',
+                  'date': '2025-04-15',
+                  'broker': '国元国际',
+                  'authors': '冯浩',
+                  'rating': '买入',
+                  'title': '新签订单超预期，毛利率仍有提升空间',
+                  'declared_type': '公司更新报告',
+                  'priority': 20,
+              },
+              {
+                  'info': 'AP202409261640059058',
+                  'date': '2024-09-26',
+                  'broker': '国元国际',
+                  'authors': '冯浩',
+                  'rating': '买入',
+                  'title': '能源装备业务盈利能力恢复，看好后续增长动能',
+                  'declared_type': '公司更新报告',
+                  'priority': 30,
+              },
+              {
+                  'info': 'AP202509091740636244',
+                  'date': '2025-09-08',
+                  'broker': '国元国际',
+                  'authors': '冯浩',
+                  'rating': '买入',
+                  'title': '火电充沛订单释放，长期水、核、服务业有望提供支撑',
+                  'declared_type': '公司更新报告',
+                  'priority': 25,
+              },
+              {
+                  'info': 'AP202604131821146976',
+                  'date': '2026-04-10',
+                  'broker': '国元国际',
+                  'authors': '冯浩',
+                  'rating': '买入',
+                  'title': '充沛在手订单有望支持公司在“十五五”期间良好发展',
+                  'declared_type': '公司更新报告',
+                  'priority': 15,
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/json,text/plain,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/report/01133.html',
+          }
+
+          def pick(row, *keys, default=''):
+              for key in keys:
+                  value = row.get(key)
+                  if value not in (None, '', []):
+                      if isinstance(value, list):
+                          return '、'.join(str(x) for x in value)
+                      return str(value)
+              return default
+
+          def normalize_date(value):
+              s = str(value or '').strip()
+              m = re.search(r'(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})', s)
+              if m:
+                  return f'{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
+              if re.fullmatch(r'20\d{6}', s):
+                  return f'{s[:4]}-{s[4:6]}-{s[6:8]}'
+              return s[:10] if len(s) >= 10 else s
+
+          def extract_rows(payload):
+              if isinstance(payload, list):
+                  return payload
+              if not isinstance(payload, dict):
+                  return []
+              for key in ('data', 'result', 'list', 'rows'):
+                  value = payload.get(key)
+                  if isinstance(value, list):
+                      return value
+                  if isinstance(value, dict):
+                      for inner in ('list', 'data', 'rows', 'items'):
+                          if isinstance(value.get(inner), list):
+                              return value[inner]
+              return []
+
+          candidates_by_info = {x['info']: dict(x) for x in hardcoded}
+          discovery_records = []
+
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          code_variants = ['01133', '1133', 'HK01133', '01133.HK', '1133.HK', '116.01133']
+          requests_to_try = []
+          for code in code_variants:
+              for qtype in (0, 1):
+                  requests_to_try.append({
+                      'pageNo': 1, 'pageSize': 500, 'code': code, 'qType': qtype,
+                      'beginTime': '2010-01-01', 'endTime': '2026-09-06',
+                  })
+          for keyword_key in ('title', 'keyword', 'searchText', 'stockName'):
+              requests_to_try.append({
+                  'pageNo': 1, 'pageSize': 500, 'qType': 0,
+                  keyword_key: '哈尔滨电气',
+                  'beginTime': '2010-01-01', 'endTime': '2026-09-06',
+              })
+
+          for params in requests_to_try:
+              try:
+                  r = session.get(endpoint, params=params, headers=headers, timeout=(20, 90))
+                  rec = {'params': params, 'status': r.status_code, 'bytes': len(r.content), 'url': r.url}
+                  print('API', r.status_code, len(r.content), r.url, flush=True)
+                  if r.status_code == 200:
+                      payload = r.json()
+                      rows = extract_rows(payload)
+                      rec['row_count'] = len(rows)
+                      matches = []
+                      for row in rows:
+                          if not isinstance(row, dict):
+                              continue
+                          text = json.dumps(row, ensure_ascii=False)
+                          compact = re.sub(r'\s+', '', text).lower()
+                          if not any(term in compact for term in ('哈尔滨电气', '哈爾濱電氣', 'harbinelectric', '01133', '1133.hk')):
+                              continue
+                          info = pick(row, 'infoCode', 'infocode', 'INFOCODE', 'info_code')
+                          if not info.startswith('AP'):
+                              continue
+                          matches.append(row)
+                          title = pick(row, 'title', 'reportTitle', 'REPORT_TITLE', 'reportName')
+                          broker = pick(row, 'orgSName', 'orgName', 'organizationName', 'ORG_SNAME', default='券商研究机构')
+                          date = normalize_date(pick(row, 'publishDate', 'publishTime', 'date', 'PUBLISHDATE'))
+                          authors = pick(row, 'researcher', 'author', 'researchers', 'RESEARCHER')
+                          rating = pick(row, 'emRatingName', 'ratingName', 'rating', 'RATING_NAME')
+                          existing = candidates_by_info.get(info, {})
+                          candidates_by_info[info] = {
+                              'info': info,
+                              'date': existing.get('date') or date,
+                              'broker': existing.get('broker') or broker,
+                              'authors': existing.get('authors') or authors,
+                              'rating': existing.get('rating') or rating,
+                              'title': existing.get('title') or title,
+                              'declared_type': existing.get('declared_type') or ('深度/首次覆盖报告' if any(k in title for k in ('深度', '首次覆盖', '首次评级')) else '券商公司报告'),
+                              'priority': existing.get('priority', 100),
+                              'api_row': row,
+                          }
+                      rec['matches'] = matches
+                  discovery_records.append(rec)
+              except Exception as exc:
+                  discovery_records.append({'params': params, 'error': repr(exc)})
+                  print('API_FAILED', repr(exc), params, flush=True)
+              time.sleep(0.25)
+
+          print('DISCOVERED_INFO_CODES', json.dumps(sorted(candidates_by_info), ensure_ascii=False), flush=True)
+
+          def fetch_pdf(info):
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?download=1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf?download=1.pdf',
+              ]
+              errors = []
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, headers=headers, timeout=(30, 300), allow_redirects=True)
+                          print('GET', info, attempt, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 60000:
+                              return r.content, str(r.url)
+                          errors.append(f'{url}: HTTP {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{url}: {repr(exc)}')
+                      time.sleep(min(attempt * 2, 6))
+              raise RuntimeError(' | '.join(errors[-8:]))
+
+          def opening_text(reader, limit=12):
+              parts = []
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(parts)).lower()
+
+          def infer_fields(item, text, pages):
+              title = item.get('title') or ''
+              broker = item.get('broker') or ''
+              date = item.get('date') or ''
+              authors = item.get('authors') or ''
+              rating = item.get('rating') or ''
+              if not broker or broker == '券商研究机构':
+                  if '华泰' in text or '華泰' in text:
+                      broker = '华泰证券'
+                  elif '国元' in text or '國元' in text:
+                      broker = '国元国际'
+              if not date:
+                  m = re.search(r'(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})', text)
+                  if m:
+                      date = f'{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
+              is_deep = pages >= 15 or any(k in title for k in ('深度', '首次覆盖', '首次评级', '首次研究'))
+              report_type = '公司深度/首次覆盖报告' if is_deep else (item.get('declared_type') or '公司跟踪报告')
+              return title or '哈尔滨电气公司研究报告', broker or '券商研究机构', date, authors, rating, report_type, is_deep
+
+          validated = []
+          failures = []
+          seen_hashes = set()
+
+          ordered_candidates = sorted(candidates_by_info.values(), key=lambda x: (x.get('priority', 100), x.get('date', '9999')))
+          for idx, item in enumerate(ordered_candidates, 1):
+              info = item['info']
+              try:
+                  data, source_url = fetch_pdf(info)
+                  temp = work / f'candidate_{idx:03d}_{info}.pdf'
+                  temp.write_bytes(data)
+                  reader = PdfReader(str(temp), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 4:
+                      raise RuntimeError(f'only {pages} pages')
+                  text = opening_text(reader)
+                  if not any(x in text for x in ('哈尔滨电气', '哈爾濱電氣', 'harbinelectric', '1133.hk', '(1133')):
+                      raise RuntimeError('company identity not found in opening pages')
+
+                  q = subprocess.run(['qpdf', '--check', str(temp)], capture_output=True, text=True)
+                  if q.returncode not in (0, 3):
+                      raise RuntimeError('qpdf failed: ' + q.stderr[-1200:])
+
+                  doc = pymupdf.open(str(temp))
+                  sample = sorted(set([0, max(0, pages // 2), pages - 1]))
+                  rendered_pages = []
+                  for pno in sample:
+                      page = doc.load_page(pno)
+                      pix = page.get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                      rp = renders / f'{idx:03d}_{pno + 1:03d}.png'
+                      pix.save(str(rp))
+                      if not rp.exists() or rp.stat().st_size < 5000 or pix.width < 400 or pix.height < 400:
+                          raise RuntimeError(f'render failed page {pno + 1}')
+                      rendered_pages.append(pno + 1)
+                  doc.close()
+
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in seen_hashes:
+                      raise RuntimeError('duplicate PDF content')
+                  seen_hashes.add(digest)
+
+                  title, broker, date, authors, rating, report_type, is_deep = infer_fields(item, text, pages)
+                  date_ord = 0
+                  try:
+                      date_ord = int(datetime.fromisoformat(date).strftime('%Y%m%d')) if date else 0
+                  except Exception:
+                      pass
+                  score = 0
+                  if info == 'AP202507101706279445':
+                      score += 100000
+                  if is_deep:
+                      score += 50000 + pages * 100
+                  else:
+                      score += pages * 100
+                  score += max(0, date_ord - 20200101) // 100
+                  if any(k in title for k in ('深度', '首次覆盖', '首次评级')):
+                      score += 10000
+
+                  rec = {
+                      **item,
+                      'title': title,
+                      'broker': broker,
+                      'date': date,
+                      'authors': authors,
+                      'rating': rating,
+                      'report_type': report_type,
+                      'is_deep': is_deep,
+                      'pages': pages,
+                      'bytes': len(data),
+                      'sha256': digest,
+                      'source_url': source_url,
+                      'temp': str(temp),
+                      'rendered_pages': rendered_pages,
+                      'score': score,
+                  }
+                  validated.append(rec)
+                  print('VALIDATED', json.dumps({k: rec.get(k) for k in ('info', 'broker', 'title', 'date', 'report_type', 'is_deep', 'pages', 'bytes', 'score', 'source_url')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  fail = {**item, 'error': repr(exc)}
+                  failures.append(fail)
+                  print('FAILED', json.dumps({k: fail.get(k) for k in ('info', 'broker', 'title', 'error')}, ensure_ascii=False), flush=True)
+
+          deep_reports = sorted([x for x in validated if x['is_deep']], key=lambda x: (-x['score'], -x['pages'], x.get('date', '')))
+          followups = sorted([x for x in validated if not x['is_deep']], key=lambda x: (-x['score'], x.get('date', '')))
+
+          # The user requested 2-3 reports. Prefer two or three genuine long-form
+          # reports. If only one public long-form report is downloadable, include
+          # two complete original follow-up reports rather than link cards.
+          if len(deep_reports) >= 3:
+              selected = deep_reports[:3]
+          elif len(deep_reports) == 2:
+              selected = deep_reports[:2]
+          elif len(deep_reports) == 1:
+              selected = deep_reports[:1] + followups[:2]
+          else:
+              selected = followups[:3]
+
+          if len(selected) < 2:
+              raise RuntimeError('Fewer than two valid original PDFs were downloaded: ' + json.dumps(failures, ensure_ascii=False))
+
+          def safe(text):
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', str(text)).strip('_')[:58]
+
+          records = []
+          for order, item in enumerate(selected, 1):
+              filename = f'{order:02d}_{safe(item["broker"])}_{safe(item["title"])}_{item.get("date", "").replace("-", "")}.pdf'
+              data = Path(item['temp']).read_bytes()
+              (out / filename).write_bytes(data)
+              records.append({
+                  'filename': filename,
+                  'broker': item['broker'],
+                  'title': item['title'],
+                  'report_type': item['report_type'],
+                  'date': item.get('date', ''),
+                  'authors': item.get('authors', ''),
+                  'rating': item.get('rating', ''),
+                  'pages': item['pages'],
+                  'bytes': item['bytes'],
+                  'sha256': item['sha256'],
+                  'source_url': item['source_url'],
+                  'eastmoney_info_code': item['info'],
+                  'source': '东方财富研究报告PDF镜像（保留原券商报告正文和版式）',
+                  'rendered_pages': item['rendered_pages'],
+                  'is_deep': item['is_deep'],
+              })
+
+          deep_count = sum(1 for r in records if r['is_deep'])
+          lines = [
+              '哈尔滨电气（01133.HK）券商研究报告',
+              '',
+              f'本包包含 {len(records)} 份可离线打开的完整原始券商 PDF，其中长篇深度/首次覆盖报告 {deep_count} 份。',
+              '未放入网页入口、URL快捷方式、摘要卡片或自行重排的摘录版。',
+              '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   类型：{r['report_type']}；日期：{r['date']}；作者：{r['authors'] or '原报告所示'}；评级：{r['rating'] or '原报告所示'}",
+                  f"   实际页数：{r['pages']} 页；文件大小：{r['bytes'] / 1048576:.2f} MB",
+                  f"   来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ]
+          lines += [
+              '核验项目：PDF 文件头、公司名称或证券代码、实际页数、qpdf 文件结构、首页/中间页/末页渲染、SHA-256 和 ZIP CRC。',
+              '报告中的评级、预测、目标价和行业判断均为报告发布时点观点，不代表当前投资建议。',
+          ]
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+          (work / 'discovery.json').write_text(json.dumps(discovery_records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (work / 'failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+          (work / 'all_validated.json').write_text(json.dumps([{k: v for k, v in x.items() if k != 'temp'} for x in validated], ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for p in sorted(out.iterdir()):
+                  z.write(p, arcname=f'{PACKAGE}/{p.name}')
+
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failed: ' + bad)
+              pdf_names = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != len(records):
+                  raise RuntimeError(f'PDF count mismatch: {len(pdf_names)} vs {len(records)}')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'DEEP', deep_count, 'PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbin-electric-broker-reports-final
+          path: 哈尔滨电气_券商研究报告_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: harbin-electric-broker-reports-diagnostics
+          path: _harbin_electric_work/
+          if-no-files-found: ignore
+          retention-days: 7
