@@ -1,0 +1,66 @@
+name: Probe direct public PDFs for Ledong Robotics
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-ledong-robotics-reports-20260906
+  workflow_dispatch:
+
+jobs:
+  direct-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+      - name: Download and validate candidate public PDFs
+        shell: bash
+        run: |
+          mkdir -p output
+          cat > /tmp/direct_probe.py <<'PY'
+          import hashlib, io, json, pathlib, requests
+          from pypdf import PdfReader
+          OUT=pathlib.Path('output')
+          urls={
+            'sdic_20260810':'https://www.sdicsi.com.hk/backend/storage/app/media/ResearchReports/CorporateReports/1236-20260810.pdf',
+            'sdic_20260826':'https://www.sdicsi.com.hk/backend/storage/app/media/ResearchReports/CorporateReports/1236-20260826.pdf',
+            'fx_5593366':'https://public.fxbaogao.com/report/2026/08/10/5593366.pdf',
+            'fx_5608254':'https://public.fxbaogao.com/report/2026/08/16/5608254.pdf',
+            'fx_5637842':'https://public.fxbaogao.com/report/2026/08/25/5637842.pdf',
+            'fx_5646471':'https://public.fxbaogao.com/report/2026/08/26/5646471.pdf',
+          }
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.fxbaogao.com/'})
+          results={}
+          for key,u in urls.items():
+            rec={'url':u}
+            try:
+              r=s.get(u,timeout=60,allow_redirects=True)
+              rec.update(status=r.status_code,final_url=r.url,content_type=r.headers.get('content-type'),bytes=len(r.content),head=r.content[:16].hex())
+              valid=r.status_code==200 and len(r.content)>100000 and b'%PDF' in r.content[:4096]
+              rec['valid_pdf']=valid
+              if valid:
+                p=OUT/f'{key}.pdf'; p.write_bytes(r.content)
+                reader=PdfReader(io.BytesIO(r.content),strict=False)
+                rec['pages']=len(reader.pages); rec['encrypted']=reader.is_encrypted
+                sample=''.join((pg.extract_text() or '') for pg in reader.pages[:min(5,len(reader.pages))])
+                rec['sample']=sample[:5000]
+                compact=''.join(sample.split())
+                rec['company_match']=any(x in compact for x in ('乐动机器人','樂動機器人','01236','1236.HK'))
+                rec['sha256']=hashlib.sha256(r.content).hexdigest()
+              print('RESULT',key,json.dumps(rec,ensure_ascii=False))
+            except Exception as e:
+              rec['error']=repr(e); print('ERROR',key,json.dumps(rec,ensure_ascii=False))
+            results[key]=rec
+          (OUT/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          python /tmp/direct_probe.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ledong_Direct_PDF_Probe
+          path: output
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 0
