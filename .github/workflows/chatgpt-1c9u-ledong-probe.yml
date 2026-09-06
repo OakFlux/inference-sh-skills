@@ -1,0 +1,105 @@
+name: Inspect 1C9U Ledong report source
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-ledong-robotics-reports-20260906
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Inspect knowledge-base page and linked resources
+        shell: bash
+        run: |
+          mkdir -p output
+          cat > /tmp/probe_1c9u.py <<'PY'
+          from __future__ import annotations
+          import json, re, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+
+          OUT=Path('output')
+          s=requests.Session(); s.headers.update({
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+          urls=[
+            'https://1c9u.com/zhishiku/%E4%BA%BA%E5%BD%A2%E6%9C%BA%E5%99%A8%E4%BA%BA%E7%9F%A5%E8%AF%86%E5%BA%93',
+            'https://www.1c9u.com/zhishiku/%E4%BA%BA%E5%BD%A2%E6%9C%BA%E5%99%A8%E4%BA%BA%E7%9F%A5%E8%AF%86%E5%BA%93',
+          ]
+          interesting_links=[]; scripts=[]
+          for i,u in enumerate(urls):
+            try:
+              r=s.get(u,timeout=60,allow_redirects=True)
+              print('\nPAGE',i,u,'=>',r.status_code,r.url,r.headers.get('content-type'),len(r.content))
+              print(r.text[:2000])
+              (OUT/f'page_{i}.html').write_bytes(r.content)
+              soup=BeautifulSoup(r.text,'html.parser')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+              text=' '.join(soup.stripped_strings)
+              pos=text.find('乐动机器人')
+              print('TEXT_AROUND',repr(text[max(0,pos-1000):pos+4000] if pos>=0 else text[:5000]))
+              for tag in soup.find_all(True):
+                vals=[]
+                for attr in ('href','src','data-href','data-url','data-file','data-download','onclick'):
+                  v=tag.get(attr)
+                  if v: vals.append((attr,str(v)))
+                tag_text=tag.get_text(' ',strip=True)
+                combined=' '.join([tag_text]+[v for _,v in vals])
+                if any(k in combined for k in ('乐动机器人','樂動機器人','20260806','1236.HK','物理AI双曲线','从感知组件到智能庭院')):
+                  print('MATCH_TAG',tag.name,'TEXT',repr(tag_text[:1500]),'ATTRS',vals)
+                  for attr,v in vals:
+                    if attr in ('href','src','data-href','data-url','data-file','data-download'):
+                      interesting_links.append(urllib.parse.urljoin(r.url,v))
+                if tag.name=='script' and tag.get('src'):
+                  scripts.append(urllib.parse.urljoin(r.url,tag.get('src')))
+              # Generic URL/file candidates in raw source
+              pats=[
+                r'https?://[^\"\'<>\\\s]+',
+                r'[^\"\'<>\\\s]{0,250}(?:20260806|1236\.HK|乐动机器人|樂動機器人|物理AI|download|pdf|fileUrl|documentUrl|resourceUrl)[^\"\'<>\\\s]{0,1000}',
+              ]
+              hits=[]
+              for p in pats: hits.extend(re.findall(p,r.text,re.I))
+              hits=list(dict.fromkeys(hits)); (OUT/f'hits_{i}.txt').write_text('\n'.join(hits),encoding='utf-8')
+              for h in hits:
+                if any(k in h.lower() for k in ('pdf','download','fileurl','documenturl','resourceurl','20260806','1236')) or '乐动' in h or '樂動' in h:
+                  print('SOURCE_HIT',repr(h[:3500]))
+            except Exception as e: print('PAGE_ERR',i,u,repr(e))
+
+          for idx,u in enumerate(dict.fromkeys(interesting_links)):
+            try:
+              r=s.get(u,timeout=60,allow_redirects=True)
+              print('\nFOLLOW',idx,u,'=>',r.status_code,r.url,r.headers.get('content-type'),len(r.content),repr(r.content[:30]))
+              (OUT/f'follow_{idx}.bin').write_bytes(r.content)
+              if 'text' in str(r.headers.get('content-type')) or 'json' in str(r.headers.get('content-type')):
+                print(r.text[:6000])
+            except Exception as e: print('FOLLOW_ERR',idx,u,repr(e))
+
+          for idx,u in enumerate(dict.fromkeys(scripts)):
+            try:
+              r=s.get(u,timeout=60,allow_redirects=True); r.raise_for_status()
+              txt=r.text
+              (OUT/f'script_{idx:03d}.js').write_bytes(r.content)
+              if any(k in txt for k in ('乐动机器人','20260806','1236.HK','物理AI')) or any(k in txt.lower() for k in ('download','fileurl','pdf')):
+                print('\nSCRIPT',idx,u,len(r.content))
+                for key in ('乐动机器人','20260806','1236.HK','物理AI','download','fileUrl','pdf'):
+                  for m in list(re.finditer(key,txt,re.I))[:15]:
+                    print('SCRIPT_CONTEXT',key,repr(txt[max(0,m.start()-600):m.start()+1800]))
+            except Exception as e: print('SCRIPT_ERR',idx,u,repr(e))
+          PY
+          python /tmp/probe_1c9u.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OneC9U_Ledong_Probe
+          path: output
+          retention-days: 2
+          if-no-files-found: error
