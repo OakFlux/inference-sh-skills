@@ -1,0 +1,77 @@
+name: Quick discover GenScript report URLs 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/genscript-quick-discovery-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Search exact report titles
+        shell: bash
+        run: |
+          python - <<'PY'
+          import html,json,os,re,time
+          from urllib.parse import quote_plus,parse_qs,urlparse,unquote
+          import requests
+          from bs4 import BeautifulSoup
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          queries=[
+            '"四位一体打造一站式生命科学服务平台" 金斯瑞 PDF',
+            '"四大业务板块加速成长" 金斯瑞 PDF',
+            '"有源之水" 金斯瑞生物科技 PDF',
+            '"多板块协同加速成长" 金斯瑞 PDF',
+            '"全产业链覆盖的国际化生物科技公司" PDF',
+            '"基因合成底层驱动" 金斯瑞 PDF',
+            '"夯实生命科学业务基础" 金斯瑞 PDF',
+            '"四大业务齐头并进" 金斯瑞 PDF',
+            '"深耕生命科学全产业链" 金斯瑞 PDF',
+            'site:pdf.dfcfw.com/pdf 金斯瑞生物科技 1548',
+          ]
+          found=[]
+          def add(u,query,engine,context=''):
+            u=html.unescape(unquote(str(u))).replace('\\/','/').strip(' \"\'<>),]')
+            if 'uddg=' in u:
+              try:u=parse_qs(urlparse(u).query).get('uddg',[u])[0]
+              except:pass
+            if u.startswith('//'):u='https:'+u
+            if not u.startswith('http'):return
+            if any(k in u.lower() for k in ('.pdf','pdf.dfcfw.com','sdyanbao.com/detail','sgpjbg.com/baogao','hangyan.co/reports','gelonghui.com')):
+              row={'url':u,'query':query,'engine':engine,'context':context[:500]}
+              if row not in found:found.append(row)
+          engines=[('bing','https://www.bing.com/search?q={}&count=50'),('brave','https://search.brave.com/search?q={}&source=web'),('ddg','https://html.duckduckgo.com/html/?q={}')]
+          for q in queries:
+            for eng,t in engines:
+              try:
+                r=s.get(t.format(quote_plus(q)),headers=h,timeout=(15,60))
+                print('SEARCH',eng,r.status_code,len(r.content),q,flush=True)
+                raw=html.unescape(r.text).replace('\\/','/')
+                for code in sorted(set(re.findall(r'AP\d{18}',raw,re.I))):
+                  print('AP_CODE',q,eng,code,flush=True)
+                for u in re.findall(r'https?://[^\s\"\'<>\\]+',raw):add(u,q,eng,'regex')
+                soup=BeautifulSoup(raw,'lxml')
+                for a in soup.find_all('a',href=True):add(a.get('href'),q,eng,' '.join(a.get_text(' ',strip=True).split()))
+              except Exception as e:print('FAIL',eng,q,repr(e),flush=True)
+              time.sleep(.2)
+          print('FOUND_JSON',json.dumps(found,ensure_ascii=False,indent=2),flush=True)
+          open('genscript_quick_urls.json','w',encoding='utf-8').write(json.dumps(found,ensure_ascii=False,indent=2))
+          PY
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: genscript-quick-discovery
+          path: genscript_quick_urls.json
+          if-no-files-found: error
+          retention-days: 7
