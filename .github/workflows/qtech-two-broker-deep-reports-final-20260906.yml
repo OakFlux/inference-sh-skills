@@ -1,0 +1,263 @@
+name: Package two complete Q Technology broker deep reports 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qtech-two-broker-deep-reports-final-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pillow pypdf pymupdf
+
+      - name: Download page images and build verified PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '丘钛科技_券商深度报告_完整PDF_2份'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+          work = Path('_qtech_two_reports_work')
+          work.mkdir(exist_ok=True)
+          renders = work / 'renders'
+          renders.mkdir(exist_ok=True)
+
+          reports = [
+              {
+                  'id': 937791,
+                  'broker': '国海证券',
+                  'title': '丘钛科技公司深度报告：摄像头与指纹识别模组结构优化，可持续发展能力向好',
+                  'report_date': '2025-12-02',
+                  'platform_date': '2025-12-12',
+                  'authors': '陈梦竹、陈重伊',
+                  'rating': '买入（首次覆盖）',
+                  'pages': 36,
+                  'page_url': 'https://oss.sdyanbao.com/page/2025/12/12/1275307',
+                  'detail_url': 'https://www.sdyanbao.com/detail/937791',
+              },
+              {
+                  'id': 716249,
+                  'broker': '国元国际',
+                  'title': '丘钛科技深度报告：AI助力手机行业回暖，高端光学模组收益弹性高',
+                  'report_date': '2024-03-11',
+                  'platform_date': '2024-03-12',
+                  'authors': '杨森',
+                  'rating': '买入',
+                  'pages': 18,
+                  'page_url': 'https://oss.sdyanbao.com/page/2024/3/12/946834',
+                  'detail_url': 'https://www.sdyanbao.com/detail/716249',
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          def download_page(report, page_index, target):
+              url = f"{report['page_url']}/{page_index}.png"
+              errors = []
+              for attempt in range(1, 5):
+                  try:
+                      r = session.get(
+                          url,
+                          headers={
+                              'Referer': report['detail_url'],
+                              'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                          },
+                          timeout=(25, 180),
+                          allow_redirects=True,
+                      )
+                      sig = r.content[:16]
+                      valid_sig = sig.startswith(b'\x89PNG') or sig.startswith(b'\xff\xd8\xff') or sig.startswith(b'RIFF')
+                      print('PAGE', report['id'], page_index, attempt, r.status_code, len(r.content), r.url, flush=True)
+                      if r.status_code == 200 and valid_sig and len(r.content) > 15000:
+                          target.write_bytes(r.content)
+                          with Image.open(target) as im:
+                              im.verify()
+                          with Image.open(target) as im:
+                              width, height = im.size
+                              if width < 600 or height < 800:
+                                  raise RuntimeError(f'image too small: {width}x{height}')
+                          return url, hashlib.sha256(r.content).hexdigest(), width, height
+                      errors.append(f'HTTP {r.status_code}/{len(r.content)} content-type={r.headers.get("content-type")}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(min(attempt * 2, 8))
+              raise RuntimeError(f"Unable to download page {page_index + 1}/{report['pages']} from {url}: {errors[-4:]}")
+
+          def build_pdf(report):
+              image_dir = work / f"images_{report['id']}"
+              image_dir.mkdir(exist_ok=True)
+              paths = []
+              page_manifest = []
+              seen_hashes = set()
+              for page_index in range(report['pages']):
+                  path = image_dir / f'{page_index:03d}.png'
+                  url, digest, width, height = download_page(report, page_index, path)
+                  if digest in seen_hashes:
+                      raise RuntimeError(f'duplicate image detected at page {page_index + 1}')
+                  seen_hashes.add(digest)
+                  paths.append(path)
+                  page_manifest.append({
+                      'page': page_index + 1,
+                      'url': url,
+                      'sha256': digest,
+                      'width': width,
+                      'height': height,
+                      'bytes': path.stat().st_size,
+                  })
+
+              pdf_path = work / f"{report['id']}.pdf"
+              doc = pymupdf.open()
+              for path in paths:
+                  with Image.open(path) as im:
+                      width, height = im.size
+                  page = doc.new_page(width=width, height=height)
+                  page.insert_image(page.rect, filename=str(path), keep_proportion=False)
+              doc.set_metadata({
+                  'title': report['title'],
+                  'author': report['broker'],
+                  'subject': '丘钛科技（01478.HK）券商研究报告',
+                  'keywords': '丘钛科技,01478.HK,券商深度报告',
+              })
+              doc.save(str(pdf_path), garbage=4, deflate=True, clean=True)
+              doc.close()
+
+              if not pdf_path.exists() or pdf_path.stat().st_size < 100000 or pdf_path.read_bytes()[:5] != b'%PDF-':
+                  raise RuntimeError('invalid generated PDF file')
+              reader = PdfReader(str(pdf_path), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != report['pages']:
+                  raise RuntimeError(f"page count mismatch: {actual_pages} vs {report['pages']}")
+              q = subprocess.run(['qpdf', '--check', str(pdf_path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError('qpdf structural validation failed: ' + q.stderr[-1200:])
+
+              render_doc = pymupdf.open(str(pdf_path))
+              sample = sorted(set([0, report['pages'] // 2, report['pages'] - 1]))
+              rendered_pages = []
+              for pno in sample:
+                  pix = render_doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  render_path = renders / f"{report['id']}_{pno + 1:03d}.png"
+                  pix.save(str(render_path))
+                  if render_path.stat().st_size < 6000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'render validation failed at page {pno + 1}')
+                  rendered_pages.append(pno + 1)
+              render_doc.close()
+
+              pdf_data = pdf_path.read_bytes()
+              return {
+                  **report,
+                  'temp_pdf': str(pdf_path),
+                  'bytes': len(pdf_data),
+                  'sha256': hashlib.sha256(pdf_data).hexdigest(),
+                  'rendered_pages': rendered_pages,
+                  'page_manifest': page_manifest,
+                  'source_type': '公开原版逐页图像按原页序合成PDF（页面内容未重排）',
+              }
+
+          validated = []
+          for report in reports:
+              validated.append(build_pdf(report))
+
+          records = []
+          for index, item in enumerate(validated, 1):
+              filename = f"{index:02d}_{item['broker']}_{item['title'].replace('丘钛科技', '').replace('：', '_')}_{item['report_date'].replace('-', '')}.pdf"
+              filename = filename.replace('/', '_').replace('\\', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
+              if len(filename) > 150:
+                  filename = f"{index:02d}_{item['broker']}_{item['report_date'].replace('-', '')}_{item['id']}.pdf"
+              data = Path(item['temp_pdf']).read_bytes()
+              (out / filename).write_bytes(data)
+              public = {k: v for k, v in item.items() if k not in ('temp_pdf', 'page_manifest')}
+              public['filename'] = filename
+              records.append(public)
+              (work / f"page_manifest_{item['id']}.json").write_text(json.dumps(item['page_manifest'], ensure_ascii=False, indent=2), encoding='utf-8')
+
+          lines = [
+              '丘钛科技（01478.HK）券商深度报告',
+              '',
+              '本包包含2份可离线打开的完整PDF正文，共54页。',
+              '公开来源提供逐页原版图像，本包严格按原页序无裁切、无重排合成为PDF。',
+              '压缩包内不包含网页快捷方式、二维码、摘要卡片或不完整预览。',
+              '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   报告日期：{r['report_date']}；公开平台日期：{r['platform_date']}；作者：{r['authors']}；评级：{r['rating']}",
+                  f"   实际页数：{r['pages']}页；文件大小：{r['bytes'] / 1048576:.2f} MB",
+                  f"   来源页面：{r['detail_url']}",
+                  f"   逐页文件目录：{r['page_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ]
+          lines += [
+              '核验项目：54张页面图像逐页下载、图像文件签名和尺寸、页面去重、PDF文件头、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+              '由于来源为页面图像，PDF可正常阅读和打印，但全文文本检索能力可能弱于券商原生矢量PDF。',
+              '报告版权归原发布机构所有；历史评级、目标价和预测不构成当前投资建议。',
+          ]
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for p in sorted(out.iterdir()):
+                  z.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC validation failed: ' + bad)
+              pdf_names = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != 2:
+                  raise RuntimeError(f'expected 2 PDFs in ZIP, found {len(pdf_names)}')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(x['pages'] for x in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtech-two-broker-deep-reports-final
+          path: 丘钛科技_券商深度报告_完整PDF_2份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtech-two-broker-deep-reports-diagnostics
+          path: _qtech_two_reports_work/
+          if-no-files-found: ignore
+          retention-days: 7
