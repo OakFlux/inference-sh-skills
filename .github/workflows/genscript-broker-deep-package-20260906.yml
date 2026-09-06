@@ -1,0 +1,454 @@
+name: Package GenScript Biotech broker deep reports 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/genscript-broker-deep-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf
+
+      - name: Discover download verify and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '金斯瑞生物科技_券商深度报告_完整PDF'
+          out = Path(PACKAGE); out.mkdir(exist_ok=True)
+          work = Path('_genscript_work'); work.mkdir(exist_ok=True)
+          renders = work / 'renders'; renders.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          common_headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/json,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Connection': 'close',
+          }
+
+          target_terms = ('金斯瑞生物科技', '金斯瑞生物', 'genscript biotech', 'genscript biotechnology', '01548.hk', '1548.hk', '1548 hk')
+          report_markers = ('证券研究报告', '證券研究報告', '公司研究', '公司深度', '首次覆盖', '首次評級', '投资价值分析报告', '港股公司研究', 'equity research', 'initiation')
+          broker_names = [
+              '中信证券','海通国际','海通证券','华西证券','西南证券','华创证券','光大证券','西部证券','国联证券','国泰海通证券',
+              '中金公司','中国国际金融','华泰证券','国信证券','招商证券','中银国际','交银国际','浦银国际','兴业证券','广发证券',
+              '东吴证券','天风证券','国元国际','申万宏源','国金证券','中泰证券','民生证券','浙商证券','开源证券','方正证券',
+              '第一上海','安信国际','招银国际','银河证券','中国银河','CICC','Haitong International','CITIC Securities'
+          ]
+
+          # Known authoritative report metadata, used to recognize and rank the
+          # desired long-form company reports after download.
+          known_titles = [
+              {'fragment':'四位一体打造一站式生命科学服务平台','broker':'中信证券','date':'2023-06-06','priority':500000},
+              {'fragment':'四大业务板块加速成长','broker':'海通国际','date':'2023-06-21','priority':490000},
+              {'fragment':'有源之水','broker':'','date':'2023-06-11','priority':480000},
+              {'fragment':'多板块协同加速成长','broker':'西南证券','date':'2022-08-03','priority':450000},
+              {'fragment':'全产业链覆盖的国际化生物科技公司','broker':'华创证券','date':'2022-07-27','priority':440000},
+              {'fragment':'基因合成底层驱动','broker':'光大证券','date':'2022-05-24','priority':430000},
+              {'fragment':'夯实生命科学业务基础','broker':'华西证券','date':'2022-04-05','priority':420000},
+              {'fragment':'四大业务齐头并进','broker':'西部证券','date':'2022-12-19','priority':410000},
+              {'fragment':'深耕生命科学全产业链','broker':'国联证券','date':'2022-09-18','priority':400000},
+              {'fragment':'全球基因合成龙头企业','broker':'西部证券','date':'2022-01-11','priority':390000},
+          ]
+
+          candidate_urls: dict[str, dict] = {}
+          ap_codes: dict[str, dict] = {}
+          search_log = []
+          crawl_queue = []
+
+          def clean_url(value: str, base: str = '') -> str:
+              if not value:
+                  return ''
+              value = html.unescape(unquote(str(value))).replace('\\/', '/').strip(' \"\'<>),]')
+              if value.startswith('//'):
+                  value = 'https:' + value
+              if base and value.startswith('/'):
+                  value = urljoin(base, value)
+              if not value.startswith(('http://','https://')):
+                  return ''
+              return value
+
+          def add_ap(code: str, source: str = '', context: str = '') -> None:
+              match = re.search(r'AP\d{18}', str(code), flags=re.I)
+              if not match:
+                  return
+              code = match.group(0).upper()
+              rec = ap_codes.setdefault(code, {'code': code, 'sources': [], 'contexts': []})
+              if source and source not in rec['sources']:
+                  rec['sources'].append(source)
+              context = re.sub(r'\s+', ' ', context)[:1200]
+              if context and context not in rec['contexts']:
+                  rec['contexts'].append(context)
+
+          def add_url(value: str, source: str = '', context: str = '') -> None:
+              url = clean_url(value, source)
+              if not url:
+                  return
+              low = url.lower()
+              if not any(token in low for token in ('.pdf', 'pdf.dfcfw.com', 'attachment', 'download', 'reportdocs', 'img3.gelonghui.com')):
+                  return
+              rec = candidate_urls.setdefault(url, {'url': url, 'sources': [], 'contexts': []})
+              if source and source not in rec['sources']:
+                  rec['sources'].append(source)
+              context = re.sub(r'\s+', ' ', context)[:1200]
+              if context and context not in rec['contexts']:
+                  rec['contexts'].append(context)
+              for code in re.findall(r'AP\d{18}', url, flags=re.I):
+                  add_ap(code, source, context)
+
+          def harvest(text: str, source: str) -> None:
+              if not text:
+                  return
+              decoded = html.unescape(text).replace('\\/', '/')
+              for code in re.findall(r'AP\d{18}', decoded, flags=re.I):
+                  add_ap(code, source, 'regex')
+              for url in re.findall(r'https?://[^\s\"\'<>\\]+', decoded):
+                  add_url(url, source, 'regex')
+
+          exact_queries = [
+              '"金斯瑞生物科技" 券商 深度报告 PDF',
+              '"金斯瑞生物科技" 首次覆盖 PDF',
+              '"金斯瑞生物科技（1548.HK）" 公司深度',
+              '"四位一体打造一站式生命科学服务平台" PDF',
+              '"四大业务板块加速成长，传奇生物成为创新药出海典范" PDF',
+              '"有源之水，广泽万物" 金斯瑞 PDF',
+              '"多板块协同加速成长，四位一体战略未来可期" PDF',
+              '"全产业链覆盖的国际化生物科技公司" 金斯瑞 PDF',
+              '"基因合成底层驱动，迈向CGT时代的生命科学龙头" PDF',
+              '"夯实生命科学业务基础，搭建基因与细胞治疗高楼" PDF',
+              '"四大业务齐头并进，产能逐步释放爬坡" PDF',
+              '"深耕生命科学全产业链，打造四位一体产业龙头" PDF',
+              'site:pdf.dfcfw.com/pdf/ "金斯瑞生物科技"',
+              'site:img3.gelonghui.com 金斯瑞生物科技 pdf',
+              '"GenScript Biotech" "1548 HK" initiation pdf',
+          ]
+          engines = [
+              ('bing', 'https://www.bing.com/search?q={q}&count=50'),
+              ('brave', 'https://search.brave.com/search?q={q}&source=web'),
+              ('duckduckgo', 'https://html.duckduckgo.com/html/?q={q}'),
+          ]
+
+          for query in exact_queries:
+              for engine, template in engines:
+                  url = template.format(q=quote_plus(query))
+                  try:
+                      response = session.get(url, headers=common_headers, timeout=(20, 90), allow_redirects=True)
+                      rec = {'query': query, 'engine': engine, 'status': response.status_code, 'bytes': len(response.content), 'url': response.url}
+                      print('SEARCH', engine, response.status_code, len(response.content), query, flush=True)
+                      if response.status_code == 200:
+                          harvest(response.text, response.url)
+                          soup = BeautifulSoup(response.text, 'lxml')
+                          links = []
+                          for tag in soup.find_all('a', href=True):
+                              href = html.unescape(tag.get('href',''))
+                              label = ' '.join(tag.get_text(' ', strip=True).split())
+                              if 'uddg=' in href:
+                                  try:
+                                      href = parse_qs(urlparse(href).query).get('uddg',[href])[0]
+                                  except Exception:
+                                      pass
+                              href = clean_url(href, response.url)
+                              if not href:
+                                  continue
+                              links.append({'url': href, 'text': label})
+                              add_url(href, response.url, label)
+                              if any(domain in href for domain in ('sgpjbg.com','sdyanbao.com','hangyan.co','futunn.com','gelonghui.com','eastmoney.com','dfcfw.com','hstong.com','sina.com.cn')):
+                                  crawl_queue.append(href)
+                          rec['links'] = links[:200]
+                      search_log.append(rec)
+                  except Exception as exc:
+                      print('SEARCH_FAIL', engine, query, repr(exc), flush=True)
+                      search_log.append({'query': query, 'engine': engine, 'url': url, 'error': repr(exc)})
+                  time.sleep(0.25)
+
+          seed_pages = [
+              'https://www.sgpjbg.com/baogao/89301.html',
+              'https://www.sgpjbg.com/baogao/86114.html',
+              'https://www.sgpjbg.com/baogao/110226.html',
+              'https://www.sgpjbg.com/baogao/99365.html',
+              'https://www.sgpjbg.com.cn/baogao/67164.html',
+              'https://www.sdyanbao.com/detail/421846',
+              'https://www.hangyan.co/reports/2900010989275579595',
+              'https://www.hangyan.co/reports/2845682649702335709',
+              'https://news.futunn.com/post/28198437/kingsley-biotech-1548-hk-handover-coverage-four-major-business-segments',
+              'https://finance.sina.com.cn/stock/stockzmt/2022-05-25/doc-imizirau4628915.shtml',
+          ]
+          pages = []
+          for item in seed_pages + crawl_queue:
+              item = clean_url(item)
+              if item and item not in pages:
+                  pages.append(item)
+          for url in pages[:240]:
+              try:
+                  response = session.get(url, headers=common_headers, timeout=(20, 90), allow_redirects=True)
+                  print('CRAWL', response.status_code, len(response.content), url, '->', response.url, flush=True)
+                  if response.status_code != 200:
+                      continue
+                  harvest(response.text, response.url)
+                  soup = BeautifulSoup(response.text, 'lxml')
+                  text = soup.get_text(' ', strip=True)[:30000]
+                  if not any(term.lower().replace(' ','') in re.sub(r'\s+','',text.lower()) for term in target_terms):
+                      continue
+                  for tag in soup.find_all(True):
+                      for attribute in ('href','src','data','data-url','data-file','data-src','file','url','pdfurl','downloadurl'):
+                          value = tag.get(attribute)
+                          if value:
+                              add_url(value, response.url, tag.get_text(' ', strip=True))
+              except Exception as exc:
+                  print('CRAWL_FAIL', url, repr(exc), flush=True)
+
+          # GitHub code search can reveal public lists containing direct report URLs.
+          token = os.environ.get('GITHUB_TOKEN','')
+          gh_headers = {**common_headers, 'Accept':'application/vnd.github+json'}
+          if token:
+              gh_headers['Authorization'] = 'Bearer ' + token
+          for query in ('"金斯瑞生物科技" "pdf.dfcfw.com"','"金斯瑞生物科技" "AP202"','"GenScript Biotech" "pdf.dfcfw.com"'):
+              try:
+                  response = session.get('https://api.github.com/search/code', params={'q':query,'per_page':100}, headers=gh_headers, timeout=(20,90))
+                  print('GITHUB_SEARCH', response.status_code, len(response.content), query, flush=True)
+                  if response.status_code == 200:
+                      for item in response.json().get('items',[])[:100]:
+                          api_url = item.get('url')
+                          if not api_url:
+                              continue
+                          file_response = session.get(api_url, headers=gh_headers, timeout=(20,60))
+                          if file_response.status_code != 200:
+                              continue
+                          download_url = file_response.json().get('download_url')
+                          if download_url:
+                              raw = session.get(download_url, headers=common_headers, timeout=(20,90))
+                              if raw.status_code == 200:
+                                  harvest(raw.text, download_url)
+              except Exception as exc:
+                  print('GITHUB_SEARCH_FAIL', query, repr(exc), flush=True)
+
+          # Canonical Eastmoney mirrors for discovered AP codes.
+          for code, meta in list(ap_codes.items()):
+              source = meta['sources'][0] if meta['sources'] else 'https://data.eastmoney.com/'
+              context = ' '.join(meta['contexts'])
+              for prefix in ('H3','H2','H301'):
+                  add_url(f'https://pdf.dfcfw.com/pdf/{prefix}_{code}_1.pdf', source, context)
+
+          (work/'search_log.json').write_text(json.dumps(search_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (work/'ap_codes.json').write_text(json.dumps(ap_codes, ensure_ascii=False, indent=2), encoding='utf-8')
+          (work/'candidate_urls.json').write_text(json.dumps(list(candidate_urls.values()), ensure_ascii=False, indent=2), encoding='utf-8')
+          print('CANDIDATES', len(candidate_urls), 'AP_CODES', len(ap_codes), flush=True)
+
+          def fetch_pdf(rec):
+              url = rec['url']
+              referers = []
+              for source in rec.get('sources',[]):
+                  if source.startswith('http') and source not in referers:
+                      referers.append(source)
+              referers += ['https://data.eastmoney.com/report/','https://www.baidu.com/','https://www.bing.com/']
+              errors = []
+              for referer in referers[:6]:
+                  for attempt in range(1,4):
+                      try:
+                          response = session.get(url, headers={**common_headers,'Referer':referer}, timeout=(30,300), allow_redirects=True)
+                          print('GET_PDF', attempt, response.status_code, len(response.content), url, 'ref', referer, flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 100000:
+                              return response.content, response.url, referer
+                          errors.append(f'{referer}:HTTP{response.status_code}/{len(response.content)}')
+                      except Exception as exc:
+                          errors.append(f'{referer}:{repr(exc)}')
+                      time.sleep(min(attempt*2,6))
+              raise RuntimeError(' | '.join(errors[-12:]))
+
+          def opening_text(reader, limit=16):
+              pieces=[]
+              for page in reader.pages[:min(limit,len(reader.pages))]:
+                  try:
+                      pieces.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return '\n'.join(pieces)
+
+          valid=[]
+          failures=[]
+          seen_hashes=set()
+          for idx, rec in enumerate(list(candidate_urls.values()),1):
+              try:
+                  data, final_url, referer = fetch_pdf(rec)
+                  digest=hashlib.sha256(data).hexdigest()
+                  if digest in seen_hashes:
+                      continue
+                  seen_hashes.add(digest)
+                  temp=work/f'candidate_{idx:04d}.pdf'; temp.write_bytes(data)
+                  reader=PdfReader(str(temp),strict=False)
+                  pages=len(reader.pages)
+                  if pages < 15 or pages > 200:
+                      raise RuntimeError(f'page count outside company deep-report range: {pages}')
+                  text=opening_text(reader,16)
+                  compact=re.sub(r'\s+','',text).lower()
+                  identity_hits=sum(compact.count(term.replace(' ','').lower()) for term in target_terms)
+                  if identity_hits < 2:
+                      raise RuntimeError(f'weak company identity: {identity_hits}')
+                  full_context=' '.join(rec.get('contexts',[]))
+                  combined=(text+' '+full_context)
+                  if not any(marker.lower() in combined.lower() for marker in report_markers):
+                      raise RuntimeError('broker research marker missing')
+                  # Reject statutory filings, prospectuses, annual reports and exchange announcements.
+                  first4=re.sub(r'\s+','',text[:16000]).lower()
+                  if any(bad in first4 for bad in ('招股说明书','上市聆讯','年度报告202','年報202','中期报告202','中期報告202')) and not any(good in first4 for good in ('证券研究报告','證券研究報告','公司深度','首次覆盖')):
+                      raise RuntimeError('statutory filing rather than broker report')
+                  broker=next((name for name in broker_names if name.lower() in combined.lower()),'券商研究机构')
+                  title='金斯瑞生物科技公司深度报告'
+                  date=''
+                  priority=0
+                  normalized=re.sub(r'\s+','',combined)
+                  for known in known_titles:
+                      fragment=re.sub(r'\s+','',known['fragment'])
+                      if fragment in normalized:
+                          title=known['fragment']
+                          broker=known['broker'] or broker
+                          date=known['date']
+                          priority=max(priority,known['priority'])
+                  if not date:
+                      match=re.search(r'(20\d{2})[年./-](\d{1,2})[月./-](\d{1,2})', text[:10000])
+                      if match:
+                          date=f'{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}'
+                  if title=='金斯瑞生物科技公司深度报告':
+                      for line in text.splitlines()[:120]:
+                          clean=' '.join(line.split()).strip(' |·—-_')
+                          if 8 <= len(clean) <= 90 and any(key in clean for key in ('金斯瑞','基因合成','四位一体','生命科学','全产业链','业务板块')):
+                              if not re.fullmatch(r'.*(1548|01548).*',clean):
+                                  title=clean
+                                  break
+                  if broker=='券商研究机构':
+                      raise RuntimeError('recognized brokerage institution missing')
+                  q=subprocess.run(['qpdf','--check',str(temp)],capture_output=True,text=True)
+                  if q.returncode not in (0,3):
+                      raise RuntimeError('qpdf failed: '+q.stderr[-1000:])
+                  doc=pymupdf.open(str(temp))
+                  rendered=[]
+                  for pno in sorted(set([0,pages//2,pages-1])):
+                      pix=doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.0,1.0),alpha=False)
+                      rp=renders/f'{idx:04d}_{pno+1:03d}.png'; pix.save(str(rp))
+                      if rp.stat().st_size < 6000 or pix.width < 400 or pix.height < 500:
+                          raise RuntimeError(f'render failed page {pno+1}')
+                      rendered.append(pno+1)
+                  doc.close()
+                  year=int(date[:4]) if re.match(r'20\d{2}',date) else 0
+                  score=priority+pages*1000+max(0,year-2018)*500
+                  item={
+                      'broker':broker,'title':title,'date':date,'report_type':'公司深度/首次覆盖报告',
+                      'pages':pages,'bytes':len(data),'sha256':digest,'source_url':final_url,
+                      'requested_url':rec['url'],'successful_referer':referer,'rendered_pages':rendered,
+                      'identity_hits':identity_hits,'score':score,'temp':str(temp),
+                  }
+                  valid.append(item)
+                  print('VALID',json.dumps({k:item[k] for k in ('broker','title','date','pages','bytes','source_url','score')},ensure_ascii=False),flush=True)
+              except Exception as exc:
+                  failures.append({'url':rec.get('url'),'error':repr(exc)})
+                  print('REJECT',rec.get('url'),repr(exc),flush=True)
+
+          (work/'all_valid.json').write_text(json.dumps([{k:v for k,v in x.items() if k!='temp'} for x in valid],ensure_ascii=False,indent=2),encoding='utf-8')
+          (work/'failures.json').write_text(json.dumps(failures,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          valid.sort(key=lambda x:(-x['score'],-x['pages'],x['date']))
+          selected=[]
+          brokers_seen=set()
+          titles_seen=set()
+          for item in valid:
+              title_key=re.sub(r'\W+','',item['title'])
+              if item['broker'] in brokers_seen or title_key in titles_seen:
+                  continue
+              selected.append(item)
+              brokers_seen.add(item['broker'])
+              titles_seen.add(title_key)
+              if len(selected)==3:
+                  break
+          if len(selected)<2:
+              raise RuntimeError('Fewer than two genuine GenScript brokerage deep reports passed validation. Valid='+json.dumps([{k:v for k,v in x.items() if k!='temp'} for x in valid],ensure_ascii=False))
+
+          def safe(value):
+              return re.sub(r'[\\/:*?"<>|\s]+','_',str(value)).strip('_')[:65]
+
+          records=[]
+          for order,item in enumerate(selected,1):
+              suffix=item['date'].replace('-','') if item['date'] else f"{item['pages']}p"
+              filename=f'{order:02d}_{safe(item["broker"])}_{safe(item["title"])}_{suffix}.pdf'
+              data=Path(item['temp']).read_bytes()
+              (out/filename).write_bytes(data)
+              records.append({k:v for k,v in item.items() if k not in ('temp','score')}|{'filename':filename})
+
+          lines=['金斯瑞生物科技（01548.HK）券商深度报告','',f'本包包含{len(records)}份可离线打开的完整券商PDF。','不含网页链接、快捷方式、二维码、摘要卡片、年报、招股书或不完整预览。','']
+          for i,r in enumerate(records,1):
+              lines += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   日期：{r['date'] or '见原报告'}；类型：{r['report_type']}；实际页数：{r['pages']}页；大小：{r['bytes']/1048576:.2f} MB",
+                  f"   公开来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",'',
+              ]
+          lines += ['核验项目：PDF文件头、公司名称/证券代码、券商与研究报告标识、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。','报告观点、评级、预测和目标价均对应历史发布时点，不构成当前投资建议。']
+          (out/'报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+
+          zip_path=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zip_path,'w',zipfile.ZIP_DEFLATED,compresslevel=9,allowZip64=True) as zf:
+              for path in sorted(out.iterdir()):
+                  zf.write(path,arcname=f'{PACKAGE}/{path.name}')
+          with zipfile.ZipFile(zip_path,'r') as zf:
+              bad=zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failed: '+bad)
+              pdfs=[name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs)!=len(records):
+                  raise RuntimeError(f'PDF count mismatch: {len(pdfs)} vs {len(records)}')
+
+          print('FINAL_ZIP',zip_path,zip_path.stat().st_size,'PDFS',len(records),'PAGES',sum(r['pages'] for r in records),flush=True)
+          print('MANIFEST',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: genscript-broker-deep-reports-final
+          path: 金斯瑞生物科技_券商深度报告_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genscript-broker-deep-reports-diagnostics
+          path: _genscript_work/
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 6
