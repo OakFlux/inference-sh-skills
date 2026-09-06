@@ -1,0 +1,439 @@
+name: Package Q Technology broker deep reports 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/q-tech-broker-deep-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Discover download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE = '丘钛科技_券商深度报告_完整PDF'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+          work = Path('_qtech_work')
+          work.mkdir(exist_ok=True)
+          renders = work / 'renders'
+          renders.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/',
+          })
+
+          def parse_payload(response):
+              text = response.text.strip()
+              try:
+                  return response.json()
+              except Exception:
+                  m = re.match(r'^[^(]+\((.*)\)\s*;?$', text, flags=re.S)
+                  if m:
+                      return json.loads(m.group(1))
+                  raise
+
+          def rows_from(payload):
+              if isinstance(payload, list):
+                  return payload
+              if not isinstance(payload, dict):
+                  return []
+              for key in ('data', 'list', 'rows', 'items'):
+                  value = payload.get(key)
+                  if isinstance(value, list):
+                      return value
+                  if isinstance(value, dict):
+                      for inner in ('data', 'list', 'rows', 'items'):
+                          if isinstance(value.get(inner), list):
+                              return value[inner]
+              result = payload.get('result') or payload.get('Result')
+              if isinstance(result, dict):
+                  for inner in ('data', 'list', 'rows', 'items'):
+                      if isinstance(result.get(inner), list):
+                          return result[inner]
+              return []
+
+          def total_pages(payload):
+              if not isinstance(payload, dict):
+                  return None
+              candidates = [payload]
+              for key in ('result', 'Result', 'data'):
+                  if isinstance(payload.get(key), dict):
+                      candidates.append(payload[key])
+              for obj in candidates:
+                  for key in ('TotalPage', 'totalPage', 'pages', 'pageCount'):
+                      try:
+                          value = int(obj.get(key))
+                          if value > 0:
+                              return value
+                      except Exception:
+                          pass
+              return None
+
+          def pick(row, *keys, default=''):
+              for key in keys:
+                  value = row.get(key)
+                  if value not in (None, '', []):
+                      if isinstance(value, list):
+                          return '、'.join(str(x) for x in value)
+                      return str(value)
+              return default
+
+          def is_target(row):
+              compact = re.sub(r'\s+', '', json.dumps(row, ensure_ascii=False)).lower()
+              if any(term in compact for term in ('丘钛科技', '丘鈦科技', 'qtechtechnology', 'qtechnology')):
+                  return True
+              exact_codes = {'01478', '1478', '01478.hk', '1478.hk', 'hk01478'}
+              for key in ('stockCode', 'stockcode', 'secuCode', 'securityCode', 'code', 'stockCodeWithMarket'):
+                  if str(row.get(key, '')).lower() in exact_codes:
+                      return True
+              return False
+
+          def base_params(page, begin='2000-01-01', end='2030-01-01'):
+              return {
+                  'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                  'rating': '*', 'ratingChange': '*',
+                  'beginTime': begin, 'endTime': end,
+                  'pageNo': str(page), 'fields': '', 'qType': '0',
+                  'orgCode': '', 'code': '*', 'rcode': '',
+                  'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+              }
+
+          endpoint = 'https://reportapi.eastmoney.com/report/list'
+          list2 = 'https://reportapi.eastmoney.com/report/list2'
+          rows_by_info = {}
+          query_log = []
+
+          def absorb(rows, source):
+              added = 0
+              for row in rows:
+                  if not isinstance(row, dict) or not is_target(row):
+                      continue
+                  info = pick(row, 'infoCode', 'infocode', 'INFOCODE', 'info_code')
+                  if not info.startswith('AP'):
+                      continue
+                  if info not in rows_by_info:
+                      rows_by_info[info] = dict(row)
+                      rows_by_info[info]['_discovery_source'] = source
+                      added += 1
+              return added
+
+          # Portals document that Hong Kong company reports are most reliably
+          # found with the Stock Connect company name rather than the code.
+          for keyword in ('丘钛科技', '丘鈦科技'):
+              for page in range(1, 11):
+                  params = base_params(page)
+                  params['keyword'] = keyword
+                  try:
+                      r = session.get(endpoint, params=params, timeout=(20, 90))
+                      payload = parse_payload(r)
+                      rows = rows_from(payload)
+                      added = absorb(rows, f'GET keyword={keyword} page={page}')
+                      query_log.append({'method': 'GET', 'url': r.url, 'status': r.status_code, 'bytes': len(r.content), 'rows': len(rows), 'added': added})
+                      print('QUERY', keyword, page, r.status_code, len(rows), 'added', added, flush=True)
+                      pages = total_pages(payload)
+                      if not rows or (pages and page >= pages):
+                          break
+                  except Exception as exc:
+                      query_log.append({'method': 'GET', 'keyword': keyword, 'page': page, 'error': repr(exc)})
+                      print('QUERY_FAIL', keyword, page, repr(exc), flush=True)
+                      break
+                  time.sleep(0.35)
+
+          # Also try exact code variants. Some deployments accept only pure digits.
+          for code in ('01478', '1478'):
+              for page in range(1, 6):
+                  params = base_params(page)
+                  params['code'] = code
+                  try:
+                      r = session.get(endpoint, params=params, timeout=(20, 90))
+                      payload = parse_payload(r)
+                      rows = rows_from(payload)
+                      added = absorb(rows, f'GET code={code} page={page}')
+                      query_log.append({'method': 'GET', 'url': r.url, 'status': r.status_code, 'bytes': len(r.content), 'rows': len(rows), 'added': added})
+                      print('CODE_QUERY', code, page, r.status_code, len(rows), 'added', added, flush=True)
+                      pages = total_pages(payload)
+                      if not rows or (pages and page >= pages):
+                          break
+                  except Exception as exc:
+                      query_log.append({'method': 'GET', 'code': code, 'page': page, 'error': repr(exc)})
+                      break
+                  time.sleep(0.35)
+
+          # Narrow date scans recover reports when the keyword parameter is ignored.
+          date_windows = [
+              ('2021-06-20', '2021-06-24'),
+              ('2025-03-08', '2025-03-12'),
+              ('2025-09-03', '2025-09-07'),
+          ]
+          for begin, end in date_windows:
+              for page in range(1, 31):
+                  params = base_params(page, begin, end)
+                  try:
+                      r = session.get(endpoint, params=params, timeout=(20, 90))
+                      payload = parse_payload(r)
+                      rows = rows_from(payload)
+                      added = absorb(rows, f'GET date={begin}:{end} page={page}')
+                      query_log.append({'method': 'GET', 'url': r.url, 'status': r.status_code, 'bytes': len(r.content), 'rows': len(rows), 'added': added})
+                      print('DATE_QUERY', begin, end, page, r.status_code, len(rows), 'added', added, flush=True)
+                      pages = total_pages(payload)
+                      if not rows or (pages and page >= pages):
+                          break
+                  except Exception as exc:
+                      query_log.append({'method': 'GET', 'begin': begin, 'end': end, 'page': page, 'error': repr(exc)})
+                      break
+                  time.sleep(0.3)
+
+          # Newer Eastmoney deployments may expose individual-stock reports via POST /list2.
+          for code in ('01478', '1478'):
+              params = base_params(1)
+              params['code'] = code
+              try:
+                  r = session.post(list2, data=params, timeout=(20, 90))
+                  payload = parse_payload(r)
+                  rows = rows_from(payload)
+                  added = absorb(rows, f'POST list2 code={code}')
+                  query_log.append({'method': 'POST', 'url': r.url, 'status': r.status_code, 'bytes': len(r.content), 'rows': len(rows), 'added': added})
+                  print('LIST2', code, r.status_code, len(rows), 'added', added, flush=True)
+              except Exception as exc:
+                  query_log.append({'method': 'POST', 'code': code, 'error': repr(exc)})
+
+          (work / 'query_log.json').write_text(json.dumps(query_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (work / 'discovered_rows.json').write_text(json.dumps(rows_by_info, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('DISCOVERED', len(rows_by_info), sorted(rows_by_info), flush=True)
+
+          if not rows_by_info:
+              raise RuntimeError('No Q Technology report records discovered from the public report API')
+
+          def fetch_pdf(info):
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?download=1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf?download=1.pdf',
+              ]
+              errors = []
+              headers = {
+                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  'Referer': 'https://data.eastmoney.com/',
+              }
+              for url in urls:
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, headers=headers, timeout=(30, 300), allow_redirects=True)
+                          print('GET_PDF', info, attempt, r.status_code, len(r.content), r.url, flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 60000:
+                              return r.content, str(r.url)
+                          errors.append(f'{url}: HTTP {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{url}: {repr(exc)}')
+                      time.sleep(min(2 * attempt, 6))
+              raise RuntimeError(' | '.join(errors[-8:]))
+
+          def opening_text(reader, limit=12):
+              parts = []
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(parts)).lower()
+
+          def safe(text, limit=60):
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', str(text)).strip('_')[:limit]
+
+          known_rank = [
+              ('手机光学驱动利润弹性', 300000),
+              ('车载、iot高速成长', 290000),
+              ('手机摄像头模组巨头', 280000),
+          ]
+
+          validated = []
+          failures = []
+          hashes = set()
+          for idx, (info, row) in enumerate(sorted(rows_by_info.items()), 1):
+              title = pick(row, 'title', 'reportTitle', 'REPORT_TITLE', 'reportName', default='丘钛科技公司研究报告')
+              broker = pick(row, 'orgSName', 'orgName', 'organizationName', 'ORG_SNAME', default='券商研究机构')
+              date = pick(row, 'publishDate', 'publishTime', 'date', 'PUBLISHDATE')[:10]
+              authors = pick(row, 'researcher', 'author', 'researchers', 'RESEARCHER')
+              rating = pick(row, 'emRatingName', 'ratingName', 'rating', 'RATING_NAME')
+              api_type = pick(row, 'reportType', 'reportTypeName', 'REPORT_TYPE')
+              try:
+                  data, source_url = fetch_pdf(info)
+                  temp = work / f'{idx:03d}_{info}.pdf'
+                  temp.write_bytes(data)
+                  reader = PdfReader(str(temp), strict=False)
+                  pages = len(reader.pages)
+                  if pages < 4:
+                      raise RuntimeError(f'only {pages} pages')
+                  text = opening_text(reader)
+                  if not any(x in text for x in ('丘钛科技', '丘鈦科技', 'qtechtechnology', 'qtechnology', '01478.hk', '1478.hk')):
+                      raise RuntimeError('company identity not found in opening pages')
+                  q = subprocess.run(['qpdf', '--check', str(temp)], capture_output=True, text=True)
+                  if q.returncode not in (0, 3):
+                      raise RuntimeError('qpdf failed: ' + q.stderr[-1000:])
+                  doc = pymupdf.open(str(temp))
+                  sample = sorted(set([0, max(0, pages // 2), pages - 1]))
+                  rendered_pages = []
+                  for pno in sample:
+                      page = doc.load_page(pno)
+                      pix = page.get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                      render_path = renders / f'{idx:03d}_{pno + 1:03d}.png'
+                      pix.save(str(render_path))
+                      if render_path.stat().st_size < 5000 or pix.width < 400 or pix.height < 400:
+                          raise RuntimeError(f'render check failed at page {pno + 1}')
+                      rendered_pages.append(pno + 1)
+                  doc.close()
+                  digest = hashlib.sha256(data).hexdigest()
+                  if digest in hashes:
+                      raise RuntimeError('duplicate PDF content')
+                  hashes.add(digest)
+
+                  lower_title = title.lower().replace(' ', '')
+                  deep = pages >= 15 or any(k in lower_title for k in ('深度研究', '公司深度', '首次覆盖', '首次评级', '首次研究'))
+                  score = pages * 100
+                  if deep:
+                      score += 100000
+                  for fragment, bonus in known_rank:
+                      if fragment in lower_title:
+                          score += bonus
+                  if '首次覆盖' in lower_title:
+                      score += 30000
+                  if date >= '2025-01-01':
+                      score += 5000
+                  rec = {
+                      'infoCode': info, 'title': title, 'broker': broker,
+                      'date': date, 'authors': authors, 'rating': rating,
+                      'api_report_type': api_type, 'pages': pages,
+                      'bytes': len(data), 'sha256': digest,
+                      'source_url': source_url, 'temp': str(temp),
+                      'rendered_pages': rendered_pages, 'deep': deep,
+                      'score': score,
+                  }
+                  validated.append(rec)
+                  print('VALIDATED', json.dumps({k: rec[k] for k in ('infoCode', 'title', 'broker', 'date', 'pages', 'deep', 'score')}, ensure_ascii=False), flush=True)
+              except Exception as exc:
+                  failures.append({'infoCode': info, 'title': title, 'broker': broker, 'error': repr(exc)})
+                  print('FAILED', info, title, repr(exc), flush=True)
+
+          (work / 'validated.json').write_text(json.dumps([{k: v for k, v in x.items() if k != 'temp'} for x in validated], ensure_ascii=False, indent=2), encoding='utf-8')
+          (work / 'failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          deep_reports = sorted([x for x in validated if x['deep']], key=lambda x: (-x['score'], -x['pages'], x['date']))
+          selected = []
+          used_titles = set()
+          for item in deep_reports:
+              key = re.sub(r'[^\w\u4e00-\u9fff]+', '', item['title'].lower())
+              if key in used_titles:
+                  continue
+              selected.append(item)
+              used_titles.add(key)
+              if len(selected) == 3:
+                  break
+
+          if len(selected) < 2:
+              raise RuntimeError('Only ' + str(len(selected)) + ' genuine deep/first-coverage reports passed validation')
+
+          records = []
+          for order, item in enumerate(selected, 1):
+              filename = f'{order:02d}_{safe(item["broker"])}_{safe(item["title"])}_{item["date"].replace("-", "")}.pdf'
+              data = Path(item['temp']).read_bytes()
+              (out / filename).write_bytes(data)
+              records.append({
+                  'filename': filename,
+                  'broker': item['broker'], 'title': item['title'],
+                  'date': item['date'], 'authors': item['authors'],
+                  'rating': item['rating'], 'report_type': '公司深度/首次覆盖报告',
+                  'pages': item['pages'], 'bytes': item['bytes'],
+                  'sha256': item['sha256'], 'source_url': item['source_url'],
+                  'eastmoney_info_code': item['infoCode'],
+                  'rendered_pages': item['rendered_pages'],
+                  'source': '东方财富公开研报PDF镜像（保留原券商报告正文和版式）',
+              })
+
+          lines = [
+              '丘钛科技（01478.HK）券商深度报告', '',
+              f'本包包含 {len(records)} 份可离线打开的完整原始券商PDF。',
+              '筛选口径：公司深度、首次覆盖或实际页数不少于15页；未放入网页入口、快捷方式、摘要卡片或自行重排摘录。', '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   日期：{r['date']}；作者：{r['authors'] or '见原报告'}；评级：{r['rating'] or '见原报告'}",
+                  f"   实际页数：{r['pages']}页；大小：{r['bytes'] / 1048576:.2f} MB",
+                  f"   来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}", '',
+              ]
+          lines += [
+              '核验项目：PDF文件头、公司名称/证券代码、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+              '报告中的评级、目标价、预测和判断均属于历史发布时点观点，不构成当前投资建议。',
+          ]
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for p in sorted(out.iterdir()):
+                  z.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failed: ' + bad)
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(records):
+                  raise RuntimeError('PDF count mismatch')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: q-tech-broker-deep-reports-final
+          path: 丘钛科技_券商深度报告_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: q-tech-broker-deep-reports-diagnostics
+          path: _qtech_work/
+          if-no-files-found: ignore
+          retention-days: 7
