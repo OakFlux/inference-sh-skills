@@ -1,0 +1,30 @@
+name: Probe Harbin Pharmaceutical direct reports
+
+on:
+  push:
+    branches:
+      - chatgpt-hayao-broker-reports-20260906
+    paths:
+      - '.github/workflows/probe-hayao-direct-only-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/probe_hayao_direct_only_20260906.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hayao-direct-probe-20260906
+          path: |
+            hayao-direct-probe.json
+            hayao-direct-pdfs/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
