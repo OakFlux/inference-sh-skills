@@ -1,0 +1,79 @@
+name: Publish Q Technology broker report package 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/q-technology-publish-artifact-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Download latest successful package artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import io, json, os, time, zipfile
+          from pathlib import Path
+          import urllib.request
+
+          repo=os.environ['GITHUB_REPOSITORY']
+          token=os.environ['GH_TOKEN']
+          headers={'Authorization':f'Bearer {token}','Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28','User-Agent':'qtech-publisher'}
+          api=f'https://api.github.com/repos/{repo}/actions/artifacts?name=q-technology-broker-reports-final&per_page=20'
+          for attempt in range(20):
+              req=urllib.request.Request(api,headers=headers)
+              with urllib.request.urlopen(req,timeout=60) as r:
+                  payload=json.load(r)
+              arts=[a for a in payload.get('artifacts',[]) if not a.get('expired')]
+              arts.sort(key=lambda x:x.get('created_at',''),reverse=True)
+              if arts:
+                  art=arts[0]
+                  print('ARTIFACT',json.dumps(art,ensure_ascii=False),flush=True)
+                  dreq=urllib.request.Request(art['archive_download_url'],headers=headers)
+                  with urllib.request.urlopen(dreq,timeout=180) as r:
+                      outer=r.read()
+                  with zipfile.ZipFile(io.BytesIO(outer)) as z:
+                      names=z.namelist(); print('OUTER_NAMES',names,flush=True)
+                      inner=[n for n in names if n.endswith('.zip')]
+                      if not inner: raise RuntimeError('No inner ZIP in artifact')
+                      data=z.read(inner[0])
+                  dest=Path('deliverables')/'丘钛科技_券商研究报告_完整PDF.zip'
+                  dest.parent.mkdir(exist_ok=True)
+                  dest.write_bytes(data)
+                  with zipfile.ZipFile(io.BytesIO(data)) as z:
+                      bad=z.testzip()
+                      pdfs=[n for n in z.namelist() if n.lower().endswith('.pdf')]
+                      print('INNER_ZIP',len(data),'PDFS',len(pdfs),'BAD',bad,'NAMES',z.namelist(),flush=True)
+                      if bad or len(pdfs)<2: raise RuntimeError('Invalid final inner ZIP')
+                  break
+              print('WAITING_FOR_ARTIFACT',attempt+1,flush=True)
+              time.sleep(15)
+          else:
+              raise RuntimeError('Package artifact not found')
+          PY
+
+      - name: Commit downloadable package
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add 'deliverables/丘钛科技_券商研究报告_完整PDF.zip'
+          if git diff --cached --quiet; then
+            echo 'No package change'
+          else
+            git commit -m 'Add Q Technology broker report ZIP'
+            git push
+          fi
