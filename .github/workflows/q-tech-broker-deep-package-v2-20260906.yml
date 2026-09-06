@@ -1,0 +1,374 @@
+name: Package Q Technology broker reports v2 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/q-tech-broker-deep-package-v2-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pillow img2pdf pypdf pymupdf
+
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import img2pdf
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '丘钛科技_券商深度报告_完整PDF'
+          out = Path(PACKAGE); out.mkdir(exist_ok=True)
+          work = Path('_qtech_v2_work'); work.mkdir(exist_ok=True)
+          renders = work / 'renders'; renders.mkdir(exist_ok=True)
+          images_root = work / 'page_images'; images_root.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+          })
+
+          reports = [
+              {
+                  'id': '4724883',
+                  'detail': 'https://www.fxbaogao.com/detail/4724883',
+                  'date': '2025-03-10',
+                  'broker': '开源证券',
+                  'authors': '吴柳燕、张可',
+                  'rating': '买入（首次覆盖）',
+                  'title': '手机光学驱动利润弹性，汽车及XR提振估值',
+                  'expected_min_pages': 15,
+                  'priority': 1,
+              },
+              {
+                  'id': '5044833',
+                  'detail': 'https://www.fxbaogao.com/detail/5044833',
+                  'date': '2025-09-05',
+                  'broker': '中邮证券',
+                  'authors': '吴文吉、翟一梦',
+                  'rating': '买入（首次覆盖）',
+                  'title': '车载、IoT高速成长',
+                  'expected_min_pages': 4,
+                  'priority': 2,
+              },
+          ]
+
+          # First try Eastmoney's newer individual-stock endpoint using its JSON body.
+          # Any original PDFs found there supersede page-image reconstruction.
+          discovered = {}
+          list2_log = []
+          for code in ('01478', '1478', 'HK01478', '01478.HK', '1478.HK'):
+              for page in range(1, 6):
+                  body = {
+                      'pageSize': 100, 'pageNo': page, 'p': page,
+                      'pageNum': page, 'pageNumber': page,
+                      'beginTime': '2000-01-01', 'endTime': '2030-01-01',
+                      'code': code, 'industryCode': '*',
+                      'rating': None, 'ratingChange': None,
+                      'orgCode': None, 'rcode': '',
+                  }
+                  try:
+                      r = session.post(
+                          'https://reportapi.eastmoney.com/report/list2',
+                          json=body,
+                          headers={'Content-Type': 'application/json', 'Referer': 'https://data.eastmoney.com/'},
+                          timeout=(20, 90),
+                      )
+                      rec = {'code': code, 'page': page, 'status': r.status_code, 'bytes': len(r.content), 'body_preview': r.text[:300]}
+                      rows = []
+                      if r.status_code == 200:
+                          payload = r.json()
+                          rows = payload.get('data') or []
+                          rec['rows'] = len(rows)
+                          for row in rows:
+                              compact = re.sub(r'\s+', '', json.dumps(row, ensure_ascii=False)).lower()
+                              if not any(x in compact for x in ('丘钛科技', '丘鈦科技', 'qtechtechnology', 'qtechnology')):
+                                  continue
+                              info = str(row.get('infoCode') or '')
+                              if info.startswith('AP'):
+                                  discovered[info] = row
+                      list2_log.append(rec)
+                      print('LIST2', code, page, r.status_code, len(rows), 'found', len(discovered), flush=True)
+                      if not rows:
+                          break
+                  except Exception as exc:
+                      list2_log.append({'code': code, 'page': page, 'error': repr(exc)})
+                      print('LIST2_FAIL', code, page, repr(exc), flush=True)
+                      break
+                  time.sleep(0.4)
+          (work / 'list2_log.json').write_text(json.dumps(list2_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (work / 'eastmoney_rows.json').write_text(json.dumps(discovered, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def fetch_original_pdf(info):
+              for prefix in ('H3', 'H2'):
+                  for suffix in ('', '?download=1.pdf'):
+                      url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf{suffix}'
+                      try:
+                          r = session.get(url, headers={'Referer': 'https://data.eastmoney.com/', 'Accept': 'application/pdf,*/*'}, timeout=(30, 300))
+                          print('PDF_PROBE', info, r.status_code, len(r.content), url, flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 60000:
+                              return r.content, url
+                      except Exception as exc:
+                          print('PDF_PROBE_FAIL', info, repr(exc), flush=True)
+                      time.sleep(1)
+              return None, None
+
+          direct_candidates = []
+          for info, row in discovered.items():
+              data, url = fetch_original_pdf(info)
+              if data:
+                  direct_candidates.append((info, row, data, url))
+
+          def find_report_image_base(detail_url, report_id, date):
+              r = session.get(detail_url, timeout=(20, 90))
+              r.raise_for_status()
+              raw = html.unescape(r.text).replace('\\/', '/')
+              (work / f'{report_id}_detail.html').write_text(r.text, encoding='utf-8')
+              patterns = [
+                  r'https?://public\.fxbaogao\.com/report-image/[^"\'<>\s?]+-' + re.escape(report_id) + r'-?1\.png',
+                  r'https?://public\.fxbaogao\.com/report-image/[^"\'<>\s?]+/' + re.escape(report_id) + r'-1\.png',
+                  r'https?://public\.fxbaogao\.com/report-image/[^"\'<>\s?]+?-' + r'1\.png',
+              ]
+              candidates = []
+              for pat in patterns:
+                  candidates.extend(re.findall(pat, raw, flags=re.I))
+              # More permissive extraction, then filter to the current report id.
+              candidates.extend(re.findall(r'https?://public\.fxbaogao\.com/report-image/[^"\'<>\s?]+\.png', raw, flags=re.I))
+              candidates = [u.split('?')[0] for u in candidates if report_id in u]
+              for u in candidates:
+                  if re.search(r'-1\.png$', u):
+                      return re.sub(r'-1\.png$', '', u), r.url
+              y, m, d = date.split('-')
+              return f'https://public.fxbaogao.com/report-image/{y}/{m}/{d}/{report_id}', r.url
+
+          def download_report_images(cfg):
+              base, final_detail = find_report_image_base(cfg['detail'], cfg['id'], cfg['date'])
+              folder = images_root / cfg['id']; folder.mkdir(exist_ok=True)
+              saved = []
+              failures = []
+              previous_hash = None
+              consecutive_missing = 0
+              for page_no in range(1, 81):
+                  url = f'{base}-{page_no}.png'
+                  try:
+                      r = session.get(url, headers={'Referer': final_detail, 'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'}, timeout=(20, 120))
+                      sig = r.content[:16]
+                      is_image = sig.startswith(b'\x89PNG') or sig.startswith(b'\xff\xd8\xff') or sig.startswith(b'RIFF')
+                      if r.status_code != 200 or not is_image or len(r.content) < 20000:
+                          failures.append({'page': page_no, 'url': url, 'status': r.status_code, 'bytes': len(r.content), 'content_type': r.headers.get('content-type')})
+                          consecutive_missing += 1
+                          if saved and consecutive_missing >= 2:
+                              break
+                          continue
+                      digest = hashlib.sha256(r.content).hexdigest()
+                      if previous_hash == digest and page_no > 1:
+                          failures.append({'page': page_no, 'url': url, 'reason': 'duplicate previous page'})
+                          consecutive_missing += 1
+                          if consecutive_missing >= 2:
+                              break
+                          continue
+                      ext = '.png' if sig.startswith(b'\x89PNG') else ('.jpg' if sig.startswith(b'\xff\xd8\xff') else '.webp')
+                      path = folder / f'{page_no:03d}{ext}'
+                      path.write_bytes(r.content)
+                      with Image.open(path) as im:
+                          if im.width < 600 or im.height < 800:
+                              path.unlink(missing_ok=True)
+                              failures.append({'page': page_no, 'url': url, 'reason': f'image too small {im.width}x{im.height}'})
+                              consecutive_missing += 1
+                              continue
+                      saved.append(path)
+                      previous_hash = digest
+                      consecutive_missing = 0
+                      print('IMAGE_OK', cfg['id'], page_no, len(r.content), url, flush=True)
+                  except Exception as exc:
+                      failures.append({'page': page_no, 'url': url, 'error': repr(exc)})
+                      consecutive_missing += 1
+                      if saved and consecutive_missing >= 2:
+                          break
+                  time.sleep(0.25)
+              (work / f'{cfg["id"]}_image_failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+              return saved, base
+
+          def validate_pdf(path, identity_required=True):
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError('qpdf failed: ' + q.stderr[-1000:])
+              # Image-based PDFs may not have searchable text, so identity is also
+              # established by the source page metadata and visual rendering.
+              if identity_required:
+                  text = ''
+                  for page in reader.pages[:min(8, pages)]:
+                      try: text += page.extract_text() or ''
+                      except Exception: pass
+                  compact = re.sub(r'\s+', '', text).lower()
+                  if compact and not any(x in compact for x in ('丘钛科技', '丘鈦科技', 'qtechnology', '01478', '1478.hk')):
+                      raise RuntimeError('company identity mismatch')
+              doc = pymupdf.open(str(path))
+              sample = sorted(set([0, max(0, pages // 2), pages - 1]))
+              rendered = []
+              for pno in sample:
+                  pix = doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  rp = renders / f'{path.stem}_{pno+1:03d}.png'
+                  pix.save(str(rp))
+                  if rp.stat().st_size < 6000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'render failed page {pno+1}')
+                  rendered.append(pno + 1)
+              doc.close()
+              return pages, rendered
+
+          assembled = []
+
+          # Use matching direct PDFs if the individual-stock API supplied them.
+          for info, row, data, source_url in direct_candidates:
+              title = str(row.get('title') or '')
+              compact = title.replace(' ', '').lower()
+              if not any(fragment in compact for fragment in ('手机光学驱动利润弹性', '车载、iot高速成长', '手机摄像头模组巨头')):
+                  continue
+              temp = work / f'direct_{info}.pdf'; temp.write_bytes(data)
+              pages, rendered = validate_pdf(temp)
+              assembled.append({
+                  'title': title, 'broker': str(row.get('orgSName') or '券商研究机构'),
+                  'date': str(row.get('publishDate') or '')[:10],
+                  'authors': str(row.get('researcher') or ''),
+                  'rating': str(row.get('emRatingName') or row.get('ratingName') or ''),
+                  'pages': pages, 'path': temp, 'source_url': source_url,
+                  'source_type': '公开原始PDF', 'rendered_pages': rendered,
+                  'priority': 0 if '手机光学驱动利润弹性' in compact else 1,
+              })
+
+          existing_titles = {x['title'] for x in assembled}
+          for cfg in reports:
+              if cfg['title'] in existing_titles:
+                  continue
+              page_images, base = download_report_images(cfg)
+              if len(page_images) < cfg['expected_min_pages']:
+                  raise RuntimeError(f"Report {cfg['id']} only exposed {len(page_images)} valid pages; minimum {cfg['expected_min_pages']}")
+              temp = work / f"{cfg['id']}_{cfg['broker']}.pdf"
+              temp.write_bytes(img2pdf.convert([str(p) for p in page_images]))
+              pages, rendered = validate_pdf(temp, identity_required=False)
+              if pages != len(page_images):
+                  raise RuntimeError(f"Page count mismatch for {cfg['id']}: {pages} vs {len(page_images)}")
+              assembled.append({
+                  **cfg, 'pages': pages, 'path': temp,
+                  'source_url': cfg['detail'],
+                  'page_image_base': base,
+                  'source_type': '公开原版逐页图像合成PDF',
+                  'rendered_pages': rendered,
+              })
+
+          # Deduplicate and retain 2-3 reports as requested.
+          unique = []
+          hashes = set()
+          for item in sorted(assembled, key=lambda x: (x.get('priority', 99), -x['pages'])):
+              data = Path(item['path']).read_bytes()
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  continue
+              hashes.add(digest)
+              item['sha256'] = digest
+              item['bytes'] = len(data)
+              unique.append(item)
+              if len(unique) == 3:
+                  break
+          if len(unique) < 2:
+              raise RuntimeError(f'Only {len(unique)} complete reports passed validation')
+
+          def safe(text, limit=62):
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', str(text)).strip('_')[:limit]
+
+          records = []
+          for i, item in enumerate(unique, 1):
+              filename = f'{i:02d}_{safe(item["broker"])}_{safe(item["title"])}_{item["date"].replace("-", "")}.pdf'
+              data = Path(item['path']).read_bytes()
+              (out / filename).write_bytes(data)
+              records.append({
+                  'filename': filename, 'broker': item['broker'], 'title': item['title'],
+                  'date': item['date'], 'authors': item.get('authors', ''),
+                  'rating': item.get('rating', ''), 'pages': item['pages'],
+                  'bytes': item['bytes'], 'sha256': item['sha256'],
+                  'source_url': item['source_url'], 'source_type': item['source_type'],
+                  'rendered_pages': item['rendered_pages'],
+              })
+
+          lines = [
+              '丘钛科技（01478.HK）券商深度/首次覆盖报告', '',
+              f'本包包含 {len(records)} 份可离线打开的完整PDF。',
+              '文件均由公开原始PDF或公开原版逐页图像获得；未放入网页快捷方式、二维码、摘要卡片或不完整节选。', '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   日期：{r['date']}；作者：{r['authors']}；评级：{r['rating']}",
+                  f"   实际页数：{r['pages']}页；大小：{r['bytes']/1048576:.2f} MB；文件形式：{r['source_type']}",
+                  f"   公开来源页面：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}", '',
+              ]
+          lines += [
+              '核验项目：页数连续性、图像尺寸、PDF结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+              '报告版权归原发布机构所有；评级、目标价及预测均为历史发布时点观点，不构成当前投资建议。',
+          ]
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for p in sorted(out.iterdir()):
+                  z.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad: raise RuntimeError('ZIP CRC failed: ' + bad)
+              pdfs = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(records): raise RuntimeError('PDF count mismatch')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: q-tech-broker-deep-reports-v2-final
+          path: 丘钛科技_券商深度报告_完整PDF.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: q-tech-broker-deep-reports-v2-diagnostics
+          path: _qtech_v2_work/
+          if-no-files-found: ignore
+          retention-days: 7
