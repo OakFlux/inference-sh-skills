@@ -1,0 +1,516 @@
+name: Package complete Q Technology broker deep reports 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qtech-final-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pillow pypdf pymupdf
+
+      - name: Search download validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          PACKAGE = '丘钛科技_券商深度报告_完整PDF_3份'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+          work = Path('_qtech_final_work')
+          work.mkdir(exist_ok=True)
+          images_root = work / 'page_images'
+          images_root.mkdir(exist_ok=True)
+          renders = work / 'renders'
+          renders.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://www.sdyanbao.com/report',
+              'Origin': 'https://www.sdyanbao.com',
+              'device': '1',
+              'x-token': '',
+          })
+
+          SEARCH_URL = 'https://api.sdyanbao.com/api/file/search'
+          DETAIL_URL = 'https://api.sdyanbao.com/api/file/detail'
+
+          def post_json(url, body, attempts=4):
+              errors = []
+              for attempt in range(1, attempts + 1):
+                  try:
+                      r = session.post(url, json=body, timeout=(25, 120))
+                      print('POST', url, attempt, r.status_code, len(r.content), json.dumps(body, ensure_ascii=False), flush=True)
+                      if r.status_code == 200:
+                          payload = r.json()
+                          if isinstance(payload, dict) and payload.get('status') == 1:
+                              return payload
+                          errors.append(f'unexpected payload: {r.text[:500]}')
+                      else:
+                          errors.append(f'HTTP {r.status_code}: {r.text[:300]}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(min(attempt * 2, 8))
+              raise RuntimeError(' | '.join(errors[-6:]))
+
+          def search_keyword(keyword):
+              found = []
+              for page in range(1, 11):
+                  body = {
+                      'device': 1,
+                      'hideTrader': 0,
+                      'onlyTitle': 1,
+                      'order': 0,
+                      'page': page,
+                      'pageSize': 100,
+                      'keyword': keyword,
+                      'pageCount': '',
+                      'dateRange': '',
+                      'startTime': '',
+                      'endTime': '',
+                      'typeIds': [],
+                      'industryIds': [],
+                      'opFrom': 1,
+                  }
+                  payload = post_json(SEARCH_URL, body)
+                  data = payload.get('data') or {}
+                  rows = data.get('files') or data.get('data') or []
+                  if not isinstance(rows, list):
+                      rows = []
+                  print('SEARCH_RESULT', keyword, page, 'rows', len(rows), 'total', data.get('total'), flush=True)
+                  found.extend(x for x in rows if isinstance(x, dict))
+                  total = int(data.get('total') or 0)
+                  if not rows or (total and page * 100 >= total):
+                      break
+                  time.sleep(0.4)
+              return found
+
+          raw_rows = []
+          for keyword in ('丘钛科技', '丘鈦科技'):
+              try:
+                  raw_rows.extend(search_keyword(keyword))
+              except Exception as exc:
+                  print('SEARCH_FAILED', keyword, repr(exc), flush=True)
+
+          # Keep the known 36-page Guohai deep-report page as a recovery seed.
+          known_ids = [937791]
+          for known_id in known_ids:
+              try:
+                  payload = post_json(DETAIL_URL, {'id': str(known_id), 'opFrom': 1})
+                  detail = payload.get('data') or {}
+                  if isinstance(detail, dict) and isinstance(detail.get('detail'), dict):
+                      detail = detail['detail']
+                  if isinstance(detail, dict):
+                      raw_rows.append(detail)
+              except Exception as exc:
+                  print('KNOWN_DETAIL_FAILED', known_id, repr(exc), flush=True)
+
+          def target_identity(row):
+              pieces = [
+                  row.get('name'), row.get('content'), row.get('keyword'),
+                  (row.get('stock') or {}).get('name') if isinstance(row.get('stock'), dict) else '',
+                  (row.get('stock') or {}).get('code') if isinstance(row.get('stock'), dict) else '',
+              ]
+              text = re.sub(r'\s+', '', ' '.join(str(x or '') for x in pieces)).lower()
+              return any(term in text for term in ('丘钛科技', '丘鈦科技', 'qtechnology', 'qtechtechnology', '1478.hk', '01478'))
+
+          by_id = {}
+          for row in raw_rows:
+              try:
+                  rid = int(row.get('id'))
+              except Exception:
+                  continue
+              if target_identity(row):
+                  by_id[rid] = row
+
+          # Refresh each result through the detail endpoint so page_url and metadata
+          # are complete even when the search response is abbreviated.
+          detailed = []
+          for rid, search_row in sorted(by_id.items()):
+              row = dict(search_row)
+              try:
+                  payload = post_json(DETAIL_URL, {'id': str(rid), 'opFrom': 1})
+                  data = payload.get('data') or {}
+                  if isinstance(data, dict) and isinstance(data.get('detail'), dict):
+                      data = data['detail']
+                  if isinstance(data, dict):
+                      row.update(data)
+              except Exception as exc:
+                  print('DETAIL_FAILED', rid, repr(exc), flush=True)
+              if target_identity(row):
+                  detailed.append(row)
+              time.sleep(0.2)
+
+          (work / 'all_search_results.json').write_text(json.dumps(detailed, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          def nested_name(row, field):
+              value = row.get(field)
+              if isinstance(value, dict):
+                  return str(value.get('name') or '')
+              return str(value or '')
+
+          def normalized_date(row):
+              value = str(row.get('time_text') or row.get('publish_date') or row.get('date') or '')
+              m = re.search(r'(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})', value)
+              if m:
+                  return f'{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}'
+              return value[:10]
+
+          def report_score(row):
+              title = str(row.get('name') or '')
+              compact = re.sub(r'\s+', '', title).lower()
+              report_type = nested_name(row, 'type')
+              pages = int(row.get('page_count') or 0)
+              date = normalized_date(row)
+              score = pages * 100
+              if report_type == '深度研究':
+                  score += 350000
+              if any(k in compact for k in ('公司深度报告', '公司深度', '深度报告', '深度研究')):
+                  score += 350000
+              if any(k in compact for k in ('首次覆盖', '首次评级', '首次研究')):
+                  score += 250000
+              if pages >= 15:
+                  score += 100000
+              if '摄像头与指纹识别模组结构优化' in compact:
+                  score += 900000
+              if '手机光学驱动利润弹性' in compact:
+                  score += 850000
+              if '安卓光学升规' in compact:
+                  score += 800000
+              if '手机摄像头模组巨头' in compact:
+                  score += 750000
+              try:
+                  score += int(datetime.fromisoformat(date).strftime('%Y%m%d')) // 100
+              except Exception:
+                  pass
+              return score
+
+          candidates = []
+          for row in detailed:
+              title = str(row.get('name') or '')
+              compact = re.sub(r'\s+', '', title).lower()
+              pages = int(row.get('page_count') or 0)
+              report_type = nested_name(row, 'type')
+              deep_signal = (
+                  report_type == '深度研究'
+                  or any(k in compact for k in ('深度', '首次覆盖', '首次评级', '首次研究'))
+                  or pages >= 14
+              )
+              if pages >= 4 and deep_signal and row.get('page_url'):
+                  item = dict(row)
+                  item['_score'] = report_score(row)
+                  candidates.append(item)
+
+          candidates.sort(key=lambda x: (-x['_score'], -int(x.get('page_count') or 0), normalized_date(x)), reverse=False)
+          print('CANDIDATES', json.dumps([
+              {
+                  'id': x.get('id'), 'name': x.get('name'), 'pages': x.get('page_count'),
+                  'date': normalized_date(x), 'org': nested_name(x, 'organization'),
+                  'type': nested_name(x, 'type'), 'uuid': x.get('data_source_uuid'),
+                  'score': x.get('_score'), 'page_url': x.get('page_url'),
+              } for x in candidates
+          ], ensure_ascii=False, indent=2), flush=True)
+
+          if len(candidates) < 2:
+              raise RuntimeError(f'Only {len(candidates)} deep-report candidates were discovered')
+
+          def opening_text(path, limit=10):
+              reader = PdfReader(str(path), strict=False)
+              parts = []
+              for page in reader.pages[:min(limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              return re.sub(r'\s+', '', '\n'.join(parts)).lower()
+
+          def try_native_pdf(row, target_path):
+              info = str(row.get('data_source_uuid') or '')
+              if not info.startswith('AP'):
+                  return None
+              headers = {
+                  'User-Agent': session.headers['User-Agent'],
+                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                  'Referer': 'https://data.eastmoney.com/',
+              }
+              for prefix in ('H3', 'H2'):
+                  for suffix in ('', '?download=1.pdf'):
+                      url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info}_1.pdf{suffix}'
+                      for attempt in range(1, 3):
+                          try:
+                              r = session.get(url, headers=headers, timeout=(30, 300), allow_redirects=True)
+                              print('NATIVE_PDF', row.get('id'), info, attempt, r.status_code, len(r.content), r.url, flush=True)
+                              if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 80000:
+                                  target_path.write_bytes(r.content)
+                                  text = opening_text(target_path)
+                                  if any(term in text for term in ('丘钛科技', '丘鈦科技', 'qtechnology', '01478', '1478.hk')):
+                                      return str(r.url)
+                                  target_path.unlink(missing_ok=True)
+                          except Exception as exc:
+                              print('NATIVE_PDF_FAILED', url, repr(exc), flush=True)
+                          time.sleep(attempt)
+              return None
+
+          def download_images_and_build(row, target_path):
+              rid = int(row['id'])
+              page_url = str(row['page_url']).rstrip('/')
+              page_count = int(row['page_count'])
+              folder = images_root / str(rid)
+              folder.mkdir(exist_ok=True)
+              paths = []
+              image_hashes = []
+              referer = f'https://www.sdyanbao.com/detail/{rid}'
+              for pno in range(page_count):
+                  url = f'{page_url}/{pno}.png'
+                  success = False
+                  errors = []
+                  for attempt in range(1, 5):
+                      try:
+                          r = session.get(
+                              url,
+                              headers={
+                                  'User-Agent': session.headers['User-Agent'],
+                                  'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+                                  'Referer': referer,
+                              },
+                              timeout=(25, 180),
+                              allow_redirects=True,
+                          )
+                          sig = r.content[:16]
+                          is_image = sig.startswith(b'\x89PNG') or sig.startswith(b'\xff\xd8\xff') or sig.startswith(b'RIFF')
+                          print('PAGE_IMAGE', rid, pno, attempt, r.status_code, len(r.content), r.url, flush=True)
+                          if r.status_code == 200 and is_image and len(r.content) > 15000:
+                              ext = '.png' if sig.startswith(b'\x89PNG') else ('.jpg' if sig.startswith(b'\xff\xd8\xff') else '.webp')
+                              path = folder / f'{pno:03d}{ext}'
+                              path.write_bytes(r.content)
+                              with Image.open(path) as im:
+                                  im.verify()
+                              with Image.open(path) as im:
+                                  if im.width < 600 or im.height < 800:
+                                      raise RuntimeError(f'image too small: {im.width}x{im.height}')
+                              paths.append(path)
+                              image_hashes.append(hashlib.sha256(r.content).hexdigest())
+                              success = True
+                              break
+                          errors.append(f'HTTP {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(repr(exc))
+                      time.sleep(min(attempt * 2, 8))
+                  if not success:
+                      raise RuntimeError(f'Missing page {pno + 1}/{page_count}: {url}; {errors[-4:]}')
+
+              if len(paths) != page_count:
+                  raise RuntimeError(f'Image count mismatch: {len(paths)} vs {page_count}')
+
+              doc = pymupdf.open()
+              for path in paths:
+                  with Image.open(path) as im:
+                      width, height = im.size
+                  page = doc.new_page(width=width, height=height)
+                  page.insert_image(page.rect, filename=str(path), keep_proportion=False)
+              doc.save(str(target_path), garbage=4, deflate=True, clean=True)
+              doc.close()
+              return page_url, image_hashes
+
+          def validate_pdf(path, expected_pages=None):
+              if not path.exists() or path.stat().st_size < 80000 or path.read_bytes()[:5] != b'%PDF-':
+                  raise RuntimeError('Invalid PDF file header or size')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if expected_pages and pages != expected_pages:
+                  raise RuntimeError(f'PDF page count {pages} differs from metadata {expected_pages}')
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError('qpdf failed: ' + q.stderr[-1200:])
+              doc = pymupdf.open(str(path))
+              sample = sorted(set([0, max(0, pages // 2), pages - 1]))
+              rendered_pages = []
+              for pno in sample:
+                  pix = doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  rp = renders / f'{path.stem}_{pno + 1:03d}.png'
+                  pix.save(str(rp))
+                  if rp.stat().st_size < 6000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'Failed to render page {pno + 1}')
+                  rendered_pages.append(pno + 1)
+              doc.close()
+              return pages, rendered_pages
+
+          validated = []
+          failures = []
+          seen_titles = set()
+          seen_hashes = set()
+          used_orgs = set()
+
+          # Two passes: first prefer institution diversity; second fill any remaining slot.
+          for diversity_pass in (True, False):
+              for row in candidates:
+                  if len(validated) >= 3:
+                      break
+                  title = str(row.get('name') or '').strip()
+                  norm_title = re.sub(r'[^a-z0-9\u4e00-\u9fff]+', '', title.lower())
+                  org = nested_name(row, 'organization') or '券商研究机构'
+                  if norm_title in seen_titles:
+                      continue
+                  if diversity_pass and org in used_orgs:
+                      continue
+                  rid = int(row['id'])
+                  temp = work / f'candidate_{rid}.pdf'
+                  try:
+                      native_url = try_native_pdf(row, temp)
+                      image_hashes = []
+                      if native_url:
+                          source_url = native_url
+                          source_type = '公开原始券商PDF'
+                          expected = None
+                      else:
+                          source_url, image_hashes = download_images_and_build(row, temp)
+                          source_type = '公开原版逐页图像合成PDF（页面内容未重排）'
+                          expected = int(row.get('page_count') or 0)
+                      pages, rendered_pages = validate_pdf(temp, expected_pages=expected)
+                      data = temp.read_bytes()
+                      digest = hashlib.sha256(data).hexdigest()
+                      if digest in seen_hashes:
+                          raise RuntimeError('Duplicate PDF content')
+                      seen_hashes.add(digest)
+                      rec = {
+                          'id': rid,
+                          'title': title,
+                          'broker': org,
+                          'authors': nested_name(row, 'researcher'),
+                          'report_type': nested_name(row, 'type') or '公司研究',
+                          'date': normalized_date(row),
+                          'rating': '',
+                          'pages': pages,
+                          'bytes': len(data),
+                          'sha256': digest,
+                          'source_url': source_url,
+                          'source_page': f'https://www.sdyanbao.com/detail/{rid}',
+                          'source_type': source_type,
+                          'data_source_uuid': row.get('data_source_uuid'),
+                          'rendered_pages': rendered_pages,
+                          'image_page_hashes': image_hashes,
+                          'temp': str(temp),
+                      }
+                      validated.append(rec)
+                      seen_titles.add(norm_title)
+                      used_orgs.add(org)
+                      print('VALIDATED', json.dumps({k: rec[k] for k in ('id', 'broker', 'title', 'date', 'pages', 'bytes', 'source_type')}, ensure_ascii=False), flush=True)
+                  except Exception as exc:
+                      fail = {'id': rid, 'broker': org, 'title': title, 'error': repr(exc)}
+                      failures.append(fail)
+                      print('FAILED', json.dumps(fail, ensure_ascii=False), flush=True)
+                  time.sleep(0.2)
+              if len(validated) >= 3:
+                  break
+
+          (work / 'validated.json').write_text(json.dumps([{k: v for k, v in x.items() if k != 'temp'} for x in validated], ensure_ascii=False, indent=2), encoding='utf-8')
+          (work / 'failures.json').write_text(json.dumps(failures, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if len(validated) < 2:
+              raise RuntimeError(f'Only {len(validated)} complete reports passed validation: {json.dumps(failures, ensure_ascii=False)}')
+
+          selected = validated[:3]
+
+          def safe(text, limit=62):
+              return re.sub(r'[\\/:*?"<>|\s]+', '_', str(text)).strip('_')[:limit]
+
+          records = []
+          for order, item in enumerate(selected, 1):
+              filename = f'{order:02d}_{safe(item["broker"])}_{safe(item["title"])}_{item["date"].replace("-", "")}.pdf'
+              data = Path(item['temp']).read_bytes()
+              (out / filename).write_bytes(data)
+              public = {k: v for k, v in item.items() if k not in ('temp', 'image_page_hashes')}
+              public['filename'] = filename
+              records.append(public)
+
+          lines = [
+              '丘钛科技（01478.HK）券商深度/首次覆盖报告',
+              '',
+              f'本包包含 {len(records)} 份可离线打开的完整PDF正文文件。',
+              '未放入网页入口、URL快捷方式、二维码、摘要卡片或不完整预览。',
+              '若公开来源仅提供逐页原版图像，已按原顺序无重排合成为PDF，并在下方如实标明。',
+              '',
+          ]
+          for i, r in enumerate(records, 1):
+              lines += [
+                  f"{i}. {r['broker']}：《{r['title']}》",
+                  f"   日期：{r['date']}；作者：{r['authors'] or '见报告正文'}；类型：{r['report_type']}",
+                  f"   实际页数：{r['pages']}页；大小：{r['bytes'] / 1048576:.2f} MB",
+                  f"   文件形式：{r['source_type']}",
+                  f"   来源页面：{r['source_page']}",
+                  f"   文件来源：{r['source_url']}",
+                  f"   SHA-256：{r['sha256']}",
+                  '',
+              ]
+          lines += [
+              '核验项目：完整页序、图像文件签名与尺寸、PDF文件头、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+              '报告版权归原发布机构所有；报告中的评级、目标价、预测及判断均为历史发布时点观点，不构成当前投资建议。',
+          ]
+          (out / '报告清单与核验说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as z:
+              for p in sorted(out.iterdir()):
+                  z.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path) as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failed: ' + bad)
+              pdf_names = [n for n in z.namelist() if n.lower().endswith('.pdf')]
+              if len(pdf_names) != len(records):
+                  raise RuntimeError(f'PDF count mismatch: {len(pdf_names)} vs {len(records)}')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', len(records), 'PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtech-complete-broker-deep-reports-final
+          path: 丘钛科技_券商深度报告_完整PDF_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtech-complete-broker-deep-reports-diagnostics
+          path: _qtech_final_work/
+          if-no-files-found: ignore
+          retention-days: 7
