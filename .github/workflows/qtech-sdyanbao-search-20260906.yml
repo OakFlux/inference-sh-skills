@@ -1,0 +1,94 @@
+name: Search Waterdrop Q Technology reports 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qtech-sdyanbao-search-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright requests
+          python -m playwright install --with-deps chromium >/dev/null 2>&1
+      - name: Search and capture API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio, json
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          out=Path('qtech-sdyanbao-search'); out.mkdir(exist_ok=True)
+          async def main():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True)
+              context=await browser.new_context(viewport={'width':1440,'height':1000})
+              page=await context.new_page()
+              reqs=[]; resps=[]
+              async def capture_response(resp):
+                u=resp.url
+                if 'api.sdyanbao.com/api/file' in u:
+                  try: body=await resp.text()
+                  except Exception as e: body='ERR '+repr(e)
+                  resps.append({'url':u,'status':resp.status,'content_type':resp.headers.get('content-type',''),'body':body[:100000]})
+                  print('RESPONSE',resp.status,u,body[:3000],flush=True)
+              def capture_request(req):
+                u=req.url
+                if 'api.sdyanbao.com/api/file' in u:
+                  rec={'url':u,'method':req.method,'post_data':req.post_data,'headers':dict(req.headers)}
+                  reqs.append(rec)
+                  print('REQUEST',json.dumps(rec,ensure_ascii=False)[:5000],flush=True)
+              page.on('request',capture_request)
+              page.on('response',lambda resp: asyncio.create_task(capture_response(resp)))
+              await page.goto('https://www.sdyanbao.com/report',wait_until='networkidle',timeout=120000)
+              await page.wait_for_timeout(3000)
+              print('TITLE',await page.title(),flush=True)
+              inputs=page.locator('input')
+              count=await inputs.count()
+              for i in range(count):
+                el=inputs.nth(i)
+                try:
+                  print('INPUT',i,await el.get_attribute('placeholder'),await el.get_attribute('type'),await el.evaluate('(e)=>e.outerHTML'),flush=True)
+                except Exception: pass
+              target=page.locator('input[placeholder*="搜索"], input[placeholder*="关键词"]').first
+              await target.fill('丘钛科技')
+              buttons=page.locator('button,div,span').filter(has_text='搜索')
+              clicked=False
+              for i in range(min(await buttons.count(),10)):
+                el=buttons.nth(i)
+                if await el.is_visible():
+                  try:
+                    print('CLICK',await el.evaluate('(e)=>e.outerHTML'),flush=True)
+                    await el.click(force=True)
+                    clicked=True
+                    break
+                  except Exception as e: print('CLICK_FAIL',repr(e),flush=True)
+              if not clicked:
+                await target.press('Enter')
+              await page.wait_for_timeout(10000)
+              body=await page.locator('body').inner_text()
+              print('BODY',body[:15000],flush=True)
+              (out/'body.txt').write_text(body,encoding='utf-8')
+              (out/'page.html').write_text(await page.content(),encoding='utf-8')
+              await page.screenshot(path=str(out/'page.png'),full_page=True)
+              await page.wait_for_timeout(2000)
+              (out/'requests.json').write_text(json.dumps(reqs,ensure_ascii=False,indent=2),encoding='utf-8')
+              (out/'responses.json').write_text(json.dumps(resps,ensure_ascii=False,indent=2),encoding='utf-8')
+              await browser.close()
+          asyncio.run(main())
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtech-sdyanbao-search
+          path: qtech-sdyanbao-search/
+          retention-days: 7
