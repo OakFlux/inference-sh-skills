@@ -1,0 +1,95 @@
+name: Quick discover LifeTech report URLs 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lifetech-quick-discovery-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Discover URLs
+        run: |
+          python - <<'PY'
+          import html,json,re
+          from urllib.parse import quote_plus,urljoin,unquote
+          import requests
+          from bs4 import BeautifulSoup
+
+          s=requests.Session();s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'}
+          out={'annual_2020':[],'interim_2026':[],'pages':[]}
+
+          def norm(u,base=''):
+            if not u:return ''
+            u=html.unescape(unquote(str(u))).replace('\\/','/').replace('\\u002F','/').strip(' \"\'<>),];')
+            if u.startswith('//'):u='https:'+u
+            if base and u.startswith('/'):u=urljoin(base,u)
+            return u
+
+          def get(url,method='GET',data=None):
+            try:
+              r=s.post(url,headers=h,data=data,timeout=(12,30),allow_redirects=True) if method=='POST' else s.get(url,headers=h,timeout=(12,30),allow_redirects=True)
+              print('FETCH',method,r.status_code,len(r.content),r.url,flush=True)
+              out['pages'].append({'url':url,'final':r.url,'status':r.status_code,'bytes':len(r.content)})
+              return r.text if r.status_code==200 else ''
+            except Exception as e:
+              print('FAIL',url,repr(e),flush=True);out['pages'].append({'url':url,'error':repr(e)});return ''
+
+          def harvest(raw,base,bucket,date_path):
+            raw=html.unescape(raw or '').replace('\\/','/').replace('\\u002F','/')
+            for u in re.findall(r'https?://[^\s\"\'<>]+\.pdf',raw,re.I):
+              u=norm(u,base)
+              if 'hkexnews.hk/listedco/listconews/sehk/' in u.lower() and date_path in u and u not in out[bucket]:out[bucket].append(u)
+            try:
+              soup=BeautifulSoup(raw,'lxml')
+              for a in soup.find_all('a',href=True):
+                u=norm(a['href'],base);txt=' '.join(a.get_text(' ',strip=True).split())
+                parent=' '.join(a.parent.get_text(' ',strip=True).split()) if a.parent else txt
+                if date_path in u and '.pdf' in u.lower() and u not in out[bucket]:
+                  out[bucket].append(u);print('LINK',bucket,u,txt,parent[:300],flush=True)
+            except Exception as e:print('PARSE_FAIL',base,repr(e),flush=True)
+
+          page='https://webbsite.0xmd.com/dbpub/docs.asp?p=133242&sort=typup'
+          raw=get(page)
+          if raw:
+            soup=BeautifulSoup(raw,'lxml')
+            for a in soup.find_all('a',href=True):
+              row=a.find_parent('tr');rowtxt=' '.join(row.get_text(' ',strip=True).split()) if row else ''
+              u=norm(a['href'],page)
+              if '2020-12-31' in rowtxt and 'Annual Report' in a.get_text(' ',strip=True) and '.pdf' in u.lower():
+                out['annual_2020'].append(u);print('ANNUAL2020',u,rowtxt,flush=True)
+          harvest(raw,page,'annual_2020','/2021/0416/')
+
+          q='site:hkexnews.hk/listedco/listconews/sehk/2021/0416 01302 "ANNUAL REPORT 2020"'
+          u='https://www.bing.com/search?q='+quote_plus(q)+'&count=50'
+          harvest(get(u),u,'annual_2020','/2021/0416/')
+
+          pages=[
+            'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&documentType=-1&from=20260828&lang=EN&market=SEHK&searchType=0&stockId=96020&t1code=-2&t2Gcode=-2&t2code=-2&to=20260906',
+            'https://www.hkej.com/instantnews/hkex/article/4496503',
+            'https://www.cfi.net.cn/p20260828002361.html',
+            'https://etnet.hk/www/eng/stocks/ci_corpan.php?code=1302',
+          ]
+          for page in pages:harvest(get(page),page,'interim_2026','/2026/0828/')
+          q='"INTERIM RESULTS ANNOUNCEMENT FOR THE SIX MONTHS ENDED 30 JUNE 2026" "LIFETECH SCI" pdf'
+          u='https://www.bing.com/search?q='+quote_plus(q)+'&count=50'
+          harvest(get(u),u,'interim_2026','/2026/0828/')
+
+          for k in ('annual_2020','interim_2026'):
+            out[k]=list(dict.fromkeys(out[k]))
+          print('RESULT',json.dumps(out,ensure_ascii=False,indent=2),flush=True)
+          open('lifetech_urls.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lifetech-quick-discovery
+          path: lifetech_urls.json
+          retention-days: 7
