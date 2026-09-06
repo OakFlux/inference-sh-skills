@@ -1,0 +1,296 @@
+name: Package Axera official annual report prospectuses and latest interim 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/axera-official-filings-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          OUTPUT_ZIP = Path('Axera_Official_Filings_2026-09-06.zip')
+          ROOT_NAME = 'Axera_爱芯元智_官方披露文件_截至2026-09-06'
+          root = Path(ROOT_NAME)
+          work = Path('_axera_validation')
+          renders = work / 'renders'
+          root.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+          renders.mkdir(exist_ok=True)
+
+          documents = [
+              {
+                  'category': '01_年度报告',
+                  'filename': '爱芯元智_2025年年度报告_英文版.pdf',
+                  'type_zh': '2025年年度报告',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0428/2026042800542.pdf',
+                  'expected_pages': 193,
+                  'year_markers': ('2025',),
+                  'type_markers': ('annualreport',),
+              },
+              {
+                  'category': '02_招股文件',
+                  'filename': '爱芯元智_招股章程_全球发售_2026-01-30_英文版.pdf',
+                  'type_zh': '最终招股章程（全球发售）',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0130/2026013000009.pdf',
+                  'expected_pages': 533,
+                  'year_markers': ('2026',),
+                  'type_markers': ('globaloffering',),
+              },
+              {
+                  'category': '02_招股文件',
+                  'filename': '爱芯元智_聆讯后资料集_PHIP_2026-01-25_英文版.pdf',
+                  'type_zh': '聆讯后资料集（PHIP）',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0210/sehk26012500106.pdf',
+                  'expected_pages': 515,
+                  'year_markers': ('2025', '2026'),
+                  'type_markers': ('posthearinginformationpack', 'applicationproof', 'globaloffering'),
+              },
+              {
+                  'category': '03_最新财务披露',
+                  'filename': '爱芯元智_2026年中期业绩公告_截至2026-06-30_英文版.pdf',
+                  'type_zh': '2026年中期业绩公告（截至2026年6月30日止六个月）',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0809/2026080900011.pdf',
+                  'expected_pages': 32,
+                  'year_markers': ('2026',),
+                  'type_markers': ('interimresultsannouncement', 'sixmonthsendedjune302026'),
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Connection': 'close',
+          }
+          referers = [
+              'https://www1.hkexnews.hk/',
+              'https://www.hkexnews.hk/',
+              'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=1000291040',
+          ]
+
+          def fetch_pdf(url: str) -> tuple[bytes, str, str]:
+              variants = [url]
+              if 'www1.hkexnews.hk' in url:
+                  variants.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  variants.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              errors = []
+              for candidate in dict.fromkeys(variants):
+                  for referer in referers:
+                      for attempt in range(1, 5):
+                          try:
+                              response = session.get(
+                                  candidate,
+                                  headers={**headers, 'Referer': referer},
+                                  timeout=(40, 360),
+                                  allow_redirects=True,
+                              )
+                              print('GET', attempt, response.status_code, len(response.content), response.headers.get('content-type'), candidate, flush=True)
+                              if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50000:
+                                  return response.content, str(response.url), referer
+                              errors.append(f'{candidate}|{referer}|HTTP {response.status_code}/{len(response.content)}')
+                          except Exception as exc:
+                              errors.append(f'{candidate}|{referer}|{type(exc).__name__}:{exc}')
+                          time.sleep(min(2 * attempt, 8))
+              raise RuntimeError('PDF download failed: ' + ' ; '.join(errors[-16:]))
+
+          def extract_opening_text(path: Path, page_limit: int = 30) -> str:
+              reader = PdfReader(str(path), strict=False)
+              parts = []
+              for page in reader.pages[:min(page_limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              text = '\n'.join(parts)
+              if len(text.strip()) < 500:
+                  doc = pymupdf.open(str(path))
+                  try:
+                      text = '\n'.join(doc.load_page(i).get_text('text') for i in range(min(page_limit, len(doc))))
+                  finally:
+                      doc.close()
+              return text
+
+          def validate(path: Path, cfg: dict) -> dict:
+              raw = path.read_bytes()
+              if not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF signature: {path}')
+              reader = PdfReader(str(path), strict=False)
+              page_count = len(reader.pages)
+              if page_count != cfg['expected_pages']:
+                  raise RuntimeError(f'Unexpected page count for {path.name}: expected {cfg["expected_pages"]}, got {page_count}')
+
+              text = extract_opening_text(path)
+              compact = re.sub(r'\s+', '', text).lower()
+              company_ok = any(marker in compact for marker in (
+                  'axerasemiconductor', '愛芯元智', '爱芯元智',
+                  'stockcode600', 'stockcode00600', '股份代號600', '股份代码600',
+              ))
+              if not company_ok:
+                  raise RuntimeError(f'Company identity marker missing: {path.name}')
+              if not any(marker in compact for marker in cfg['year_markers']):
+                  raise RuntimeError(f'Year marker missing: {path.name}')
+              if not any(marker in compact for marker in cfg['type_markers']):
+                  raise RuntimeError(f'Document type marker missing: {path.name}')
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {path.name}: {qpdf.stderr[-1200:]}')
+
+              doc = pymupdf.open(str(path))
+              sample_pages = sorted(set([0, page_count // 2, page_count - 1]))
+              render_records = []
+              try:
+                  for page_no in sample_pages:
+                      page = doc.load_page(page_no)
+                      pix = page.get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                      render_path = renders / f'{path.stem}_page_{page_no + 1:04d}.png'
+                      pix.save(str(render_path))
+                      if pix.width < 400 or pix.height < 400 or render_path.stat().st_size < 5000:
+                          raise RuntimeError(f'Render check failed: {path.name}, page {page_no + 1}')
+                      render_records.append({
+                          'page': page_no + 1,
+                          'width': pix.width,
+                          'height': pix.height,
+                          'bytes': render_path.stat().st_size,
+                      })
+              finally:
+                  doc.close()
+
+              return {
+                  'pages': page_count,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'qpdf_return_code': qpdf.returncode,
+                  'rendered_pages': render_records,
+                  'opening_text_preview': re.sub(r'\s+', ' ', text)[:1000],
+              }
+
+          records = []
+          seen_hashes = set()
+          for cfg in documents:
+              category_dir = root / cfg['category']
+              category_dir.mkdir(parents=True, exist_ok=True)
+              data, final_url, referer = fetch_pdf(cfg['url'])
+              pdf_path = category_dir / cfg['filename']
+              pdf_path.write_bytes(data)
+              check = validate(pdf_path, cfg)
+              if check['sha256'] in seen_hashes:
+                  raise RuntimeError(f'Duplicate content detected: {pdf_path.name}')
+              seen_hashes.add(check['sha256'])
+              record = {
+                  'relative_path': str(pdf_path.relative_to(root)),
+                  'document_type': cfg['type_zh'],
+                  'source': '香港交易所披露易（HKEXnews）官方文件',
+                  'source_url': final_url,
+                  'successful_referer': referer,
+                  **check,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps({k: record[k] for k in ('relative_path','document_type','pages','bytes','sha256','source_url')}, ensure_ascii=False), flush=True)
+
+          readme_lines = [
+              '爱芯元智半导体股份有限公司（00600.HK）官方披露文件',
+              '资料截止日期：2026年9月6日',
+              '',
+              '收录范围：',
+              '1. 独立年度报告：2025年年度报告（爱芯元智于2026年上市，因此港交所暂无更早年度的独立年报）；',
+              '2. 招股文件：2026年1月30日最终招股章程，以及2026年1月25日聆讯后资料集（PHIP）；',
+              '3. 最新财务披露：2026年8月9日发布的截至2026年6月30日止六个月中期业绩公告。',
+              '',
+              '说明：香港主板公司通常按年度及半年度披露定期财务报告，并无A股式法定季度报告。本包因此以最新中期业绩公告作为“最新季报/最新一期定期财务披露”。',
+              '招股章程及PHIP包含公司上市前多个会计年度的历史财务资料。',
+              '本包收录的是港交所可直接取得的官方英文版本，文件未重排、未删页、未加水印。',
+              '',
+              f'文件数量：{len(records)}份PDF；总页数：{sum(r["pages"] for r in records)}页。',
+              '',
+              '逐项清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme_lines.extend([
+                  f'{index}. {record["relative_path"]}',
+                  f'   类型：{record["document_type"]}',
+                  f'   页数：{record["pages"]}页；大小：{record["bytes"] / 1048576:.2f} MB',
+                  f'   官方来源：{record["source_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+          readme_lines.extend([
+              '核验项目：PDF文件头、公司名称/股份代码、报告年份与类型、精确页数、qpdf结构检查、首页/中间页/末页渲染、SHA-256、ZIP CRC。',
+          ])
+          (root / 'README_文件清单与口径说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{r["sha256"]}  {r["relative_path"]}\n' for r in records),
+              encoding='utf-8',
+          )
+
+          with zipfile.ZipFile(OUTPUT_ZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for file_path in sorted(root.rglob('*')):
+                  if file_path.is_file():
+                      zf.write(file_path, arcname=str(file_path))
+
+          with zipfile.ZipFile(OUTPUT_ZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed: {bad}')
+              pdf_names = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != len(documents):
+                  raise RuntimeError(f'Expected {len(documents)} PDFs in ZIP, found {len(pdf_names)}')
+
+          print('FINAL_ZIP', OUTPUT_ZIP, OUTPUT_ZIP.stat().st_size, flush=True)
+          print('PDF_COUNT', len(records), 'TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: axera-official-filings-package
+          path: Axera_Official_Filings_2026-09-06.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload validation renders
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: axera-validation-diagnostics
+          path: _axera_validation/
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 6
