@@ -1,0 +1,30 @@
+name: Probe Kerry Properties FXBaogao public images
+
+on:
+  push:
+    branches:
+      - chatgpt-kerry-properties-broker-reports-20260906
+    paths:
+      - '.github/workflows/probe-kerry-fxbaogao-images-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests beautifulsoup4 pillow
+      - run: python scripts/probe_kerry_fxbaogao_images_20260906.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kerry-fxbaogao-image-probe-20260906
+          path: |
+            kerry-fxbaogao-results.json
+            kerry-fxbaogao-probe/
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
