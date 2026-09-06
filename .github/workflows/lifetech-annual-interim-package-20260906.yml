@@ -1,0 +1,503 @@
+name: Package LifeTech Scientific annual reports and latest interim disclosure 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lifetech-annual-interim-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf pymupdf
+
+      - name: Discover, download, verify, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '先健科技_2020-2025年报及最新定期报告'
+          out = Path(PACKAGE)
+          work = Path('_lifetech_work')
+          renders = work / 'renders'
+          out.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+          renders.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          base_headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'text/html,application/xhtml+xml,application/json,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Connection': 'close',
+          }
+
+          known_annuals = {
+              2025: 'https://www.hkexnews.hk/listedco/listconews/sehk/2026/0422/2026042200493.pdf',
+              2024: 'https://www.hkexnews.hk/listedco/listconews/sehk/2025/0425/2025042503445.pdf',
+              2023: 'https://www.hkexnews.hk/listedco/listconews/sehk/2024/0418/2024041800424.pdf',
+              2022: 'https://www.hkexnews.hk/listedco/listconews/sehk/2023/0418/2023041800917.pdf',
+              2021: 'https://www.hkexnews.hk/listedco/listconews/sehk/2022/0421/2022042100713.pdf',
+          }
+
+          hkex_pdf_pattern = re.compile(
+              r'https?://(?:www\d?\.)?hkexnews\.hk/listedco/listconews/sehk/\d{4}/\d{4}/[0-9A-Za-z_\-]+\.pdf',
+              flags=re.I,
+          )
+          relative_hkex_pattern = re.compile(
+              r'(?:https?:)?//(?:www\d?\.)?hkexnews\.hk/listedco/listconews/sehk/\d{4}/\d{4}/[0-9A-Za-z_\-]+\.pdf',
+              flags=re.I,
+          )
+
+          discovery_log = []
+
+          def get_text(url: str, method: str = 'GET', data: dict | None = None) -> str:
+              errors = []
+              for attempt in range(1, 4):
+                  try:
+                      if method == 'POST':
+                          r = session.post(url, headers=base_headers, data=data or {}, timeout=(25, 120), allow_redirects=True)
+                      else:
+                          r = session.get(url, headers=base_headers, timeout=(25, 120), allow_redirects=True)
+                      print('FETCH_HTML', attempt, r.status_code, len(r.content), r.url, flush=True)
+                      discovery_log.append({'url': url, 'method': method, 'status': r.status_code, 'bytes': len(r.content), 'final_url': r.url})
+                      if r.status_code == 200 and len(r.content) > 100:
+                          return r.text
+                      errors.append(f'HTTP {r.status_code}/{len(r.content)}')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                  time.sleep(attempt * 2)
+              print('FETCH_HTML_FAILED', url, errors[-3:], flush=True)
+              return ''
+
+          def normalize_url(raw: str, base: str = '') -> str:
+              if not raw:
+                  return ''
+              u = html.unescape(unquote(str(raw))).replace('\\/', '/').replace('\\u002F', '/').strip(' \"\'<>),];')
+              if 'uddg=' in u:
+                  try:
+                      u = parse_qs(urlparse(u).query).get('uddg', [u])[0]
+                  except Exception:
+                      pass
+              if u.startswith('//'):
+                  u = 'https:' + u
+              if base and u.startswith('/'):
+                  u = urljoin(base, u)
+              return u
+
+          def harvest_hkex_urls(text: str, base: str = '') -> list[str]:
+              if not text:
+                  return []
+              raw = html.unescape(text).replace('\\/', '/').replace('\\u002F', '/')
+              found = []
+              for u in hkex_pdf_pattern.findall(raw):
+                  u = normalize_url(u, base)
+                  if u and u not in found:
+                      found.append(u)
+              for u in relative_hkex_pattern.findall(raw):
+                  u = normalize_url(u, base)
+                  if u and u not in found:
+                      found.append(u)
+              try:
+                  soup = BeautifulSoup(raw, 'lxml')
+                  for tag in soup.find_all(True):
+                      for attr in ('href', 'src', 'data', 'data-url', 'data-href', 'download'):
+                          value = tag.get(attr)
+                          if not value:
+                              continue
+                          u = normalize_url(value, base)
+                          if 'hkexnews.hk/listedco/listconews/sehk/' in u.lower() and '.pdf' in u.lower() and u not in found:
+                              found.append(u)
+              except Exception:
+                  pass
+              return found
+
+          def discover_2020_annual() -> list[str]:
+              candidates = []
+              page = 'https://webbsite.0xmd.com/dbpub/docs.asp?p=133242&sort=typup'
+              raw = get_text(page)
+              if raw:
+                  soup = BeautifulSoup(raw, 'lxml')
+                  for a in soup.find_all('a', href=True):
+                      label = ' '.join(a.get_text(' ', strip=True).split())
+                      row = a.find_parent('tr')
+                      row_text = ' '.join(row.get_text(' ', strip=True).split()) if row else label
+                      href = normalize_url(a.get('href'), page)
+                      if 'Annual Report' in label and '2020-12-31' in row_text and '.pdf' in href.lower():
+                          candidates.append(href)
+                  for u in harvest_hkex_urls(raw, page):
+                      if '/2021/0416/' in u:
+                          candidates.append(u)
+
+              qpage = 'https://stock.qianzhan.com/hk/sourcefiles_01302.HK.html'
+              qraw = get_text(qpage)
+              if qraw:
+                  soup = BeautifulSoup(qraw, 'lxml')
+                  for tag in soup.find_all(True):
+                      text = ' '.join(tag.get_text(' ', strip=True).split())
+                      if '2020年度' in text or '2020年度報告' in text or '2020年报' in text:
+                          for a in tag.find_all('a', href=True):
+                              href = normalize_url(a['href'], qpage)
+                              if '.pdf' in href.lower():
+                                  candidates.append(href)
+                  for u in harvest_hkex_urls(qraw, qpage):
+                      if '/2021/0416/' in u:
+                          candidates.append(u)
+
+              queries = [
+                  'site:hkexnews.hk/listedco/listconews/sehk/2021/0416 "ANNUAL REPORT 2020" "LIFETECH SCIENTIFIC"',
+                  'site:hkexnews.hk/listedco/listconews/sehk/2021/0416 01302 annual report 2020 pdf',
+                  '"先健科技" "2020年度報告" pdf',
+              ]
+              for query in queries:
+                  search_url = 'https://www.bing.com/search?q=' + quote_plus(query) + '&count=50'
+                  sraw = get_text(search_url)
+                  for u in harvest_hkex_urls(sraw, search_url):
+                      if '/2021/0416/' in u:
+                          candidates.append(u)
+                  if sraw:
+                      for m in re.findall(r'https?://[^\s\"\'<>]+\.pdf', html.unescape(sraw).replace('\\/', '/')):
+                          u = normalize_url(m)
+                          if '/2021/0416/' in u and u not in candidates:
+                              candidates.append(u)
+              dedup = []
+              for u in candidates:
+                  if u and u not in dedup:
+                      dedup.append(u)
+              print('ANNUAL_2020_CANDIDATES', json.dumps(dedup, ensure_ascii=False), flush=True)
+              return dedup
+
+          def discover_2026_interim() -> list[str]:
+              candidates = []
+              official_pages = [
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=96020',
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&documentType=-1&from=20260828&lang=EN&market=SEHK&searchType=0&stockId=96020&t1code=-2&t2Gcode=-2&t2code=-2&to=20260906',
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&documentType=-1&from=20260828&lang=ZH&market=SEHK&searchType=0&stockId=96020&t1code=-2&t2Gcode=-2&t2code=-2&to=20260906',
+              ]
+              for page in official_pages:
+                  raw = get_text(page)
+                  if raw:
+                      soup = BeautifulSoup(raw, 'lxml')
+                      for a in soup.find_all('a', href=True):
+                          label = ' '.join(a.get_text(' ', strip=True).split())
+                          parent_text = ' '.join(a.parent.get_text(' ', strip=True).split()) if a.parent else label
+                          href = normalize_url(a['href'], page)
+                          combined = (label + ' ' + parent_text).lower()
+                          if '.pdf' in href.lower() and ('interim results' in combined or '中期業績' in combined or '中期业绩' in combined) and ('2026' in combined or '/2026/0828/' in href):
+                              candidates.append(href)
+                      for u in harvest_hkex_urls(raw, page):
+                          if '/2026/0828/' in u:
+                              candidates.append(u)
+
+              servlet = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              post_data = {
+                  'sortDir': '0', 'sortByOptions': 'DateTime', 'category': '0', 'market': 'SEHK',
+                  'stockId': '96020', 'documentType': '-1', 'from': '20260828', 'to': '20260906',
+                  'title': '', 'searchType': '0', 't1code': '-2', 't2Gcode': '-2', 't2code': '-2',
+                  'rowRange': '200', 'lang': 'EN',
+              }
+              raw = get_text(servlet, method='POST', data=post_data)
+              for u in harvest_hkex_urls(raw, servlet):
+                  if '/2026/0828/' in u:
+                      candidates.append(u)
+
+              other_pages = [
+                  'https://www.hkej.com/instantnews/hkex/article/4496503',
+                  'https://www.cfi.net.cn/p20260828002361.html',
+                  'https://etnet.hk/www/eng/stocks/ci_corpan.php?code=1302',
+                  'https://treelazy.com/stock-en/hk/01302/conference',
+              ]
+              for page in other_pages:
+                  raw = get_text(page)
+                  for u in harvest_hkex_urls(raw, page):
+                      if '/2026/0828/' in u:
+                          candidates.append(u)
+
+              queries = [
+                  '"INTERIM RESULTS ANNOUNCEMENT FOR THE SIX MONTHS ENDED 30 JUNE 2026" "LIFETECH SCI" pdf',
+                  '"截至二零二六年六月三十日止六個月中期業績公佈" "先健科技" pdf',
+                  'site:hkexnews.hk/listedco/listconews/sehk/2026/0828 01302 interim results pdf',
+              ]
+              for query in queries:
+                  search_url = 'https://www.bing.com/search?q=' + quote_plus(query) + '&count=50'
+                  sraw = get_text(search_url)
+                  for u in harvest_hkex_urls(sraw, search_url):
+                      if '/2026/0828/' in u:
+                          candidates.append(u)
+
+              dedup = []
+              for u in candidates:
+                  if u and u not in dedup:
+                      dedup.append(u)
+              print('INTERIM_2026_CANDIDATES', json.dumps(dedup, ensure_ascii=False), flush=True)
+              return dedup
+
+          def download_pdf(url: str, referers: list[str]) -> tuple[bytes, str, str]:
+              errors = []
+              url_variants = [url]
+              if 'www1.hkexnews.hk' in url:
+                  url_variants.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              if 'www.hkexnews.hk' in url:
+                  url_variants.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              for candidate in list(dict.fromkeys(url_variants)):
+                  for ref in referers:
+                      for attempt in range(1, 4):
+                          try:
+                              headers = {**base_headers, 'Referer': ref, 'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8'}
+                              r = session.get(candidate, headers=headers, timeout=(35, 300), allow_redirects=True)
+                              print('GET_PDF', attempt, r.status_code, len(r.content), r.headers.get('content-type'), candidate, 'ref', ref, flush=True)
+                              if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50000:
+                                  return r.content, str(r.url), ref
+                              errors.append(f'{candidate}|{ref}|HTTP {r.status_code}/{len(r.content)}')
+                          except Exception as exc:
+                              errors.append(f'{candidate}|{ref}|{repr(exc)}')
+                          time.sleep(min(attempt * 2, 6))
+              raise RuntimeError(' ; '.join(errors[-12:]))
+
+          def extract_text(path: Path, max_pages: int = 15) -> str:
+              reader = PdfReader(str(path), strict=False)
+              parts = []
+              for page in reader.pages[:min(max_pages, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              text = '\n'.join(parts)
+              if len(text.strip()) < 200:
+                  try:
+                      doc = pymupdf.open(str(path))
+                      text = '\n'.join(doc.load_page(i).get_text('text') for i in range(min(max_pages, len(doc))))
+                      doc.close()
+                  except Exception:
+                      pass
+              return text
+
+          def validate_pdf(path: Path, kind: str, year: int) -> dict:
+              data = path.read_bytes()
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError('invalid PDF signature')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if kind == 'annual' and pages < 80:
+                  raise RuntimeError(f'annual report too short: {pages} pages')
+              if kind == 'interim_announcement' and pages < 8:
+                  raise RuntimeError(f'interim announcement too short: {pages} pages')
+              text = extract_text(path, 18)
+              compact = re.sub(r'\s+', '', text).lower()
+              if not any(term in compact for term in ('lifetechscientific', '先健科技', 'stockcode1302', '股份代號1302', '01302')):
+                  raise RuntimeError('LifeTech/company identity not found')
+              if str(year) not in compact:
+                  raise RuntimeError(f'year {year} not found in opening pages')
+              if kind == 'annual' and not any(term in compact for term in ('annualreport', '年度報告', '年度报告')):
+                  raise RuntimeError('annual report marker missing')
+              if kind == 'interim_announcement' and not any(term in compact for term in ('interimresults', '中期業績', '中期业绩')):
+                  raise RuntimeError('interim-results marker missing')
+
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError('qpdf validation failed: ' + q.stderr[-1000:])
+
+              doc = pymupdf.open(str(path))
+              sample_pages = sorted(set([0, max(0, pages // 2), pages - 1]))
+              rendered = []
+              for pno in sample_pages:
+                  pix = doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                  rp = renders / f'{path.stem}_p{pno + 1:03d}.png'
+                  pix.save(str(rp))
+                  if rp.stat().st_size < 5000 or pix.width < 400 or pix.height < 400:
+                      raise RuntimeError(f'render check failed on page {pno + 1}')
+                  rendered.append({'page': pno + 1, 'width': pix.width, 'height': pix.height, 'bytes': rp.stat().st_size})
+              doc.close()
+              return {
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'rendered_pages': rendered,
+                  'opening_text_preview': re.sub(r'\s+', ' ', text)[:700],
+              }
+
+          # Discover missing official URLs.
+          annual_2020_candidates = discover_2020_annual()
+          interim_candidates = discover_2026_interim()
+          (work / 'discovery_log.json').write_text(json.dumps(discovery_log, ensure_ascii=False, indent=2), encoding='utf-8')
+          (work / 'annual_2020_candidates.json').write_text(json.dumps(annual_2020_candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+          (work / 'interim_2026_candidates.json').write_text(json.dumps(interim_candidates, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          if not annual_2020_candidates:
+              raise RuntimeError('Unable to discover the official 2020 annual report URL')
+          if not interim_candidates:
+              raise RuntimeError('Unable to discover the official 2026 interim-results announcement URL')
+
+          records = []
+          seen_hashes = set()
+          annual_urls = dict(known_annuals)
+
+          # Select the first candidate that validates as the 2020 annual report.
+          annual_2020_error = []
+          for candidate in annual_2020_candidates:
+              try:
+                  data, final_url, ref = download_pdf(candidate, ['https://webbsite.0xmd.com/', 'https://www1.hkexnews.hk/', 'https://www.hkexnews.hk/'])
+                  temp = work / 'annual_2020_candidate.pdf'
+                  temp.write_bytes(data)
+                  check = validate_pdf(temp, 'annual', 2020)
+                  annual_urls[2020] = final_url
+                  (work / 'annual_2020_selected.pdf').write_bytes(data)
+                  print('SELECTED_2020_ANNUAL', final_url, check['pages'], flush=True)
+                  break
+              except Exception as exc:
+                  annual_2020_error.append({'url': candidate, 'error': repr(exc)})
+                  print('REJECT_2020_ANNUAL', candidate, repr(exc), flush=True)
+          if 2020 not in annual_urls:
+              raise RuntimeError('No valid 2020 annual report candidate: ' + json.dumps(annual_2020_error, ensure_ascii=False))
+
+          # Download annual reports 2020-2025.
+          for year in range(2020, 2026):
+              url = annual_urls[year]
+              if year == 2020 and (work / 'annual_2020_selected.pdf').exists():
+                  data = (work / 'annual_2020_selected.pdf').read_bytes()
+                  final_url = url
+                  ref = 'https://webbsite.0xmd.com/'
+              else:
+                  data, final_url, ref = download_pdf(url, ['https://www1.hkexnews.hk/', 'https://www.hkexnews.hk/', 'https://webbsite.0xmd.com/'])
+              filename = f'{year}_先健科技_年度报告_官方英文版.pdf'
+              path = out / filename
+              path.write_bytes(data)
+              checks = validate_pdf(path, 'annual', year)
+              if checks['sha256'] in seen_hashes:
+                  raise RuntimeError(f'duplicate PDF detected for annual report {year}')
+              seen_hashes.add(checks['sha256'])
+              record = {
+                  'filename': filename,
+                  'year': year,
+                  'document_type': '年度报告',
+                  'language': '英文',
+                  'source': '香港交易所披露易（HKEXnews）',
+                  'source_url': final_url,
+                  'successful_referer': ref,
+                  **checks,
+              }
+              records.append(record)
+              print('VALIDATED_ANNUAL', json.dumps({k: record[k] for k in ('year','filename','pages','bytes','source_url')}, ensure_ascii=False), flush=True)
+
+          # Select and download the latest 2026 interim-results announcement.
+          interim_selected = None
+          interim_errors = []
+          for candidate in interim_candidates:
+              try:
+                  data, final_url, ref = download_pdf(candidate, ['https://www1.hkexnews.hk/', 'https://www.hkexnews.hk/', 'https://www.hkej.com/', 'https://etnet.hk/'])
+                  temp = work / 'interim_2026_candidate.pdf'
+                  temp.write_bytes(data)
+                  checks = validate_pdf(temp, 'interim_announcement', 2026)
+                  interim_selected = (data, final_url, ref, checks)
+                  print('SELECTED_2026_INTERIM', final_url, checks['pages'], flush=True)
+                  break
+              except Exception as exc:
+                  interim_errors.append({'url': candidate, 'error': repr(exc)})
+                  print('REJECT_2026_INTERIM', candidate, repr(exc), flush=True)
+          if interim_selected is None:
+              raise RuntimeError('No valid 2026 interim-results announcement candidate: ' + json.dumps(interim_errors, ensure_ascii=False))
+
+          data, final_url, ref, checks = interim_selected
+          filename = '2026_先健科技_中期业绩公告_截至2026年6月30日.pdf'
+          path = out / filename
+          path.write_bytes(data)
+          if checks['sha256'] in seen_hashes:
+              raise RuntimeError('latest periodic filing duplicates an annual report')
+          seen_hashes.add(checks['sha256'])
+          records.append({
+              'filename': filename,
+              'year': 2026,
+              'document_type': '中期业绩公告（最新可得定期披露）',
+              'language': '以港交所可下载版本为准',
+              'source': '香港交易所披露易（HKEXnews）',
+              'source_url': final_url,
+              'successful_referer': ref,
+              **checks,
+          })
+
+          note_lines = [
+              '先健科技（01302.HK）2020-2025年报及最新定期报告',
+              '',
+              '文件范围：',
+              '1. 2020年至2025年年度报告，共6份，均为香港交易所披露易正式PDF（英文版）。',
+              '2. 截至2026年9月6日，港交所已发布2026年8月28日的截至2026年6月30日止六个月中期业绩公告；完整2026中期报告尚未在检索结果中列出，因此将该中期业绩公告作为“最新季报/最新定期报告”收入本包。',
+              '',
+              '压缩包不含网页快捷方式、二维码、摘要卡片或第三方重排文件。',
+              '',
+          ]
+          for i, record in enumerate(records, 1):
+              note_lines += [
+                  f"{i}. {record['filename']}",
+                  f"   类型：{record['document_type']}；页数：{record['pages']}页；大小：{record['bytes']/1048576:.2f} MB",
+                  f"   来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ]
+          note_lines += [
+              '核验项目：PDF文件头、公司名称/股份代码、年份与报告类型、实际页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+          ]
+          (out / '文件清单与核验说明.txt').write_text('\n'.join(note_lines), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path('LifeTech_Scientific_2020-2025_Annual_and_2026_Interim.zip')
+          with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for p in sorted(out.iterdir()):
+                  zf.write(p, arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zip_path, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failed at ' + bad)
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'Expected 7 PDFs, found {len(pdfs)}')
+
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'PDFS', 7, 'TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifetech-annual-interim-final
+          path: LifeTech_Scientific_2020-2025_Annual_and_2026_Interim.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifetech-annual-interim-diagnostics
+          path: _lifetech_work/
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 6
