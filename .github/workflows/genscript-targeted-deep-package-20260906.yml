@@ -1,0 +1,161 @@
+name: Package targeted GenScript deep research reports 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/genscript-targeted-deep-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib,json,re,subprocess,time,zipfile
+          from pathlib import Path
+          import pymupdf,requests
+          from pypdf import PdfReader
+
+          PACKAGE='金斯瑞生物科技_券商深度报告_完整PDF_3份'
+          out=Path(PACKAGE); out.mkdir(exist_ok=True)
+          work=Path('_genscript_targeted_work'); work.mkdir(exist_ok=True)
+          renders=work/'renders'; renders.mkdir(exist_ok=True)
+
+          candidates=[
+            {'code':'AP202306251591276208','broker':'海通国际','title':'交接覆盖：四大业务板块加速成长，传奇生物成为创新药出海典范','date':'2023-06-21','priority':1000},
+            {'code':'AP202205251567754531','broker':'光大证券','title':'基因合成底层驱动，迈向CGT时代的生命科学龙头','date':'2022-05-24','priority':950},
+            {'code':'AP202202091545932429','broker':'','title':'四位一体的生命科学全产业链龙头','date':'2022-02-09','priority':900},
+            {'code':'AP202108311513433627','broker':'','title':'金斯瑞生物科技公司深度研究','date':'2021-08-30','priority':850},
+            {'code':'AP202404251631261455','broker':'','title':'金斯瑞生物科技公司研究报告','date':'2024-04-25','priority':800},
+            {'code':'AP202508251733943304','broker':'','title':'金斯瑞生物科技公司研究报告','date':'2025-08-25','priority':780},
+          ]
+          brokers=['中信证券','海通国际','海通证券','华西证券','西南证券','华创证券','光大证券','西部证券','国联证券','国泰海通证券','中金公司','中国国际金融','华泰证券','国信证券','招商证券','中银国际','交银国际','浦银国际','兴业证券','广发证券','东吴证券','天风证券','国元国际','申万宏源','国金证券','中泰证券','民生证券','浙商证券','开源证券','方正证券','第一上海','安信国际','招银国际','银河证券','中国银河','CICC','Haitong International','CITIC Securities']
+          s=requests.Session();s.trust_env=False
+          base_h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36','Accept':'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7','Connection':'close'}
+
+          def fetch(cfg):
+            code=cfg['code']
+            urls=[f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf',f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf?download=1.pdf',f'https://pdf.dfcfw.com/pdf/H2_{code}_1.pdf']
+            if code=='AP202508251733943304':urls.append('http://testtoo1.oss-cn-hangzhou.aliyuncs.com/eastmoney_pdf/AP202508251733943304.pdf')
+            refs=[f'https://data.eastmoney.com/report/info/{code}.html',f'https://data.eastmoney.com/report/zw_stock.jshtml?infocode={code}','https://data.eastmoney.com/report/','https://www.baidu.com/']
+            errors=[]
+            for url in urls:
+              for ref in refs:
+                for attempt in range(1,4):
+                  try:
+                    r=s.get(url,headers={**base_h,'Referer':ref},timeout=(30,300),allow_redirects=True)
+                    print('GET',code,attempt,r.status_code,len(r.content),r.headers.get('content-type'),url,'ref',ref,flush=True)
+                    if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>100000:return r.content,r.url,ref
+                    errors.append(f'{url}|{ref}|{r.status_code}|{len(r.content)}')
+                  except Exception as e:errors.append(f'{url}|{ref}|{repr(e)}')
+                  time.sleep(min(attempt*2,6))
+            raise RuntimeError(' ; '.join(errors[-12:]))
+
+          def text_of(reader,limit=15):
+            parts=[]
+            for p in reader.pages[:min(limit,len(reader.pages))]:
+              try:parts.append(p.extract_text() or '')
+              except Exception:pass
+            return '\n'.join(parts)
+
+          valid=[];fail=[];hashes=set()
+          for idx,cfg in enumerate(candidates,1):
+            try:
+              data,url,ref=fetch(cfg); digest=hashlib.sha256(data).hexdigest()
+              if digest in hashes:continue
+              hashes.add(digest)
+              tmp=work/f'{idx:02d}_{cfg["code"]}.pdf';tmp.write_bytes(data)
+              reader=PdfReader(str(tmp),strict=False);pages=len(reader.pages)
+              if pages<15 or pages>150:raise RuntimeError(f'not a long-form company report: {pages} pages')
+              text=text_of(reader);compact=re.sub(r'\s+','',text).lower()
+              hits=sum(compact.count(x) for x in ('金斯瑞生物科技','金斯瑞生物','genscriptbiotech','01548.hk','1548.hk','1548hk'))
+              if hits<2:raise RuntimeError(f'company identity hits={hits}')
+              if not any(x in compact for x in ('证券研究报告','證券研究報告','公司研究','公司深度','首次覆盖','首次評級','投资价值分析报告','港股公司报告')):raise RuntimeError('research-report marker missing')
+              broker=cfg['broker'] or next((b for b in brokers if b.lower().replace(' ','') in compact),'')
+              if not broker:raise RuntimeError('broker identity missing')
+              # Confirm configured broker when provided.
+              if cfg['broker'] and cfg['broker'].lower().replace(' ','') not in compact and not (cfg['broker']=='海通国际' and 'haitonginternational' in compact):raise RuntimeError('configured broker identity mismatch')
+              title=cfg['title'];date=cfg['date']
+              # Improve generic titles using prominent first-page lines.
+              if title=='金斯瑞生物科技公司研究报告':
+                for line in text.splitlines()[:100]:
+                  cl=' '.join(line.split()).strip(' |·—-_')
+                  if 10<=len(cl)<=90 and any(k in cl for k in ('金斯瑞','生命科学','基因合成','业务','成长','平台')) and not re.fullmatch(r'.*(1548|01548).*',cl):
+                    title=cl;break
+              q=subprocess.run(['qpdf','--check',str(tmp)],capture_output=True,text=True)
+              if q.returncode not in (0,3):raise RuntimeError('qpdf failed: '+q.stderr[-1000:])
+              doc=pymupdf.open(str(tmp));rendered=[]
+              for pno in sorted(set([0,pages//2,pages-1])):
+                pix=doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.1,1.1),alpha=False)
+                rp=renders/f'{idx:02d}_{pno+1:03d}.png';pix.save(str(rp))
+                if rp.stat().st_size<7000 or pix.width<450 or pix.height<550:raise RuntimeError(f'render failed page {pno+1}')
+                rendered.append(pno+1)
+              doc.close()
+              rec={**cfg,'broker':broker,'title':title,'pages':pages,'bytes':len(data),'sha256':digest,'source_url':url,'successful_referer':ref,'rendered_pages':rendered,'temp':str(tmp),'identity_hits':hits,'score':cfg['priority']+pages}
+              valid.append(rec);print('VALID',json.dumps({k:rec[k] for k in ('code','broker','title','date','pages','bytes','source_url')},ensure_ascii=False),flush=True)
+            except Exception as e:
+              fail.append({**cfg,'error':repr(e)});print('FAIL',cfg['code'],repr(e),flush=True)
+
+          (work/'valid.json').write_text(json.dumps([{k:v for k,v in x.items() if k!='temp'} for x in valid],ensure_ascii=False,indent=2),encoding='utf-8')
+          (work/'failures.json').write_text(json.dumps(fail,ensure_ascii=False,indent=2),encoding='utf-8')
+          valid.sort(key=lambda x:(-x['score'],-x['pages']))
+          selected=[];seen_b=set()
+          for x in valid:
+            if x['broker'] in seen_b:continue
+            selected.append(x);seen_b.add(x['broker'])
+            if len(selected)==3:break
+          if len(selected)<2:raise RuntimeError('Fewer than two valid deep reports: '+json.dumps(fail,ensure_ascii=False))
+
+          def safe(x):return re.sub(r'[\\/:*?"<>|\s]+','_',str(x)).strip('_')[:65]
+          records=[]
+          for i,x in enumerate(selected,1):
+            fn=f'{i:02d}_{safe(x["broker"])}_{safe(x["title"])}_{x["date"].replace("-","")}.pdf'
+            data=Path(x['temp']).read_bytes();(out/fn).write_bytes(data)
+            records.append({k:v for k,v in x.items() if k not in ('temp','score','priority')}|{'filename':fn,'report_type':'公司深度/首次覆盖报告'})
+          lines=['金斯瑞生物科技（01548.HK）券商深度报告','',f'本包包含{len(records)}份可离线打开的完整原始券商PDF。','不含网页快捷方式、二维码、摘要卡片、年报、招股书或预览节选。','']
+          for i,r in enumerate(records,1):lines += [f"{i}. {r['broker']}：《{r['title']}》",f"   日期：{r['date']}；页数：{r['pages']}页；大小：{r['bytes']/1048576:.2f} MB",f"   来源：{r['source_url']}",f"   SHA-256：{r['sha256']}",'']
+          lines += ['核验项目：PDF文件头、公司名称/股票代码、券商身份、研究报告标识、页数、qpdf结构、首页/中间页/末页渲染、SHA-256与ZIP CRC。','报告观点及评级均对应历史发布时点，不构成当前投资建议。']
+          (out/'报告清单与核验说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          (out/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records),encoding='utf-8')
+          zp=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(zp,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
+            for p in sorted(out.iterdir()):z.write(p,arcname=f'{PACKAGE}/{p.name}')
+          with zipfile.ZipFile(zp) as z:
+            bad=z.testzip()
+            if bad:raise RuntimeError('ZIP CRC failed: '+bad)
+            if len([n for n in z.namelist() if n.lower().endswith('.pdf')])!=len(records):raise RuntimeError('PDF count mismatch')
+          print('FINAL_ZIP',zp,zp.stat().st_size,'PDFS',len(records),'PAGES',sum(x['pages'] for x in records),flush=True)
+          print('MANIFEST',json.dumps(records,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: genscript-targeted-deep-reports-final
+          path: 金斯瑞生物科技_券商深度报告_完整PDF_3份.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genscript-targeted-deep-reports-diagnostics
+          path: _genscript_targeted_work/
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 6
