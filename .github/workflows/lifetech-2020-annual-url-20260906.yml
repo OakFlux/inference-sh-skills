@@ -1,0 +1,63 @@
+name: Discover LifeTech 2020 annual report URL 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lifetech-2020-annual-url-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Query HKEX title search
+        run: |
+          python - <<'PY'
+          import json
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.7',
+          }
+          results = []
+          for lang in ('EN', 'ZH'):
+              url = (
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&documentType=-1'
+                  f'&from=20210416&lang={lang}&market=SEHK&searchType=0&stockId=96020'
+                  '&t1code=-2&t2Gcode=-2&t2code=-2&to=20210416'
+              )
+              r = session.get(url, headers=headers, timeout=(20, 90), allow_redirects=True)
+              print('FETCH', lang, r.status_code, len(r.content), r.url, flush=True)
+              r.raise_for_status()
+              soup = BeautifulSoup(r.text, 'lxml')
+              for a in soup.find_all('a', href=True):
+                  text = ' '.join(a.get_text(' ', strip=True).split())
+                  parent = a.find_parent('tr')
+                  row_text = ' '.join(parent.get_text(' ', strip=True).split()) if parent else text
+                  href = urljoin(r.url, a['href'])
+                  if '.pdf' in href.lower():
+                      record = {'lang': lang, 'text': text, 'row_text': row_text, 'url': href}
+                      results.append(record)
+                      print('PDF_LINK', json.dumps(record, ensure_ascii=False), flush=True)
+          selected = [x for x in results if ('ANNUAL REPORT 2020' in x['row_text'].upper() or '2020年度報告' in x['row_text'] or '二零二零年年度報告' in x['row_text'])]
+          if not selected:
+              raise RuntimeError('No 2020 annual report link found: ' + json.dumps(results, ensure_ascii=False))
+          output = {'selected': selected, 'all_pdf_links': results}
+          print('RESULT', json.dumps(output, ensure_ascii=False, indent=2), flush=True)
+          open('lifetech_2020_annual_url.json', 'w', encoding='utf-8').write(json.dumps(output, ensure_ascii=False, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lifetech-2020-annual-url
+          path: lifetech_2020_annual_url.json
+          retention-days: 7
