@@ -1,0 +1,134 @@
+name: Inspect Waterdrop Q Technology report endpoints 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qtech-sdyanbao-diagnostic-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 lxml playwright
+          python -m playwright install --with-deps chromium >/dev/null 2>&1
+      - name: Inspect page and download actions
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import asyncio, json, re, html, requests
+          from pathlib import Path
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+          out=Path('qtech-sdyanbao-diagnostic'); out.mkdir(exist_ok=True)
+          url='https://www.sdyanbao.com/detail/937791'
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+          try:
+            r=s.get(url,timeout=(20,90),allow_redirects=True)
+            print('REQUESTS',r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+            (out/'page.html').write_text(r.text,encoding='utf-8')
+            raw=html.unescape(r.text).replace('\\/','/')
+            links=[]
+            soup=BeautifulSoup(raw,'lxml')
+            for tag in soup.find_all(True):
+              attrs={}
+              for k,v in tag.attrs.items():
+                if isinstance(v,list): v=' '.join(v)
+                if any(q in str(k).lower() for q in ('href','src','url','file','download','pdf','id','data')) or any(q in str(v).lower() for q in ('937791','.pdf','download','file','oss','cos','cdn')):
+                  attrs[k]=v
+              if attrs:
+                links.append({'tag':tag.name,'text':' '.join(tag.get_text(' ',strip=True).split())[:200],'attrs':attrs})
+            (out/'dom_attrs.json').write_text(json.dumps(links,ensure_ascii=False,indent=2),encoding='utf-8')
+            print('DOM_ATTRS',json.dumps(links[:300],ensure_ascii=False),flush=True)
+            strings=[ln.strip() for ln in raw.splitlines() if any(k in ln.lower() for k in ('937791','.pdf','download','fileurl','pdfurl','oss','cos','preview'))]
+            (out/'interesting_lines.txt').write_text('\n'.join(strings),encoding='utf-8')
+            print('LINES',json.dumps(strings[:300],ensure_ascii=False),flush=True)
+          except Exception as e: print('REQUESTS_FAIL',repr(e),flush=True)
+
+          async def main():
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True)
+              context=await browser.new_context(accept_downloads=True,viewport={'width':1440,'height':1200})
+              page=await context.new_page()
+              responses=[]; requests_log=[]
+              def on_response(resp):
+                u=resp.url
+                if any(k in u.lower() for k in ('937791','.pdf','download','file','oss','cos','api','detail')):
+                  responses.append({'url':u,'status':resp.status,'content_type':resp.headers.get('content-type','')})
+              def on_request(req):
+                u=req.url
+                if any(k in u.lower() for k in ('937791','.pdf','download','file','oss','cos','api','detail')):
+                  requests_log.append({'url':u,'method':req.method,'post_data':req.post_data,'resource_type':req.resource_type})
+              page.on('response',on_response); page.on('request',on_request)
+              await page.goto(url,wait_until='domcontentloaded',timeout=120000)
+              await page.wait_for_timeout(8000)
+              print('TITLE',await page.title(),page.url,flush=True)
+              body=(await page.locator('body').inner_text())
+              (out/'body.txt').write_text(body,encoding='utf-8')
+              html_text=await page.content(); (out/'browser_page.html').write_text(html_text,encoding='utf-8')
+              elems=await page.locator('a,button,[role=button],div,span').evaluate_all("""els => els.map((e,i)=>({i,tag:e.tagName,text:(e.innerText||e.textContent||'').trim().replace(/\\s+/g,' ').slice(0,200),href:e.href||'',cls:e.className||'',id:e.id||'',outer:e.outerHTML.slice(0,1000)})).filter(x=>x.text.includes('立即下载')||x.text.includes('下载')||x.href.includes('download')||x.href.includes('.pdf'))""")
+              (out/'download_elements.json').write_text(json.dumps(elems,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('ELEMENTS',json.dumps(elems[:100],ensure_ascii=False),flush=True)
+
+              locators=[page.get_by_text('立即下载',exact=True),page.get_by_text('立即下载'),page.locator('a:has-text("立即下载")'),page.locator('button:has-text("立即下载")')]
+              clicked=False
+              for loc in locators:
+                try:
+                  count=await loc.count()
+                  for i in range(min(count,5)):
+                    el=loc.nth(i)
+                    if not await el.is_visible(): continue
+                    print('CLICKING',i,await el.evaluate('(e)=>e.outerHTML'),flush=True)
+                    try:
+                      async with page.expect_download(timeout=12000) as di:
+                        await el.click(force=True)
+                      dl=await di.value
+                      dest=out/(dl.suggested_filename or 'download.bin')
+                      await dl.save_as(str(dest))
+                      print('DOWNLOADED',dest,dest.stat().st_size,dl.url,flush=True)
+                      clicked=True
+                      break
+                    except PlaywrightTimeoutError:
+                      print('NO_DOWNLOAD_EVENT',page.url,flush=True)
+                      await page.wait_for_timeout(4000)
+                      print('AFTER_CLICK_BODY',(await page.locator('body').inner_text())[-1500:],flush=True)
+                    except Exception as e:
+                      print('CLICK_FAIL',repr(e),flush=True)
+                  if clicked: break
+                except Exception as e: print('LOCATOR_FAIL',repr(e),flush=True)
+
+              # collect cookies and local storage in case a signed URL is generated client-side
+              cookies=await context.cookies()
+              storage=await page.evaluate('()=>({local:{...localStorage},session:{...sessionStorage}})')
+              (out/'cookies.json').write_text(json.dumps(cookies,ensure_ascii=False,indent=2),encoding='utf-8')
+              (out/'storage.json').write_text(json.dumps(storage,ensure_ascii=False,indent=2),encoding='utf-8')
+              def uniq(rows):
+                seen=set(); ans=[]
+                for x in rows:
+                  key=(x.get('method',''),x['url'])
+                  if key not in seen: seen.add(key); ans.append(x)
+                return ans
+              responses=uniq(responses); requests_log=uniq(requests_log)
+              (out/'responses.json').write_text(json.dumps(responses,ensure_ascii=False,indent=2),encoding='utf-8')
+              (out/'requests.json').write_text(json.dumps(requests_log,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('RESPONSES',json.dumps(responses,ensure_ascii=False),flush=True)
+              print('REQUESTS_LOG',json.dumps(requests_log,ensure_ascii=False),flush=True)
+              await browser.close()
+          asyncio.run(main())
+          PY
+      - name: Upload diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtech-sdyanbao-diagnostic
+          path: qtech-sdyanbao-diagnostic/
+          retention-days: 7
