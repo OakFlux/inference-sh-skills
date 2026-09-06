@@ -1,0 +1,113 @@
+name: Probe Ledong Robotics report CDN
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-ledong-robotics-reports-20260906
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --quiet aiohttp requests beautifulsoup4
+      - name: Probe CDN pages concurrently and inspect viewer HTML
+        shell: bash
+        run: |
+          cat > /tmp/probe_ledong_cdn.py <<'PY'
+          from __future__ import annotations
+          import asyncio, json, re, urllib.parse
+          from pathlib import Path
+          import aiohttp, requests
+          from bs4 import BeautifulSoup
+
+          OUT=Path('output'); OUT.mkdir(exist_ok=True)
+          reports={
+            '5593366': {'date':'2026/08/10','name':'sdic_first'},
+            '5608254': {'date':'2026/08/16','name':'industrial_first'},
+            '5637842': {'date':'2026/08/25','name':'bocom_update'},
+            '5646471': {'date':'2026/08/26','name':'sdic_update'},
+          }
+
+          async def fetch_one(session,rid,date,page,ext):
+              url=f'https://public.fxbaogao.com/report-image/{date}/{rid}-{page}.{ext}'
+              headers={'Referer':f'https://www.fxbaogao.com/view?id={rid}','Range':'bytes=0-4095','User-Agent':'Mozilla/5.0'}
+              try:
+                  async with session.get(url,headers=headers,allow_redirects=True) as r:
+                      data=await r.content.read(4096)
+                      ct=r.headers.get('content-type','')
+                      valid=r.status in (200,206) and len(data)>100 and (ct.startswith('image/') or data.startswith(b'\x89PNG') or data[:3]==b'\xff\xd8\xff')
+                      return {'page':page,'ext':ext,'url':url,'status':r.status,'type':ct,'length':r.headers.get('content-length'),'sample':len(data),'valid':valid}
+              except Exception as e:
+                  return {'page':page,'ext':ext,'url':url,'error':repr(e),'valid':False}
+
+          async def probe_images():
+              timeout=aiohttp.ClientTimeout(total=12,connect=5,sock_read=7)
+              connector=aiohttp.TCPConnector(limit=40,ssl=False)
+              async with aiohttp.ClientSession(timeout=timeout,connector=connector) as session:
+                  final={}
+                  for rid,meta in reports.items():
+                      tasks=[]
+                      for p in range(1,61):
+                          for ext in ('png','jpg','webp'):
+                              tasks.append(fetch_one(session,rid,meta['date'],p,ext))
+                      res=await asyncio.gather(*tasks)
+                      good=[x for x in res if x.get('valid')]
+                      final[rid]={'good':good,'all':res}
+                      byext={}
+                      for x in good: byext.setdefault(x['ext'],[]).append(x['page'])
+                      print('REPORT',rid,'GOOD_BY_EXT',json.dumps(byext,ensure_ascii=False))
+                      for x in res:
+                          if x.get('valid') or x.get('status') not in (404,403):
+                              print('PAGE_RESULT',rid,json.dumps(x,ensure_ascii=False))
+                  (OUT/'cdn_probe.json').write_text(json.dumps(final,ensure_ascii=False,indent=2),encoding='utf-8')
+          asyncio.run(probe_images())
+
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9'})
+          pattern=re.compile(r'https?://[^\"\'<>\\\s]+|[^\"\'<>\\\s]{0,250}(?:download|pdf|fileUrl|report-image|pageCount|totalPage|reportId|mofoun|viewer)[^\"\'<>\\\s]{0,700}',re.I)
+          urls=[]
+          for rid in reports:
+              for kind,url in [('detail',f'https://www.fxbaogao.com/detail/{rid}'),('view',f'https://www.fxbaogao.com/view?id={rid}')]:
+                  try:
+                      r=s.get(url,timeout=(5,15),allow_redirects=True)
+                      print('PAGE',rid,kind,r.status_code,r.url,r.headers.get('content-type'),len(r.content),s.cookies.get_dict())
+                      (OUT/f'{kind}_{rid}.html').write_bytes(r.content)
+                      hits=list(dict.fromkeys(pattern.findall(r.text)))
+                      (OUT/f'{kind}_{rid}_hits.txt').write_text('\n'.join(hits),encoding='utf-8')
+                      for h in hits:
+                          if any(k in h.lower() for k in ('download','pdf','fileurl','report-image','pagecount','totalpage','reportid','mofoun','viewer')):
+                              print('HIT',rid,kind,repr(h[:2600]))
+                      soup=BeautifulSoup(r.text,'html.parser')
+                      for tag in soup.find_all(['script','iframe','embed','object']):
+                          for attr in ('src','data'):
+                              v=tag.get(attr)
+                              if v:
+                                  u=urllib.parse.urljoin(r.url,v); urls.append(u); print('RESOURCE',rid,kind,tag.name,u)
+                  except Exception as e: print('PAGE_ERR',rid,kind,repr(e))
+
+          for idx,u in enumerate(dict.fromkeys(urls)):
+              try:
+                  r=s.get(u,timeout=(5,20)); r.raise_for_status()
+                  text=r.text
+                  (OUT/f'script_{idx:03d}.txt').write_bytes(r.content)
+                  for m in pattern.findall(text):
+                      if any(k in m.lower() for k in ('download','pdf','fileurl','report-image','pagecount','totalpage','reportid','mofoun','viewer')):
+                          print('SCRIPT_HIT',idx,u,repr(m[:3000]))
+              except Exception as e: print('RESOURCE_ERR',idx,u,repr(e))
+          PY
+          python /tmp/probe_ledong_cdn.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Ledong_Robotics_CDN_Probe
+          path: output
+          retention-days: 2
+          if-no-files-found: error
+          compression-level: 6
