@@ -1,0 +1,297 @@
+name: Final LifeTech Scientific annual and interim package 20260906
+
+on:
+  push:
+    paths:
+      - '.github/workflows/lifetech-final-package-20260906.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download, validate, and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          OUTPUT_ZIP = Path('LifeTech_Scientific_2020-2025_Annual_and_2026_Interim.zip')
+          FOLDER = 'LifeTech_Scientific_2020-2025_Annual_and_2026_Interim'
+          out = Path(FOLDER)
+          work = Path('_lifetech_final_work')
+          renders = work / 'renders'
+          out.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+          renders.mkdir(exist_ok=True)
+
+          documents = [
+              {
+                  'year': 2020,
+                  'type': 'Annual Report',
+                  'filename': 'LifeTech_Scientific_2020_Annual_Report.pdf',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2021/0416/2021041600433.pdf',
+                  'min_pages': 80,
+                  'markers': ('annualreport2020', 'annualreport', '年度報告'),
+              },
+              {
+                  'year': 2021,
+                  'type': 'Annual Report',
+                  'filename': 'LifeTech_Scientific_2021_Annual_Report.pdf',
+                  'url': 'https://www.hkexnews.hk/listedco/listconews/sehk/2022/0421/2022042100713.pdf',
+                  'min_pages': 80,
+                  'markers': ('annualreport2021', 'annualreport', '年度報告'),
+              },
+              {
+                  'year': 2022,
+                  'type': 'Annual Report',
+                  'filename': 'LifeTech_Scientific_2022_Annual_Report.pdf',
+                  'url': 'https://www.hkexnews.hk/listedco/listconews/sehk/2023/0418/2023041800917.pdf',
+                  'min_pages': 80,
+                  'markers': ('annualreport2022', 'annualreport', '年度報告'),
+              },
+              {
+                  'year': 2023,
+                  'type': 'Annual Report',
+                  'filename': 'LifeTech_Scientific_2023_Annual_Report.pdf',
+                  'url': 'https://www.hkexnews.hk/listedco/listconews/sehk/2024/0418/2024041800424.pdf',
+                  'min_pages': 80,
+                  'markers': ('annualreport2023', 'annualreport', '年度報告'),
+              },
+              {
+                  'year': 2024,
+                  'type': 'Annual Report',
+                  'filename': 'LifeTech_Scientific_2024_Annual_Report.pdf',
+                  'url': 'https://www.hkexnews.hk/listedco/listconews/sehk/2025/0425/2025042503445.pdf',
+                  'min_pages': 80,
+                  'markers': ('annualreport2024', 'annualreport', '年度報告'),
+              },
+              {
+                  'year': 2025,
+                  'type': 'Annual Report',
+                  'filename': 'LifeTech_Scientific_2025_Annual_Report.pdf',
+                  'url': 'https://www.hkexnews.hk/listedco/listconews/sehk/2026/0422/2026042200493.pdf',
+                  'min_pages': 80,
+                  'markers': ('annualreport2025', 'annualreport', '年度報告'),
+              },
+              {
+                  'year': 2026,
+                  'type': 'Interim Results Announcement for the six months ended 30 June 2026',
+                  'filename': 'LifeTech_Scientific_2026_Interim_Results_Announcement.pdf',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0828/2026082800322.pdf',
+                  'min_pages': 8,
+                  'markers': ('interimresults', 'interimresultsannouncement', '中期業績'),
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          base_headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9,zh-CN;q=0.7',
+              'Connection': 'close',
+          }
+
+          def fetch_pdf(url: str) -> tuple[bytes, str, str]:
+              variants = [url]
+              if 'www1.hkexnews.hk' in url:
+                  variants.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  variants.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              referers = [
+                  'https://www1.hkexnews.hk/',
+                  'https://www.hkexnews.hk/',
+                  'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=96020',
+              ]
+              errors = []
+              for candidate in dict.fromkeys(variants):
+                  for referer in referers:
+                      for attempt in range(1, 4):
+                          try:
+                              r = session.get(candidate, headers={**base_headers, 'Referer': referer}, timeout=(35, 300), allow_redirects=True)
+                              print('GET', attempt, r.status_code, len(r.content), r.headers.get('content-type'), candidate, 'ref', referer, flush=True)
+                              if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50000:
+                                  return r.content, str(r.url), referer
+                              errors.append(f'{candidate}|{referer}|HTTP {r.status_code}/{len(r.content)}')
+                          except Exception as exc:
+                              errors.append(f'{candidate}|{referer}|{repr(exc)}')
+                          time.sleep(min(attempt * 2, 6))
+              raise RuntimeError('PDF download failed: ' + ' ; '.join(errors[-12:]))
+
+          def opening_text(path: Path, page_limit: int = 24) -> str:
+              reader = PdfReader(str(path), strict=False)
+              parts = []
+              for page in reader.pages[:min(page_limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              text = '\n'.join(parts)
+              if len(text.strip()) < 300:
+                  doc = pymupdf.open(str(path))
+                  try:
+                      text = '\n'.join(doc.load_page(i).get_text('text') for i in range(min(page_limit, len(doc))))
+                  finally:
+                      doc.close()
+              return text
+
+          def validate_pdf(path: Path, cfg: dict) -> dict:
+              data = path.read_bytes()
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF signature: {path.name}')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < cfg['min_pages']:
+                  raise RuntimeError(f'Too few pages for {path.name}: {pages}')
+
+              text = opening_text(path)
+              compact = re.sub(r'\s+', '', text).lower()
+              company_ok = any(term in compact for term in (
+                  'lifetechscientific', 'lifetechscientificcorporation',
+                  '先健科技', 'stockcode1302', 'stockcode01302', '股份代號1302', '01302',
+              ))
+              if not company_ok:
+                  raise RuntimeError(f'Company identity not found in {path.name}')
+              if str(cfg['year']) not in compact:
+                  raise RuntimeError(f'Year {cfg["year"]} not found in {path.name}')
+              if not any(marker in compact for marker in cfg['markers']):
+                  raise RuntimeError(f'Document-type marker not found in {path.name}')
+
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {path.name}: {q.stderr[-1000:]}')
+
+              doc = pymupdf.open(str(path))
+              sample_pages = sorted(set([0, max(0, pages // 2), pages - 1]))
+              rendered = []
+              try:
+                  for pno in sample_pages:
+                      pix = doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                      render_path = renders / f'{path.stem}_page_{pno + 1:03d}.png'
+                      pix.save(str(render_path))
+                      if render_path.stat().st_size < 5000 or pix.width < 400 or pix.height < 400:
+                          raise RuntimeError(f'Render validation failed for {path.name}, page {pno + 1}')
+                      rendered.append({
+                          'page': pno + 1,
+                          'width': pix.width,
+                          'height': pix.height,
+                          'bytes': render_path.stat().st_size,
+                      })
+              finally:
+                  doc.close()
+
+              return {
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'qpdf_return_code': q.returncode,
+                  'rendered_pages': rendered,
+                  'opening_text_preview': re.sub(r'\s+', ' ', text)[:800],
+              }
+
+          records = []
+          hashes = set()
+          for cfg in documents:
+              data, final_url, referer = fetch_pdf(cfg['url'])
+              path = out / cfg['filename']
+              path.write_bytes(data)
+              check = validate_pdf(path, cfg)
+              if check['sha256'] in hashes:
+                  raise RuntimeError(f'Duplicate PDF content: {path.name}')
+              hashes.add(check['sha256'])
+              record = {
+                  'filename': cfg['filename'],
+                  'year': cfg['year'],
+                  'document_type': cfg['type'],
+                  'source': 'HKEXnews official issuer filing',
+                  'source_url': final_url,
+                  'successful_referer': referer,
+                  **check,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps({k: record[k] for k in ('filename','year','document_type','pages','bytes','sha256','source_url')}, ensure_ascii=False), flush=True)
+
+          readme = [
+              '先健科技（01302.HK）2020—2025年报及最新定期报告',
+              '',
+              '本压缩包包含：',
+              '1. 2020—2025年度报告，共6份；',
+              '2. 2026年8月28日发布的截至2026年6月30日止六个月中期业绩公告，共1份。',
+              '',
+              '截至2026年9月6日，港交所尚未列出完整的2026年中期报告；因此本包将最新的2026年中期业绩公告作为“最新季报/最新定期披露”。',
+              '全部PDF均直接取自香港交易所披露易（HKEXnews），未加入网页快捷方式、二维码或第三方重排文件。',
+              '',
+          ]
+          for index, record in enumerate(records, 1):
+              readme += [
+                  f"{index}. {record['filename']}",
+                  f"   类型：{record['document_type']}；实际页数：{record['pages']}页；文件大小：{record['bytes']/1048576:.2f} MB",
+                  f"   官方来源：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ]
+          readme += [
+              '核验项目：PDF文件头、公司名称/股份代码、报告年份与类型、实际页数、qpdf文件结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。',
+          ]
+          (out / 'README_文件清单与核验说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTPUT_ZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for file_path in sorted(out.iterdir()):
+                  zf.write(file_path, arcname=f'{FOLDER}/{file_path.name}')
+
+          with zipfile.ZipFile(OUTPUT_ZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC validation failed: ' + bad)
+              pdf_names = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 7:
+                  raise RuntimeError(f'Expected 7 PDFs, found {len(pdf_names)}')
+
+          print('FINAL_ZIP', OUTPUT_ZIP, OUTPUT_ZIP.stat().st_size, 'PDFS', len(records), 'TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifetech-final-package
+          path: LifeTech_Scientific_2020-2025_Annual_and_2026_Interim.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lifetech-final-diagnostics
+          path: _lifetech_final_work/
+          if-no-files-found: ignore
+          retention-days: 7
+          compression-level: 6
