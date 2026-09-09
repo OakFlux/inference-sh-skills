@@ -1,0 +1,345 @@
+name: Package Consun Pharmaceutical official reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/consun-pharma-official-reports-package-20260909.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download, validate and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          import urllib3
+          from pypdf import PdfReader
+
+          urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+          PACKAGE = '康臣药业_2015-2025年报及最新中期财务披露'
+          FINAL_ZIP = Path(PACKAGE + '.zip')
+          OUT = Path(PACKAGE)
+          WORK = Path('_work')
+          PREVIEW = WORK / 'preview'
+          OUT.mkdir(exist_ok=True)
+          PREVIEW.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en;q=0.6',
+              'Connection': 'keep-alive',
+          }
+
+          def compact(text):
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', text.upper())
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def candidate_variants(url):
+              values = [url]
+              if 'chinaconsun.com' in url:
+                  if '://www.chinaconsun.com/' in url:
+                      values.append(url.replace('://www.chinaconsun.com/', '://chinaconsun.com/'))
+                  elif '://chinaconsun.com/' in url:
+                      values.append(url.replace('://chinaconsun.com/', '://www.chinaconsun.com/'))
+                  if url.startswith('https://'):
+                      values.append(url.replace('https://', 'http://', 1))
+              return list(dict.fromkeys(values))
+
+          def fetch_pdf(url):
+              errors = []
+              for actual in candidate_variants(url):
+                  verify_modes = (True, False) if 'chinaconsun.com' in actual else (True,)
+                  for verify in verify_modes:
+                      for attempt in range(1, 4):
+                          try:
+                              referer = 'https://chinaconsun.com/' if 'chinaconsun.com' in actual else 'https://www1.hkexnews.hk/'
+                              r = session.get(
+                                  actual,
+                                  headers={**headers, 'Referer': referer},
+                                  timeout=(30, 900),
+                                  allow_redirects=True,
+                                  verify=verify,
+                              )
+                              print('GET', actual, 'verify=', verify, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                              if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50000:
+                                  return r, actual
+                              errors.append(f'{actual}: status={r.status_code}, bytes={len(r.content)}')
+                          except Exception as exc:
+                              errors.append(f'{actual}: {type(exc).__name__}: {exc}')
+                          time.sleep(attempt)
+              raise RuntimeError(' | '.join(errors[-12:]))
+
+          def extract_probe_text(path, pages):
+              text = []
+              reader = PdfReader(str(path))
+              wanted = list(range(min(40, pages)))
+              wanted += list(range(max(0, pages - 4), pages))
+              for idx in sorted(set(wanted)):
+                  try:
+                      text.append(reader.pages[idx].extract_text() or '')
+                  except Exception as exc:
+                      print('PYPDF TEXT WARNING', path.name, idx + 1, repr(exc), flush=True)
+              joined = '\n'.join(text)
+              if len(compact(joined)) < 300:
+                  txt = path.with_suffix('.txt')
+                  run = subprocess.run(
+                      ['pdftotext', '-f', '1', '-l', str(min(40, pages)), str(path), str(txt)],
+                      capture_output=True, text=True,
+                  )
+                  if run.returncode == 0 and txt.exists():
+                      joined += '\n' + txt.read_text(encoding='utf-8', errors='ignore')
+              return joined
+
+          def validate(path, year, report_type, min_pages):
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError('PDF signature missing')
+              reader = PdfReader(str(path))
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'page count too small: {pages} < {min_pages}')
+              probe = extract_probe_text(path, pages)
+              norm = compact(probe)
+              identities = (
+                  '康臣葯業集團有限公司', '康臣药业集团有限公司',
+                  '康臣藥業集團有限公司', 'CONSUNPHARMACEUTICALGROUPLIMITED',
+                  'CONSUNPHARMACEUTICALGROUPLTD',
+              )
+              if not any(compact(x) in norm for x in identities):
+                  raise RuntimeError('company identity marker missing')
+              if str(year) not in norm:
+                  raise RuntimeError(f'report year marker missing: {year}')
+              if report_type == '年度报告':
+                  markers = ('ANNUALREPORT', '年報', '年度報告', '年报', '年度报告')
+              else:
+                  markers = ('INTERIMREPORT', 'INTERIMRESULTS', '中期報告', '中期業績', '中期报告', '中期业绩')
+              if not any(compact(x) in norm for x in markers):
+                  raise RuntimeError(f'report type marker missing: {report_type}')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError('qpdf validation failed: ' + check.stderr[-800:])
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f'{path.stem}_{label}'
+                  render = subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '72', str(path), str(prefix)],
+                      capture_output=True, text=True,
+                  )
+                  image = Path(str(prefix) + '.png')
+                  if render.returncode != 0 or not image.exists() or image.stat().st_size < 1000:
+                      raise RuntimeError(f'{label}-page render failed: {render.stderr[-500:]}')
+              if compact('康臣葯業集團有限公司') in norm or compact('康臣藥業集團有限公司') in norm:
+                  language = '繁体中文'
+              elif compact('康臣药业集团有限公司') in norm:
+                  language = '简体中文'
+              else:
+                  language = '英文'
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'language': language,
+              }
+
+          def obtain(seq, year, report_type, filename, urls, min_pages):
+              errors = []
+              for idx, url in enumerate(dict.fromkeys(urls), 1):
+                  temp = WORK / f'{seq:02d}_{idx}.pdf'
+                  try:
+                      response, requested = fetch_pdf(url)
+                      temp.write_bytes(response.content)
+                      meta = validate(temp, year, report_type, min_pages)
+                      dest = OUT / filename
+                      shutil.copy2(temp, dest)
+                      record = {
+                          'sequence': seq,
+                          'filename': filename,
+                          'year': year,
+                          'report_type': report_type,
+                          'requested_url': requested,
+                          'final_url': response.url,
+                          **meta,
+                      }
+                      print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+                      return record
+                  except Exception as exc:
+                      msg = f'{url}: {type(exc).__name__}: {exc}'
+                      errors.append(msg)
+                      print('REJECTED', msg, flush=True)
+                      temp.unlink(missing_ok=True)
+              raise RuntimeError('All sources failed for ' + filename + '\n' + '\n'.join(errors))
+
+          annual_sources = {
+              2015: ['https://www.chinaconsun.com/upfile/2018/10/20181024171807_858.pdf'],
+              2016: ['https://www.chinaconsun.com/upfile/2018/10/20181024172009_335.pdf'],
+              2017: ['https://www.chinaconsun.com/upfile/2018/10/20181024172628_534.pdf'],
+              2018: ['https://www.chinaconsun.com/upfile/2019/04/20190430114435_540.pdf'],
+              2019: ['https://www.chinaconsun.com/upfile/2020/04/20200429085807_455.pdf'],
+              2020: ['https://www.chinaconsun.com/upfile/2021/04/20210422133059_686.pdf'],
+              2021: ['https://www.chinaconsun.com/upfile/2022/04/20220426221223_655.pdf'],
+              2022: ['https://chinaconsun.com/upfile/2023/04/20230428103119_161.pdf'],
+              2023: ['https://chinaconsun.com/upfile/2024/05/20240506115026_943.pdf'],
+              2024: ['https://chinaconsun.com/upfile/2025/04/20250428221146_888.pdf'],
+              2025: [
+                  'https://www.hkexnews.hk/listedco/listconews/sehk/2026/0428/2026042801744_c.pdf',
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0428/2026042801743.pdf',
+                  'https://raw.githubusercontent.com/zephyr1125/ZephyrSpace/main/%E8%B4%A2%E6%8A%A5/%E5%BA%B7%E8%87%A3%E8%8D%AF%E4%B8%9A/%E5%BA%B7%E8%87%A3%E8%8D%AF%E4%B8%9A2025%E5%B9%B4%E5%BA%A6%E6%8A%A5%E5%91%8A.pdf',
+              ],
+          }
+          for year in annual_sources:
+              annual_sources[year].append(
+                  f'https://www.annualreports.com/HostedData/AnnualReportArchive/C/HKG_1681_{year}.pdf'
+              )
+
+          records = []
+          for seq, year in enumerate(range(2015, 2026), 1):
+              records.append(obtain(
+                  seq,
+                  year,
+                  '年度报告',
+                  f'{seq:02d}_康臣药业_{year}年年度报告.pdf',
+                  annual_sources[year],
+                  55,
+              ))
+
+          records.append(obtain(
+              12,
+              2026,
+              '中期业绩公告',
+              '12_康臣药业_2026年中期业绩公告_截至2026年6月30日.pdf',
+              [
+                  'https://www.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082600202_c.pdf',
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082600201.pdf',
+                  'https://raw.githubusercontent.com/zephyr1125/ZephyrSpace/main/%E8%B4%A2%E6%8A%A5/%E5%BA%B7%E8%87%A3%E8%8D%AF%E4%B8%9A/%E5%BA%B7%E8%87%A3%E8%8D%AF%E4%B8%9A2026%E4%B8%AD%E6%9C%9F%E4%B8%9A%E7%BB%A9%E5%85%AC%E5%91%8A.pdf',
+              ],
+              10,
+          ))
+
+          records.append(obtain(
+              13,
+              2025,
+              '中期报告',
+              '13_康臣药业_2025年中期报告_最新已刊发完整中期报告.pdf',
+              [
+                  'https://chinaconsun.com/upfile/2025/09/20250919083134_926.pdf',
+                  'https://www.chinaconsun.com/upfile/2025/09/20250919083134_926.pdf',
+              ],
+              30,
+          ))
+
+          if len(records) != 13:
+              raise RuntimeError(f'expected 13 PDFs, got {len(records)}')
+          hashes = [r['sha256'] for r in records]
+          if len(set(hashes)) != len(hashes):
+              raise RuntimeError('duplicate PDF content detected')
+
+          with (OUT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '文件名', '报告期', '报告类型', '语言', '页数', '文件大小_字节', 'SHA256', '最终下载地址', '候选来源地址']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for r in records:
+                  writer.writerow({
+                      '序号': r['sequence'],
+                      '文件名': r['filename'],
+                      '报告期': r['year'],
+                      '报告类型': r['report_type'],
+                      '语言': r['language'],
+                      '页数': r['pages'],
+                      '文件大小_字节': r['bytes'],
+                      'SHA256': r['sha256'],
+                      '最终下载地址': r['final_url'],
+                      '候选来源地址': r['requested_url'],
+                  })
+
+          (OUT / 'manifest.json').write_text(
+              json.dumps({
+                  'company': '康臣葯業集團有限公司 / Consun Pharmaceutical Group Limited',
+                  'stock_code': '01681.HK',
+                  'as_of_date': '2026-09-09',
+                  'annual_report_years': list(range(2015, 2026)),
+                  'latest_periodic_financial_disclosure': '截至2026年6月30日止六个月的2026年中期业绩公告',
+                  'latest_full_interim_report_published': '2025年中期报告',
+                  'files': records,
+              }, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          checksum_lines = [f"{r['sha256']}  {r['filename']}" for r in records]
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(checksum_lines) + '\n', encoding='utf-8')
+
+          readme = [
+              '康臣葯業集團有限公司（Consun Pharmaceutical Group Limited）',
+              '香港交易所股份代号：01681',
+              '2015-2025年年度报告及最新中期财务披露',
+              '资料核对日期：2026-09-09',
+              '',
+              '一、压缩包内容',
+              '1. 2015年至2025年共11份年度报告。',
+              '2. 2026年中期业绩公告（截至2026年6月30日止六个月），作为截至核对日最新的定期财务披露。',
+              '3. 2025年中期报告，作为截至核对日公司网站已刊发的最新完整中期报告补充收录。',
+              '4. 来源与校验清单.csv、manifest.json、SHA256SUMS.txt。',
+              '',
+              '二、关于“最新季报”的口径说明',
+              '康臣药业为香港联交所主板上市公司，通常不按A股口径发布第一季度和第三季度报告。',
+              '截至2026年9月9日，最新正式定期财务披露为2026年中期业绩公告；完整2026年中期报告尚未在公司定期报告页面刊发，因此另附最新已刊发的2025年完整中期报告。',
+              '',
+              '三、核验项目',
+              '每份PDF均检查：PDF文件头、公司身份、报告年度、报告类型、页数、qpdf结构、首尾页渲染、SHA-256。',
+              '下载顺序以公司官网或香港交易所为优先来源；仅在官方地址不可用时启用备用镜像，并在清单中记录实际来源。',
+              '',
+              '四、文件明细',
+          ]
+          for r in records:
+              readme.append(
+                  f"{r['sequence']:02d}. {r['filename']}｜{r['language']}｜{r['pages']}页｜{r['bytes']}字节｜SHA-256 {r['sha256']}"
+              )
+          (OUT / 'README_CN.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          with zipfile.ZipFile(FINAL_ZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(OUT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, path.as_posix())
+
+          print('FINAL_ZIP', FINAL_ZIP, FINAL_ZIP.stat().st_size, sha256(FINAL_ZIP), flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: consun-pharma-reports-20260909
+          path: 康臣药业_2015-2025年报及最新中期财务披露.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
