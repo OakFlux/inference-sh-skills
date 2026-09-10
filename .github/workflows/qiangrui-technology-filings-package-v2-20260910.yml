@@ -1,0 +1,410 @@
+name: Package Qiangrui Technology official filings v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qiangrui-technology-filings-package-v2-20260910.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, html, json, re, shutil, subprocess, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from pypdf import PdfReader
+
+          CODE = '301128'
+          ORG_ID = 'nssc1000397'
+          COMPANY = '深圳市强瑞精密技术股份有限公司'
+          SHORT = '强瑞技术'
+          AS_OF = '2026-09-10'
+          PACKAGE = '强瑞技术_全部年报_招股说明书及最新定期报告_截至2026-09-10'
+          OUT = Path(PACKAGE)
+          WORK = Path('_work')
+          PREVIEW = WORK / 'preview'
+          FINAL_ZIP = Path(PACKAGE + '.zip')
+          OUT.mkdir(exist_ok=True)
+          PREVIEW.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          api_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Origin': 'https://www.cninfo.com.cn',
+              'Referer': f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={CODE}&orgId={ORG_ID}',
+              'X-Requested-With': 'XMLHttpRequest',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://www.cninfo.com.cn/',
+          }
+
+          def compact(text):
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(text).upper())
+
+          def clean_title(value):
+              value = html.unescape(str(value or ''))
+              value = re.sub(r'<[^>]+>', '', value)
+              value = re.sub(r'\s+', '', value.replace('\u3000', ' ')).strip()
+              for sep in ('：', ':'):
+                  if sep in value and value.split(sep, 1)[0] in (SHORT, COMPANY):
+                      value = value.split(sep, 1)[1]
+              return value
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def ann_time(row):
+              try:
+                  return int(row.get('announcementTime') or 0)
+              except Exception:
+                  return 0
+
+          def query_cninfo(se_date, category='', searchkey=''):
+              merged = {}
+              for endpoint in ('https://www.cninfo.com.cn/new/hisAnnouncement/query', 'http://www.cninfo.com.cn/new/hisAnnouncement/query'):
+                  seen_signatures = set()
+                  for page in range(1, 31):
+                      payload = {
+                          'pageNum': page,
+                          'pageSize': 30,
+                          'column': 'szse',
+                          'tabName': 'fulltext',
+                          'plate': 'sz',
+                          'stock': f'{CODE},{ORG_ID}',
+                          'searchkey': searchkey,
+                          'secid': '',
+                          'category': category,
+                          'trade': '',
+                          'seDate': se_date,
+                          'sortName': '',
+                          'sortType': '',
+                          'isHLtitle': 'true',
+                      }
+                      try:
+                          r = session.post(endpoint, data=payload, headers=api_headers, timeout=(25, 180))
+                          print('QUERY', endpoint, se_date, category, searchkey, page, r.status_code, len(r.content), flush=True)
+                          r.raise_for_status()
+                          data = r.json()
+                          rows = data.get('announcements') or []
+                          filtered = [x for x in rows if str(x.get('secCode') or '') == CODE or SHORT in str(x.get('secName') or '')]
+                          signature = tuple(str(x.get('announcementId') or x.get('adjunctUrl')) for x in filtered)
+                          if signature and signature in seen_signatures:
+                              print('REPEATED PAGE SIGNATURE; STOP', page, flush=True)
+                              break
+                          if signature:
+                              seen_signatures.add(signature)
+                          for row in filtered:
+                              key = str(row.get('announcementId') or row.get('adjunctUrl') or row.get('announcementTitle'))
+                              merged[key] = row
+                          total = int(data.get('totalAnnouncement') or data.get('totalRecordNum') or 0)
+                          if not rows or (total and page * 30 >= total):
+                              break
+                      except Exception as exc:
+                          print('QUERY ERROR', endpoint, se_date, category, searchkey, page, repr(exc), flush=True)
+                          break
+                  if merged:
+                      break
+              return list(merged.values())
+
+          all_rows = {}
+          windows = [
+              ('2021-01-01~2021-12-31', '', ''),
+              ('2022-01-01~2022-12-31', 'category_ndbg_szsh', ''),
+              ('2023-01-01~2023-12-31', 'category_ndbg_szsh', ''),
+              ('2024-01-01~2024-12-31', 'category_ndbg_szsh', ''),
+              ('2025-01-01~2025-12-31', 'category_ndbg_szsh', ''),
+              ('2026-01-01~2026-06-30', 'category_ndbg_szsh', ''),
+              ('2026-07-01~2026-09-10', 'category_bndbg_szsh', ''),
+              ('2026-03-01~2026-05-31', 'category_yjdbg_szsh', ''),
+              ('2021-01-01~2021-12-31', '', '招股说明书'),
+          ]
+          for se_date, category, searchkey in windows:
+              for row in query_cninfo(se_date, category, searchkey):
+                  key = str(row.get('announcementId') or row.get('adjunctUrl') or row.get('announcementTitle'))
+                  all_rows[key] = row
+
+          rows = list(all_rows.values())
+          print('UNIQUE ROWS', len(rows), flush=True)
+          for row in sorted(rows, key=ann_time):
+              title = clean_title(row.get('announcementTitle'))
+              if any(x in title for x in ('年度报告', '半年度报告', '季度报告', '招股说明书')):
+                  print('CANDIDATE', json.dumps({
+                      'title': title,
+                      'time': row.get('announcementTime'),
+                      'url': row.get('adjunctUrl'),
+                      'id': row.get('announcementId'),
+                  }, ensure_ascii=False), flush=True)
+
+          def exact_report(title, year, kind):
+              t = clean_title(title)
+              revision = r'(?:[（(](?:更正后|修订版|更新后|变更后)[）)])?'
+              if kind == 'annual':
+                  return bool(re.fullmatch(rf'{year}年年度报告(?:全文)?{revision}', t))
+              if kind == 'semi':
+                  return bool(re.fullmatch(rf'{year}年半年度报告(?:全文)?{revision}', t))
+              if kind == 'q1':
+                  return bool(re.fullmatch(rf'{year}年第一季度报告(?:全文)?{revision}', t))
+              return False
+
+          def choose(candidates, prefer_revision=True):
+              if not candidates:
+                  return None
+              def score(row):
+                  t = clean_title(row.get('announcementTitle'))
+                  revised = 1 if any(x in t for x in ('更正后', '修订版', '更新后', '变更后')) else 0
+                  return ((revised if prefer_revision else 0), ann_time(row))
+              return sorted(candidates, key=score, reverse=True)[0]
+
+          annuals = {}
+          for year in range(2021, 2026):
+              annuals[year] = choose([x for x in rows if exact_report(x.get('announcementTitle'), year, 'annual')])
+          missing = [year for year, row in annuals.items() if row is None]
+          if missing:
+              raise RuntimeError(f'Missing annual reports: {missing}')
+
+          phrase = '首次公开发行股票并在创业板上市招股说明书'
+          prospectus_candidates = []
+          for row in rows:
+              t = clean_title(row.get('announcementTitle'))
+              if phrase in t and not any(x in t for x in ('摘要', '提示性公告', '审核问询', '回复', '法律意见', '上市公告书')):
+                  prospectus_candidates.append(row)
+          if not prospectus_candidates:
+              for row in rows:
+                  t = clean_title(row.get('announcementTitle'))
+                  if '招股说明书' in t and not any(x in t for x in ('摘要', '提示性公告', '审核问询', '回复', '法律意见')):
+                      prospectus_candidates.append(row)
+          if not prospectus_candidates:
+              raise RuntimeError('IPO prospectus not found')
+          prospectus = sorted(
+              prospectus_candidates,
+              key=lambda x: (
+                  3 if clean_title(x.get('announcementTitle')) == phrase else 0,
+                  2 if all(y not in clean_title(x.get('announcementTitle')) for y in ('注册稿', '申报稿')) else 0,
+                  ann_time(x),
+              ), reverse=True,
+          )[0]
+
+          semi = choose([x for x in rows if exact_report(x.get('announcementTitle'), 2026, 'semi')])
+          q1 = choose([x for x in rows if exact_report(x.get('announcementTitle'), 2026, 'q1')])
+          if semi is None:
+              raise RuntimeError('2026 semi-annual report not found')
+          if q1 is None:
+              raise RuntimeError('2026 first-quarter report not found')
+
+          selected = [{
+              'year': 2021,
+              'kind': '首次公开发行招股说明书',
+              'filename': '01_强瑞技术_首次公开发行股票并在创业板上市招股说明书.pdf',
+              'row': prospectus,
+              'min_pages': 200,
+          }]
+          seq = 2
+          for year in sorted(annuals):
+              selected.append({
+                  'year': year,
+                  'kind': '年度报告',
+                  'filename': f'{seq:02d}_强瑞技术_{year}年年度报告.pdf',
+                  'row': annuals[year],
+                  'min_pages': 70,
+              })
+              seq += 1
+          selected += [
+              {
+                  'year': 2026,
+                  'kind': '半年度报告（最新完整定期报告）',
+                  'filename': f'{seq:02d}_强瑞技术_2026年半年度报告_最新完整定期报告.pdf',
+                  'row': semi,
+                  'min_pages': 40,
+              },
+              {
+                  'year': 2026,
+                  'kind': '第一季度报告（最新严格季度报告）',
+                  'filename': f'{seq + 1:02d}_强瑞技术_2026年第一季度报告_变更后.pdf',
+                  'row': q1,
+                  'min_pages': 5,
+              },
+          ]
+
+          def source_url(row):
+              value = str(row.get('adjunctUrl') or '').strip()
+              if not value:
+                  raise RuntimeError('Missing adjunctUrl')
+              return value if value.startswith('http') else urljoin('https://static.cninfo.com.cn/', value.lstrip('/'))
+
+          def download(url, path):
+              errors = []
+              candidates = [url]
+              if url.startswith('https://'):
+                  candidates.append(url.replace('https://', 'http://', 1))
+              for candidate in candidates:
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(candidate, headers=pdf_headers, timeout=(30, 900), allow_redirects=True)
+                          print('GET PDF', candidate, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 30000:
+                              path.write_bytes(r.content)
+                              return r.url
+                          errors.append(f'{candidate}: {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{candidate}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors[-10:]))
+
+          def extract_probe(path, page_count):
+              reader = PdfReader(str(path))
+              indices = list(range(min(40, page_count))) + list(range(max(0, page_count - 3), page_count))
+              text = []
+              for idx in sorted(set(indices)):
+                  try:
+                      text.append(reader.pages[idx].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT WARNING', path.name, idx + 1, repr(exc), flush=True)
+              return '\n'.join(text)
+
+          def validate(path, item):
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError('PDF signature missing')
+              reader = PdfReader(str(path))
+              pages = len(reader.pages)
+              if pages < item['min_pages']:
+                  raise RuntimeError(f'Page count too small: {pages}')
+              norm = compact(extract_probe(path, pages))
+              if not any(compact(x) in norm for x in (COMPANY, SHORT, 'SHENZHENQIANGRUIPRECISIONTECHNOLOGY')):
+                  raise RuntimeError('Company identity missing')
+              if str(item['year']) not in norm:
+                  raise RuntimeError(f'Year marker missing: {item["year"]}')
+              if '招股说明书' in item['kind']:
+                  markers = ('招股说明书', 'PROSPECTUS')
+              elif item['kind'] == '年度报告':
+                  markers = ('年度报告', 'ANNUALREPORT')
+              elif '半年度报告' in item['kind']:
+                  markers = ('半年度报告', 'SEMIANNUALREPORT', 'INTERIMREPORT')
+              else:
+                  markers = ('第一季度报告', 'FIRSTQUARTERREPORT')
+              if not any(compact(x) in norm for x in markers):
+                  raise RuntimeError(f'Report type marker missing: {item["kind"]}')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError('qpdf failed: ' + check.stderr[-500:])
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f'{path.stem}_{label}'
+                  render = subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '72', str(path), str(prefix)],
+                      capture_output=True, text=True,
+                  )
+                  image = Path(str(prefix) + '.png')
+                  if render.returncode != 0 or not image.exists() or image.stat().st_size < 1000:
+                      raise RuntimeError(f'{label} page render failed')
+              return {'pages': pages, 'bytes': path.stat().st_size, 'sha256': sha256(path)}
+
+          records = []
+          for item in selected:
+              row = item['row']
+              dest = OUT / item['filename']
+              requested = source_url(row)
+              final = download(requested, dest)
+              meta = validate(dest, item)
+              record = {
+                  'sequence': len(records) + 1,
+                  'filename': item['filename'],
+                  'year': item['year'],
+                  'report_type': item['kind'],
+                  'announcement_title': clean_title(row.get('announcementTitle')),
+                  'announcement_time': row.get('announcementTime'),
+                  'announcement_id': row.get('announcementId'),
+                  'source_url': final,
+                  **meta,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 PDFs, got {len(records)}')
+          if len({r['sha256'] for r in records}) != len(records):
+              raise RuntimeError('Duplicate PDF content detected')
+
+          with (OUT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '文件名', '报告期', '报告类型', '公告标题', '公告时间戳', '页数', '文件大小_字节', 'SHA256', '官方来源地址', '公告ID']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for r in records:
+                  writer.writerow({
+                      '序号': r['sequence'], '文件名': r['filename'], '报告期': r['year'],
+                      '报告类型': r['report_type'], '公告标题': r['announcement_title'],
+                      '公告时间戳': r['announcement_time'], '页数': r['pages'],
+                      '文件大小_字节': r['bytes'], 'SHA256': r['sha256'],
+                      '官方来源地址': r['source_url'], '公告ID': r['announcement_id'],
+                  })
+
+          (OUT / 'manifest.json').write_text(json.dumps({
+              'company': COMPANY,
+              'stock_code': '301128.SZ',
+              'cninfo_org_id': ORG_ID,
+              'as_of_date': AS_OF,
+              'annual_report_years': list(range(2021, 2026)),
+              'latest_complete_periodic_report': '2026年半年度报告',
+              'latest_strict_quarterly_report': '2026年第一季度报告（变更后）',
+              'files': records,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['filename']}" for r in records) + '\n', encoding='utf-8')
+
+          lines = [
+              f'{COMPANY}（{SHORT}，301128.SZ）',
+              '全部年度报告、首次公开发行招股说明书及最新定期报告',
+              f'核对日期：{AS_OF}', '',
+              '收录内容：',
+              '1. 2021—2025年度完整年度报告，共5份。',
+              '2. 首次公开发行股票并在创业板上市招股说明书。',
+              '3. 2026年半年度报告，作为截至核对日最新完整定期报告。',
+              '4. 2026年第一季度报告（变更后），作为严格季度报告口径的补充。', '',
+              '说明：强瑞技术于2021年上市，因此上市公司年度报告从2021年度开始。未收录年度报告摘要、英文版或单独审计附件。',
+              '全部PDF均已检查文件签名、公司名称、年份、报告类型、页数、qpdf结构、首尾页渲染及SHA-256。', '',
+              '文件明细：',
+          ]
+          for r in records:
+              lines.append(f"{r['sequence']:02d}. {r['filename']}｜{r['pages']}页｜{r['bytes']}字节｜SHA-256 {r['sha256']}")
+          (OUT / 'README_CN.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          with zipfile.ZipFile(FINAL_ZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(OUT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, path.as_posix())
+          print('FINAL ZIP', FINAL_ZIP.name, FINAL_ZIP.stat().st_size, sha256(FINAL_ZIP), flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: qiangrui-technology-filings-v2-20260910
+          path: 强瑞技术_全部年报_招股说明书及最新定期报告_截至2026-09-10.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
