@@ -1,0 +1,276 @@
+name: Package Qiangrui Technology official filings v3
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qiangrui-technology-filings-package-v3-20260910.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - name: Install PDF validators
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package verified filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          COMPANY = '深圳市强瑞精密技术股份有限公司'
+          SHORT = '强瑞技术'
+          PACKAGE = '强瑞技术_全部年报_招股说明书及最新定期报告_截至2026-09-10'
+          OUT = Path(PACKAGE)
+          PREVIEW = Path('_work/preview')
+          FINAL_ZIP = Path(PACKAGE + '.zip')
+          OUT.mkdir(exist_ok=True)
+          PREVIEW.mkdir(parents=True, exist_ok=True)
+
+          docs = [
+              {
+                  'filename': '01_强瑞技术_首次公开发行股票并在创业板上市招股说明书.pdf',
+                  'year': 2021,
+                  'kind': '首次公开发行招股说明书',
+                  'title': '首次公开发行股票并在创业板上市招股说明书',
+                  'announcement_id': '1211389021',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2021-10-27/1211389021.PDF',
+                  'min_pages': 200,
+              },
+              {
+                  'filename': '02_强瑞技术_2021年年度报告.pdf',
+                  'year': 2021,
+                  'kind': '年度报告',
+                  'title': '2021年年度报告',
+                  'announcement_id': '1212961508',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2022-04-19/1212961508.PDF',
+                  'min_pages': 70,
+              },
+              {
+                  'filename': '03_强瑞技术_2022年年度报告.pdf',
+                  'year': 2022,
+                  'kind': '年度报告',
+                  'title': '2022年年度报告',
+                  'announcement_id': '1216522966',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2023-04-22/1216522966.PDF',
+                  'min_pages': 70,
+              },
+              {
+                  'filename': '04_强瑞技术_2023年年度报告.pdf',
+                  'year': 2023,
+                  'kind': '年度报告',
+                  'title': '2023年年度报告',
+                  'announcement_id': '1219704616',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2024-04-20/1219704616.PDF',
+                  'min_pages': 70,
+              },
+              {
+                  'filename': '05_强瑞技术_2024年年度报告.pdf',
+                  'year': 2024,
+                  'kind': '年度报告',
+                  'title': '2024年年度报告',
+                  'announcement_id': '1223308411',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2025-04-22/1223308411.pdf',
+                  'min_pages': 70,
+              },
+              {
+                  'filename': '06_强瑞技术_2025年年度报告.pdf',
+                  'year': 2025,
+                  'kind': '年度报告',
+                  'title': '2025年年度报告',
+                  'announcement_id': '1225107202',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2026-04-16/1225107202.PDF',
+                  'min_pages': 70,
+              },
+              {
+                  'filename': '07_强瑞技术_2026年半年度报告_最新完整定期报告.pdf',
+                  'year': 2026,
+                  'kind': '半年度报告（最新完整定期报告）',
+                  'title': '2026年半年度报告',
+                  'announcement_id': '1225469062',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2026-08-12/1225469062.PDF',
+                  'min_pages': 40,
+              },
+              {
+                  'filename': '08_强瑞技术_2026年第一季度报告_变更后.pdf',
+                  'year': 2026,
+                  'kind': '第一季度报告（变更后，最新严格季度报告）',
+                  'title': '深圳市强瑞精密技术股份有限公司2026年第一季度报告（变更后）',
+                  'announcement_id': '1225217570',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2026-04-27/1225217570.PDF',
+                  'min_pages': 5,
+              },
+          ]
+
+          session = requests.Session()
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://www.cninfo.com.cn/',
+          }
+
+          def compact(text):
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(text).upper())
+
+          def sha256(path):
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download(url, path):
+              errors = []
+              for candidate in (url, url.replace('https://', 'http://', 1)):
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(candidate, headers=headers, timeout=(30, 900), allow_redirects=True)
+                          print('GET', candidate, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 30000:
+                              path.write_bytes(r.content)
+                              return r.url
+                          errors.append(f'{candidate}: {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{candidate}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError('Download failed: ' + ' | '.join(errors[-10:]))
+
+          def probe_text(reader, pages):
+              indices = list(range(min(45, pages))) + list(range(max(0, pages - 3), pages))
+              out = []
+              for idx in sorted(set(indices)):
+                  try:
+                      out.append(reader.pages[idx].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT WARNING', idx + 1, repr(exc), flush=True)
+              return '\n'.join(out)
+
+          def validate(path, doc):
+              with path.open('rb') as f:
+                  if f.read(5) != b'%PDF-':
+                      raise RuntimeError('PDF signature missing')
+              reader = PdfReader(str(path))
+              pages = len(reader.pages)
+              if pages < doc['min_pages']:
+                  raise RuntimeError(f'Page count too small for {path.name}: {pages}')
+              norm = compact(probe_text(reader, pages))
+              identities = (COMPANY, SHORT, 'SHENZHENQIANGRUIPRECISIONTECHNOLOGY')
+              if not any(compact(x) in norm for x in identities):
+                  raise RuntimeError(f'Company identity missing: {path.name}')
+              if str(doc['year']) not in norm:
+                  raise RuntimeError(f'Year marker missing: {path.name}')
+              if '招股说明书' in doc['kind']:
+                  markers = ('招股说明书', 'PROSPECTUS')
+              elif doc['kind'] == '年度报告':
+                  markers = ('年度报告', 'ANNUALREPORT')
+              elif '半年度报告' in doc['kind']:
+                  markers = ('半年度报告', 'SEMIANNUALREPORT', 'INTERIMREPORT')
+              else:
+                  markers = ('第一季度报告', '一季度报告', 'FIRSTQUARTERREPORT')
+              if not any(compact(x) in norm for x in markers):
+                  raise RuntimeError(f'Report type marker missing: {path.name}')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {path.name}: {check.stderr[-500:]}')
+              for label, page_no in (('first', 1), ('last', pages)):
+                  prefix = PREVIEW / f'{path.stem}_{label}'
+                  run = subprocess.run(
+                      ['pdftoppm', '-f', str(page_no), '-singlefile', '-png', '-r', '72', str(path), str(prefix)],
+                      capture_output=True, text=True,
+                  )
+                  image = Path(str(prefix) + '.png')
+                  if run.returncode != 0 or not image.exists() or image.stat().st_size < 1000:
+                      raise RuntimeError(f'{label} page render failed for {path.name}')
+              return {'pages': pages, 'bytes': path.stat().st_size, 'sha256': sha256(path)}
+
+          records = []
+          for i, doc in enumerate(docs, 1):
+              dest = OUT / doc['filename']
+              final_url = download(doc['url'], dest)
+              meta = validate(dest, doc)
+              record = {
+                  'sequence': i,
+                  'filename': doc['filename'],
+                  'year': doc['year'],
+                  'report_type': doc['kind'],
+                  'announcement_title': doc['title'],
+                  'announcement_id': doc['announcement_id'],
+                  'official_url': final_url,
+                  **meta,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 8 or len({r['sha256'] for r in records}) != 8:
+              raise RuntimeError('Record count or uniqueness validation failed')
+
+          with (OUT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '文件名', '报告期', '报告类型', '公告标题', '页数', '文件大小_字节', 'SHA256', '巨潮资讯官方地址', '公告ID']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for r in records:
+                  writer.writerow({
+                      '序号': r['sequence'], '文件名': r['filename'], '报告期': r['year'],
+                      '报告类型': r['report_type'], '公告标题': r['announcement_title'],
+                      '页数': r['pages'], '文件大小_字节': r['bytes'], 'SHA256': r['sha256'],
+                      '巨潮资讯官方地址': r['official_url'], '公告ID': r['announcement_id'],
+                  })
+
+          (OUT / 'manifest.json').write_text(json.dumps({
+              'company': COMPANY,
+              'short_name': SHORT,
+              'stock_code': '301128.SZ',
+              'cninfo_org_id': 'nssc1000397',
+              'as_of_date': '2026-09-10',
+              'annual_report_years': [2021, 2022, 2023, 2024, 2025],
+              'latest_complete_periodic_report': '2026年半年度报告',
+              'latest_strict_quarterly_report': '2026年第一季度报告（变更后）',
+              'files': records,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text('\n'.join(f"{r['sha256']}  {r['filename']}" for r in records) + '\n', encoding='utf-8')
+
+          lines = [
+              f'{COMPANY}（{SHORT}，301128.SZ）',
+              '全部年度报告、招股说明书及最新定期报告',
+              '核对日期：2026-09-10', '',
+              '收录内容：',
+              '1. 2021—2025年度完整年度报告，共5份。',
+              '2. 首次公开发行股票并在创业板上市招股说明书。',
+              '3. 2026年半年度报告，作为截至核对日最新完整定期报告。',
+              '4. 2026年第一季度报告（变更后），作为严格“季度报告”口径的补充。', '',
+              '强瑞技术于2021年上市，因此上市公司年度报告从2021年度开始；未收录摘要、英文版或单独审计附件。',
+              '各PDF均来自巨潮资讯，并已检查文件签名、公司名称、年份、报告类型、页数、qpdf结构、首尾页渲染及SHA-256。', '',
+              '文件明细：',
+          ]
+          for r in records:
+              lines.append(f"{r['sequence']:02d}. {r['filename']}｜{r['pages']}页｜{r['bytes']}字节｜SHA-256 {r['sha256']}")
+          (OUT / 'README_CN.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          with zipfile.ZipFile(FINAL_ZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(OUT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, path.as_posix())
+          print('FINAL ZIP', FINAL_ZIP.name, FINAL_ZIP.stat().st_size, sha256(FINAL_ZIP), flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: qiangrui-technology-filings-v3-20260910
+          path: 强瑞技术_全部年报_招股说明书及最新定期报告_截至2026-09-10.zip
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 0
