@@ -1,0 +1,160 @@
+name: Probe exact public sources for Hesai reports
+
+on:
+  push:
+    branches:
+      - tmp/hesai-broker-reports-20260914
+    paths:
+      - '.github/workflows/hesai-exact-source-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/hesai-broker-reports-20260914
+      - name: Install packages
+        run: python -m pip install --quiet requests beautifulsoup4 selenium
+      - name: Probe exact sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf exact_probe
+          mkdir -p exact_probe
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+
+          OUT=Path('exact_probe')
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':UA,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+          result={'eastmoney':[],'pages':[],'browser':[],'candidate_urls':[]}
+
+          def norm(s): return re.sub(r'\s+','',str(s or '')).lower()
+          def extract_urls(text,base):
+              found=set()
+              for m in re.findall(r'https?://[^\s\"\'<>\\]+',text,re.I):
+                  found.add(m.replace('\\/','/').replace('\\u002F','/').rstrip('.,);]'))
+              soup=BeautifulSoup(text,'html.parser')
+              for tag in soup.find_all(['a','iframe','embed','object','script','link','source']):
+                  for attr in ('href','src','data','data-src','data-url','data-file','data-pdf'):
+                      v=tag.get(attr)
+                      if v: found.add(urllib.parse.urljoin(base,v))
+              return sorted(found)
+
+          # 1. Eastmoney exact publication-day scans, both list and list2.
+          dates=['2025-07-18','2025-07-19','2025-07-20','2025-07-21','2025-08-15','2025-08-18','2025-11-24','2025-11-25','2025-12-23','2026-01-27','2026-03-01','2026-03-02','2026-03-23','2026-03-24']
+          hit_words=['禾赛','hesai','02525','2525.hk','hsai']
+          for day in dates:
+              for qtype in ('0','1'):
+                  for page in range(1,31):
+                      params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':day,'endTime':day,'pageNo':str(page),'fields':'','qType':qtype,'orgCode':'*','code':'*','rcode':'*','p':str(page),'pageNum':str(page),'pageNumber':str(page),'_':str(int(time.time()*1000))}
+                      item={'day':day,'qType':qtype,'page':page,'method':'GET'}
+                      try:
+                          r=s.get('https://reportapi.eastmoney.com/report/list',params=params,headers={'Referer':'https://data.eastmoney.com/'},timeout=30)
+                          item.update({'status':r.status_code,'size':len(r.content)})
+                          payload=r.json(); data=payload.get('data') if isinstance(payload,dict) else None
+                          rows=data if isinstance(data,list) else ((data.get('dataList') or data.get('list') or data.get('rows') or []) if isinstance(data,dict) else [])
+                          hits=[]
+                          for row in rows or []:
+                              txt=' '.join(str(row.get(k,'')) for k in row.keys())
+                              if any(w in norm(txt) for w in hit_words):
+                                  code=row.get('infoCode') or row.get('infocode') or row.get('info_code')
+                                  pdf=f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf' if code else None
+                                  hits.append({'row':row,'pdf':pdf})
+                                  if pdf: result['candidate_urls'].append(pdf)
+                          item['hits']=hits; item['row_count']=len(rows or [])
+                          result['eastmoney'].append(item)
+                          if not rows or len(rows)<100: break
+                      except Exception as e:
+                          item['error']=repr(e); result['eastmoney'].append(item); break
+
+          # 2. Raw pages and likely API paths.
+          raw_urls=[
+            'https://gmg.9fzt.com/report/HKSE/02525/822828120354.html',
+            'https://gmg.9fzt.com/report/HKSE/02525/817415051324.html',
+            'https://www.yanbaoke.com/',
+            'https://www.yanbaoke.com/search?keyword=%E7%A6%BE%E8%B5%9B',
+            'https://www.yanbaoke.com/search?q=%E7%A6%BE%E8%B5%9B',
+            'https://www.fxbaogao.com/view?id=5242889',
+            'https://www.fxbaogao.com/view?id=5164905',
+            'https://www.fxbaogao.com/view?id=4958732',
+            'https://finance.sina.com.cn/stock/relnews/cn/2025-08-18/doc-infmkunh2164777.shtml',
+            'https://finance.sina.com.cn/roll/2025-08-24/doc-infmzseq3854505.shtml',
+          ]
+          for i,u in enumerate(raw_urls,1):
+              item={'url':u}
+              try:
+                  r=s.get(u,timeout=60,allow_redirects=True)
+                  item.update({'status':r.status_code,'final_url':r.url,'type':r.headers.get('content-type'),'size':len(r.content)})
+                  text=r.content.decode(r.apparent_encoding or 'utf-8',errors='ignore')
+                  (OUT/f'raw_{i:02d}.html').write_text(text,encoding='utf-8',errors='ignore')
+                  urls=extract_urls(text,r.url)
+                  item['interesting']=[x for x in urls if any(k in x.lower() for k in ('.pdf','download','file','report','document','api','oss','cos','cdn'))][:500]
+                  result['candidate_urls'] += item['interesting']
+              except Exception as e: item['error']=repr(e)
+              result['pages'].append(item)
+
+          # 3. Browser resource/network capture on exact sources.
+          options=Options(); options.add_argument('--headless=new'); options.add_argument('--no-sandbox'); options.add_argument('--disable-dev-shm-usage'); options.add_argument('--window-size=1600,1200'); options.add_argument('--lang=zh-CN'); options.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          driver=webdriver.Chrome(options=options); driver.set_page_load_timeout(60)
+          for i,u in enumerate(raw_urls,1):
+              item={'url':u}
+              try:
+                  driver.get(u); time.sleep(6)
+                  item['current_url']=driver.current_url; item['title']=driver.title
+                  html=driver.page_source; (OUT/f'browser_{i:02d}.html').write_text(html,encoding='utf-8',errors='ignore')
+                  item['anchors']=driver.execute_script("return Array.from(document.querySelectorAll('a')).map(a=>({text:(a.innerText||'').trim(),href:a.href})).filter(x=>x.href)")
+                  item['forms']=driver.execute_script("return Array.from(document.querySelectorAll('form')).map(f=>({action:f.action,method:f.method}))")
+                  item['resources']=driver.execute_script("return performance.getEntriesByType('resource').map(x=>x.name)")
+                  logs=driver.get_log('performance'); net=[]
+                  for ent in logs:
+                      try:
+                          msg=json.loads(ent['message'])['message']; p=msg.get('params',{})
+                          if msg.get('method') in ('Network.requestWillBeSent','Network.responseReceived'):
+                              obj=p.get('request') or p.get('response') or {}; url=obj.get('url')
+                              if url: net.append(url)
+                      except Exception: pass
+                  item['network']=sorted(set(net))
+                  urls=extract_urls(html,driver.current_url)+item['resources']+item['network']+[a['href'] for a in item['anchors']]
+                  item['interesting']=sorted(set(x for x in urls if any(k in x.lower() for k in ('.pdf','download','file','report','document','api','oss','cos','cdn','search'))))
+                  result['candidate_urls'] += item['interesting']
+              except Exception as e: item['error']=repr(e)
+              result['browser'].append(item)
+          driver.quit()
+
+          # 4. Test PDF-looking URLs anonymously.
+          tests=[]
+          for u in sorted(set(result['candidate_urls'])):
+              if '.pdf' not in u.lower(): continue
+              t={'url':u}
+              try:
+                  r=s.get(u,timeout=120,allow_redirects=True,headers={'Referer':'https://www.yanbaoke.com/'})
+                  t.update({'status':r.status_code,'final_url':r.url,'type':r.headers.get('content-type'),'size':len(r.content),'prefix':r.content[:12].hex()})
+              except Exception as e: t['error']=repr(e)
+              tests.append(t)
+          result['pdf_tests']=tests
+          result['candidate_urls']=sorted(set(result['candidate_urls']))
+          (OUT/'results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'eastmoney_hits':[x for x in result['eastmoney'] if x.get('hits')],'page_interesting':[{'url':x['url'],'interesting':x.get('interesting')} for x in result['pages']],'browser_interesting':[{'url':x['url'],'interesting':x.get('interesting')} for x in result['browser']],'pdf_tests':tests},ensure_ascii=False,indent=2))
+          PY
+      - name: Upload exact source probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-exact-source-probe-20260914
+          path: exact_probe
+          retention-days: 3
