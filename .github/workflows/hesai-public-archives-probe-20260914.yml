@@ -1,0 +1,167 @@
+name: Probe public Hesai research archives
+
+on:
+  push:
+    branches:
+      - tmp/hesai-broker-reports-20260914
+    paths:
+      - '.github/workflows/hesai-public-archives-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/hesai-broker-reports-20260914
+      - name: Install packages
+        run: python -m pip install --quiet requests beautifulsoup4 selenium
+      - name: Probe archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf archive_probe
+          mkdir -p archive_probe
+          python - <<'PY'
+          import json, re, time, urllib.parse
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+
+          OUT=Path('archive_probe')
+          ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36'
+          s=requests.Session(); s.headers.update({'User-Agent':ua,'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.7'})
+          result={'sina':[],'eastmoney':[],'iyanbao':[],'candidates':[]}
+
+          def candidates(text,base):
+              found=set()
+              for pat in [r'https?://[^\s\"\'<>\\]+?\.pdf(?:\?[^\s\"\'<>\\]*)?',r'[\"\']([^\"\']+?\.pdf(?:\?[^\"\']*)?)[\"\']']:
+                  for x in re.findall(pat,text,re.I):
+                      if isinstance(x,tuple): x=x[0]
+                      x=str(x).replace('\\/','/').replace('\\u002F','/')
+                      found.add(urllib.parse.urljoin(base,x))
+              soup=BeautifulSoup(text,'html.parser')
+              for tag in soup.find_all(['a','iframe','embed','object','script','link']):
+                  for attr in ['href','src','data','data-src','data-url','data-file']:
+                      v=tag.get(attr)
+                      if not v: continue
+                      u=urllib.parse.urljoin(base,v)
+                      if any(k in u.lower() for k in ['.pdf','download','report','file']): found.add(u)
+              return sorted(found)
+
+          # Sina report archive, including alternate URL patterns.
+          rptids=['808593787467']
+          sina_urls=[]
+          for rid in rptids:
+              sina_urls += [
+                f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/lastest/rptid/{rid}/index.phtml',
+                f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml',
+                f'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml',
+              ]
+          for i,u in enumerate(sina_urls,1):
+              item={'url':u}
+              try:
+                  r=s.get(u,timeout=45,allow_redirects=True)
+                  item.update({'status':r.status_code,'final_url':r.url,'type':r.headers.get('content-type'),'size':len(r.content),'encoding':r.encoding})
+                  text=r.content.decode(r.apparent_encoding or 'gb18030',errors='ignore')
+                  (OUT/f'sina_{i}.html').write_text(text,encoding='utf-8')
+                  item['candidates']=candidates(text,r.url)
+                  item['interesting_lines']=[ln.strip() for ln in text.splitlines() if any(k in ln.lower() for k in ['pdf','download','附件','原文'])][:100]
+                  result['candidates'] += item['candidates']
+              except Exception as e: item['error']=repr(e)
+              result['sina'].append(item)
+
+          # Eastmoney report archive around known publication dates.
+          windows=[('2025-07-15','2025-07-25'),('2025-08-10','2025-08-25'),('2025-09-10','2025-09-30'),('2025-12-15','2025-12-31'),('2026-03-15','2026-03-31')]
+          for begin,end in windows:
+              for qtype in ['0','1']:
+                  for page in range(1,11):
+                      params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':begin,'endTime':end,'pageNo':str(page),'fields':'','qType':qtype,'orgCode':'*','code':'*','rcode':'*','p':str(page),'pageNum':str(page),'pageNumber':str(page),'_':str(int(time.time()*1000))}
+                      item={'begin':begin,'end':end,'qType':qtype,'page':page}
+                      try:
+                          r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=30,headers={'Referer':'https://data.eastmoney.com/'})
+                          item.update({'status':r.status_code,'size':len(r.content)})
+                          payload=r.json()
+                          data=payload.get('data') if isinstance(payload,dict) else None
+                          rows=data if isinstance(data,list) else (data.get('dataList') if isinstance(data,dict) else [])
+                          rows=rows or []
+                          hits=[]
+                          for row in rows:
+                              text=' '.join(str(row.get(k,'')) for k in ['title','stockName','orgSName','orgName','researcher'])
+                              if any(k.lower() in text.lower() for k in ['禾赛','HSAI','02525']):
+                                  code=row.get('infoCode') or row.get('infocode') or row.get('info_code')
+                                  rec={'row':row,'pdf':f'https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf' if code else None}
+                                  hits.append(rec)
+                                  if rec['pdf']: result['candidates'].append(rec['pdf'])
+                          item['hits']=hits
+                          total=(payload.get('total') or payload.get('Total') or (data.get('total') if isinstance(data,dict) else None))
+                          item['row_count']=len(rows); item['total']=total
+                          if not rows or len(rows)<100:
+                              result['eastmoney'].append(item); break
+                      except Exception as e:
+                          item['error']=repr(e)
+                      result['eastmoney'].append(item)
+
+          # Browser capture for Sina and iYanbao search/detail pages.
+          options=Options(); options.add_argument('--headless=new'); options.add_argument('--no-sandbox'); options.add_argument('--disable-dev-shm-usage'); options.add_argument('--window-size=1600,1200'); options.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          driver=webdriver.Chrome(options=options); driver.set_page_load_timeout(60)
+          browser_urls=sina_urls+[
+            'https://www.iyanbao.com/?keyword=%E7%A6%BE%E8%B5%9B',
+            'https://www.iyanbao.com/search?keyword=%E7%A6%BE%E8%B5%9B',
+            'https://www.iyanbao.com/detail/858411',
+          ]
+          for i,u in enumerate(browser_urls,1):
+              item={'url':u}
+              try:
+                  driver.get(u); time.sleep(7)
+                  item['current_url']=driver.current_url; item['title']=driver.title
+                  html=driver.page_source; (OUT/f'browser_{i}.html').write_text(html,encoding='utf-8',errors='ignore')
+                  item['html_candidates']=candidates(html,driver.current_url)
+                  item['anchors']=driver.execute_script("return Array.from(document.querySelectorAll('a')).map(a=>({text:(a.innerText||'').trim(),href:a.href})).filter(x=>x.href)")
+                  item['resources']=driver.execute_script("return performance.getEntriesByType('resource').map(x=>x.name)")
+                  logs=driver.get_log('performance'); net=[]
+                  for ent in logs:
+                      try:
+                          msg=json.loads(ent['message'])['message']; p=msg.get('params',{})
+                          if msg.get('method') in ('Network.requestWillBeSent','Network.responseReceived'):
+                              obj=p.get('request') or p.get('response') or {}; url=obj.get('url')
+                              if url: net.append(url)
+                      except Exception: pass
+                  item['network']=sorted(set(net))
+                  for x in item['html_candidates']+item['resources']+item['network']+[a['href'] for a in item['anchors']]:
+                      if any(k in x.lower() for k in ['.pdf','download','report','search','detail','file']): result['candidates'].append(x)
+              except Exception as e: item['error']=repr(e)
+              result['iyanbao'].append(item)
+          driver.quit()
+
+          # Test PDF-looking candidates.
+          tests=[]
+          for u in sorted(set(result['candidates'])):
+              if '.pdf' not in u.lower(): continue
+              t={'url':u}
+              try:
+                  r=s.get(u,timeout=90,allow_redirects=True,headers={'Referer':'https://www.iyanbao.com/'})
+                  t.update({'status':r.status_code,'final_url':r.url,'type':r.headers.get('content-type'),'size':len(r.content),'prefix':r.content[:8].hex()})
+              except Exception as e: t['error']=repr(e)
+              tests.append(t)
+          result['pdf_tests']=tests
+          result['candidates']=sorted(set(result['candidates']))
+          (OUT/'results.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'sina':result['sina'],'eastmoney_hits':[x for x in result['eastmoney'] if x.get('hits')],'pdf_tests':tests,'candidates':result['candidates']},ensure_ascii=False,indent=2))
+          PY
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-public-archives-probe-20260914
+          path: archive_probe
+          retention-days: 3
