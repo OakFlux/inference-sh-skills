@@ -1,0 +1,512 @@
+name: Package Chongda Technology official reports 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/chongda-tech-official-reports-package-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pymupdf
+
+      - name: Discover download validate and package official reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import html
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+
+          CODE = '002815'
+          COMPANY = '崇达技术股份有限公司'
+          SHORT = '崇达技术'
+          AS_OF = '2026-09-14'
+          ROOT_NAME = '崇达技术_2020-2025年报及最新定期报告_截至2026-09-14'
+          ROOT = Path(ROOT_NAME)
+          WORK = Path('_chongda_work')
+          RENDERS = WORK / 'renders'
+          OUTZIP = Path('Chongda_Technology_2020-2025_Annual_Reports_Latest_Reports_2026-09-14.zip')
+          ROOT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          ua = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          api_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/json,text/plain,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Origin': 'https://www.cninfo.com.cn',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'X-Requested-With': 'XMLHttpRequest',
+              'Connection': 'close',
+          }
+          pdf_headers = {
+              'User-Agent': ua,
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'Connection': 'close',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(value).upper())
+
+          def clean_title(value: str) -> str:
+              text = html.unescape(str(value or ''))
+              text = re.sub(r'<[^>]+>', '', text)
+              text = re.sub(r'\s+', '', text.replace('\u3000', ' ')).strip()
+              for prefix in (COMPANY, SHORT):
+                  for sep in ('：', ':'):
+                      if text.startswith(prefix + sep):
+                          text = text[len(prefix + sep):]
+              return text
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def ann_time(row: dict) -> int:
+              try:
+                  return int(row.get('announcementTime') or row.get('announcementDate') or 0)
+              except Exception:
+                  return 0
+
+          def discover_org_id() -> str:
+              endpoint = 'https://www.cninfo.com.cn/new/information/topSearch/query'
+              for keyword in (SHORT, CODE, COMPANY):
+                  for method in ('post', 'get'):
+                      try:
+                          if method == 'post':
+                              response = session.post(endpoint, data={'keyWord': keyword, 'maxNum': 30}, headers=api_headers, timeout=(20, 120))
+                          else:
+                              response = session.get(endpoint, params={'keyWord': keyword, 'maxNum': 30}, headers=api_headers, timeout=(20, 120))
+                          print('TOPSEARCH', method, keyword, response.status_code, len(response.content), flush=True)
+                          if response.status_code != 200:
+                              continue
+                          payload = response.json()
+                          if isinstance(payload, dict):
+                              for key in ('data', 'result', 'records', 'keyBoardList'):
+                                  if isinstance(payload.get(key), list):
+                                      payload = payload[key]
+                                      break
+                              else:
+                                  payload = [payload]
+                          for row in payload or []:
+                              code = str(row.get('code') or row.get('secCode') or row.get('stockCode') or '')
+                              name = str(row.get('zwjc') or row.get('secName') or row.get('name') or '')
+                              org = row.get('orgId') or row.get('orgid')
+                              if org and (code == CODE or SHORT in name):
+                                  print('ORG_ID', org, json.dumps(row, ensure_ascii=False), flush=True)
+                                  return str(org)
+                      except Exception as exc:
+                          print('TOPSEARCH_ERROR', method, keyword, repr(exc), flush=True)
+              return ''
+
+          ORG_ID = discover_org_id()
+          print('RESOLVED_ORG_ID', ORG_ID, flush=True)
+
+          def query_cninfo(se_date: str, category: str = '', searchkey: str = '') -> list[dict]:
+              merged: dict[str, dict] = {}
+              endpoints = (
+                  'https://www.cninfo.com.cn/new/hisAnnouncement/query',
+                  'http://www.cninfo.com.cn/new/hisAnnouncement/query',
+              )
+              stocks = []
+              if ORG_ID:
+                  stocks.append(f'{CODE},{ORG_ID}')
+              stocks += [CODE, '']
+              for stock_value in stocks:
+                  for endpoint in endpoints:
+                      seen_pages = set()
+                      for page in range(1, 31):
+                          form = {
+                              'pageNum': str(page),
+                              'pageSize': '30',
+                              'column': 'szse',
+                              'tabName': 'fulltext',
+                              'plate': 'sz',
+                              'stock': stock_value,
+                              'searchkey': searchkey if stock_value else (searchkey or SHORT),
+                              'secid': '',
+                              'category': category,
+                              'trade': '',
+                              'seDate': se_date,
+                              'sortName': 'time',
+                              'sortType': 'desc',
+                              'isHLtitle': 'true',
+                          }
+                          try:
+                              response = session.post(endpoint, data=form, headers=api_headers, timeout=(25, 180))
+                              print('QUERY', endpoint, stock_value, se_date, category, form['searchkey'], page, response.status_code, len(response.content), flush=True)
+                              response.raise_for_status()
+                              data = response.json()
+                              rows = data.get('announcements') or []
+                              filtered = [row for row in rows if str(row.get('secCode') or '') == CODE or SHORT in str(row.get('secName') or '')]
+                              signature = tuple(str(row.get('announcementId') or row.get('adjunctUrl')) for row in filtered)
+                              if signature and signature in seen_pages:
+                                  break
+                              if signature:
+                                  seen_pages.add(signature)
+                              for row in filtered:
+                                  key = str(row.get('announcementId') or row.get('adjunctUrl') or row.get('announcementTitle'))
+                                  merged[key] = row
+                              total = int(data.get('totalAnnouncement') or data.get('totalRecordNum') or 0)
+                              if not rows or (total and page * 30 >= total):
+                                  break
+                          except Exception as exc:
+                              print('QUERY_ERROR', endpoint, stock_value, se_date, category, page, repr(exc), flush=True)
+                              break
+                      if merged:
+                          break
+                  if merged:
+                      break
+              return list(merged.values())
+
+          rows_map: dict[str, dict] = {}
+          windows = [
+              ('2021-01-01~2021-06-30', 'category_ndbg_szsh', ''),
+              ('2022-01-01~2022-06-30', 'category_ndbg_szsh', ''),
+              ('2023-01-01~2023-06-30', 'category_ndbg_szsh', ''),
+              ('2024-01-01~2024-06-30', 'category_ndbg_szsh', ''),
+              ('2025-01-01~2025-06-30', 'category_ndbg_szsh', ''),
+              ('2026-01-01~2026-06-30', 'category_ndbg_szsh', ''),
+              ('2026-07-01~2026-09-14', 'category_bndbg_szsh', ''),
+              ('2026-03-01~2026-05-31', 'category_yjdbg_szsh', ''),
+              ('2021-01-01~2026-09-14', '', '年度报告'),
+              ('2026-01-01~2026-09-14', '', '半年度报告'),
+              ('2026-01-01~2026-09-14', '', '第一季度报告'),
+          ]
+          for se_date, category, searchkey in windows:
+              results = query_cninfo(se_date, category, searchkey)
+              for row in results:
+                  key = str(row.get('announcementId') or row.get('adjunctUrl') or row.get('announcementTitle'))
+                  rows_map[key] = row
+
+          rows = list(rows_map.values())
+          print('UNIQUE_ROWS', len(rows), flush=True)
+          for row in sorted(rows, key=ann_time):
+              title = clean_title(row.get('announcementTitle'))
+              if any(token in title for token in ('年度报告', '半年度报告', '季度报告')):
+                  print('CANDIDATE', json.dumps({
+                      'title': title,
+                      'time': row.get('announcementTime'),
+                      'url': row.get('adjunctUrl'),
+                      'id': row.get('announcementId'),
+                      'size': row.get('adjunctSize'),
+                  }, ensure_ascii=False), flush=True)
+
+          def forbidden(title: str) -> bool:
+              return any(token in title for token in (
+                  '摘要', '英文版', '英文', '审计报告', '社会责任', '可持续发展',
+                  '环境、社会及管治', 'ESG', '提示性公告', '取消', '问询函',
+                  '关于', '董事会决议', '监事会决议', '独立董事',
+              ))
+
+          def choose_report(year: int, kind: str) -> dict | None:
+              candidates = []
+              for row in rows:
+                  title = clean_title(row.get('announcementTitle'))
+                  if forbidden(title):
+                      continue
+                  if kind == 'annual':
+                      okay = f'{year}年年度报告' in title and '半年度' not in title
+                  elif kind == 'semi':
+                      okay = f'{year}年半年度报告' in title
+                  elif kind == 'q1':
+                      okay = f'{year}年第一季度报告' in title or f'{year}年一季度报告' in title
+                  else:
+                      okay = False
+                  if okay:
+                      candidates.append(row)
+              if not candidates:
+                  return None
+
+              def score(row: dict):
+                  title = clean_title(row.get('announcementTitle'))
+                  exact_titles = {
+                      f'{year}年年度报告', f'{year}年半年度报告',
+                      f'{year}年第一季度报告', f'{year}年一季度报告',
+                  }
+                  exact = 10 if title in exact_titles else 0
+                  revised = 6 if any(token in title for token in ('更正后', '修订版', '更新后', '变更后')) else 0
+                  try:
+                      size = int(row.get('adjunctSize') or 0)
+                  except Exception:
+                      size = 0
+                  return exact + revised, ann_time(row), size
+
+              return sorted(candidates, key=score, reverse=True)[0]
+
+          annuals = {year: choose_report(year, 'annual') for year in range(2020, 2026)}
+          missing = [year for year, row in annuals.items() if row is None]
+          if missing:
+              raise RuntimeError(f'Missing annual reports: {missing}')
+          semi = choose_report(2026, 'semi')
+          q1 = choose_report(2026, 'q1')
+          if semi is None:
+              raise RuntimeError('Missing 2026 semi-annual report')
+          if q1 is None:
+              raise RuntimeError('Missing 2026 first-quarter report')
+
+          selected = []
+          seq = 1
+          for year in range(2020, 2026):
+              selected.append({
+                  'year': year,
+                  'kind': '年度报告',
+                  'filename': f'{seq:02d}_崇达技术_{year}年年度报告.pdf',
+                  'row': annuals[year],
+                  'min_pages': 80,
+              })
+              seq += 1
+          selected.append({
+              'year': 2026,
+              'kind': '半年度报告（最新完整定期报告）',
+              'filename': f'{seq:02d}_崇达技术_2026年半年度报告_最新完整定期报告.pdf',
+              'row': semi,
+              'min_pages': 40,
+          })
+          seq += 1
+          selected.append({
+              'year': 2026,
+              'kind': '第一季度报告（最新严格季度报告）',
+              'filename': f'{seq:02d}_崇达技术_2026年第一季度报告_最新严格季度报告.pdf',
+              'row': q1,
+              'min_pages': 5,
+          })
+
+          def source_url(row: dict) -> str:
+              value = str(row.get('adjunctUrl') or '').strip()
+              if not value:
+                  raise RuntimeError('Missing adjunctUrl')
+              if value.startswith('http://') or value.startswith('https://'):
+                  return value
+              return urljoin('https://static.cninfo.com.cn/', value.lstrip('/'))
+
+          def download_pdf(url: str, path: Path) -> str:
+              errors = []
+              candidates = [url]
+              if url.startswith('https://'):
+                  candidates.append(url.replace('https://', 'http://', 1))
+              for candidate in candidates:
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(candidate, headers=pdf_headers, timeout=(30, 1200), allow_redirects=True)
+                          print('GET_PDF', candidate, response.status_code, response.headers.get('content-type'), len(response.content), flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 30000:
+                              path.write_bytes(response.content)
+                              return str(response.url)
+                          errors.append(f'{candidate}: {response.status_code}/{len(response.content)}')
+                      except Exception as exc:
+                          errors.append(f'{candidate}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors[-10:]))
+
+          def validate_pdf(path: Path, item: dict) -> dict:
+              raw = path.read_bytes()
+              if not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF signature: {path.name}')
+              doc = pymupdf.open(str(path))
+              pages = len(doc)
+              if pages < item['min_pages']:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: page count {pages} < {item["min_pages"]}')
+              probe_indices = sorted(set(list(range(min(45, pages))) + [pages // 2, pages - 1]))
+              text_parts = []
+              for index in probe_indices:
+                  try:
+                      text_parts.append(doc.load_page(index).get_text('text'))
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, index + 1, repr(exc), flush=True)
+              norm = compact('\n'.join(text_parts))
+              if not any(compact(marker) in norm for marker in (COMPANY, SHORT, CODE)):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: company identity marker missing')
+              if compact(str(item['year'])) not in norm:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: report year marker missing')
+              if item['kind'].startswith('年度'):
+                  type_markers = ('年度报告', 'ANNUALREPORT')
+              elif item['kind'].startswith('半年度'):
+                  type_markers = ('半年度报告', '中期报告', 'INTERIMREPORT')
+              else:
+                  type_markers = ('第一季度报告', '一季度报告', 'FIRSTQUARTER')
+              if not any(compact(marker) in norm for marker in type_markers):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: document type marker missing')
+
+              render_records = []
+              for page_no in sorted(set((0, pages // 2, pages - 1))):
+                  page = doc.load_page(page_no)
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(0.9, 0.9), alpha=False)
+                  render_path = RENDERS / f'{path.stem}_page_{page_no + 1:04d}.png'
+                  pix.save(str(render_path))
+                  if render_path.stat().st_size < 3000:
+                      doc.close()
+                      raise RuntimeError(f'{path.name}: render check failed on page {page_no + 1}')
+                  render_records.append({'page': page_no + 1, 'bytes': render_path.stat().st_size})
+              doc.close()
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf failed: {qpdf.stderr[-1000:]}')
+              return {
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'qpdf_return_code': qpdf.returncode,
+                  'rendered_pages': render_records,
+              }
+
+          records = []
+          seen_hashes = set()
+          for item in selected:
+              row = item['row']
+              url = source_url(row)
+              path = ROOT / item['filename']
+              actual_url = download_pdf(url, path)
+              check = validate_pdf(path, item)
+              if check['sha256'] in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF content: {path.name}')
+              seen_hashes.add(check['sha256'])
+              record = {
+                  'filename': item['filename'],
+                  'report_year': item['year'],
+                  'document_type': item['kind'],
+                  'announcement_title': clean_title(row.get('announcementTitle')),
+                  'announcement_time': row.get('announcementTime'),
+                  'announcement_id': row.get('announcementId'),
+                  'official_url': url,
+                  'downloaded_from': actual_url,
+                  **check,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 PDFs, got {len(records)}')
+
+          with (ROOT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '文件名', '报告期', '文档类型', '公告标题', '公告时间', '页数', '文件大小_字节', 'SHA256', '官方来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for index, record in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': index,
+                      '文件名': record['filename'],
+                      '报告期': record['report_year'],
+                      '文档类型': record['document_type'],
+                      '公告标题': record['announcement_title'],
+                      '公告时间': record['announcement_time'],
+                      '页数': record['pages'],
+                      '文件大小_字节': record['bytes'],
+                      'SHA256': record['sha256'],
+                      '官方来源': record['official_url'],
+                  })
+
+          (ROOT / 'manifest.json').write_text(json.dumps({
+              'company': COMPANY,
+              'stock_code': CODE,
+              'as_of_date': AS_OF,
+              'annual_report_years': list(range(2020, 2026)),
+              'latest_complete_periodic_report': '2026年半年度报告',
+              'latest_strict_quarterly_report': '2026年第一季度报告',
+              'files': records,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          readme = [
+              '崇达技术股份有限公司（002815.SZ）官方定期报告',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '收录范围：',
+              '1. 2020年至2025年完整年度报告，共6份；',
+              '2. 2026年半年度报告，作为截至核对日最新完整定期财务报告；',
+              '3. 2026年第一季度报告，作为严格“最新季报”口径的补充；',
+              '4. 不收录年度报告摘要、英文版、董事会文件、审计附件或ESG报告。',
+              '',
+              '口径说明：截至2026年9月14日，2026年第三季度报告尚未到法定披露期。为避免“最新季报”含义歧义，本包同时保留最新半年报和最新严格季度报告。',
+              'PDF优先取自巨潮资讯网官方披露文件，保持原始版式，未删页、未重排、未加水印。',
+              '',
+              f'共{len(records)}份PDF，合计{sum(record["pages"] for record in records)}页，PDF总大小{sum(record["bytes"] for record in records) / 1048576:.2f} MB。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme.extend([
+                  f'{index}. {record["filename"]}',
+                  f'   {record["document_type"]}｜{record["pages"]}页｜{record["bytes"] / 1048576:.2f} MB',
+                  f'   公告标题：{record["announcement_title"]}',
+                  f'   官方来源：{record["official_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+          readme.append('核验项目：PDF文件头、公司名称/证券代码、报告年份、报告类型、页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。')
+          (ROOT / 'README_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path))
+
+          with zipfile.ZipFile(OUTZIP, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in archive.namelist())
+              if pdf_count != 8:
+                  raise RuntimeError(f'Expected 8 PDFs in ZIP, found {pdf_count}')
+
+          print('FINAL_ZIP', OUTZIP, OUTZIP.stat().st_size, sha256_file(OUTZIP), flush=True)
+          print('TOTAL_PAGES', sum(record['pages'] for record in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: chongda-technology-reports-20260914
+          path: Chongda_Technology_2020-2025_Annual_Reports_Latest_Reports_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chongda-technology-validation-diagnostics
+          path: _chongda_work/
+          if-no-files-found: ignore
+          retention-days: 2
+          compression-level: 6
