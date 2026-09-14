@@ -1,0 +1,42 @@
+name: Cache public web assets 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cache-public-web-assets-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cache:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download public assets
+        run: |
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import requests
+          from pathlib import Path
+          urls = {
+            'asset_0.js':'https://www.sdyanbao.com/_nuxt/0bec462.js',
+            'asset_1.js':'https://www.sdyanbao.com/_nuxt/7ff3a18.js',
+            'asset_2.js':'https://www.sdyanbao.com/_nuxt/359ac1f.js',
+            'asset_3.js':'https://www.sdyanbao.com/_nuxt/a94fdf1.js',
+            'detail.html':'https://www.sdyanbao.com/detail/894460',
+          }
+          out=Path('public_assets'); out.mkdir()
+          for name,url in urls.items():
+            r=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=60)
+            r.raise_for_status()
+            (out/name).write_bytes(r.content)
+            print(name,len(r.content),r.headers.get('content-type'),flush=True)
+          PY
+      - name: Upload assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-web-assets-20260914
+          path: public_assets/
+          retention-days: 2
