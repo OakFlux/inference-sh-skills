@@ -1,0 +1,38 @@
+name: Check TransThera prospectus page images
+
+on:
+  push:
+    paths:
+      - '.github/workflows/transthera-prospectus-pages-check-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check representative pages
+        run: |
+          python -m pip install --quiet requests pillow
+          python - <<'PY'
+          import io
+          import requests
+          from PIL import Image
+          base='https://oss.sdyanbao.com/page/2025/6/13/1203556'
+          for i in [0,1,9,10,100,337,672,673,674]:
+              for ext in ['png','jpg','jpeg','webp']:
+                  u=f'{base}/{i}.{ext}'
+                  try:
+                      r=requests.get(u,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.sdyanbao.com/detail/894460'},timeout=30)
+                      if r.status_code==200 and len(r.content)>1000:
+                          im=Image.open(io.BytesIO(r.content))
+                          print('FOUND',i,ext,r.status_code,len(r.content),im.format,im.size,im.mode,u,flush=True)
+                          break
+                      else:
+                          print('MISS',i,ext,r.status_code,len(r.content),flush=True)
+                  except Exception as e:
+                      print('ERR',i,ext,type(e).__name__,e,flush=True)
+          PY
