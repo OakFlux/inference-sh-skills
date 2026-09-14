@@ -1,0 +1,45 @@
+name: Query public Hesai report index
+
+on:
+  push:
+    branches:
+      - tmp/hesai-broker-reports-20260914
+    paths:
+      - '.github/workflows/hesai-fx-search-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/hesai-broker-reports-20260914
+      - name: Query
+        run: |
+          mkdir -p fx_search
+          python - <<'PY'
+          import json, requests
+          url='https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth'
+          out={}
+          for q in ['禾赛','禾赛科技','HSAI','禾赛-W']:
+              r=requests.post(url,json={'keywords':q,'pageIndex':1,'pageSize':50,'order':2,'nop':-1},headers={'User-Agent':'Mozilla/5.0','Content-Type':'application/json'},timeout=30)
+              print(q,r.status_code,len(r.content))
+              try: out[q]=r.json()
+              except Exception: out[q]={'status':r.status_code,'text':r.text}
+          open('fx_search/results.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          for q,v in out.items():
+              print('\nQUERY',q)
+              data=(v.get('data') or {}) if isinstance(v,dict) else {}
+              for x in (data.get('dataList') or []):
+                  print(x.get('docId'),x.get('orgName'),x.get('pageNum'),x.get('title'),x)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hesai-fx-search-20260914
+          path: fx_search
+          retention-days: 3
