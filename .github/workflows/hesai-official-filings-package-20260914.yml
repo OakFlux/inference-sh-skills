@@ -1,0 +1,480 @@
+name: Package Hesai annual reports prospectuses and latest quarter 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hesai-official-filings-package-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pymupdf beautifulsoup4
+
+      - name: Download validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          OUTPUT_ZIP = Path('Hesai_All_Annual_Reports_Prospectuses_Latest_Quarter_2026-09-14.zip')
+          ROOT_NAME = '禾赛_全部年报_招股说明书及最新季报_截至2026-09-14'
+          root = Path(ROOT_NAME)
+          work = Path('_hesai_validation')
+          renders = work / 'renders'
+          root.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+          renders.mkdir(exist_ok=True)
+
+          documents = [
+              {
+                  'category': '01_年度报告',
+                  'filename': '禾赛_2022年年度报告_Form_20-F_完整版.pdf',
+                  'type_zh': '2022年年度报告（Form 20-F）',
+                  'release_date': '2023-04-20',
+                  'urls': ['https://investor.hesaitech.com/static-files/797ccf0c-8bb2-42bc-a048-8e52176b621b'],
+                  'expected_pages': 210,
+                  'min_pages': 180,
+                  'year_markers': ('2022',),
+                  'type_markers': ('annualreport', 'form20-f'),
+              },
+              {
+                  'category': '01_年度报告',
+                  'filename': '禾赛_2023年年度报告_Form_20-F_完整版.pdf',
+                  'type_zh': '2023年年度报告（Form 20-F）',
+                  'release_date': '2024-04-25',
+                  'urls': ['https://investor.hesaitech.com/static-files/223d39f0-0a21-4d9a-9830-a7b2ef9332bc'],
+                  'expected_pages': 222,
+                  'min_pages': 190,
+                  'year_markers': ('2023',),
+                  'type_markers': ('annualreport', 'form20-f'),
+              },
+              {
+                  'category': '01_年度报告',
+                  'filename': '禾赛_2024年年度报告_Form_20-F_完整版.pdf',
+                  'type_zh': '2024年年度报告（Form 20-F）',
+                  'release_date': '2025-04-01',
+                  'urls': ['https://investor.hesaitech.com/static-files/67fbedf2-04a1-4f54-b116-ef15d55d7d0f'],
+                  'expected_pages': 198,
+                  'min_pages': 170,
+                  'year_markers': ('2024',),
+                  'type_markers': ('annualreport', 'form20-f'),
+              },
+              {
+                  'category': '01_年度报告',
+                  'filename': '禾赛_2025年年度报告_Form_20-F_完整版.pdf',
+                  'type_zh': '2025年年度报告（Form 20-F）',
+                  'release_date': '2026-04-24',
+                  'urls': ['https://investor.hesaitech.com/static-files/b758475b-c739-4f9c-ad06-a763623b413b'],
+                  'expected_pages': 240,
+                  'min_pages': 200,
+                  'year_markers': ('2025',),
+                  'type_markers': ('annualreport', 'form20-f'),
+              },
+              {
+                  'category': '02_招股说明书',
+                  'filename': '禾赛_2023年纳斯达克IPO最终招股说明书_424B4_完整版.pdf',
+                  'type_zh': '2023年纳斯达克首次公开发行最终招股说明书（424B4）',
+                  'release_date': '2023-02-09',
+                  'urls': [],
+                  'discover_detail_urls': [
+                      'https://investor.hesaitech.com/sec-filings/sec-filing/424b4/0001104659-23-017567',
+                      'https://hesai.gcs-web.com/sec-filings/sec-filing/424b4/0001104659-23-017567',
+                  ],
+                  'sec_html_url': 'https://www.sec.gov/Archives/edgar/data/1861737/000110465923017567/tm2120356-28_424b4.htm',
+                  'expected_pages': None,
+                  'min_pages': 250,
+                  'year_markers': ('2023',),
+                  'type_markers': ('prospectus', 'initialpublicoffering'),
+              },
+              {
+                  'category': '02_招股说明书',
+                  'filename': '禾赛_2025年香港全球发售招股章程_完整版.pdf',
+                  'type_zh': '2025年香港全球发售最终招股章程',
+                  'release_date': '2025-09-08',
+                  'urls': ['https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0908/2025090800017.pdf'],
+                  'expected_pages': None,
+                  'min_pages': 400,
+                  'year_markers': ('2025',),
+                  'type_markers': ('globaloffering', 'prospectus'),
+              },
+              {
+                  'category': '02_招股说明书',
+                  'filename': '禾赛_2025年全球发售美国最终招股补充文件_424B5.pdf',
+                  'type_zh': '2025年全球发售美国最终招股补充文件（424B5）',
+                  'release_date': '2025-09-12',
+                  'urls': ['https://investor.hesaitech.com/static-files/9d6eb9b5-91f1-4f21-952f-03222547e69c'],
+                  'expected_pages': 119,
+                  'min_pages': 100,
+                  'year_markers': ('2025',),
+                  'type_markers': ('prospectussupplement', 'globaloffering'),
+              },
+              {
+                  'category': '03_最新季报',
+                  'filename': '禾赛_2026年第二季度业绩_Form_6-K_截至2026-06-30.pdf',
+                  'type_zh': '2026年第二季度业绩及中期财务资料（Form 6-K）',
+                  'release_date': '2026-08-18',
+                  'urls': ['https://investor.hesaitech.com/static-files/41782b09-9c75-47ee-88ac-188e15b051a8'],
+                  'expected_pages': 47,
+                  'min_pages': 40,
+                  'year_markers': ('2026',),
+                  'type_markers': ('form6-k', 'secondquarter2026'),
+              },
+              {
+                  'category': '03_最新季报',
+                  'filename': '禾赛_2026年第二季度未经审核财务业绩_港交所版.pdf',
+                  'type_zh': '2026年第二季度未经审核财务业绩（港交所披露版本）',
+                  'release_date': '2026-08-18',
+                  'urls': ['https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0818/2026081800396.pdf'],
+                  'expected_pages': 20,
+                  'min_pages': 15,
+                  'year_markers': ('2026',),
+                  'type_markers': ('quarterendedjune30,2026', 'secondquarter2026', '截至2026年6月30日止季度'),
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          base_headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36 research-contact@example.com',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,text/html;q=0.8,*/*;q=0.7',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Connection': 'close',
+          }
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def compact(text: str) -> str:
+              return re.sub(r'[^0-9a-zA-Z\u3400-\u9FFF]+', '', text).lower()
+
+          def url_variants(url: str) -> list[str]:
+              variants = [url]
+              if 'www1.hkexnews.hk' in url:
+                  variants.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              if 'investor.hesaitech.com' in url:
+                  variants.append(url.replace('investor.hesaitech.com', 'hesai.gcs-web.com'))
+              if 'hesai.gcs-web.com' in url:
+                  variants.append(url.replace('hesai.gcs-web.com', 'investor.hesaitech.com'))
+              return list(dict.fromkeys(variants))
+
+          def discover_pdf_urls(detail_urls: list[str]) -> list[str]:
+              found = []
+              for detail_url in detail_urls:
+                  for candidate in url_variants(detail_url):
+                      try:
+                          response = session.get(
+                              candidate,
+                              headers={**base_headers, 'Referer': 'https://investor.hesaitech.com/'},
+                              timeout=(30, 120),
+                              allow_redirects=True,
+                          )
+                          print('DISCOVER', response.status_code, len(response.content), candidate, flush=True)
+                          if response.status_code != 200:
+                              continue
+                          soup = BeautifulSoup(response.text, 'html.parser')
+                          for anchor in soup.find_all('a', href=True):
+                              href = urljoin(str(response.url), anchor['href'])
+                              label = compact(anchor.get_text(' ', strip=True))
+                              href_l = href.lower()
+                              if '/static-files/' in href_l or href_l.endswith('.pdf') or 'downloadpdf' in label:
+                                  found.append(href)
+                          for match in re.findall(r'https?://[^\"\'<>\s]+(?:static-files/[^\"\'<>\s]+|\.pdf)', response.text, flags=re.I):
+                              found.append(match.replace('&amp;', '&'))
+                      except Exception as exc:
+                          print('DISCOVER_ERROR', candidate, type(exc).__name__, str(exc)[:500], flush=True)
+              return list(dict.fromkeys(found))
+
+          def fetch_pdf(urls: list[str]) -> tuple[bytes, str, str]:
+              errors = []
+              candidates = []
+              for url in urls:
+                  candidates.extend(url_variants(url))
+              for candidate in dict.fromkeys(candidates):
+                  if 'hkexnews.hk' in candidate:
+                      referers = ['https://www1.hkexnews.hk/', 'https://www.hkexnews.hk/']
+                  elif 'sec.gov' in candidate:
+                      referers = ['https://www.sec.gov/']
+                  else:
+                      referers = ['https://investor.hesaitech.com/', 'https://www.hesaitech.com/']
+                  for referer in referers:
+                      for attempt in range(1, 5):
+                          try:
+                              response = session.get(
+                                  candidate,
+                                  headers={**base_headers, 'Referer': referer},
+                                  timeout=(45, 600),
+                                  allow_redirects=True,
+                              )
+                              print('GET', attempt, response.status_code, len(response.content), response.headers.get('content-type'), candidate, flush=True)
+                              if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50000:
+                                  return response.content, str(response.url), referer
+                              errors.append(f'{candidate}|{referer}|HTTP {response.status_code}/{len(response.content)}')
+                          except Exception as exc:
+                              errors.append(f'{candidate}|{referer}|{type(exc).__name__}:{exc}')
+                          time.sleep(min(attempt * 2, 8))
+              raise RuntimeError('PDF download failed: ' + ' ; '.join(errors[-24:]))
+
+          def chrome_from_sec_html(sec_url: str, output_path: Path) -> str:
+              response = session.get(
+                  sec_url,
+                  headers={
+                      **base_headers,
+                      'User-Agent': 'Hesai filing archival script research-contact@example.com',
+                      'Referer': 'https://www.sec.gov/',
+                  },
+                  timeout=(45, 300),
+              )
+              response.raise_for_status()
+              html = response.text
+              base = sec_url.rsplit('/', 1)[0] + '/'
+              base_tag = f'<base href="{base}">'
+              if '<head' in html.lower():
+                  html = re.sub(r'(<head[^>]*>)', r'\1' + base_tag, html, count=1, flags=re.I)
+              else:
+                  html = '<html><head>' + base_tag + '</head><body>' + html + '</body></html>'
+              html_path = work / 'hesai_2023_424b4_source.html'
+              html_path.write_text(html, encoding='utf-8')
+              chrome = next((shutil.which(x) for x in ('google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser') if shutil.which(x)), None)
+              if not chrome:
+                  raise RuntimeError('No headless Chrome/Chromium executable found')
+              cmd = [
+                  chrome,
+                  '--headless=new',
+                  '--no-sandbox',
+                  '--disable-gpu',
+                  '--disable-dev-shm-usage',
+                  '--allow-file-access-from-files',
+                  '--disable-web-security',
+                  '--no-pdf-header-footer',
+                  f'--print-to-pdf={output_path.resolve()}',
+                  html_path.resolve().as_uri(),
+              ]
+              run = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+              print('CHROME', run.returncode, run.stdout[-1000:], run.stderr[-2000:], flush=True)
+              if run.returncode != 0 or not output_path.exists() or output_path.stat().st_size < 100000:
+                  raise RuntimeError('Chrome PDF conversion failed')
+              return sec_url + ' (SEC HTML converted to PDF without content alteration)'
+
+          def extract_probe_text(path: Path, page_count: int) -> str:
+              reader = PdfReader(str(path), strict=False)
+              indices = list(range(min(35, page_count)))
+              indices += list(range(max(0, page_count - 5), page_count))
+              parts = []
+              for idx in sorted(set(indices)):
+                  try:
+                      parts.append(reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              text = '\n'.join(parts)
+              if len(compact(text)) < 500:
+                  doc = pymupdf.open(str(path))
+                  try:
+                      text += '\n' + '\n'.join(doc.load_page(i).get_text('text') for i in sorted(set(indices)))
+                  finally:
+                      doc.close()
+              return text
+
+          def validate(path: Path, cfg: dict) -> dict:
+              raw = path.read_bytes()
+              if not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF signature: {path.name}')
+              reader = PdfReader(str(path), strict=False)
+              page_count = len(reader.pages)
+              expected = cfg.get('expected_pages')
+              if expected is not None and page_count != expected:
+                  raise RuntimeError(f'Unexpected page count for {path.name}: expected {expected}, got {page_count}')
+              if page_count < cfg['min_pages']:
+                  raise RuntimeError(f'Page count too small for {path.name}: {page_count} < {cfg["min_pages"]}')
+
+              text = extract_probe_text(path, page_count)
+              normalized = compact(text)
+              company_markers = ('hesaigroup', 'hesaitechnology', '禾赛科技', '禾賽科技', 'stockcode2525', '股份代號2525')
+              if not any(compact(x) in normalized for x in company_markers):
+                  raise RuntimeError(f'Company identity marker missing: {path.name}')
+              if not any(compact(x) in normalized for x in cfg['year_markers']):
+                  raise RuntimeError(f'Year marker missing: {path.name}')
+              if not any(compact(x) in normalized for x in cfg['type_markers']):
+                  raise RuntimeError(f'Document type marker missing: {path.name}')
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {path.name}: {qpdf.stderr[-1200:]}')
+
+              doc = pymupdf.open(str(path))
+              render_records = []
+              try:
+                  for page_no in sorted(set([0, page_count // 2, page_count - 1])):
+                      pix = doc.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                      render_path = renders / f'{path.stem}_page_{page_no + 1:04d}.png'
+                      pix.save(str(render_path))
+                      if pix.width < 400 or pix.height < 400 or render_path.stat().st_size < 3000:
+                          raise RuntimeError(f'Render validation failed: {path.name}, page {page_no + 1}')
+                      render_records.append({'page': page_no + 1, 'width': pix.width, 'height': pix.height, 'bytes': render_path.stat().st_size})
+              finally:
+                  doc.close()
+
+              return {
+                  'pages': page_count,
+                  'bytes': len(raw),
+                  'sha256': sha256_bytes(raw),
+                  'qpdf_return_code': qpdf.returncode,
+                  'rendered_pages': render_records,
+              }
+
+          records = []
+          seen_hashes = set()
+          for cfg in documents:
+              category_dir = root / cfg['category']
+              category_dir.mkdir(parents=True, exist_ok=True)
+              pdf_path = category_dir / cfg['filename']
+              source_url = ''
+              successful_referer = ''
+
+              urls = list(cfg.get('urls', []))
+              if cfg.get('discover_detail_urls'):
+                  discovered = discover_pdf_urls(cfg['discover_detail_urls'])
+                  print('DISCOVERED_PDF_URLS', json.dumps(discovered, ensure_ascii=False), flush=True)
+                  urls = discovered + urls
+
+              try:
+                  data, source_url, successful_referer = fetch_pdf(urls)
+                  pdf_path.write_bytes(data)
+              except Exception as download_exc:
+                  if cfg.get('sec_html_url'):
+                      print('DIRECT_PDF_FALLBACK', type(download_exc).__name__, str(download_exc)[-2000:], flush=True)
+                      source_url = chrome_from_sec_html(cfg['sec_html_url'], pdf_path)
+                      successful_referer = 'https://www.sec.gov/'
+                  else:
+                      raise
+
+              check = validate(pdf_path, cfg)
+              if check['sha256'] in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF content detected: {pdf_path.name}')
+              seen_hashes.add(check['sha256'])
+              record = {
+                  'relative_path': str(pdf_path.relative_to(root)),
+                  'document_type': cfg['type_zh'],
+                  'release_date': cfg['release_date'],
+                  'source_url': source_url,
+                  'successful_referer': successful_referer,
+                  **check,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps({k: record[k] for k in ('relative_path', 'document_type', 'release_date', 'pages', 'bytes', 'sha256', 'source_url')}, ensure_ascii=False), flush=True)
+
+          if len(records) != 9:
+              raise RuntimeError(f'Expected 9 PDFs, got {len(records)}')
+
+          readme_lines = [
+              '禾赛科技 / Hesai Group（NASDAQ: HSAI；HKEX: 02525）官方披露文件',
+              '资料截止日期：2026年9月14日',
+              '',
+              '收录范围：',
+              '1. 上市以来全部独立年度报告：2022、2023、2024、2025年Form 20-F完整版本，共4份。禾赛于2023年2月在纳斯达克上市，因此2022年度报告为上市后的首份独立年报；',
+              '2. 最终招股文件：2023年纳斯达克IPO最终招股说明书（424B4）、2025年香港全球发售最终招股章程，以及对应的美国最终招股补充文件（424B5）；',
+              '3. 最新季度报告：截至2026年6月30日的2026年第二季度业绩。分别收录SEC Form 6-K完整文件和港交所季度财务业绩版本。',
+              '',
+              '口径说明：',
+              '截至2026年9月14日，2026年第三季度尚未结束且相关报告尚未发布，最新已披露季度为2026年第二季度。',
+              '年度报告按每个会计年度保留一份完整Form 20-F，不重复收录内容相同的港交所转载版本、年报摘要或年度业绩公告。',
+              '招股文件仅收录已完成上市发行对应的最终官方版本；未完成发行的早期申请稿、聆讯后资料集和初步招股文件不作为最终招股说明书重复收录。',
+              '所有PDF保持原始版式，未删页、未重排、未加水印。',
+              '',
+              f'文件数量：{len(records)}份PDF；总页数：{sum(r["pages"] for r in records)}页；总PDF大小：{sum(r["bytes"] for r in records) / 1048576:.2f} MB。',
+              '',
+              '逐项清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme_lines.extend([
+                  f'{index}. {record["relative_path"]}',
+                  f'   类型：{record["document_type"]}',
+                  f'   发布日期：{record["release_date"]}',
+                  f'   页数：{record["pages"]}页；大小：{record["bytes"] / 1048576:.2f} MB',
+                  f'   来源：{record["source_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+          readme_lines.append('核验项目：PDF文件头、公司名称/证券代码、报告年度与类型、页数、qpdf结构检查、首页/中间页/末页渲染、SHA-256、ZIP CRC。')
+          (root / 'README_文件清单与口径说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["relative_path"]}\n' for r in records), encoding='utf-8')
+
+          with (root / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '文件路径', '文档类型', '发布日期', '页数', '文件大小_字节', 'SHA256', '实际来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for index, r in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': index,
+                      '文件路径': r['relative_path'],
+                      '文档类型': r['document_type'],
+                      '发布日期': r['release_date'],
+                      '页数': r['pages'],
+                      '文件大小_字节': r['bytes'],
+                      'SHA256': r['sha256'],
+                      '实际来源': r['source_url'],
+                  })
+
+          with zipfile.ZipFile(OUTPUT_ZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=8, allowZip64=True) as zf:
+              for file_path in sorted(root.rglob('*')):
+                  if file_path.is_file():
+                      zf.write(file_path, arcname=str(file_path))
+
+          with zipfile.ZipFile(OUTPUT_ZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed: {bad}')
+              pdf_names = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != 9:
+                  raise RuntimeError(f'Expected 9 PDFs in ZIP, found {len(pdf_names)}')
+
+          final_sha = hashlib.sha256(OUTPUT_ZIP.read_bytes()).hexdigest()
+          print('FINAL_ZIP', OUTPUT_ZIP, OUTPUT_ZIP.stat().st_size, final_sha, flush=True)
+          print('PDF_COUNT', len(records), 'TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-official-filings-package-20260914
+          path: Hesai_All_Annual_Reports_Prospectuses_Latest_Quarter_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-validation-diagnostics-20260914
+          path: _hesai_validation/
+          if-no-files-found: ignore
+          retention-days: 3
+          compression-level: 6
