@@ -1,0 +1,315 @@
+name: Package Cirrus Aircraft official annual reports prospectus and latest interim 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/cirrus-official-filings-package-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pymupdf
+
+      - name: Download validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          OUTPUT_ZIP = Path('Cirrus_Aircraft_2507_Official_Filings_2026-09-14.zip')
+          ROOT_NAME = '西锐飞机_02507_年报招股书及最新中期报告_截至2026-09-14'
+          root = Path(ROOT_NAME)
+          work = Path('_cirrus_validation')
+          renders = work / 'renders'
+          root.mkdir(exist_ok=True)
+          work.mkdir(exist_ok=True)
+          renders.mkdir(exist_ok=True)
+
+          documents = [
+              {
+                  'category': '01_年度报告',
+                  'filename': '西锐飞机_2024年年度报告_完整版.pdf',
+                  'type_zh': '2024年年度报告',
+                  'release_date': '2025-04-28',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0428/2025042804425.pdf',
+                      'https://cdn.financialreports.eu/financialreports/media/filings/50636/2025/RNS/50636_rns_2025-04-28_7e64e30f-01cd-4e17-8630-0aec51f71226.pdf',
+                  ],
+                  'expected_pages': 213,
+                  'year_markers': ('2024',),
+                  'type_markers': ('annualreport',),
+              },
+              {
+                  'category': '01_年度报告',
+                  'filename': '西锐飞机_2025年年度报告_完整版.pdf',
+                  'type_zh': '2025年年度报告',
+                  'release_date': '2026-04-24',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0424/2026042403596.pdf',
+                      'https://cdn.financialreports.eu/financialreports/media/filings/50636/2026/RNS/50636_rns_2026-03-24_7378c3f0-9d09-4a5a-ab0c-fdf5b5cee8ca.pdf',
+                  ],
+                  'expected_pages': 229,
+                  'year_markers': ('2025',),
+                  'type_markers': ('annualreport',),
+              },
+              {
+                  'category': '02_招股说明书',
+                  'filename': '西锐飞机_招股说明书_全球发售_2024-06-28_完整版.pdf',
+                  'type_zh': '最终招股章程（全球发售）',
+                  'release_date': '2024-06-28',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0628/2024062800083.pdf',
+                      'https://cdn.sprinkle.com/library/pdfs/9457012d-8fa2-45a1-8242-7a86d8f6bd83.pdf',
+                  ],
+                  'expected_pages': 648,
+                  'year_markers': ('2024',),
+                  'type_markers': ('globaloffering', 'prospectus'),
+              },
+              {
+                  'category': '03_最新定期报告',
+                  'filename': '西锐飞机_2026年中期报告_截至2026-06-30_最新版.pdf',
+                  'type_zh': '2026年中期报告（最新一期完整定期财务报告）',
+                  'release_date': '2026-08-26',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082601967.pdf',
+                      'https://cdn.financialreports.eu/financialreports/media/filings/50636/2026/RNS/50636_rns_2026-08-26_081caa5d-f806-4b60-af3e-c034226d4072.pdf',
+                  ],
+                  'expected_pages': 57,
+                  'year_markers': ('2026',),
+                  'type_markers': ('interimreport', 'sixmonthsendedjune302026'),
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Connection': 'close',
+          }
+          referers = [
+              'https://www1.hkexnews.hk/',
+              'https://www.hkexnews.hk/',
+              'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&market=SEHK&stockId=1000227110',
+          ]
+
+          def fetch_pdf(urls: list[str]) -> tuple[bytes, str, str]:
+              errors = []
+              candidates = []
+              for url in urls:
+                  candidates.append(url)
+                  if 'www1.hkexnews.hk' in url:
+                      candidates.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              for candidate in dict.fromkeys(candidates):
+                  candidate_referers = referers if 'hkexnews.hk' in candidate else ['https://www.google.com/', 'https://www1.hkexnews.hk/']
+                  for referer in candidate_referers:
+                      for attempt in range(1, 5):
+                          try:
+                              response = session.get(
+                                  candidate,
+                                  headers={**headers, 'Referer': referer},
+                                  timeout=(45, 420),
+                                  allow_redirects=True,
+                              )
+                              print('GET', attempt, response.status_code, len(response.content), response.headers.get('content-type'), candidate, flush=True)
+                              if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50000:
+                                  return response.content, str(response.url), referer
+                              errors.append(f'{candidate}|{referer}|HTTP {response.status_code}/{len(response.content)}')
+                          except Exception as exc:
+                              errors.append(f'{candidate}|{referer}|{type(exc).__name__}:{exc}')
+                          time.sleep(min(2 * attempt, 8))
+              raise RuntimeError('PDF download failed: ' + ' ; '.join(errors[-20:]))
+
+          def extract_opening_text(path: Path, page_limit: int = 35) -> str:
+              reader = PdfReader(str(path), strict=False)
+              parts = []
+              for page in reader.pages[:min(page_limit, len(reader.pages))]:
+                  try:
+                      parts.append(page.extract_text() or '')
+                  except Exception:
+                      pass
+              text = '\n'.join(parts)
+              if len(text.strip()) < 500:
+                  doc = pymupdf.open(str(path))
+                  try:
+                      text = '\n'.join(doc.load_page(i).get_text('text') for i in range(min(page_limit, len(doc))))
+                  finally:
+                      doc.close()
+              return text
+
+          def validate(path: Path, cfg: dict) -> dict:
+              raw = path.read_bytes()
+              if not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF signature: {path}')
+              reader = PdfReader(str(path), strict=False)
+              page_count = len(reader.pages)
+              if page_count != cfg['expected_pages']:
+                  raise RuntimeError(f'Unexpected page count for {path.name}: expected {cfg["expected_pages"]}, got {page_count}')
+
+              text = extract_opening_text(path)
+              compact = re.sub(r'\s+', '', text).lower()
+              company_ok = any(marker in compact for marker in (
+                  'cirrusaircraft', '西銳飛機', '西锐飞机',
+                  'stockcode2507', 'stockcode02507', '股份代號2507', '股份代码2507',
+              ))
+              if not company_ok:
+                  raise RuntimeError(f'Company identity marker missing: {path.name}')
+              if not any(marker in compact for marker in cfg['year_markers']):
+                  raise RuntimeError(f'Year marker missing: {path.name}')
+              if not any(marker in compact for marker in cfg['type_markers']):
+                  raise RuntimeError(f'Document type marker missing: {path.name}')
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {path.name}: {qpdf.stderr[-1200:]}')
+
+              doc = pymupdf.open(str(path))
+              sample_pages = sorted(set([0, page_count // 2, page_count - 1]))
+              render_records = []
+              try:
+                  for page_no in sample_pages:
+                      page = doc.load_page(page_no)
+                      pix = page.get_pixmap(matrix=pymupdf.Matrix(1.0, 1.0), alpha=False)
+                      render_path = renders / f'{path.stem}_page_{page_no + 1:04d}.png'
+                      pix.save(str(render_path))
+                      if pix.width < 400 or pix.height < 400 or render_path.stat().st_size < 5000:
+                          raise RuntimeError(f'Render check failed: {path.name}, page {page_no + 1}')
+                      render_records.append({
+                          'page': page_no + 1,
+                          'width': pix.width,
+                          'height': pix.height,
+                          'bytes': render_path.stat().st_size,
+                      })
+              finally:
+                  doc.close()
+
+              return {
+                  'pages': page_count,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'qpdf_return_code': qpdf.returncode,
+                  'rendered_pages': render_records,
+                  'opening_text_preview': re.sub(r'\s+', ' ', text)[:1000],
+              }
+
+          records = []
+          seen_hashes = set()
+          for cfg in documents:
+              category_dir = root / cfg['category']
+              category_dir.mkdir(parents=True, exist_ok=True)
+              data, final_url, referer = fetch_pdf(cfg['urls'])
+              pdf_path = category_dir / cfg['filename']
+              pdf_path.write_bytes(data)
+              check = validate(pdf_path, cfg)
+              if check['sha256'] in seen_hashes:
+                  raise RuntimeError(f'Duplicate content detected: {pdf_path.name}')
+              seen_hashes.add(check['sha256'])
+              record = {
+                  'relative_path': str(pdf_path.relative_to(root)),
+                  'document_type': cfg['type_zh'],
+                  'release_date': cfg['release_date'],
+                  'primary_official_url': cfg['urls'][0],
+                  'downloaded_from': final_url,
+                  'successful_referer': referer,
+                  **check,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps({k: record[k] for k in ('relative_path','document_type','release_date','pages','bytes','sha256','downloaded_from')}, ensure_ascii=False), flush=True)
+
+          readme_lines = [
+              '西锐飞机有限公司 / Cirrus Aircraft Limited（02507.HK）官方披露文件',
+              '资料截止日期：2026年9月14日',
+              '',
+              '收录范围：',
+              '1. 全部独立年度报告：2024年年度报告、2025年年度报告。公司于2024年7月上市，港交所暂无上市前的独立年度报告；',
+              '2. 最终招股章程：2024年6月28日发布的全球发售招股章程完整版；',
+              '3. 最新一期完整定期财务报告：2026年中期报告（截至2026年6月30日止六个月），发布于2026年8月26日。',
+              '',
+              '“最新季报”口径说明：西锐飞机为香港主板上市公司，并未发布A股式第一季度/第三季度报告。本包因此收录截至资料截止日最新的完整中期报告，作为最新一期定期财务报告。',
+              '本包只收录完整报告，不以年度业绩公告、年报摘要或中期业绩公告替代正式报告。',
+              'PDF均保持原始版式，未删页、未重排、未加水印。下载优先使用香港交易所披露易官方链接；若官方节点暂时限流，则使用内容完全一致的公开镜像并以页数、公司标识、文档类型、SHA-256及渲染结果复核。',
+              '',
+              f'文件数量：{len(records)}份PDF；总页数：{sum(r["pages"] for r in records)}页。',
+              '',
+              '逐项清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              readme_lines.extend([
+                  f'{index}. {record["relative_path"]}',
+                  f'   类型：{record["document_type"]}',
+                  f'   发布日期：{record["release_date"]}',
+                  f'   页数：{record["pages"]}页；大小：{record["bytes"] / 1048576:.2f} MB',
+                  f'   港交所官方链接：{record["primary_official_url"]}',
+                  f'   本次实际下载来源：{record["downloaded_from"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+          readme_lines.append('核验项目：PDF文件头、公司名称/股份代码、报告年份与类型、精确页数、qpdf结构检查、首页/中间页/末页渲染、SHA-256、ZIP CRC。')
+          (root / 'README_文件清单与口径说明.txt').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{r["sha256"]}  {r["relative_path"]}\n' for r in records),
+              encoding='utf-8',
+          )
+
+          with zipfile.ZipFile(OUTPUT_ZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=9, allowZip64=True) as zf:
+              for file_path in sorted(root.rglob('*')):
+                  if file_path.is_file():
+                      zf.write(file_path, arcname=str(file_path))
+
+          with zipfile.ZipFile(OUTPUT_ZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed: {bad}')
+              pdf_names = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdf_names) != len(documents):
+                  raise RuntimeError(f'Expected {len(documents)} PDFs in ZIP, found {len(pdf_names)}')
+
+          print('FINAL_ZIP', OUTPUT_ZIP, OUTPUT_ZIP.stat().st_size, flush=True)
+          print('FINAL_ZIP_SHA256', hashlib.sha256(OUTPUT_ZIP.read_bytes()).hexdigest(), flush=True)
+          print('PDF_COUNT', len(records), 'TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          print('MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-aircraft-official-filings-package-20260914
+          path: Cirrus_Aircraft_2507_Official_Filings_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cirrus-aircraft-validation-diagnostics-20260914
+          path: _cirrus_validation/
+          if-no-files-found: ignore
+          retention-days: 3
+          compression-level: 6
