@@ -1,0 +1,420 @@
+name: Package CaoCao annual reports and latest interim disclosure
+
+on:
+  push:
+    paths:
+      - '.github/workflows/caocao-2020-2025-reports-package-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pymupdf
+
+      - name: Discover official filings, validate, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+
+          AS_OF = '2026-09-14'
+          COMPANY_ZH = '曹操出行有限公司'
+          COMPANY_EN = 'CaoCao Inc.'
+          STOCK_CODE = '02643.HK'
+          STOCK_ID = '1000260787'
+          ROOT_NAME = '曹操出行_2020-2025年报及最新定期报告_截至2026-09-14'
+          ROOT = Path(ROOT_NAME)
+          WORK = Path('_caocao_work')
+          RENDERS = WORK / 'renders'
+          OUTZIP = Path('CaoCao_2020-2025_Annual_Reports_Latest_Interim_2026-09-14.zip')
+          for p in (ROOT, WORK, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          BASE_HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'application/json,text/plain,application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en;q=0.6',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml',
+              'Connection': 'close',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(value).upper())
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def parse_result(payload):
+              if isinstance(payload, list):
+                  if all(isinstance(x, dict) for x in payload):
+                      return payload
+                  for x in payload:
+                      found = parse_result(x)
+                      if found:
+                          return found
+              if isinstance(payload, dict):
+                  for key in ('result', 'data', 'rows', 'items'):
+                      if key in payload:
+                          value = payload[key]
+                          if isinstance(value, str):
+                              try:
+                                  value = json.loads(value)
+                              except Exception:
+                                  pass
+                          found = parse_result(value)
+                          if found:
+                              return found
+                  for value in payload.values():
+                      found = parse_result(value)
+                      if found:
+                          return found
+              return []
+
+          def hkex_search(lang: str) -> list[dict]:
+              endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': '20200101',
+                  'toDate': '20260914',
+                  'title': '',
+                  'searchType': '1',
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'rowRange': '500',
+                  'lang': lang,
+              }
+              r = session.get(endpoint, params=params, headers=BASE_HEADERS, timeout=(30, 180))
+              print('SEARCH', lang, r.status_code, len(r.content), r.url, flush=True)
+              r.raise_for_status()
+              try:
+                  raw = r.json()
+              except Exception:
+                  raw = json.loads(r.text.lstrip('\ufeff'))
+              rows = parse_result(raw)
+              if not rows:
+                  raise RuntimeError(f'Unable to parse HKEX title search response for {lang}')
+              normalized = []
+              for row in rows:
+                  title = str(row.get('TITLE') or row.get('title') or row.get('HEADLINE') or row.get('headline') or '')
+                  link = str(row.get('FILE_LINK') or row.get('fileLink') or row.get('link') or row.get('URL') or row.get('url') or '')
+                  release = str(row.get('RELEASE_TIME') or row.get('releaseTime') or row.get('DATE_TIME') or row.get('dateTime') or row.get('DATE') or row.get('date') or '')
+                  doc_type = str(row.get('DOCUMENT_TYPE') or row.get('documentType') or row.get('CATEGORY') or row.get('category') or '')
+                  stock_code = str(row.get('STOCK_CODE') or row.get('stockCode') or '')
+                  if link:
+                      link = urljoin('https://www1.hkexnews.hk', link)
+                  normalized.append({
+                      'title': title,
+                      'link': link,
+                      'release': release,
+                      'document_type': doc_type,
+                      'stock_code': stock_code,
+                      'raw': row,
+                      'lang': lang,
+                  })
+              print('ROWS', lang, len(normalized), flush=True)
+              for row in normalized:
+                  n = compact(row['title'])
+                  if any(k in n for k in ('ANNUALREPORT2025', '2025年報', '2025年度報告', 'INTERIMRESULTSANNOUNCEMENTFORTHESIXMONTHSENDEDJUNE302026', '2026中期業績', '2026中期业绩', 'GLOBALOFFERING', '全球發售', '全球发售')):
+                      print('CANDIDATE', json.dumps({k: row[k] for k in ('lang','release','title','link','document_type')}, ensure_ascii=False), flush=True)
+              return normalized
+
+          rows = hkex_search('en') + hkex_search('zh')
+
+          def score(row: dict, kind: str) -> int:
+              title = compact(row['title'])
+              release = re.sub(r'\D', '', row['release'])
+              link = row['link'].lower()
+              lang_bonus = 60 if row['lang'] == 'zh' or '_c.pdf' in link else 0
+              pdf_bonus = 30 if link.endswith('.pdf') or '.pdf?' in link else 0
+              if kind == 'annual2025':
+                  base = 0
+                  if 'ANNUALREPORT2025' in title or ('2025' in title and ('年度報告' in title or '年報' in title or '年度报告' in title)):
+                      base += 500
+                  if '20260424' in release or '/2026/0424/' in link:
+                      base += 150
+                  if any(x in title for x in ('RESULTSANNOUNCEMENT','業績公告','业绩公告')):
+                      base -= 300
+                  return base + lang_bonus + pdf_bonus
+              if kind == 'interim2026':
+                  base = 0
+                  if '2026' in title and any(x in title for x in ('INTERIMRESULTS','中期業績','中期业绩')):
+                      base += 500
+                  if 'SIXMONTHSENDEDJUNE302026' in title or '截至2026年6月30日止六個月' in title or '截至2026年6月30日止六个月' in title:
+                      base += 200
+                  if '20260827' in release or '/2026/0827/' in link:
+                      base += 150
+                  if 'INTERIMREPORT' in title or '中期報告' in title or '中期报告' in title:
+                      base += 40
+                  return base + lang_bonus + pdf_bonus
+              if kind == 'prospectus2025':
+                  base = 0
+                  if any(x in title for x in ('GLOBALOFFERING','全球發售','全球发售')):
+                      base += 500
+                  if '20250617' in release or '/2025/0617/' in link:
+                      base += 180
+                  if 'FORMALNOTICE' in title or '正式通告' in title:
+                      base -= 350
+                  return base + lang_bonus + pdf_bonus
+              return 0
+
+          def select(kind: str) -> dict:
+              ranked = sorted(rows, key=lambda r: score(r, kind), reverse=True)
+              best = ranked[0]
+              print('SELECT', kind, score(best, kind), json.dumps({k: best[k] for k in ('lang','release','title','link')}, ensure_ascii=False), flush=True)
+              if score(best, kind) < 450 or not best['link']:
+                  raise RuntimeError(f'Could not identify required HKEX filing: {kind}')
+              return best
+
+          selected = {
+              'annual2025': select('annual2025'),
+              'interim2026': select('interim2026'),
+              'prospectus2025': select('prospectus2025'),
+          }
+
+          # Known official fallbacks from the HKEX title page, used only if the API-selected link fails.
+          fallbacks = {
+              'annual2025': ['https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0424/2026042402098.pdf'],
+              'prospectus2025': ['https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0617/2025061700008.pdf'],
+              'interim2026': [],
+          }
+
+          def download_pdf(kind: str, primary: str) -> tuple[bytes, str]:
+              candidates = [primary] + fallbacks.get(kind, [])
+              expanded = []
+              for u in candidates:
+                  if not u:
+                      continue
+                  expanded.append(u)
+                  if 'www1.hkexnews.hk' in u:
+                      expanded.append(u.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              errors = []
+              for url in list(dict.fromkeys(expanded)):
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(url, headers={**BASE_HEADERS, 'Accept': 'application/pdf,*/*'}, timeout=(30, 900), allow_redirects=True)
+                          print('GET', kind, attempt, r.status_code, len(r.content), r.headers.get('content-type'), url, flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50000:
+                              return r.content, str(r.url)
+                          errors.append(f'{url}: {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{url}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError(f'Download failed for {kind}: ' + ' | '.join(errors[-12:]))
+
+          def validate(path: Path, kind: str, min_pages: int, expected_year: str) -> dict:
+              data = path.read_bytes()
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'{path.name}: PDF signature missing')
+              doc = pymupdf.open(str(path))
+              pages = len(doc)
+              if pages < min_pages:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: page count {pages} < {min_pages}')
+              sample_indices = sorted(set(list(range(min(30, pages))) + [pages // 2, pages - 1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in sample_indices)
+              norm = compact(text)
+              identities = ('CAOCAOINC', '曹操出行有限公司', 'STOCKCODE02643', '股份代號02643', '股份代码02643')
+              if not any(compact(x) in norm for x in identities):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: company identity not found')
+              if expected_year not in norm:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: expected year {expected_year} not found')
+              markers = {
+                  'annual2025': ('ANNUALREPORT', '年度報告', '年度报告'),
+                  'interim2026': ('INTERIMRESULTS', '中期業績', '中期业绩', 'SIXMONTHSENDEDJUNE302026'),
+                  'prospectus2025': ('GLOBALOFFERING', '全球發售', '全球发售'),
+              }[kind]
+              if not any(compact(x) in norm for x in markers):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: document type marker not found')
+              rendered = []
+              for page_no in sorted(set((0, pages // 2, pages - 1))):
+                  pix = doc.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(0.9, 0.9), alpha=False)
+                  out = RENDERS / f'{path.stem}_page_{page_no + 1:04d}.png'
+                  pix.save(str(out))
+                  if pix.width < 400 or pix.height < 400 or out.stat().st_size < 3000:
+                      doc.close()
+                      raise RuntimeError(f'{path.name}: render validation failed at page {page_no + 1}')
+                  rendered.append({'page': page_no + 1, 'width': pix.width, 'height': pix.height, 'bytes': out.stat().st_size})
+              doc.close()
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf check failed: {q.stderr[-1000:]}')
+              return {
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'qpdf_return_code': q.returncode,
+                  'rendered_pages': rendered,
+              }
+
+          configs = [
+              ('annual2025', '01_曹操出行_2025年年度报告_首份上市后年报.pdf', 120, '2025', '2025年年度报告'),
+              ('interim2026', '02_曹操出行_2026年中期业绩公告_最新定期财务披露.pdf', 20, '2026', '2026年中期业绩公告'),
+              ('prospectus2025', '03_曹操出行_2025年全球发售招股书_上市前历史财务资料补充.pdf', 500, '2025', '2025年全球发售招股书'),
+          ]
+
+          records = []
+          seen_hashes = set()
+          for kind, filename, min_pages, year, doc_type in configs:
+              data, actual_url = download_pdf(kind, selected[kind]['link'])
+              path = ROOT / filename
+              path.write_bytes(data)
+              meta = validate(path, kind, min_pages, year)
+              if meta['sha256'] in seen_hashes:
+                  raise RuntimeError(f'Duplicate content detected: {filename}')
+              seen_hashes.add(meta['sha256'])
+              language = '繁体中文' if '_c.pdf' in actual_url.lower() or selected[kind]['lang'] == 'zh' else '英文'
+              record = {
+                  'filename': filename,
+                  'document_type': doc_type,
+                  'release_time': selected[kind]['release'],
+                  'title_from_hkex': selected[kind]['title'],
+                  'language': language,
+                  'official_url': actual_url,
+                  **meta,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          # Explicitly document why standalone annual reports for 2020-2024 are absent.
+          note = [
+              '曹操出行有限公司（CaoCao Inc.，02643.HK）',
+              '2020-2025年报及最新定期财务报告资料包',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '一、重要口径说明',
+              '曹操出行于2025年6月25日在香港联交所主板上市。港交所公开披露档案中不存在2020、2021、2022、2023及2024年度的独立上市公司年度报告；这些年度发生在公司上市之前，不能以其他公司的年报或媒体整理材料替代。',
+              '截至资料核对日，上市后正式年度报告只有2025年度一份。',
+              '',
+              '二、压缩包内容',
+              '1. 2025年年度报告：曹操出行上市后的首份正式年度报告。该报告含2021-2025年五年财务摘要。',
+              '2. 2026年中期业绩公告：截至2026年6月30日止六个月，是截至核对日最新定期财务披露。香港主板公司通常不按A股口径发布一季报和三季报。',
+              '3. 2025年全球发售招股书：作为上市前历史经审计财务资料补充，包含公司上市前报告期的详细财务报表、业务和风险资料；不冒充2020-2024年度独立年报。',
+              '',
+              '三、关于2026年中期报告',
+              '截至2026年9月14日，港交所已披露2026年中期业绩公告，但尚未披露完整的2026年中期报告。因此本包收录最新业绩公告。',
+              '',
+              '四、校验',
+              '每份PDF均检查PDF文件头、公司名称或股份代码、报告年度、文档类型、页数、qpdf结构以及首页/中间页/末页渲染，并计算SHA-256。',
+              '',
+              '文件清单：',
+          ]
+          for idx, r in enumerate(records, 1):
+              note.extend([
+                  f'{idx}. {r["filename"]}',
+                  f'   类型：{r["document_type"]}',
+                  f'   语言：{r["language"]}',
+                  f'   页数：{r["pages"]}',
+                  f'   大小：{r["bytes"] / 1048576:.2f} MB',
+                  f'   港交所标题：{r["title_from_hkex"]}',
+                  f'   官方来源：{r["official_url"]}',
+                  f'   SHA-256：{r["sha256"]}',
+                  '',
+              ])
+          (ROOT / 'README_文件清单与缺失年份说明.txt').write_text('\n'.join(note), encoding='utf-8')
+
+          with (ROOT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','文件名','文档类型','发布日期','语言','页数','文件大小_字节','SHA256','港交所标题','官方来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for idx, r in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': idx,
+                      '文件名': r['filename'],
+                      '文档类型': r['document_type'],
+                      '发布日期': r['release_time'],
+                      '语言': r['language'],
+                      '页数': r['pages'],
+                      '文件大小_字节': r['bytes'],
+                      'SHA256': r['sha256'],
+                      '港交所标题': r['title_from_hkex'],
+                      '官方来源': r['official_url'],
+                  })
+
+          manifest = {
+              'company': COMPANY_ZH,
+              'english_name': COMPANY_EN,
+              'stock_code': STOCK_CODE,
+              'listing_date': '2025-06-25',
+              'as_of_date': AS_OF,
+              'requested_years': list(range(2020, 2026)),
+              'standalone_annual_reports_available': [2025],
+              'standalone_annual_reports_unavailable': [2020, 2021, 2022, 2023, 2024],
+              'latest_periodic_financial_disclosure': '2026年中期业绩公告（截至2026年6月30日止六个月）',
+              'files': records,
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, str(path))
+          with zipfile.ZipFile(OUTZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in zf.namelist())
+              if pdf_count != 3:
+                  raise RuntimeError(f'Expected 3 PDFs, found {pdf_count}')
+
+          print('FINAL_ZIP', OUTZIP, OUTZIP.stat().st_size, sha256_file(OUTZIP), flush=True)
+          print('TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          print('PDF_COUNT', len(records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: caocao-reports-package-20260914
+          path: CaoCao_2020-2025_Annual_Reports_Latest_Interim_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: caocao-validation-diagnostics
+          path: _caocao_work/
+          if-no-files-found: ignore
+          retention-days: 2
+          compression-level: 6
