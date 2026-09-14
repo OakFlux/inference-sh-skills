@@ -1,0 +1,100 @@
+name: Probe sdyanbao download API for TransThera prospectus
+
+on:
+  push:
+    paths:
+      - '.github/workflows/transthera-sdyanbao-download-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Probe detail and download endpoints
+        shell: bash
+        run: |
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          base='https://www.sdyanbao.com'
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept':'application/json,text/plain,*/*',
+            'Referer':base+'/detail/894460',
+            'Origin':base,
+          })
+          # prime cookies
+          try:
+            r=s.get(base+'/detail/894460',timeout=30)
+            print('PRIME',r.status_code,len(r.content),dict(s.cookies),flush=True)
+          except Exception as e: print('PRIMEERR',repr(e),flush=True)
+
+          attempts=[]
+          for endpoint in ['/api/file/detail','/api/file/download']:
+            payloads=[
+              {'id':894460},
+              {'id':'894460'},
+              {'file_id':894460},
+              {'fileId':894460},
+              {'original_id':1203556},
+              {'id':894460,'device':1},
+              {'id':894460,'hash':'01712042b0e400000028140000a48000000000006000000000001600000080000000800092000200006000c00020000000362200000000000080808000000000'},
+            ]
+            for mode in ['json','form']:
+              for payload in payloads:
+                try:
+                  kwargs={'json':payload} if mode=='json' else {'data':payload}
+                  r=s.post(base+endpoint,timeout=60,allow_redirects=False,**kwargs)
+                  ctype=r.headers.get('content-type','')
+                  loc=r.headers.get('location')
+                  head=r.content[:500]
+                  print('\nTRY',endpoint,mode,json.dumps(payload,ensure_ascii=False),'STATUS',r.status_code,'CTYPE',ctype,'LEN',len(r.content),'LOC',loc,flush=True)
+                  print('BODY',head.decode('utf-8','replace'),flush=True)
+                  rec={'endpoint':endpoint,'mode':mode,'payload':payload,'status':r.status_code,'ctype':ctype,'length':len(r.content),'location':loc,'body':head.decode('utf-8','replace')}
+                  attempts.append(rec)
+                  if r.content.startswith(b'%PDF-') and len(r.content)>100000:
+                    Path('transthera_prospectus_from_api.pdf').write_bytes(r.content)
+                    print('SAVED_DIRECT_PDF',len(r.content),flush=True)
+                  else:
+                    try:
+                      obj=r.json()
+                      print('JSON',json.dumps(obj,ensure_ascii=False)[:5000],flush=True)
+                      rec['json']=obj
+                      def walk(x):
+                        if isinstance(x,dict):
+                          for k,v in x.items():
+                            if isinstance(v,str) and (v.startswith('http') or '.pdf' in v.lower()): yield k,v
+                            yield from walk(v)
+                        elif isinstance(x,list):
+                          for v in x: yield from walk(v)
+                      for k,u in walk(obj):
+                        print('URL_CANDIDATE',k,u,flush=True)
+                        try:
+                          rr=s.get(u if u.startswith('http') else base+u,timeout=120,allow_redirects=True)
+                          print('URL_FETCH',rr.status_code,len(rr.content),rr.headers.get('content-type'),rr.url,flush=True)
+                          if rr.content.startswith(b'%PDF-') and len(rr.content)>100000:
+                            Path('transthera_prospectus_from_api.pdf').write_bytes(rr.content)
+                            print('SAVED_URL_PDF',len(rr.content),rr.url,flush=True)
+                        except Exception as ee: print('URL_FETCH_ERR',repr(ee),flush=True)
+                    except Exception:
+                      pass
+                except Exception as e:
+                  print('ERR',endpoint,mode,payload,type(e).__name__,e,flush=True)
+                  attempts.append({'endpoint':endpoint,'mode':mode,'payload':payload,'error':repr(e)})
+          Path('sdyanbao_download_probe.json').write_text(json.dumps(attempts,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: transthera-sdyanbao-download-probe
+          path: |
+            sdyanbao_download_probe.json
+            transthera_prospectus_from_api.pdf
+          if-no-files-found: warn
+          retention-days: 2
