@@ -1,0 +1,53 @@
+name: Probe Hesai 424B4 PDF link
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hesai-424b4-link-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: |
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          urls = [
+            'https://investor.hesaitech.com/sec-filings/sec-filing/424b4/0001104659-23-017567',
+            'https://hesai.gcs-web.com/sec-filings/sec-filing/424b4/0001104659-23-017567',
+          ]
+          out=[]
+          for u in urls:
+            for ua in ['Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','curl/8.5.0']:
+              try:
+                r=requests.get(u,headers={'User-Agent':ua,'Accept':'text/html,*/*','Referer':'https://investor.hesaitech.com/'},timeout=20,allow_redirects=True)
+                print('PAGE',u,r.status_code,len(r.content),r.url)
+                rec={'url':u,'status':r.status_code,'bytes':len(r.content),'final':r.url,'links':[]}
+                if r.status_code==200:
+                  s=BeautifulSoup(r.text,'html.parser')
+                  for a in s.find_all('a',href=True):
+                    href=urljoin(r.url,a['href'])
+                    txt=' '.join(a.get_text(' ',strip=True).split())
+                    if 'pdf' in href.lower() or 'pdf' in txt.lower() or 'static-files' in href.lower():
+                      rec['links'].append({'text':txt,'href':href})
+                out.append(rec)
+              except Exception as e:
+                print('ERR',u,type(e).__name__,e)
+                out.append({'url':u,'error':repr(e)})
+          open('hesai_424b4_probe.json','w',encoding='utf-8').write(json.dumps(out,ensure_ascii=False,indent=2))
+          print(json.dumps(out,ensure_ascii=False,indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hesai-424b4-link-probe
+          path: hesai_424b4_probe.json
+          retention-days: 1
