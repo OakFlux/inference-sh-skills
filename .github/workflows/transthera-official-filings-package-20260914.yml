@@ -1,0 +1,410 @@
+name: Package TransThera official filings 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/transthera-official-filings-package-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pymupdf beautifulsoup4
+
+      - name: Discover download validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+          from bs4 import BeautifulSoup
+
+          AS_OF = '2026-09-14'
+          COMPANY_ZH = '药捷安康（南京）科技股份有限公司'
+          COMPANY_TRAD = '藥捷安康（南京）科技股份有限公司'
+          COMPANY_EN = 'TransThera Sciences (Nanjing), Inc.'
+          STOCK_CODE = '02617.HK'
+          ROOT_NAME = '药捷安康_全部年报_招股说明书及最新定期报告_截至2026-09-14'
+          ROOT = Path(ROOT_NAME)
+          WORK = Path('_transthera_validation')
+          RENDERS = WORK / 'renders'
+          OUTZIP = Path('TransThera_All_Annual_Reports_Prospectus_Latest_Report_2026-09-14.zip')
+          ROOT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'curl/8.5.0',
+              'Accept': 'application/pdf,text/html,application/xhtml+xml,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en;q=0.6',
+              'Referer': 'https://www1.hkexnews.hk/',
+              'Connection': 'close',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(value).upper())
+
+          def sha256_bytes(data: bytes) -> str:
+              return hashlib.sha256(data).hexdigest()
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def expand_urls(urls: list[str]) -> list[str]:
+              out = []
+              for url in urls:
+                  out.append(url)
+                  if 'www1.hkexnews.hk' in url:
+                      out.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+                  elif 'www.hkexnews.hk' in url:
+                      out.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              return list(dict.fromkeys(out))
+
+          def fetch(url: str, *, min_bytes: int = 1000) -> tuple[bytes, str, str]:
+              errors = []
+              for candidate in expand_urls([url]):
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(candidate, headers=headers, timeout=(30, 900), allow_redirects=True)
+                          ctype = response.headers.get('content-type', '')
+                          print('GET', attempt, response.status_code, len(response.content), ctype, candidate, flush=True)
+                          if response.status_code == 200 and len(response.content) >= min_bytes:
+                              return response.content, str(response.url), ctype
+                          errors.append(f'{candidate}: HTTP {response.status_code}/{len(response.content)}')
+                      except Exception as exc:
+                          errors.append(f'{candidate}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError('download failed: ' + ' | '.join(errors[-12:]))
+
+          def fetch_pdf_candidates(urls: list[str], *, min_bytes: int = 40000) -> tuple[bytes, str]:
+              errors = []
+              for url in expand_urls(urls):
+                  try:
+                      data, actual, _ = fetch(url, min_bytes=min_bytes)
+                      if data.startswith(b'%PDF-'):
+                          return data, actual
+                      errors.append(f'{url}: not PDF')
+                  except Exception as exc:
+                      errors.append(f'{url}: {type(exc).__name__}: {exc}')
+              raise RuntimeError('all PDF candidates failed: ' + ' | '.join(errors[-20:]))
+
+          def discover_prospectus() -> tuple[bytes, str]:
+              listing_pages = [
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0613/2025061300065_c.htm',
+                  'https://www.hkexnews.hk/listedco/listconews/sehk/2025/0613/2025061300065_c.htm',
+                  'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0613/2025061300066.htm',
+                  'https://www.hkexnews.hk/listedco/listconews/sehk/2025/0613/2025061300066.htm',
+              ]
+              pdf_links = []
+              for page_url in listing_pages:
+                  try:
+                      html_bytes, actual, _ = fetch(page_url, min_bytes=5000)
+                      soup = BeautifulSoup(html_bytes, 'html.parser')
+                      for anchor in soup.find_all('a', href=True):
+                          href = urljoin(actual, anchor.get('href'))
+                          label = ' '.join(anchor.get_text(' ', strip=True).split())
+                          if '.pdf' in href.lower():
+                              pdf_links.append((label, href))
+                              print('DISCOVERED_PDF_LINK', label, href, flush=True)
+                  except Exception as exc:
+                      print('LISTING_PAGE_ERROR', page_url, repr(exc), flush=True)
+
+              # HKEX numbering fallbacks around the listing-document page.
+              for number in range(50, 67):
+                  stem = f'20250613000{number:02d}'
+                  pdf_links.extend([
+                      ('numbering-fallback-cn', f'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0613/{stem}_c.pdf'),
+                      ('numbering-fallback-en', f'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0613/{stem}.pdf'),
+                  ])
+
+              # Deduplicate while prioritizing links explicitly labelled as prospectus/global offering.
+              unique = {}
+              for label, href in pdf_links:
+                  unique[href] = label
+              ranked = sorted(
+                  unique.items(),
+                  key=lambda item: (
+                      0 if any(k in compact(item[1]) for k in ('招股章程','招股说明书','PROSPECTUS','GLOBALOFFERING')) else 1,
+                      item[0],
+                  ),
+              )
+
+              rejected = []
+              for href, label in ranked:
+                  try:
+                      data, actual, _ = fetch(href, min_bytes=200000)
+                      if not data.startswith(b'%PDF-'):
+                          continue
+                      temp = WORK / 'prospectus_candidate.pdf'
+                      temp.parent.mkdir(parents=True, exist_ok=True)
+                      temp.write_bytes(data)
+                      doc = pymupdf.open(str(temp))
+                      pages = len(doc)
+                      indices = sorted(set(list(range(min(30, pages))) + [pages // 2, pages - 1]))
+                      text = '\n'.join(doc.load_page(i).get_text('text') for i in indices)
+                      doc.close()
+                      norm = compact(text)
+                      identity_ok = any(compact(x) in norm for x in (
+                          COMPANY_ZH, COMPANY_TRAD, COMPANY_EN, 'TRANSTHERASCIENCES', '股份代號2617', 'STOCKCODE2617'
+                      ))
+                      type_ok = any(compact(x) in norm for x in (
+                          '招股章程', '招股说明书', 'PROSPECTUS', 'GLOBALOFFERING', '全球發售', '全球发售'
+                      ))
+                      print('PROSPECTUS_CANDIDATE', pages, len(data), identity_ok, type_ok, label, actual, flush=True)
+                      if pages >= 500 and identity_ok and type_ok:
+                          return data, actual
+                      rejected.append(f'{actual}: pages={pages}, identity={identity_ok}, type={type_ok}')
+                  except Exception as exc:
+                      rejected.append(f'{href}: {type(exc).__name__}: {exc}')
+              raise RuntimeError('prospectus not found; rejected=' + ' | '.join(rejected[-30:]))
+
+          documents = [
+              {
+                  'category': '01_年度报告',
+                  'filename': '01_药捷安康_2025年年度报告_完整版.pdf',
+                  'document_type': '2025年年度报告',
+                  'release_date': '2026-04-23',
+                  'year': '2025',
+                  'min_pages': 100,
+                  'type_markers': ('ANNUALREPORT', '年度報告', '年度报告'),
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0423/2026042303041_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0423/2026042303040.pdf',
+                  ],
+              },
+              {
+                  'category': '02_招股说明书',
+                  'filename': '02_药捷安康_2025年全球发售最终招股说明书_完整版.pdf',
+                  'document_type': '2025年全球发售最终招股说明书',
+                  'release_date': '2025-06-13',
+                  'year': '2025',
+                  'min_pages': 500,
+                  'type_markers': ('PROSPECTUS', 'GLOBALOFFERING', '招股章程', '招股说明书', '全球發售', '全球发售'),
+                  'discover': 'prospectus',
+              },
+              {
+                  'category': '03_最新定期财务披露',
+                  'filename': '03_药捷安康_2026年中期业绩公告_截至2026年6月30日.pdf',
+                  'document_type': '2026年中期业绩公告（最新定期财务披露）',
+                  'release_date': '2026-08-26',
+                  'year': '2026',
+                  'min_pages': 20,
+                  'type_markers': ('INTERIMRESULTS', '中期業績', '中期业绩', 'SIXMONTHSENDED30JUNE2026'),
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082600898_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0826/2026082600897.pdf',
+                  ],
+              },
+              {
+                  'category': '04_补充_最新已刊发完整中期报告',
+                  'filename': '04_药捷安康_2025年中期报告_最新已刊发完整中期报告.pdf',
+                  'document_type': '2025年中期报告（最新已刊发完整中期报告）',
+                  'release_date': '2025-09-19',
+                  'year': '2025',
+                  'min_pages': 40,
+                  'type_markers': ('INTERIMREPORT', '中期報告', '中期报告'),
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0919/2025091900589_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0919/2025091900588.pdf',
+                  ],
+              },
+          ]
+
+          def validate_pdf(path: Path, cfg: dict) -> dict:
+              raw = path.read_bytes()
+              if not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'{path.name}: invalid PDF signature')
+              doc = pymupdf.open(str(path))
+              pages = len(doc)
+              if pages < cfg['min_pages']:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: page count {pages} < {cfg["min_pages"]}')
+              probe_indices = sorted(set(list(range(min(45, pages))) + [pages // 2, pages - 1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in probe_indices)
+              norm = compact(text)
+              identity_markers = (
+                  COMPANY_ZH, COMPANY_TRAD, COMPANY_EN, 'TRANSTHERASCIENCES',
+                  'STOCKCODE2617', '股份代號2617', '股份代码2617',
+              )
+              if not any(compact(marker) in norm for marker in identity_markers):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: company identity marker missing')
+              if compact(cfg['year']) not in norm:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: report year marker missing')
+              if not any(compact(marker) in norm for marker in cfg['type_markers']):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: document type marker missing')
+
+              rendered = []
+              for page_no in sorted(set((0, pages // 2, pages - 1))):
+                  page = doc.load_page(page_no)
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(0.9, 0.9), alpha=False)
+                  render_path = RENDERS / f'{path.stem}_page_{page_no + 1:04d}.png'
+                  pix.save(str(render_path))
+                  if pix.width < 400 or pix.height < 400 or render_path.stat().st_size < 3000:
+                      doc.close()
+                      raise RuntimeError(f'{path.name}: render validation failed on page {page_no + 1}')
+                  rendered.append({'page': page_no + 1, 'width': pix.width, 'height': pix.height, 'bytes': render_path.stat().st_size})
+              doc.close()
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf validation failed: {qpdf.stderr[-1000:]}')
+              return {
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': sha256_bytes(raw),
+                  'qpdf_return_code': qpdf.returncode,
+                  'rendered_pages': rendered,
+              }
+
+          records = []
+          seen_hashes = set()
+          for cfg in documents:
+              directory = ROOT / cfg['category']
+              directory.mkdir(parents=True, exist_ok=True)
+              if cfg.get('discover') == 'prospectus':
+                  data, actual_url = discover_prospectus()
+              else:
+                  data, actual_url = fetch_pdf_candidates(cfg['urls'])
+              path = directory / cfg['filename']
+              path.write_bytes(data)
+              check = validate_pdf(path, cfg)
+              if check['sha256'] in seen_hashes:
+                  raise RuntimeError(f'duplicate PDF content detected: {path.name}')
+              seen_hashes.add(check['sha256'])
+              language = '繁体中文' if actual_url.lower().endswith('_c.pdf') else '英文'
+              record = {
+                  'relative_path': str(path.relative_to(ROOT)),
+                  'document_type': cfg['document_type'],
+                  'release_date': cfg['release_date'],
+                  'official_url': actual_url,
+                  'language': language,
+                  **check,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 4:
+              raise RuntimeError(f'expected 4 PDFs, got {len(records)}')
+
+          with (ROOT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','文件路径','文档类型','发布日期','语言','页数','文件大小_字节','SHA256','官方来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for index, record in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': index,
+                      '文件路径': record['relative_path'],
+                      '文档类型': record['document_type'],
+                      '发布日期': record['release_date'],
+                      '语言': record['language'],
+                      '页数': record['pages'],
+                      '文件大小_字节': record['bytes'],
+                      'SHA256': record['sha256'],
+                      '官方来源': record['official_url'],
+                  })
+
+          manifest = {
+              'company': COMPANY_ZH,
+              'traditional_chinese_name': COMPANY_TRAD,
+              'english_name': COMPANY_EN,
+              'stock_code': STOCK_CODE,
+              'listing_date': '2025-06-23',
+              'as_of_date': AS_OF,
+              'annual_report_years': [2025],
+              'latest_periodic_financial_disclosure': '2026年中期业绩公告（截至2026年6月30日止六个月）',
+              'latest_full_interim_report_published': '2025年中期报告',
+              'files': records,
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["relative_path"]}\n' for r in records), encoding='utf-8')
+
+          lines = [
+              f'{COMPANY_ZH}（{STOCK_CODE}）官方披露文件',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '收录内容：',
+              '1. 2025年年度报告；',
+              '2. 2025年全球发售最终招股说明书；',
+              '3. 2026年中期业绩公告，作为截至核对日最新定期财务披露；',
+              '4. 2025年中期报告，作为截至核对日最新已刊发的完整中期报告补充。',
+              '',
+              '药捷安康于2025年6月23日在香港联交所上市，因此截至核对日上市后独立年度报告只有2025年度一份。香港主板公司通常不按A股制度发布第一季度及第三季度报告；截至2026年9月14日，港交所已披露2026年中期业绩公告，但尚未刊发2026年完整中期报告。',
+              '所有PDF均来自香港交易所披露易，保持官方原始版式，未删页、未重排、未加水印。',
+              '',
+              f'共{len(records)}份PDF，合计{sum(r["pages"] for r in records)}页，PDF总大小{sum(r["bytes"] for r in records)/1048576:.2f} MB。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f'{index}. {record["relative_path"]}',
+                  f'   {record["document_type"]}｜{record["release_date"]}｜{record["language"]}｜{record["pages"]}页｜{record["bytes"]/1048576:.2f} MB',
+                  f'   官方来源：{record["official_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+          lines.append('核验项目：PDF文件头、公司名称/股份代码、报告年度、报告类型、页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。')
+          (ROOT / 'README_文件清单与口径说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path))
+          with zipfile.ZipFile(OUTZIP, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              if sum(name.lower().endswith('.pdf') for name in archive.namelist()) != 4:
+                  raise RuntimeError('unexpected PDF count in ZIP')
+
+          print('FINAL_ZIP', OUTZIP, OUTZIP.stat().st_size, sha256_file(OUTZIP), flush=True)
+          print('TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: transthera-official-filings-package-20260914
+          path: TransThera_All_Annual_Reports_Prospectus_Latest_Report_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transthera-validation-diagnostics
+          path: _transthera_validation/
+          if-no-files-found: ignore
+          retention-days: 2
