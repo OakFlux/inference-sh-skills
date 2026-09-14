@@ -1,0 +1,224 @@
+name: Package Fenghua Gaoke broker reports
+
+on:
+  push:
+    branches:
+      - cr-power-artifact-20260904
+    paths:
+      - '.github/workflows/fenghua-gaoke-broker-reports-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out artifact branch
+        uses: actions/checkout@v4
+        with:
+          ref: cr-power-artifact-20260904
+          fetch-depth: 1
+
+      - name: Install PDF validation tools
+        run: |
+          python -m pip install --quiet requests pypdf
+
+      - name: Download, validate, and package reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf fenghua_work 风华高科_000636_券商深度报告_3份_2020 风华高科_000636_券商深度报告_3份_2020.zip
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+
+          PACKAGE_NAME = "风华高科_000636_券商深度报告_3份_2020"
+          ROOT = Path(PACKAGE_NAME)
+          ROOT.mkdir(parents=True, exist_ok=True)
+          ZIP_PATH = Path(PACKAGE_NAME + ".zip")
+
+          REPORTS = [
+              {
+                  "index": 1,
+                  "broker": "广发证券",
+                  "date": "2020-05-05",
+                  "title": "国内领先被动元件企业，加码扩产迎国产替代浪潮",
+                  "expected_pages": 22,
+                  "url": "https://img3.gelonghui.com/pdf/cf711-1b767dd9-edc1-4f80-8da5-b9e22909b865.pdf",
+                  "referer": "https://www.gelonghui.com/",
+              },
+              {
+                  "index": 2,
+                  "broker": "国联证券",
+                  "date": "2020-06-22",
+                  "title": "大幅扩产迎5G，新机遇与新格局",
+                  "expected_pages": 23,
+                  "url": "https://img3.gelonghui.com/pdf/593f8-b5652cd6-4708-409a-b1ed-f199de71f282.pdf",
+                  "referer": "https://www.gelonghui.com/",
+              },
+              {
+                  "index": 3,
+                  "broker": "东吴证券",
+                  "date": "2020-08-28",
+                  "title": "国产被动元器件龙头，天时地利人和促腾飞",
+                  "expected_pages": 32,
+                  "url": "https://pdf.dfcfw.com/pdf/H3_AP202008311404431973_1.pdf?1601215122000.pdf=",
+                  "referer": "https://data.eastmoney.com/",
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          ua = (
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/152.0.0.0 Safari/537.36"
+          )
+
+          def safe_filename(value: str) -> str:
+              return "".join("_" if ch in '\\/:*?\"<>|' else ch for ch in value).strip()
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open("rb") as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download_pdf(report: dict) -> bytes:
+              headers = {
+                  "User-Agent": ua,
+                  "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+                  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+                  "Referer": report["referer"],
+                  "Connection": "keep-alive",
+              }
+              errors = []
+              for attempt in range(1, 8):
+                  try:
+                      response = session.get(
+                          report["url"],
+                          headers=headers,
+                          timeout=(30, 300),
+                          allow_redirects=True,
+                      )
+                      print(
+                          "GET", report["broker"], attempt, response.status_code,
+                          response.headers.get("content-type"), len(response.content),
+                          response.url,
+                          flush=True,
+                      )
+                      content = response.content
+                      if response.status_code == 200 and content.startswith(b"%PDF-") and len(content) > 200_000:
+                          return content
+                      errors.append(
+                          f"attempt={attempt} status={response.status_code} bytes={len(content)} "
+                          f"type={response.headers.get('content-type')}"
+                      )
+                  except Exception as exc:
+                      errors.append(f"attempt={attempt} error={exc!r}")
+                  time.sleep(min(attempt * 2, 10))
+              raise RuntimeError("Download failed: " + report["title"] + " | " + " | ".join(errors[-8:]))
+
+          manifest = []
+          for report in REPORTS:
+              filename = (
+                  f"{report['index']:02d}_{report['broker']}_风华高科_"
+                  f"{report['title']}_{report['date']}_{report['expected_pages']}页.pdf"
+              )
+              path = ROOT / safe_filename(filename)
+              path.write_bytes(download_pdf(report))
+
+              reader = PdfReader(str(path), strict=False)
+              if reader.is_encrypted and reader.decrypt("") == 0:
+                  raise RuntimeError(f"Encrypted PDF cannot be opened: {path.name}")
+              pages = len(reader.pages)
+              if pages != int(report["expected_pages"]):
+                  raise RuntimeError(
+                      f"Page-count mismatch for {path.name}: expected {report['expected_pages']}, got {pages}"
+                  )
+
+              first_text = "\n".join(
+                  (reader.pages[i].extract_text() or "") for i in range(min(3, pages))
+              )
+              compact = "".join(first_text.split())
+              if "风华高科" not in compact and "000636" not in compact:
+                  raise RuntimeError(f"Company identity not found in opening pages: {path.name}")
+
+              record = {
+                  "file": path.name,
+                  "broker": report["broker"],
+                  "date": report["date"],
+                  "title": report["title"],
+                  "pages": pages,
+                  "bytes": path.stat().st_size,
+                  "sha256": sha256_file(path),
+                  "source_url": report["url"],
+              }
+              manifest.append(record)
+              print("VALIDATED", json.dumps(record, ensure_ascii=False), flush=True)
+
+          source_lines = [
+              "风华高科（000636）券商深度报告 - 来源与校验记录",
+              "",
+              "本压缩包包含3份公开可获取的原始券商研究报告PDF。",
+              "每份文件均已校验PDF文件头、页数、公司名称/股票代码与SHA-256。",
+              "",
+          ]
+          for i, item in enumerate(manifest, 1):
+              source_lines.extend(
+                  [
+                      f"{i}. {item['broker']}｜{item['date']}｜《{item['title']}》",
+                      f"   文件：{item['file']}",
+                      f"   页数：{item['pages']}页",
+                      f"   大小：{item['bytes']}字节",
+                      f"   SHA-256：{item['sha256']}",
+                      f"   原始来源：{item['source_url']}",
+                      "",
+                  ]
+              )
+          (ROOT / "来源与校验记录.txt").write_text("\n".join(source_lines), encoding="utf-8")
+          (ROOT / "manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+
+          with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(ROOT.rglob("*")):
+                  if path.is_file():
+                      archive.write(path, arcname=f"{ROOT.name}/{path.relative_to(ROOT)}")
+
+          if ZIP_PATH.stat().st_size < 500_000:
+              raise RuntimeError(f"ZIP unexpectedly small: {ZIP_PATH.stat().st_size} bytes")
+
+          print(
+              "ZIP_READY",
+              ZIP_PATH,
+              ZIP_PATH.stat().st_size,
+              sha256_file(ZIP_PATH),
+              flush=True,
+          )
+          PY
+
+      - name: Upload report archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: fenghua-gaoke-broker-reports-3-pdfs-20260914
+          path: |
+            风华高科_000636_券商深度报告_3份_2020.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
