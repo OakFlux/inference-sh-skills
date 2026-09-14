@@ -1,0 +1,78 @@
+name: Locate public long-form Hesai and lidar research PDFs
+
+on:
+  push:
+    branches:
+      - tmp/hesai-broker-reports-20260914
+    paths:
+      - '.github/workflows/hesai-iyanbao-targeted-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  locate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/hesai-broker-reports-20260914
+      - name: Install
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Query iYanbao
+        run: |
+          rm -rf targeted && mkdir targeted
+          python - <<'PY'
+          import json, urllib.parse, requests
+          from bs4 import BeautifulSoup
+          from pathlib import Path
+
+          queries = [
+            '百舸争流 激光雷达 量产元年',
+            '百舸争流，激光雷达迎来量产元年',
+            '激光雷达行业深度报告 百舸争流',
+            '激光雷达行业深度报告',
+            '禾赛科技 HSAI 深度报告',
+            '全球车载激光雷达龙头 量产降本拉开序幕',
+            '禾赛科技',
+            '禾赛',
+          ]
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'})
+          allq=[]; uniq={}
+          for qi,q in enumerate(queries,1):
+              url='https://www.iyanbao.com/search?keyword='+urllib.parse.quote(q)
+              item={'query':q,'url':url}
+              try:
+                  r=s.get(url,timeout=60)
+                  item.update({'status':r.status_code,'size':len(r.content)})
+                  text=r.content.decode(r.apparent_encoding or 'utf-8',errors='ignore')
+                  Path(f'targeted/{qi:02d}.html').write_text(text,encoding='utf-8')
+                  soup=BeautifulSoup(text,'html.parser'); tag=soup.find('script',id='__NEXT_DATA__')
+                  pp={}
+                  if tag and tag.string:
+                      pp=json.loads(tag.string).get('props',{}).get('pageProps',{})
+                  rows=pp.get('searchList') or []
+                  item['searchTotal']=pp.get('searchTotal')
+                  item['results']=[]
+                  for x in rows:
+                      if not isinstance(x,dict): continue
+                      inst=x.get('institution')
+                      if isinstance(inst,dict): inst=inst.get('value') or inst.get('key')
+                      rec={k:x.get(k) for k in ['id','title','pages','publishTimestamp','pdfUrl','reportType','content']}
+                      rec['institution']=inst
+                      rec['content']=(rec.get('content') or '')[:1200]
+                      item['results'].append(rec)
+                      if rec.get('id') is not None: uniq[str(rec['id'])]=rec
+              except Exception as e: item['error']=repr(e)
+              allq.append(item)
+              print('\nQUERY',q,'TOTAL',item.get('searchTotal'))
+              for x in item.get('results',[]): print(json.dumps(x,ensure_ascii=False))
+          Path('targeted/results.json').write_text(json.dumps({'queries':allq,'unique':list(uniq.values())},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hesai-iyanbao-targeted-20260914
+          path: targeted
+          retention-days: 3
