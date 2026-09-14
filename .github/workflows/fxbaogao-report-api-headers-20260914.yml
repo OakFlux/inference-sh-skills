@@ -1,0 +1,43 @@
+name: Query fxbaogao metadata with browser headers
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fxbaogao-report-api-headers-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Query metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --connect-timeout 10 --max-time 30 -L -A 'Mozilla/5.0' \
+            -H 'Accept: application/json,text/plain,*/*' \
+            -H 'Origin: https://www.fxbaogao.com' \
+            -H 'Referer: https://www.fxbaogao.com/view?id=4897747' \
+            -H 'content-type: application/x-www-form-urlencoded; charset=UTF-8' \
+            -H 'CLIENT-TYPE-X: pc' \
+            -H 'version: 1.0.0' \
+            -H 'user-id: 0' \
+            -H 'user-token: QQ' \
+            -H 'x-fp:' \
+            -H 'x-bot:' \
+            'https://api.fxbaogao.com/mofoun/report/readReport/readReport?reportId=4897747' \
+            -o report_metadata.json
+          wc -c report_metadata.json
+          head -c 50000 report_metadata.json
+      - name: Upload metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-report-metadata-headers
+          path: report_metadata.json
+          if-no-files-found: warn
+          retention-days: 2
