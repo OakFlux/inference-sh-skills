@@ -1,0 +1,88 @@
+name: Classify public iYanbao PDFs for Hesai reports
+
+on:
+  push:
+    branches:
+      - tmp/hesai-broker-reports-20260914
+    paths:
+      - '.github/workflows/hesai-iyanbao-classify-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  classify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/hesai-broker-reports-20260914
+      - name: Install PDF tools
+        run: python -m pip install --quiet requests pypdf pymupdf
+      - name: Download and classify
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf iyanbao_classify
+          mkdir -p iyanbao_classify/pdfs
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json, re
+          import requests, fitz
+          from pypdf import PdfReader
+
+          URLS=[
+          'https://file.iyanbao.com/pdf/03b07-af2ae5c3-1c56-467c-99ac-cec678c9a2d1.pdf',
+          'https://file.iyanbao.com/pdf/1a796-a569267e-7a6f-4793-9597-f8bff94e1062.pdf',
+          'https://file.iyanbao.com/pdf/319ab-89630051-d32f-482b-ac3b-863c665712c8.pdf',
+          'https://file.iyanbao.com/pdf/41bb4-6271eb5f-fd17-449e-a174-13e31eac5b65.pdf',
+          'https://file.iyanbao.com/pdf/6b9b1-1936eeec-e339-48a8-9a72-9fe891d644c2.pdf',
+          'https://file.iyanbao.com/pdf/a0b0b-01c477a3-a6fa-447b-9674-8801b9fe4438.pdf',
+          'https://file.iyanbao.com/pdf/b7e9f-9ec8862d-5817-4065-a411-2e85a0c7079c.pdf',
+          'https://file.iyanbao.com/pdf/dbb1e-b10a7ff9-33a2-47fa-b269-cb194590ed8f.pdf',
+          'https://file.iyanbao.com/pdf/e42a9-f0f64dc1-392a-4eaa-af5e-a1818cfb948d.pdf',
+          'https://file.iyanbao.com/pdf/facab-6a6b76b2-1a29-4b48-b5db-f7c3c9021ce5.pdf',
+          ]
+          out=Path('iyanbao_classify'); pdfdir=out/'pdfs'
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://www.iyanbao.com/'})
+          records=[]
+          for i,u in enumerate(URLS,1):
+              rec={'index':i,'url':u}
+              try:
+                  r=s.get(u,timeout=180,allow_redirects=True)
+                  rec.update({'status':r.status_code,'size':len(r.content),'content_type':r.headers.get('content-type')})
+                  if r.status_code!=200 or not r.content.startswith(b'%PDF-'):
+                      records.append(rec); continue
+                  p=pdfdir/f'{i:02d}.pdf'; p.write_bytes(r.content)
+                  rec['sha256']=hashlib.sha256(r.content).hexdigest()
+                  reader=PdfReader(str(p),strict=False); rec['pages']=len(reader.pages)
+                  sample=[]
+                  for n in sorted(set(list(range(min(8,len(reader.pages))))+[len(reader.pages)//2,max(0,len(reader.pages)-1)])):
+                      try: sample.append(reader.pages[n].extract_text() or '')
+                      except Exception: pass
+                  text='\n'.join(sample)
+                  # fallback through PyMuPDF
+                  if len(text.strip())<200:
+                      doc=fitz.open(str(p)); text='\n'.join(page.get_text('text') for page in list(doc)[:min(8,len(doc))])
+                  rec['sample']=text[:12000]
+                  rec['hesai_match']=bool(re.search(r'禾赛|Hesai|HSAI|02525|2525\.HK',text,re.I))
+                  rec['title_lines']=[x.strip() for x in text.splitlines() if x.strip()][:35]
+                  rec['filename']=p.name
+              except Exception as e: rec['error']=repr(e)
+              records.append(rec)
+          (out/'classification.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          for r in records:
+              print('\n===',r.get('index'),r.get('pages'),r.get('hesai_match'),r.get('size'),r.get('url'))
+              print('\n'.join(r.get('title_lines',[])[:25]))
+          PY
+      - name: Upload classification
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-iyanbao-classification-20260914
+          path: iyanbao_classify
+          retention-days: 3
