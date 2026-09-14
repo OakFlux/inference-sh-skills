@@ -1,0 +1,54 @@
+name: Quick probe fxbaogao view page 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fxbaogao-view-quick-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Fetch pages and inspect asset references
+        shell: bash
+        run: |
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'text/html,*/*'})
+          out=Path('fxquick'); out.mkdir()
+          for name,url in [('detail','https://www.fxbaogao.com/detail/4897747'),('view','https://www.fxbaogao.com/view?id=4897747')]:
+            try:
+              r=s.get(url,timeout=(15,45),allow_redirects=True)
+              print('PAGE',name,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              (out/f'{name}.html').write_bytes(r.content)
+              text=r.text
+              for pat in ['4897747','report-image','public.fxbaogao.com','.pdf','pdfUrl','fileUrl','download','view?id','pageCount','totalPage','reportId','api/']:
+                hits=list(re.finditer(re.escape(pat),text,re.I))
+                print('PAT',name,pat,len(hits),flush=True)
+                for m in hits[:10]: print(text[max(0,m.start()-800):m.start()+1800].replace('\n',' ')[:2600],flush=True)
+              soup=BeautifulSoup(text,'html.parser')
+              for tag in soup.find_all(['script','a','img'],src=True)+soup.find_all(['a'],href=True):
+                raw=tag.get('src') or tag.get('href')
+                full=urljoin(r.url,raw)
+                if any(x in full.lower() for x in ['4897747','report-image','pdf','download','view','api']):
+                  print('REF',name,tag.name,full,flush=True)
+            except Exception as e:
+              print('ERROR',name,type(e).__name__,e,flush=True)
+          PY
+      - name: Upload raw pages
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-view-quick-probe
+          path: fxquick/
+          retention-days: 2
