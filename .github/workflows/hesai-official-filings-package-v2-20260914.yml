@@ -1,0 +1,132 @@
+name: Package Hesai filings direct official links 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/hesai-official-filings-package-v2-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pymupdf
+
+      - name: Download validate package
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv, hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests, pymupdf
+
+          OUTZIP = Path('Hesai_All_Annual_Reports_Prospectuses_Latest_Quarter_2026-09-14.zip')
+          ROOT = Path('禾赛_全部年报_招股说明书及最新季报_截至2026-09-14')
+          RENDERS = Path('_hesai_v2_renders')
+          ROOT.mkdir(exist_ok=True); RENDERS.mkdir(exist_ok=True)
+
+          docs = [
+            ('01_年度报告','禾赛_2022年年度报告_Form_20-F_完整版.pdf','2022年年度报告（Form 20-F）','2023-04-20','https://investor.hesaitech.com/static-files/797ccf0c-8bb2-42bc-a048-8e52176b621b',180,('2022',),('annualreport','form20-f')),
+            ('01_年度报告','禾赛_2023年年度报告_Form_20-F_完整版.pdf','2023年年度报告（Form 20-F）','2024-04-25','https://investor.hesaitech.com/static-files/223d39f0-0a21-4d9a-9830-a7b2ef9332bc',190,('2023',),('annualreport','form20-f')),
+            ('01_年度报告','禾赛_2024年年度报告_Form_20-F_完整版.pdf','2024年年度报告（Form 20-F）','2025-04-01','https://investor.hesaitech.com/static-files/67fbedf2-04a1-4f54-b116-ef15d55d7d0f',170,('2024',),('annualreport','form20-f')),
+            ('01_年度报告','禾赛_2025年年度报告_Form_20-F_完整版.pdf','2025年年度报告（Form 20-F）','2026-04-24','https://investor.hesaitech.com/static-files/b758475b-c739-4f9c-ad06-a763623b413b',200,('2025',),('annualreport','form20-f')),
+            ('02_招股说明书','禾赛_2023年纳斯达克IPO最终招股说明书_424B4_完整版.pdf','2023年纳斯达克IPO最终招股说明书（424B4）','2023-02-09','https://investor.hesaitech.com/static-files/d7cf35e4-668e-415c-afd4-38d30abe1220',250,('2023',),('prospectus','initialpublicoffering')),
+            ('02_招股说明书','禾赛_2025年香港全球发售招股章程_完整版.pdf','2025年香港全球发售最终招股章程','2025-09-08','https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0908/2025090800017.pdf',400,('2025',),('globaloffering','prospectus')),
+            ('02_招股说明书','禾赛_2025年全球发售美国最终招股补充文件_424B5.pdf','2025年全球发售美国最终招股补充文件（424B5）','2025-09-12','https://investor.hesaitech.com/static-files/9d6eb9b5-91f1-4f21-952f-03222547e69c',100,('2025',),('prospectussupplement','globaloffering')),
+            ('03_最新季报','禾赛_2026年第二季度业绩_Form_6-K_截至2026-06-30.pdf','2026年第二季度业绩及中期财务资料（Form 6-K）','2026-08-18','https://investor.hesaitech.com/static-files/41782b09-9c75-47ee-88ac-188e15b051a8',40,('2026',),('form6-k','secondquarter2026')),
+            ('03_最新季报','禾赛_2026年第二季度未经审核财务业绩_港交所版.pdf','2026年第二季度未经审核财务业绩（港交所版）','2026-08-18','https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0818/2026081800396.pdf',15,('2026',),('quarterendedjune302026','secondquarter2026','截至2026年6月30日止季度')),
+          ]
+
+          S = requests.Session()
+          HEADERS = {'User-Agent':'curl/8.5.0','Accept':'application/pdf,*/*','Referer':'https://investor.hesaitech.com/','Connection':'close'}
+          def variants(url):
+            out=[url]
+            if 'investor.hesaitech.com' in url: out.append(url.replace('investor.hesaitech.com','hesai.gcs-web.com'))
+            if 'www1.hkexnews.hk' in url: out.append(url.replace('www1.hkexnews.hk','www.hkexnews.hk'))
+            return out
+          def fetch(url):
+            errors=[]
+            for u in variants(url):
+              for attempt in range(1,3):
+                try:
+                  r=S.get(u,headers=HEADERS,timeout=(20,180),allow_redirects=True)
+                  print('GET',r.status_code,len(r.content),u,flush=True)
+                  if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>50000: return r.content,str(r.url)
+                  errors.append(f'{u}: HTTP {r.status_code}/{len(r.content)}')
+                except Exception as e: errors.append(f'{u}: {type(e).__name__}: {e}')
+                time.sleep(attempt)
+            raise RuntimeError(' | '.join(errors))
+          def compact(t): return re.sub(r'[^0-9A-Za-z\u3400-\u9FFF]+','',t).lower()
+          def validate(path,min_pages,years,types):
+            raw=path.read_bytes()
+            doc=pymupdf.open(str(path)); pages=len(doc)
+            if pages<min_pages: raise RuntimeError(f'{path.name}: pages {pages} < {min_pages}')
+            idx=sorted(set(list(range(min(25,pages)))+[pages-1]))
+            text='\n'.join(doc.load_page(i).get_text('text') for i in idx)
+            norm=compact(text)
+            if not any(compact(x) in norm for x in ('Hesai Group','Hesai Technology','禾赛科技','禾賽科技','股份代號2525','stock code 2525')): raise RuntimeError(f'{path.name}: company marker missing')
+            if not any(compact(x) in norm for x in years): raise RuntimeError(f'{path.name}: year missing')
+            if not any(compact(x) in norm for x in types): raise RuntimeError(f'{path.name}: type marker missing')
+            for pno in sorted(set((0,pages//2,pages-1))):
+              pix=doc.load_page(pno).get_pixmap(matrix=pymupdf.Matrix(0.8,0.8),alpha=False)
+              p=RENDERS/f'{path.stem}_{pno+1}.png'; pix.save(str(p))
+              if p.stat().st_size<2000: raise RuntimeError(f'{path.name}: render failed page {pno+1}')
+            doc.close()
+            q=subprocess.run(['qpdf','--check',str(path)],capture_output=True,text=True)
+            if q.returncode not in (0,3): raise RuntimeError(f'{path.name}: qpdf failed {q.stderr[-500:]}')
+            return pages,len(raw),hashlib.sha256(raw).hexdigest()
+
+          recs=[]; hashes=set()
+          for category,filename,dtype,date,url,min_pages,years,types in docs:
+            d=ROOT/category; d.mkdir(parents=True,exist_ok=True)
+            data,actual=fetch(url); p=d/filename; p.write_bytes(data)
+            pages,size,h=validate(p,min_pages,years,types)
+            if h in hashes: raise RuntimeError('duplicate '+filename)
+            hashes.add(h)
+            r={'relative_path':str(p.relative_to(ROOT)),'document_type':dtype,'release_date':date,'source_url':actual,'pages':pages,'bytes':size,'sha256':h}
+            recs.append(r); print('VERIFIED',json.dumps(r,ensure_ascii=False),flush=True)
+
+          (ROOT/'manifest.json').write_text(json.dumps(recs,ensure_ascii=False,indent=2),encoding='utf-8')
+          (ROOT/'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['relative_path']}\n" for r in recs),encoding='utf-8')
+          with (ROOT/'来源与校验清单.csv').open('w',encoding='utf-8-sig',newline='') as f:
+            w=csv.DictWriter(f,fieldnames=['序号','文件路径','文档类型','发布日期','页数','文件大小_字节','SHA256','实际来源']); w.writeheader()
+            for i,r in enumerate(recs,1): w.writerow({'序号':i,'文件路径':r['relative_path'],'文档类型':r['document_type'],'发布日期':r['release_date'],'页数':r['pages'],'文件大小_字节':r['bytes'],'SHA256':r['sha256'],'实际来源':r['source_url']})
+          lines=['禾赛科技 / Hesai Group（NASDAQ: HSAI；HKEX: 02525）官方披露文件','资料截止日期：2026年9月14日','','收录内容：','1. 上市以来全部独立年度报告：2022—2025年Form 20-F，共4份。','2. 最终招股文件：2023年纳斯达克IPO最终招股说明书、2025年香港全球发售最终招股章程及美国最终招股补充文件，共3份。','3. 最新季度披露：截至2026年6月30日的2026年第二季度业绩，收录SEC Form 6-K及港交所季度业绩版本，共2份。','','截至2026年9月14日，2026年第三季度报告尚未发布，最新已披露季度为2026年第二季度。','年度报告按年度保留一份完整版本，不重复收录年报摘要或同内容转载版。','所有PDF均保持官方原始版式，未删页、未加水印。','',f"共{len(recs)}份PDF，合计{sum(r['pages'] for r in recs)}页，PDF总大小{sum(r['bytes'] for r in recs)/1048576:.2f} MB。",'','文件清单：']
+          for i,r in enumerate(recs,1): lines += [f"{i}. {r['relative_path']}",f"   {r['document_type']}｜{r['release_date']}｜{r['pages']}页｜{r['bytes']/1048576:.2f} MB",f"   来源：{r['source_url']}",f"   SHA-256：{r['sha256']}",'']
+          lines.append('核验项目：PDF文件头、公司名称、报告年度与类型、页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。')
+          (ROOT/'README_文件清单与口径说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          with zipfile.ZipFile(OUTZIP,'w',zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+            for p in sorted(ROOT.rglob('*')):
+              if p.is_file(): z.write(p,str(p))
+          with zipfile.ZipFile(OUTZIP) as z:
+            bad=z.testzip(); assert bad is None,bad
+            assert sum(n.lower().endswith('.pdf') for n in z.namelist())==9
+          print('FINAL',OUTZIP,OUTZIP.stat().st_size,hashlib.sha256(OUTZIP.read_bytes()).hexdigest(),flush=True)
+          print('TOTAL_PAGES',sum(r['pages'] for r in recs),flush=True)
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-official-filings-package-v2-20260914
+          path: Hesai_All_Annual_Reports_Prospectuses_Latest_Quarter_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-v2-diagnostics
+          path: _hesai_v2_renders/
+          if-no-files-found: ignore
+          retention-days: 2
