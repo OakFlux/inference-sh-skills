@@ -1,0 +1,91 @@
+name: Probe public report service 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/transthera-report-service-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Request report metadata and file
+        shell: bash
+        run: |
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import requests
+
+          base='https://api.sdyanbao.com'
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept':'application/json,text/plain,*/*',
+            'Origin':'https://www.sdyanbao.com',
+            'Referer':'https://www.sdyanbao.com/detail/894460',
+            'X-Token':'',
+            'Device':'1',
+          })
+          outputs=[]
+          for endpoint,payload in [
+            ('/api/file/detail',{'id':894460,'opFrom':1}),
+            ('/api/file/download',{'id':894460,'opFrom':1}),
+            ('/api/file/download',{'file_id':894460,'opFrom':1}),
+            ('/api/file/download',{'id':894460,'device':1,'opFrom':1}),
+          ]:
+            for mode in ('json','form'):
+              try:
+                kwargs={'json':payload} if mode=='json' else {'data':payload}
+                r=s.post(base+endpoint,timeout=90,allow_redirects=False,**kwargs)
+                ctype=r.headers.get('content-type','')
+                print('\nRESPONSE',endpoint,mode,r.status_code,ctype,len(r.content),r.headers.get('location'),flush=True)
+                print(r.content[:3000].decode('utf-8','replace'),flush=True)
+                rec={'endpoint':endpoint,'mode':mode,'payload':payload,'status':r.status_code,'ctype':ctype,'length':len(r.content),'location':r.headers.get('location')}
+                if r.content.startswith(b'%PDF-') and len(r.content)>100000:
+                  Path('transthera_prospectus.pdf').write_bytes(r.content)
+                  rec['saved']='direct-pdf'
+                else:
+                  try:
+                    obj=r.json(); rec['json']=obj
+                    print('JSON',json.dumps(obj,ensure_ascii=False)[:10000],flush=True)
+                    def walk(x):
+                      if isinstance(x,dict):
+                        for k,v in x.items():
+                          if isinstance(v,str) and (v.startswith('http') or '.pdf' in v.lower()): yield k,v
+                          yield from walk(v)
+                      elif isinstance(x,list):
+                        for v in x: yield from walk(v)
+                    for key,url in walk(obj):
+                      print('FILE_CANDIDATE',key,url,flush=True)
+                      try:
+                        rr=s.get(url if url.startswith('http') else base+url,timeout=300,allow_redirects=True)
+                        print('FILE_FETCH',rr.status_code,len(rr.content),rr.headers.get('content-type'),rr.url,flush=True)
+                        if rr.content.startswith(b'%PDF-') and len(rr.content)>100000:
+                          Path('transthera_prospectus.pdf').write_bytes(rr.content)
+                          rec['saved_url']=rr.url
+                      except Exception as ee:
+                        print('FILE_FETCH_ERROR',repr(ee),flush=True)
+                  except Exception as e:
+                    rec['json_error']=repr(e)
+                outputs.append(rec)
+              except Exception as e:
+                print('REQUEST_ERROR',endpoint,mode,repr(e),flush=True)
+                outputs.append({'endpoint':endpoint,'mode':mode,'payload':payload,'error':repr(e)})
+          Path('report_service_probe.json').write_text(json.dumps(outputs,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: transthera-report-service-probe
+          path: |
+            report_service_probe.json
+            transthera_prospectus.pdf
+          if-no-files-found: warn
+          retention-days: 2
