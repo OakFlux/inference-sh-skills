@@ -1,0 +1,308 @@
+name: Package GenFleet official filings v2 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/genfleet-official-filings-package-v2-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pymupdf
+
+      - name: Download validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+
+          AS_OF = '2026-09-14'
+          ROOT = Path('劲方医药_全部年报_招股说明书及最新定期报告_截至2026-09-14')
+          RENDERS = Path('_genfleet_v2_validation/renders')
+          OUTZIP = Path('GenFleet_All_Annual_Reports_Prospectus_Latest_Report_2026-09-14.zip')
+          ROOT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          docs = [
+              {
+                  'category': '01_年度报告',
+                  'filename': '01_劲方医药_2025年年度报告_完整版.pdf',
+                  'document_type': '2025年年度报告',
+                  'release_date': '2026-04-17',
+                  'expected_pages': 221,
+                  'year': '2025',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0417/2026041701936_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0417/2026041701935.pdf',
+                  ],
+              },
+              {
+                  'category': '02_招股说明书',
+                  'filename': '02_劲方医药_2025年全球发售最终招股说明书_完整版.pdf',
+                  'document_type': '2025年全球发售最终招股说明书',
+                  'release_date': '2025-09-11',
+                  'expected_pages': 724,
+                  'year': '2025',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0911/2025091100032_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0911/2025091100031.pdf',
+                  ],
+              },
+              {
+                  'category': '03_最新定期财务披露',
+                  'filename': '03_劲方医药_2026年中期业绩公告_截至2026年6月30日.pdf',
+                  'document_type': '2026年中期业绩公告（最新定期财务披露）',
+                  'release_date': '2026-08-21',
+                  'expected_pages': 38,
+                  'year': '2026',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0821/2026082100176_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0821/2026082100175.pdf',
+                  ],
+              },
+              {
+                  'category': '04_补充_最新已刊发完整中期报告',
+                  'filename': '04_劲方医药_2025年中期报告_最新已刊发完整中期报告.pdf',
+                  'document_type': '2025年中期报告（最新已刊发完整中期报告）',
+                  'release_date': '2025-09-30',
+                  'expected_pages': 57,
+                  'year': '2025',
+                  'urls': [
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0930/2025093002145_c.pdf',
+                      'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0930/2025093002144.pdf',
+                  ],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en;q=0.6',
+              'Referer': 'https://www1.hkexnews.hk/',
+              'Connection': 'close',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(value).upper())
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def variants(urls: list[str]) -> list[str]:
+              result = []
+              for url in urls:
+                  result.append(url)
+                  if 'www1.hkexnews.hk' in url:
+                      result.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              return list(dict.fromkeys(result))
+
+          def fetch_pdf(urls: list[str]) -> tuple[bytes, str]:
+              errors = []
+              for url in variants(urls):
+                  for attempt in range(1, 4):
+                      try:
+                          response = session.get(url, headers=headers, timeout=(35, 900), allow_redirects=True)
+                          print('GET', attempt, response.status_code, len(response.content), url, flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 40000:
+                              return response.content, str(response.url)
+                          errors.append(f'{url}: HTTP {response.status_code}/{len(response.content)}')
+                      except Exception as exc:
+                          errors.append(f'{url}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors[-16:]))
+
+          def validate(path: Path, cfg: dict) -> dict:
+              raw = path.read_bytes()
+              if not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'{path.name}: invalid PDF signature')
+              doc = pymupdf.open(str(path))
+              pages = len(doc)
+              if pages != cfg['expected_pages']:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: expected {cfg["expected_pages"]} pages, got {pages}')
+
+              probe_indices = sorted(set(list(range(min(35, pages))) + [pages // 2, pages - 1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in probe_indices)
+              norm = compact(text)
+              identity_markers = (
+                  'GENFLEETTHERAPEUTICS', '勁方醫藥', '劲方医药',
+                  'STOCKCODE2595', '股份代號2595', '股份代码2595',
+              )
+              if not any(compact(marker) in norm for marker in identity_markers):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: company identity marker missing')
+              if cfg['year'] not in norm:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: year marker missing')
+
+              rendered = []
+              for page_no in sorted(set((0, pages // 2, pages - 1))):
+                  page = doc.load_page(page_no)
+                  pix = page.get_pixmap(matrix=pymupdf.Matrix(0.9, 0.9), alpha=False)
+                  render_path = RENDERS / f'{path.stem}_page_{page_no + 1:04d}.png'
+                  pix.save(str(render_path))
+                  if pix.width < 400 or pix.height < 400 or render_path.stat().st_size < 3000:
+                      doc.close()
+                      raise RuntimeError(f'{path.name}: render validation failed on page {page_no + 1}')
+                  rendered.append({'page': page_no + 1, 'width': pix.width, 'height': pix.height, 'bytes': render_path.stat().st_size})
+              doc.close()
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf failed: {qpdf.stderr[-800:]}')
+
+              return {
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'qpdf_return_code': qpdf.returncode,
+                  'rendered_pages': rendered,
+              }
+
+          records = []
+          seen_hashes = set()
+          for cfg in docs:
+              directory = ROOT / cfg['category']
+              directory.mkdir(parents=True, exist_ok=True)
+              data, actual_url = fetch_pdf(cfg['urls'])
+              path = directory / cfg['filename']
+              path.write_bytes(data)
+              check = validate(path, cfg)
+              if check['sha256'] in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF content: {path.name}')
+              seen_hashes.add(check['sha256'])
+              record = {
+                  'relative_path': str(path.relative_to(ROOT)),
+                  'document_type': cfg['document_type'],
+                  'release_date': cfg['release_date'],
+                  'official_url': actual_url,
+                  'language': '繁体中文' if actual_url.lower().endswith('_c.pdf') else '英文',
+                  **check,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 4:
+              raise RuntimeError(f'Expected 4 PDFs, got {len(records)}')
+
+          with (ROOT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','文件路径','文档类型','发布日期','语言','页数','文件大小_字节','SHA256','官方来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for index, record in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': index,
+                      '文件路径': record['relative_path'],
+                      '文档类型': record['document_type'],
+                      '发布日期': record['release_date'],
+                      '语言': record['language'],
+                      '页数': record['pages'],
+                      '文件大小_字节': record['bytes'],
+                      'SHA256': record['sha256'],
+                      '官方来源': record['official_url'],
+                  })
+
+          manifest = {
+              'company': '劲方医药科技（上海）股份有限公司',
+              'english_name': 'GenFleet Therapeutics (Shanghai) Inc.',
+              'stock_code': '02595.HK',
+              'as_of_date': AS_OF,
+              'listing_date': '2025-09-19',
+              'annual_report_years': [2025],
+              'latest_periodic_financial_disclosure': '2026年中期业绩公告（截至2026年6月30日止六个月）',
+              'latest_full_interim_report_published': '2025年中期报告',
+              'files': records,
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["relative_path"]}\n' for r in records), encoding='utf-8')
+
+          lines = [
+              '劲方医药科技（上海）股份有限公司（02595.HK）官方披露文件',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '收录内容：',
+              '1. 2025年年度报告；',
+              '2. 2025年全球发售最终招股说明书；',
+              '3. 2026年中期业绩公告，作为截至核对日最新定期财务披露；',
+              '4. 2025年中期报告，作为最新已刊发完整中期报告的补充。',
+              '',
+              '劲方医药于2025年9月上市，因此截至核对日只有2025年度一份上市后独立年报。香港主板公司不按A股制度发布第一季度和第三季度报告，故本包以2026年中期业绩公告作为“最新季报/最新一期定期财务披露”。截至2026年9月14日，2026年完整中期报告尚未刊发。',
+              '所有PDF均来自香港交易所披露易，保持官方原始版式，未删页、未重排、未加水印。',
+              '',
+              f'共{len(records)}份PDF，合计{sum(r["pages"] for r in records)}页，PDF总大小{sum(r["bytes"] for r in records)/1048576:.2f} MB。',
+              '',
+              '文件清单：',
+          ]
+          for index, record in enumerate(records, 1):
+              lines.extend([
+                  f'{index}. {record["relative_path"]}',
+                  f'   {record["document_type"]}｜{record["release_date"]}｜{record["language"]}｜{record["pages"]}页｜{record["bytes"]/1048576:.2f} MB',
+                  f'   官方来源：{record["official_url"]}',
+                  f'   SHA-256：{record["sha256"]}',
+                  '',
+              ])
+          lines.append('核验项目：PDF文件头、公司名称/股份代码、报告年度、精确页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。')
+          (ROOT / 'README_文件清单与口径说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path))
+          with zipfile.ZipFile(OUTZIP, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              if sum(name.lower().endswith('.pdf') for name in archive.namelist()) != 4:
+                  raise RuntimeError('Unexpected PDF count in ZIP')
+
+          print('FINAL_ZIP', OUTZIP, OUTZIP.stat().st_size, sha256_file(OUTZIP), flush=True)
+          print('TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: genfleet-official-filings-package-v2-20260914
+          path: GenFleet_All_Annual_Reports_Prospectus_Latest_Report_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: genfleet-v2-validation-diagnostics
+          path: _genfleet_v2_validation/
+          if-no-files-found: ignore
+          retention-days: 2
+          compression-level: 6
