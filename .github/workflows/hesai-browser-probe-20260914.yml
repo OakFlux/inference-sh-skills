@@ -1,0 +1,156 @@
+name: Probe Hesai report viewer network
+
+on:
+  push:
+    branches:
+      - tmp/hesai-broker-reports-20260914
+    paths:
+      - '.github/workflows/hesai-browser-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  browser-probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/hesai-broker-reports-20260914
+      - name: Install packages
+        run: python -m pip install --quiet requests selenium beautifulsoup4
+      - name: Probe with Chrome
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf browser_probe
+          mkdir -p browser_probe
+          python - <<'PY'
+          import json, os, re, time
+          from pathlib import Path
+          import requests
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+
+          out = Path('browser_probe')
+          sess = requests.Session()
+          sess.headers.update({'User-Agent':'Mozilla/5.0','Content-Type':'application/json'})
+          payload = {'keywords':'禾赛','pageIndex':1,'pageSize':20,'order':2,'nop':-1}
+          r = sess.post('https://api.fxbaogao.com/mofoun/report/searchReportData/searchListNoAuth', json=payload, timeout=30)
+          print('SEARCH', r.status_code, len(r.content), r.text[:1000])
+          (out/'fx_search.json').write_bytes(r.content)
+          docs=[]
+          try:
+              data=r.json().get('data',{})
+              docs=data.get('dataList') or []
+          except Exception: pass
+          doc_ids=[]
+          for d in docs:
+              title=str(d.get('title',''))
+              if '禾赛' in title:
+                  doc_ids.append(str(d.get('docId')))
+                  print('DOC', d.get('docId'), d.get('orgName'), d.get('pageNum'), title)
+          if '4958732' not in doc_ids: doc_ids.insert(0,'4958732')
+          doc_ids=doc_ids[:12]
+
+          options=Options()
+          options.add_argument('--headless=new')
+          options.add_argument('--no-sandbox')
+          options.add_argument('--disable-dev-shm-usage')
+          options.add_argument('--disable-gpu')
+          options.add_argument('--window-size=1600,1200')
+          options.add_argument('--lang=zh-CN')
+          options.set_capability('goog:loggingPrefs', {'performance':'ALL','browser':'ALL'})
+          driver=webdriver.Chrome(options=options)
+          driver.set_page_load_timeout(60)
+          all_results=[]
+          urls=[]
+          for doc_id in doc_ids:
+              for kind, url in [
+                  ('detail',f'https://www.fxbaogao.com/detail/{doc_id}'),
+                  ('view',f'https://www.fxbaogao.com/view?id={doc_id}')]:
+                  item={'doc_id':doc_id,'kind':kind,'url':url}
+                  try:
+                      driver.get(url)
+                      time.sleep(8)
+                      item['current_url']=driver.current_url
+                      item['title']=driver.title
+                      html=driver.page_source
+                      (out/f'{doc_id}_{kind}.html').write_text(html,encoding='utf-8',errors='ignore')
+                      item['html_size']=len(html)
+                      item['anchors']=driver.execute_script("return Array.from(document.querySelectorAll('a')).map(a=>({text:(a.innerText||'').trim(),href:a.href})).filter(x=>x.href)")
+                      item['frames']=driver.execute_script("return Array.from(document.querySelectorAll('iframe,embed,object')).map(x=>({tag:x.tagName,src:x.src||x.data||'',type:x.type||''}))")
+                      item['resources']=driver.execute_script("return performance.getEntriesByType('resource').map(x=>x.name)")
+                      logs=driver.get_log('performance')
+                      net=[]
+                      for entry in logs:
+                          try:
+                              msg=json.loads(entry['message'])['message']
+                              if msg['method'] in ('Network.requestWillBeSent','Network.responseReceived'):
+                                  p=msg['params']
+                                  u=(p.get('request') or p.get('response') or {}).get('url')
+                                  if u: net.append(u)
+                          except Exception: pass
+                      item['network']=sorted(set(net))
+                      for collection in (item['resources'],item['network']):
+                          for u in collection:
+                              if any(k in u.lower() for k in ('.pdf','download','file','document','report','oss','cos','cdn')):
+                                  urls.append(u)
+                      for a in item['anchors']:
+                          if any(k in a['href'].lower() for k in ('.pdf','download','view','file')):
+                              urls.append(a['href'])
+                  except Exception as e:
+                      item['error']=repr(e)
+                  all_results.append(item)
+
+          extra=[
+            'https://www.vzkoo.com/read/2025072393f91aa19d9f68d44e6c5489.html',
+            'https://www.vzkoo.com/read/4650358727080153088.html',
+            'https://www.360why.com/bg/dc53ae000097792.html',
+            'https://www.hangyan.co/reports/3586373163543430735',
+          ]
+          for i,url in enumerate(extra,1):
+              item={'kind':'extra','url':url}
+              try:
+                  driver.get(url); time.sleep(8)
+                  item['current_url']=driver.current_url; item['title']=driver.title
+                  html=driver.page_source
+                  (out/f'extra_{i}.html').write_text(html,encoding='utf-8',errors='ignore')
+                  item['anchors']=driver.execute_script("return Array.from(document.querySelectorAll('a')).map(a=>({text:(a.innerText||'').trim(),href:a.href})).filter(x=>x.href)")
+                  item['frames']=driver.execute_script("return Array.from(document.querySelectorAll('iframe,embed,object')).map(x=>({tag:x.tagName,src:x.src||x.data||'',type:x.type||''}))")
+                  item['resources']=driver.execute_script("return performance.getEntriesByType('resource').map(x=>x.name)")
+                  logs=driver.get_log('performance')
+                  net=[]
+                  for entry in logs:
+                      try:
+                          msg=json.loads(entry['message'])['message']
+                          if msg['method'] in ('Network.requestWillBeSent','Network.responseReceived'):
+                              p=msg['params']; u=(p.get('request') or p.get('response') or {}).get('url')
+                              if u: net.append(u)
+                      except Exception: pass
+                  item['network']=sorted(set(net))
+                  for collection in (item['resources'],item['network']):
+                      for u in collection:
+                          if any(k in u.lower() for k in ('.pdf','download','file','document','report','oss','cos','cdn')): urls.append(u)
+                  for a in item['anchors']:
+                      if any(k in a['href'].lower() for k in ('.pdf','download','view','file')): urls.append(a['href'])
+              except Exception as e: item['error']=repr(e)
+              all_results.append(item)
+          driver.quit()
+          data={'docs':docs,'results':all_results,'candidate_urls':sorted(set(urls))}
+          (out/'browser_results.json').write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('CANDIDATES')
+          print('\n'.join(sorted(set(urls))))
+          PY
+      - name: Upload browser probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-browser-probe-20260914
+          path: browser_probe
+          retention-days: 3
