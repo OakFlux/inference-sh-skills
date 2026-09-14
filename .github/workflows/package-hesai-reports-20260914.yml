@@ -1,0 +1,159 @@
+name: Package validated Hesai broker research PDFs
+
+on:
+  push:
+    branches:
+      - tmp/hesai-broker-reports-20260914
+    paths:
+      - '.github/workflows/package-hesai-reports-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Taipei
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/hesai-broker-reports-20260914
+      - name: Install PDF tools
+        run: python -m pip install --quiet requests pypdf
+      - name: Download, validate, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf hesai_package
+          mkdir -p hesai_package/reports hesai_package/output
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          ROOT = Path('hesai_package')
+          REPORTS = ROOT / 'reports'
+          OUTPUT = ROOT / 'output'
+          ZIP_NAME = '禾赛_HSAI_02525_券商研究报告_3份_完整PDF.zip'
+
+          targets = [
+              {
+                  'filename': '01_国海证券_禾赛科技HSAI深度报告_全球车载激光雷达龙头量产降本拉开序幕_2024-02-23_37页.pdf',
+                  'url': 'https://file.iyanbao.com/pdf/df78f-2bb663bf-2c81-4da8-8526-5a512e6e8978.pdf',
+                  'broker': '国海证券',
+                  'date': '2024-02-23',
+                  'title': '禾赛科技（HSAI）深度报告：全球车载激光雷达龙头，量产降本拉开序幕',
+                  'type': '公司深度／首次覆盖',
+                  'expected_pages': 37,
+                  'keywords': ['禾赛', 'HSAI', '全球车载激光雷达龙头'],
+              },
+              {
+                  'filename': '02_西部证券_激光雷达行业深度报告_自动驾驶商业化提速千亿蓝海百家争鸣_2021-03-02_53页.pdf',
+                  'url': 'https://file.iyanbao.com/pdf/ff014-9b350bed-8d4c-4f86-a700-982001a0b3d3.pdf',
+                  'broker': '西部证券',
+                  'date': '2021-03-02',
+                  'title': '激光雷达行业深度报告：自动驾驶商业化提速，千亿蓝海百家争鸣',
+                  'type': '行业深度（重点覆盖禾赛）',
+                  'expected_pages': 53,
+                  'keywords': ['激光雷达', '禾赛'],
+              },
+              {
+                  'filename': '03_国金证券_具身智能行业研究_美国或推机器人国家战略禾赛再获独家定点_2025-03-27_13页.pdf',
+                  'url': 'https://file.iyanbao.com/pdf/a0b0b-01c477a3-a6fa-447b-9674-8801b9fe4438.pdf',
+                  'broker': '国金证券',
+                  'date': '2025-03-27',
+                  'title': '具身智能行业研究：美国或推机器人国家战略，禾赛再获独家定点',
+                  'type': '行业专题（直接覆盖禾赛）',
+                  'expected_pages': 13,
+                  'keywords': ['禾赛', '机器人', '激光雷达'],
+              },
+          ]
+
+          s = requests.Session()
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://www.iyanbao.com/',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+          })
+
+          records = []
+          for target in targets:
+              r = s.get(target['url'], timeout=180, allow_redirects=True)
+              r.raise_for_status()
+              data = r.content
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f"Not a PDF: {target['url']} {r.status_code} {r.headers.get('content-type')}")
+              path = REPORTS / target['filename']
+              path.write_bytes(data)
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages != target['expected_pages']:
+                  raise RuntimeError(f"Page mismatch for {path.name}: expected {target['expected_pages']}, got {pages}")
+              sample_parts = []
+              sample_indices = sorted(set(list(range(min(12, pages))) + [pages // 2, pages - 1]))
+              for idx in sample_indices:
+                  try:
+                      sample_parts.append(reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              sample = '\n'.join(sample_parts)
+              normalized = re.sub(r'\s+', '', sample).lower()
+              missing = [kw for kw in target['keywords'] if re.sub(r'\s+', '', kw).lower() not in normalized]
+              if missing:
+                  raise RuntimeError(f"Keyword validation failed for {path.name}: {missing}")
+              digest = hashlib.sha256(data).hexdigest()
+              records.append({
+                  **{k: target[k] for k in ('filename','broker','date','title','type','url')},
+                  'pages': pages,
+                  'size_bytes': len(data),
+                  'sha256': digest,
+              })
+              print(json.dumps(records[-1], ensure_ascii=False), flush=True)
+
+          manifest_lines = [
+              '禾赛（HSAI / 02525.HK）券商研究报告包',
+              '整理日期：2026-09-14',
+              '',
+              '说明：公开渠道目前可完整匿名下载的禾赛纯公司深度较少。本包选择1份公司深度、1份激光雷达行业深度和1份近期具身智能专题；均为券商发布的完整原始PDF，且直接覆盖禾赛。',
+              '',
+          ]
+          for i, rec in enumerate(records, 1):
+              manifest_lines += [
+                  f'{i}. {rec["broker"]}｜{rec["date"]}｜{rec["title"]}',
+                  f'   类型：{rec["type"]}',
+                  f'   页数：{rec["pages"]}页',
+                  f'   文件：{rec["filename"]}',
+                  f'   SHA-256：{rec["sha256"]}',
+                  f'   公开来源：{rec["url"]}',
+                  '',
+              ]
+          manifest_lines += [
+              '校验结果：三份文件均通过PDF文件头、可解析页数、禾赛/激光雷达关键词及SHA-256校验。',
+              '本包未包含付费页面、预览图拼接件、摘要重排版或下载脚本。',
+          ]
+          (REPORTS / '来源与校验.txt').write_text('\n'.join(manifest_lines), encoding='utf-8')
+          (REPORTS / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = OUTPUT / ZIP_NAME
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
+              for path in sorted(REPORTS.iterdir()):
+                  zf.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP integrity failure: {bad}')
+          print('ZIP', zip_path, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+      - name: Upload final archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: hesai-broker-research-3-complete-pdfs-20260914
+          path: hesai_package/output/禾赛_HSAI_02525_券商研究报告_3份_完整PDF.zip
+          retention-days: 7
+          compression-level: 0
