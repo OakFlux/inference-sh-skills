@@ -1,0 +1,88 @@
+name: Probe fxbaogao report API 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fxbaogao-report-api-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query public report APIs
+        shell: bash
+        run: |
+          python -m pip install --quiet requests
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import requests
+
+          s=requests.Session()
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept':'application/json,text/plain,*/*',
+            'Origin':'https://www.fxbaogao.com',
+            'Referer':'https://www.fxbaogao.com/view?id=4897747',
+          })
+          bases=['https://api.fxbaogao.com','https://a.mofoun.com','https://report.fxbaogao.com']
+          endpoints=[
+            ('GET','/mofoun/report/readReport/readReport',{'reportId':4897747}),
+            ('GET','/mofoun/report/report/getReportPreviewImages',{'reportId':4897747}),
+            ('GET','/mofoun/report/report/downloadReportByBean',{'reportId':4897747}),
+            ('GET','/mofoun/report/searchReport/detail/catalog',{'reportId':4897747}),
+          ]
+          records=[]
+          candidates=[]
+          def walk(x):
+            if isinstance(x,dict):
+              for k,v in x.items():
+                if isinstance(v,str) and (v.startswith('http') or '.pdf' in v.lower() or 'report/' in v.lower()):
+                  yield k,v
+                yield from walk(v)
+            elif isinstance(x,list):
+              for v in x: yield from walk(v)
+          for base in bases:
+            for method,path,params in endpoints:
+              try:
+                r=s.get(base+path,params=params,timeout=60,allow_redirects=True)
+                rec={'url':r.url,'status':r.status_code,'ctype':r.headers.get('content-type',''),'length':len(r.content),'head':r.text[:2000]}
+                print('\nRESPONSE',r.status_code,len(r.content),r.headers.get('content-type'),r.url,flush=True)
+                print(r.text[:8000],flush=True)
+                try:
+                  obj=r.json(); rec['json']=obj
+                  for k,u in walk(obj):
+                    candidates.append((k,u))
+                    print('CANDIDATE',k,u,flush=True)
+                except Exception as e:
+                  rec['json_error']=repr(e)
+                records.append(rec)
+              except Exception as e:
+                records.append({'base':base,'path':path,'error':repr(e)})
+                print('ERROR',base,path,repr(e),flush=True)
+          for k,u in candidates:
+            try:
+              url=u if u.startswith('http') else 'https://public.fxbaogao.com/'+u.lstrip('/')
+              r=s.get(url,timeout=300,allow_redirects=True)
+              print('FETCH_CANDIDATE',k,r.status_code,len(r.content),r.headers.get('content-type'),r.url,flush=True)
+              if r.content.startswith(b'%PDF-') and len(r.content)>100000:
+                Path('transthera_final_prospectus.pdf').write_bytes(r.content)
+                print('SAVED_PDF',len(r.content),r.url,flush=True)
+            except Exception as e:
+              print('FETCH_ERROR',k,u,repr(e),flush=True)
+          Path('fxbaogao_api_probe.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-report-api-probe
+          path: |
+            fxbaogao_api_probe.json
+            transthera_final_prospectus.pdf
+          if-no-files-found: warn
+          retention-days: 2
