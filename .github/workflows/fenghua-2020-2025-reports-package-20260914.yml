@@ -1,0 +1,423 @@
+name: Package Fenghua Advanced Technology reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fenghua-2020-2025-reports-package-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pymupdf
+
+      - name: Query official CNINFO filings, validate, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+
+          AS_OF = '2026-09-14'
+          COMPANY = '广东风华高新科技股份有限公司'
+          SHORT_NAME = '风华高科'
+          STOCK_CODE = '000636'
+          ORG_ID = 'gssz0000636'
+          ROOT_NAME = '风华高科_2020-2025年报及最新季报_截至2026-09-14'
+          ROOT = Path(ROOT_NAME)
+          WORK = Path('_fenghua_work')
+          RENDERS = WORK / 'renders'
+          OUTZIP = Path('Fenghua_Advanced_Technology_2020-2025_Annual_Reports_Latest_Reports_2026-09-14.zip')
+          for p in (ROOT, WORK, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          API = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          STATIC = 'https://static.cninfo.com.cn/'
+          HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'application/json, text/javascript, */*; q=0.01',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'Origin': 'https://www.cninfo.com.cn',
+              'Referer': 'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=000636&orgId=gssz0000636',
+              'X-Requested-With': 'XMLHttpRequest',
+              'Connection': 'close',
+          }
+
+          def compact(s: str) -> str:
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(s).upper())
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def query(category: str, date_from='2020-01-01', date_to='2026-09-14') -> list[dict]:
+              all_rows = []
+              for stock_value in (f'{STOCK_CODE},{ORG_ID}', STOCK_CODE):
+                  page = 1
+                  local = []
+                  while page <= 20:
+                      data = {
+                          'pageNum': str(page),
+                          'pageSize': '30',
+                          'column': 'szse',
+                          'tabName': 'fulltext',
+                          'plate': 'sz',
+                          'stock': stock_value,
+                          'searchkey': '',
+                          'secid': '',
+                          'category': category,
+                          'trade': '',
+                          'seDate': f'{date_from}~{date_to}',
+                          'sortName': '',
+                          'sortType': '',
+                          'isHLtitle': 'true',
+                      }
+                      r = session.post(API, data=data, headers=HEADERS, timeout=(30, 120))
+                      print('QUERY', category, stock_value, page, r.status_code, len(r.content), flush=True)
+                      r.raise_for_status()
+                      obj = r.json()
+                      rows = obj.get('announcements') or []
+                      local.extend(rows)
+                      total_pages = int(obj.get('totalpages') or obj.get('totalPages') or 1)
+                      if page >= total_pages or not rows:
+                          break
+                      page += 1
+                  if local:
+                      all_rows = local
+                      break
+              if not all_rows:
+                  raise RuntimeError(f'No CNINFO announcements returned for {category}')
+              normalized = []
+              for row in all_rows:
+                  title = re.sub(r'<[^>]+>', '', str(row.get('announcementTitle') or ''))
+                  adjunct = str(row.get('adjunctUrl') or '')
+                  announcement_id = str(row.get('announcementId') or '')
+                  publish_ms = row.get('announcementTime')
+                  publish_date = ''
+                  if publish_ms:
+                      try:
+                          publish_date = time.strftime('%Y-%m-%d', time.localtime(int(publish_ms) / 1000))
+                      except Exception:
+                          publish_date = str(publish_ms)
+                  normalized.append({
+                      'title': title,
+                      'adjunct_url': adjunct,
+                      'url': urljoin(STATIC, adjunct),
+                      'announcement_id': announcement_id,
+                      'publish_date': publish_date,
+                      'publish_ms': int(publish_ms or 0),
+                      'sec_code': str(row.get('secCode') or ''),
+                      'sec_name': str(row.get('secName') or ''),
+                      'org_id': str(row.get('orgId') or ''),
+                      'raw': row,
+                  })
+              print('RESULT_COUNT', category, len(normalized), flush=True)
+              for x in normalized:
+                  print('ANN', category, x['publish_date'], x['title'], x['url'], flush=True)
+              return normalized
+
+          annual_rows = query('category_ndbg_szsh;', '2020-01-01', AS_OF)
+          half_rows = query('category_bndbg_szsh;', '2026-01-01', AS_OF)
+          q1_rows = query('category_yjdbg_szsh;', '2026-01-01', AS_OF)
+
+          def is_full_annual(title: str, year: int) -> bool:
+              n = compact(title)
+              if str(year) not in n or '年度报告' not in n:
+                  return False
+              excluded = ('摘要', '英文', '取消', '关于', '审计报告', '社会责任', '环境社会', 'ESG', '更正公告', '补充公告')
+              return not any(compact(x) in n for x in excluded)
+
+          def rank_full(rows: list[dict], year: int, report_marker: str, exclusions=()) -> list[dict]:
+              candidates = []
+              for r in rows:
+                  n = compact(r['title'])
+                  if str(year) not in n or compact(report_marker) not in n:
+                      continue
+                  if any(compact(x) in n for x in exclusions):
+                      continue
+                  candidates.append(r)
+              candidates.sort(key=lambda x: (x['publish_ms'], '修订' in x['title'] or '更新' in x['title']), reverse=True)
+              return candidates
+
+          selections = []
+          for year in range(2020, 2026):
+              candidates = [r for r in annual_rows if is_full_annual(r['title'], year)]
+              candidates.sort(key=lambda x: x['publish_ms'], reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'Full annual report not found for {year}')
+              chosen = candidates[0]
+              selections.append({
+                  'kind': 'annual',
+                  'year': year,
+                  'title': chosen['title'],
+                  'publish_date': chosen['publish_date'],
+                  'url': chosen['url'],
+                  'filename': f'{year - 2019:02d}_风华高科_{year}年年度报告_完整版.pdf',
+                  'min_pages': 120,
+                  'type_markers': ('年度报告',),
+              })
+
+          half_candidates = rank_full(
+              half_rows, 2026, '半年度报告',
+              exclusions=('摘要', '英文', '取消', '关于', '更正公告', '补充公告')
+          )
+          if not half_candidates:
+              raise RuntimeError('2026 full semiannual report not found')
+          half = half_candidates[0]
+          selections.append({
+              'kind': 'half',
+              'year': 2026,
+              'title': half['title'],
+              'publish_date': half['publish_date'],
+              'url': half['url'],
+              'filename': '07_风华高科_2026年半年度报告_最新完整定期报告.pdf',
+              'min_pages': 100,
+              'type_markers': ('半年度报告',),
+          })
+
+          q1_candidates = rank_full(
+              q1_rows, 2026, '第一季度报告',
+              exclusions=('英文', '取消', '关于', '更正公告', '补充公告')
+          )
+          if not q1_candidates:
+              # Some CNINFO titles use 一季度报告 rather than 第一季度报告.
+              q1_candidates = rank_full(
+                  q1_rows, 2026, '一季度报告',
+                  exclusions=('英文', '取消', '关于', '更正公告', '补充公告')
+              )
+          if not q1_candidates:
+              raise RuntimeError('2026 first-quarter report not found')
+          q1 = q1_candidates[0]
+          selections.append({
+              'kind': 'q1',
+              'year': 2026,
+              'title': q1['title'],
+              'publish_date': q1['publish_date'],
+              'url': q1['url'],
+              'filename': '08_风华高科_2026年第一季度报告_最新严格季报.pdf',
+              'min_pages': 8,
+              'type_markers': ('第一季度报告', '一季度报告'),
+          })
+
+          print('SELECTIONS', json.dumps(selections, ensure_ascii=False, indent=2), flush=True)
+
+          def download_pdf(url: str) -> tuple[bytes, str]:
+              candidates = [url]
+              if 'static.cninfo.com.cn' in url:
+                  candidates.append(url.replace('https://', 'http://', 1))
+              errors = []
+              for candidate in list(dict.fromkeys(candidates)):
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(
+                              candidate,
+                              headers={
+                                  'User-Agent': HEADERS['User-Agent'],
+                                  'Accept': 'application/pdf,*/*',
+                                  'Referer': HEADERS['Referer'],
+                                  'Connection': 'close',
+                              },
+                              timeout=(30, 900),
+                              allow_redirects=True,
+                          )
+                          print('GET', attempt, r.status_code, len(r.content), r.headers.get('content-type'), candidate, flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50000:
+                              return r.content, str(r.url)
+                          errors.append(f'{candidate}: {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{candidate}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors[-10:]))
+
+          def validate_pdf(path: Path, cfg: dict) -> dict:
+              data = path.read_bytes()
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'{path.name}: invalid PDF signature')
+              doc = pymupdf.open(str(path))
+              pages = len(doc)
+              if pages < cfg['min_pages']:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: page count {pages} < {cfg["min_pages"]}')
+              sample = sorted(set(list(range(min(40, pages))) + [pages // 2, pages - 1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in sample)
+              norm = compact(text)
+              identities = (COMPANY, SHORT_NAME, STOCK_CODE, '广东风华高科', '风华高新科技')
+              if not any(compact(x) in norm for x in identities):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: company identity marker missing')
+              if str(cfg['year']) not in norm:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: expected year {cfg["year"]} missing')
+              if not any(compact(x) in norm for x in cfg['type_markers']):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: report type marker missing')
+              rendered = []
+              for page_no in sorted(set((0, pages // 2, pages - 1))):
+                  pix = doc.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(0.9, 0.9), alpha=False)
+                  image = RENDERS / f'{path.stem}_page_{page_no + 1:04d}.png'
+                  pix.save(str(image))
+                  if pix.width < 400 or pix.height < 400 or image.stat().st_size < 3000:
+                      doc.close()
+                      raise RuntimeError(f'{path.name}: render check failed at page {page_no + 1}')
+                  rendered.append({'page': page_no + 1, 'width': pix.width, 'height': pix.height, 'bytes': image.stat().st_size})
+              doc.close()
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf check failed: {q.stderr[-1000:]}')
+              return {
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'qpdf_return_code': q.returncode,
+                  'rendered_pages': rendered,
+              }
+
+          records = []
+          seen = set()
+          for cfg in selections:
+              data, actual_url = download_pdf(cfg['url'])
+              path = ROOT / cfg['filename']
+              path.write_bytes(data)
+              meta = validate_pdf(path, cfg)
+              if meta['sha256'] in seen:
+                  raise RuntimeError(f'Duplicate report content: {path.name}')
+              seen.add(meta['sha256'])
+              record = {
+                  'filename': cfg['filename'],
+                  'document_type': cfg['title'],
+                  'report_year': cfg['year'],
+                  'publish_date': cfg['publish_date'],
+                  'official_url': actual_url,
+                  'source_platform': '巨潮资讯网（中国证监会指定上市公司信息披露平台）',
+                  **meta,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 8:
+              raise RuntimeError(f'Expected 8 PDFs, got {len(records)}')
+
+          with (ROOT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','文件名','文档类型','报告年度','发布日期','页数','文件大小_字节','SHA256','官方来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for idx, r in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': idx,
+                      '文件名': r['filename'],
+                      '文档类型': r['document_type'],
+                      '报告年度': r['report_year'],
+                      '发布日期': r['publish_date'],
+                      '页数': r['pages'],
+                      '文件大小_字节': r['bytes'],
+                      'SHA256': r['sha256'],
+                      '官方来源': r['official_url'],
+                  })
+
+          manifest = {
+              'company': COMPANY,
+              'short_name': SHORT_NAME,
+              'stock_code': STOCK_CODE,
+              'exchange': '深圳证券交易所',
+              'as_of_date': AS_OF,
+              'annual_report_years': list(range(2020, 2026)),
+              'latest_full_periodic_report': '2026年半年度报告',
+              'latest_strict_quarterly_report': '2026年第一季度报告',
+              'note': '截至2026年9月14日，2026年第三季度报告尚未发布，因此同时收录最新完整定期报告（半年报）与最新严格季度报告（一季报）。',
+              'files': records,
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records), encoding='utf-8')
+
+          readme = [
+              f'{COMPANY}（{STOCK_CODE}.SZ）',
+              '2020—2025年年度报告及最新定期报告资料包',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '收录内容：',
+              '1. 2020—2025年完整年度报告，共6份；',
+              '2. 2026年半年度报告，作为截至核对日最新完整定期财务报告；',
+              '3. 2026年第一季度报告，作为截至核对日最新严格意义上的季度报告。',
+              '',
+              '截至2026年9月14日，2026年第三季度报告尚未发布。为避免“最新季报”口径歧义，本包同时收录2026年半年报和2026年一季报。',
+              '所有PDF均来自巨潮资讯网完整版本，未混入年报摘要、英文版、社会责任报告、ESG报告或单独审计附件。',
+              '',
+              f'共{len(records)}份PDF，合计{sum(r["pages"] for r in records)}页，PDF总大小{sum(r["bytes"] for r in records) / 1048576:.2f} MB。',
+              '',
+              '文件清单：',
+          ]
+          for idx, r in enumerate(records, 1):
+              readme.extend([
+                  f'{idx}. {r["filename"]}',
+                  f'   巨潮标题：{r["document_type"]}',
+                  f'   发布日期：{r["publish_date"]}',
+                  f'   页数：{r["pages"]}',
+                  f'   大小：{r["bytes"] / 1048576:.2f} MB',
+                  f'   SHA-256：{r["sha256"]}',
+                  '',
+              ])
+          readme.append('校验项目：PDF文件头、公司名称或证券代码、报告年度、报告类型、页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。')
+          (ROOT / 'README_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, str(path))
+          with zipfile.ZipFile(OUTZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in zf.namelist())
+              if pdf_count != 8:
+                  raise RuntimeError(f'Expected 8 PDFs in ZIP, got {pdf_count}')
+
+          print('FINAL_ZIP', OUTZIP, OUTZIP.stat().st_size, sha256_file(OUTZIP), flush=True)
+          print('TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          print('PDF_COUNT', len(records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fenghua-reports-package-20260914
+          path: Fenghua_Advanced_Technology_2020-2025_Annual_Reports_Latest_Reports_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fenghua-validation-diagnostics
+          path: _fenghua_work/
+          if-no-files-found: ignore
+          retention-days: 2
