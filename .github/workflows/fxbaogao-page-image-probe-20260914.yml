@@ -1,0 +1,45 @@
+name: Probe TransThera prospectus page images
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fxbaogao-page-image-probe-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check representative page images
+        run: |
+          python -m pip install --quiet requests pillow
+          python - <<'PY'
+          import io, json
+          from pathlib import Path
+          import requests
+          from PIL import Image
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://www.fxbaogao.com/view?id=4897747'})
+          rec=[]
+          for i in [1,2,10,11,100,337,673,674,675]:
+            u=f'https://public.fxbaogao.com/report-image/2025/06/13/4897747-{i}.png'
+            try:
+              r=s.get(u,timeout=30,allow_redirects=True)
+              row={'page':i,'status':r.status_code,'bytes':len(r.content),'ctype':r.headers.get('content-type'),'url':r.url}
+              if r.status_code==200 and len(r.content)>1000:
+                im=Image.open(io.BytesIO(r.content)); row.update({'format':im.format,'size':im.size,'mode':im.mode})
+              rec.append(row); print(json.dumps(row,ensure_ascii=False),flush=True)
+            except Exception as e:
+              row={'page':i,'error':repr(e)}; rec.append(row); print(json.dumps(row),flush=True)
+          Path('page_image_probe.json').write_text(json.dumps(rec,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - name: Upload probe
+        uses: actions/upload-artifact@v4
+        with:
+          name: transthera-page-image-probe
+          path: page_image_probe.json
+          retention-days: 2
