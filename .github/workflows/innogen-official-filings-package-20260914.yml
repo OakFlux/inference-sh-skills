@@ -1,0 +1,306 @@
+name: Package Innogen official filings 20260914
+
+on:
+  push:
+    paths:
+      - '.github/workflows/innogen-official-filings-package-20260914.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pymupdf
+
+      - name: Download validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+
+          AS_OF = '2026-09-14'
+          ROOT_NAME = '银诺医药_全部年报_招股说明书及最新定期报告_截至2026-09-14'
+          ROOT = Path(ROOT_NAME)
+          WORK = Path('_innogen_validation')
+          RENDERS = WORK / 'renders'
+          OUTZIP = Path('Innogen_All_Annual_Reports_Prospectus_Latest_Report_2026-09-14.zip')
+          ROOT.mkdir(exist_ok=True)
+          RENDERS.mkdir(parents=True, exist_ok=True)
+
+          docs = [
+              {
+                  'category': '01_年度报告',
+                  'filename': '银诺医药_2025年年度报告_完整版.pdf',
+                  'document_type': '2025年年度报告',
+                  'release_date': '2026-04-28',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0428/2026042805057.pdf',
+                  'expected_pages': 141,
+                  'year_markers': ('2025',),
+                  'type_markers': ('annualreport',),
+              },
+              {
+                  'category': '02_招股说明书',
+                  'filename': '银诺医药_2025年香港全球发售招股说明书_完整版.pdf',
+                  'document_type': '2025年香港全球发售最终招股说明书',
+                  'release_date': '2025-08-07',
+                  'url': 'https://www.hkexnews.hk/listedco/listconews/sehk/2025/0807/2025080700014_c.pdf',
+                  'expected_pages': 624,
+                  'year_markers': ('2025',),
+                  'type_markers': ('招股章程', '全球發售', '全球发售'),
+              },
+              {
+                  'category': '03_最新定期报告',
+                  'filename': '银诺医药_2026年中期业绩公告_截至2026-06-30_最新财务披露.pdf',
+                  'document_type': '2026年中期业绩公告（最新一期财务披露）',
+                  'release_date': '2026-08-25',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0825/2026082501007.pdf',
+                  'expected_pages': 36,
+                  'year_markers': ('2026',),
+                  'type_markers': ('interimresults', 'sixmonthsended30june2026'),
+              },
+              {
+                  'category': '03_最新定期报告',
+                  'filename': '银诺医药_2025年中期报告_最新已刊发完整中期报告.pdf',
+                  'document_type': '2025年中期报告（最新已刊发完整中期报告）',
+                  'release_date': '2025-09-29',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0929/2025092901686.pdf',
+                  'expected_pages': 49,
+                  'year_markers': ('2025',),
+                  'type_markers': ('interimreport',),
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://www1.hkexnews.hk/',
+              'Connection': 'close',
+          }
+
+          def compact(text: str) -> str:
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(text).upper())
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def variants(url: str) -> list[str]:
+              out = [url]
+              if 'www1.hkexnews.hk' in url:
+                  out.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  out.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              return list(dict.fromkeys(out))
+
+          def fetch_pdf(url: str) -> tuple[bytes, str]:
+              errors = []
+              for candidate in variants(url):
+                  for attempt in range(1, 5):
+                      try:
+                          response = session.get(candidate, headers=headers, timeout=(40, 420), allow_redirects=True)
+                          print('GET', attempt, response.status_code, len(response.content), response.headers.get('content-type'), candidate, flush=True)
+                          if response.status_code == 200 and response.content.startswith(b'%PDF-') and len(response.content) > 50000:
+                              return response.content, str(response.url)
+                          errors.append(f'{candidate}: HTTP {response.status_code}/{len(response.content)}')
+                      except Exception as exc:
+                          errors.append(f'{candidate}: {type(exc).__name__}: {exc}')
+                      time.sleep(min(attempt * 2, 8))
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors[-16:]))
+
+          def validate_pdf(path: Path, cfg: dict) -> dict:
+              raw = path.read_bytes()
+              if not raw.startswith(b'%PDF-'):
+                  raise RuntimeError(f'Invalid PDF signature: {path.name}')
+              doc = pymupdf.open(str(path))
+              pages = len(doc)
+              if pages != cfg['expected_pages']:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: expected {cfg["expected_pages"]} pages, got {pages}')
+
+              probe_indices = sorted(set(list(range(min(35, pages))) + [pages // 2, pages - 1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in probe_indices)
+              norm = compact(text)
+              company_markers = (
+                  'GUANGZHOUINNOGENPHARMACEUTICALGROUPCOLTD',
+                  '廣州銀諾醫藥集團股份有限公司',
+                  '广州银诺医药集团股份有限公司',
+                  'STOCKCODE2591', '股份代號2591', '股份代码2591',
+              )
+              if not any(compact(marker) in norm for marker in company_markers):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: company identity marker missing')
+              if not any(compact(marker) in norm for marker in cfg['year_markers']):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: year marker missing')
+              if not any(compact(marker) in norm for marker in cfg['type_markers']):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: document type marker missing')
+
+              rendered = []
+              for page_no in sorted(set((0, pages // 2, pages - 1))):
+                  pix = doc.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(0.9, 0.9), alpha=False)
+                  render_path = RENDERS / f'{path.stem}_page_{page_no + 1:04d}.png'
+                  pix.save(str(render_path))
+                  if render_path.stat().st_size < 3000:
+                      doc.close()
+                      raise RuntimeError(f'{path.name}: render check failed on page {page_no + 1}')
+                  rendered.append({'page': page_no + 1, 'bytes': render_path.stat().st_size})
+              doc.close()
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf failed: {qpdf.stderr[-1000:]}')
+              return {
+                  'pages': pages,
+                  'bytes': len(raw),
+                  'sha256': hashlib.sha256(raw).hexdigest(),
+                  'qpdf_return_code': qpdf.returncode,
+                  'rendered_pages': rendered,
+              }
+
+          records = []
+          seen_hashes = set()
+          for cfg in docs:
+              folder = ROOT / cfg['category']
+              folder.mkdir(parents=True, exist_ok=True)
+              data, actual_url = fetch_pdf(cfg['url'])
+              path = folder / cfg['filename']
+              path.write_bytes(data)
+              check = validate_pdf(path, cfg)
+              if check['sha256'] in seen_hashes:
+                  raise RuntimeError(f'Duplicate PDF detected: {path.name}')
+              seen_hashes.add(check['sha256'])
+              record = {
+                  'relative_path': str(path.relative_to(ROOT)),
+                  'document_type': cfg['document_type'],
+                  'release_date': cfg['release_date'],
+                  'official_url': cfg['url'],
+                  'downloaded_from': actual_url,
+                  **check,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          with (ROOT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号', '文件路径', '文档类型', '发布日期', '页数', '文件大小_字节', 'SHA256', '官方来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for index, r in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': index,
+                      '文件路径': r['relative_path'],
+                      '文档类型': r['document_type'],
+                      '发布日期': r['release_date'],
+                      '页数': r['pages'],
+                      '文件大小_字节': r['bytes'],
+                      'SHA256': r['sha256'],
+                      '官方来源': r['official_url'],
+                  })
+
+          manifest = {
+              'company': '广州银诺医药集团股份有限公司 / Guangzhou Innogen Pharmaceutical Group Co., Ltd.',
+              'stock_code': '02591.HK',
+              'as_of_date': AS_OF,
+              'listing_date': '2025-08-15',
+              'annual_report_years': [2025],
+              'latest_periodic_financial_disclosure': '2026年中期业绩公告（截至2026年6月30日止六个月）',
+              'latest_full_interim_report_published': '2025年中期报告',
+              'files': records,
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{r["sha256"]}  {r["relative_path"]}\n' for r in records),
+              encoding='utf-8',
+          )
+
+          readme = [
+              '广州银诺医药集团股份有限公司（02591.HK）官方披露文件',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '收录范围：',
+              '1. 全部独立年度报告：2025年年度报告。公司于2025年8月15日上市，因此港交所暂无更早的上市后独立年度报告；',
+              '2. 2025年8月7日全球发售最终招股说明书；',
+              '3. 2026年中期业绩公告，作为截至核对日最新一期财务披露；',
+              '4. 2025年中期报告，作为截至核对日最新已刊发的完整中期报告补充收录。',
+              '',
+              '“最新季报”口径说明：银诺医药为香港主板上市公司，并无A股式第一季度及第三季度法定报告。',
+              '截至2026年9月14日，公司已于2026年8月25日发布截至2026年6月30日止六个月的中期业绩公告，但尚未刊发2026年完整中期报告。',
+              '因此本包同时保留最新中期业绩公告和最新已刊发完整中期报告。',
+              '',
+              f'共{len(records)}份PDF，合计{sum(r["pages"] for r in records)}页，PDF总大小{sum(r["bytes"] for r in records) / 1048576:.2f} MB。',
+              '',
+              '文件清单：',
+          ]
+          for index, r in enumerate(records, 1):
+              readme.extend([
+                  f'{index}. {r["relative_path"]}',
+                  f'   {r["document_type"]}｜{r["release_date"]}｜{r["pages"]}页｜{r["bytes"] / 1048576:.2f} MB',
+                  f'   官方来源：{r["official_url"]}',
+                  f'   SHA-256：{r["sha256"]}',
+                  '',
+              ])
+          readme.append('核验项目：PDF文件头、公司名称/股份代码、报告年份与类型、精确页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。')
+          (ROOT / 'README_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as archive:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, str(path))
+
+          with zipfile.ZipFile(OUTZIP, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC check failed: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in archive.namelist())
+              if pdf_count != len(docs):
+                  raise RuntimeError(f'Expected {len(docs)} PDFs in ZIP, found {pdf_count}')
+
+          print('FINAL_ZIP', OUTZIP, OUTZIP.stat().st_size, sha256_file(OUTZIP), flush=True)
+          print('TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: innogen-official-filings-package-20260914
+          path: Innogen_All_Annual_Reports_Prospectus_Latest_Report_2026-09-14.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: innogen-validation-diagnostics
+          path: _innogen_validation/
+          if-no-files-found: ignore
+          retention-days: 2
+          compression-level: 6
