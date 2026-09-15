@@ -1,0 +1,282 @@
+name: Package Haixi Pharma verified annual and interim reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/haixi-pharma-reports-package-direct-20260915.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pymupdf
+
+      - name: Download validate and package verified HKEX filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+
+          AS_OF = '2026-09-15'
+          COMPANY_ZH = '福建海西新药创制股份有限公司'
+          COMPANY_TRAD = '福建海西新藥創制股份有限公司'
+          COMPANY_EN = 'Fujian Haixi Pharmaceuticals Co., Ltd.'
+          STOCK_CODE = '02637.HK'
+          ROOT_NAME = '海西医药（海西新药）_全部年报及最新季报_截至2026-09-15'
+          ROOT = Path(ROOT_NAME)
+          WORK = Path('_haixi_pharma_direct_work')
+          RENDERS = WORK / 'renders'
+          OUTZIP = Path('Haixi_Pharma_All_Annual_Reports_Latest_Periodic_Filings_2026-09-15.zip')
+          for p in (ROOT, WORK, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          docs = [
+              {
+                  'filename': '01_海西新药_2025年年度报告_完整版.pdf',
+                  'document_type': '2025年年度报告',
+                  'hkex_title': '2025年報',
+                  'report_year': '2025',
+                  'release_time': '2026-04-29 20:54',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0429/2026042904745_c.pdf',
+                  'min_pages': 100,
+                  'markers': ('ANNUALREPORT', '年報', '年度報告', '年报', '年度报告'),
+              },
+              {
+                  'filename': '02_海西新药_2026年中期业绩公告_最新定期财务披露.pdf',
+                  'document_type': '2026年中期业绩公告',
+                  'hkex_title': '截至2026年6月30日止六個月的中期業績公告',
+                  'report_year': '2026',
+                  'release_time': '2026-08-28 20:43',
+                  'url': 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0828/2026082802703_c.pdf',
+                  'min_pages': 20,
+                  'markers': ('INTERIMRESULTS', '中期業績', '中期业绩'),
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en;q=0.6',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=1000273504',
+              'Connection': 'close',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(value).upper())
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download_pdf(url: str) -> tuple[bytes, str]:
+              candidates = [url, url.replace('www1.hkexnews.hk', 'www.hkexnews.hk')]
+              errors = []
+              for candidate in candidates:
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(candidate, headers=headers, timeout=(30, 900), allow_redirects=True)
+                          print('GET', attempt, r.status_code, len(r.content), r.headers.get('content-type'), candidate, flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50000:
+                              return r.content, str(r.url)
+                          errors.append(f'{candidate}: {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{candidate}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors[-10:]))
+
+          def validate_pdf(path: Path, cfg: dict) -> dict:
+              data = path.read_bytes()
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'{path.name}: invalid PDF signature')
+              doc = pymupdf.open(str(path))
+              pages = len(doc)
+              if pages < cfg['min_pages']:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: page count {pages} < {cfg["min_pages"]}')
+              sample = sorted(set(list(range(min(45, pages))) + [pages // 2, pages - 1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in sample)
+              norm = compact(text)
+              identities = (
+                  COMPANY_ZH, COMPANY_TRAD, COMPANY_EN, 'HAIXIPHARMA',
+                  'STOCKCODE02637', '股份代號02637', '股份代码02637', '02637',
+              )
+              if not any(compact(x) in norm for x in identities):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: company identity marker missing')
+              if cfg['report_year'] not in norm:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: year marker {cfg["report_year"]} missing')
+              if not any(compact(x) in norm for x in cfg['markers']):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: document type marker missing')
+              rendered = []
+              for page_no in sorted(set((0, pages // 2, pages - 1))):
+                  pix = doc.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(0.9, 0.9), alpha=False)
+                  image = RENDERS / f'{path.stem}_page_{page_no + 1:04d}.png'
+                  pix.save(str(image))
+                  if pix.width < 400 or pix.height < 400 or image.stat().st_size < 3000:
+                      doc.close()
+                      raise RuntimeError(f'{path.name}: render validation failed on page {page_no + 1}')
+                  rendered.append({'page': page_no + 1, 'width': pix.width, 'height': pix.height, 'bytes': image.stat().st_size})
+              doc.close()
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf check failed: {q.stderr[-1000:]}')
+              return {
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'qpdf_return_code': q.returncode,
+                  'rendered_pages': rendered,
+              }
+
+          records = []
+          seen = set()
+          for cfg in docs:
+              data, actual_url = download_pdf(cfg['url'])
+              path = ROOT / cfg['filename']
+              path.write_bytes(data)
+              meta = validate_pdf(path, cfg)
+              if meta['sha256'] in seen:
+                  raise RuntimeError(f'Duplicate report content: {path.name}')
+              seen.add(meta['sha256'])
+              record = {
+                  'filename': cfg['filename'],
+                  'document_type': cfg['document_type'],
+                  'hkex_title': cfg['hkex_title'],
+                  'report_year': cfg['report_year'],
+                  'release_time': cfg['release_time'],
+                  'language': '繁体中文',
+                  'official_url': actual_url,
+                  **meta,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          with (ROOT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','文件名','文档类型','港交所标题','报告年度','发布日期','语言','页数','文件大小_字节','SHA256','官方来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for idx, r in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': idx,
+                      '文件名': r['filename'],
+                      '文档类型': r['document_type'],
+                      '港交所标题': r['hkex_title'],
+                      '报告年度': r['report_year'],
+                      '发布日期': r['release_time'],
+                      '语言': r['language'],
+                      '页数': r['pages'],
+                      '文件大小_字节': r['bytes'],
+                      'SHA256': r['sha256'],
+                      '官方来源': r['official_url'],
+                  })
+
+          manifest = {
+              'company': COMPANY_ZH,
+              'traditional_name': COMPANY_TRAD,
+              'english_name': COMPANY_EN,
+              'stock_code': STOCK_CODE,
+              'listing_date': '2025-10-20',
+              'as_of_date': AS_OF,
+              'annual_report_years': [2025],
+              'latest_periodic_financial_disclosure': '2026年中期业绩公告（截至2026年6月30日止六个月）',
+              'latest_strict_quarterly_disclosure': None,
+              'note': '海西新药于2025年10月上市，因此上市后完整年报目前只有2025年度一份。截至2026年9月15日，未发现公司单独披露2026年第一季度或第三季度报告；最新正式定期财务披露为2026年中期业绩公告。',
+              'files': records,
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records), encoding='utf-8')
+
+          readme = [
+              f'{COMPANY_ZH}（HAIXI PHARMA，{STOCK_CODE}）官方披露文件',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '收录内容：',
+              '1. 2025年度完整年度报告；',
+              '2. 2026年中期业绩公告，作为截至核对日最新正式定期财务披露。',
+              '',
+              '海西新药于2025年10月20日在香港联交所上市，因此目前上市后正式完整年报只有2025年度一份。',
+              '截至2026年9月15日，未发现公司单独披露2026年第一季度或第三季度报告；“最新季报”按港股披露口径以最新中期业绩公告收录。',
+              '2026年完整中期报告截至核对日尚未刊发，因此未以其他非定期公告替代。',
+              '',
+              f'共{len(records)}份PDF，合计{sum(r["pages"] for r in records)}页，PDF总大小{sum(r["bytes"] for r in records) / 1048576:.2f} MB。',
+              '',
+              '文件清单：',
+          ]
+          for idx, r in enumerate(records, 1):
+              readme.extend([
+                  f'{idx}. {r["filename"]}',
+                  f'   类型：{r["document_type"]}',
+                  f'   港交所标题：{r["hkex_title"]}',
+                  f'   发布日期：{r["release_time"]}',
+                  f'   语言：{r["language"]}',
+                  f'   页数：{r["pages"]}',
+                  f'   大小：{r["bytes"] / 1048576:.2f} MB',
+                  f'   SHA-256：{r["sha256"]}',
+                  '',
+              ])
+          readme.append('校验项目：PDF文件头、公司名称/股份代码、报告年度、文档类型、页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。')
+          (ROOT / 'README_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, str(path))
+          with zipfile.ZipFile(OUTZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in zf.namelist())
+              if pdf_count != 2:
+                  raise RuntimeError(f'Expected 2 PDFs in ZIP, got {pdf_count}')
+
+          print('FINAL_ZIP', OUTZIP, OUTZIP.stat().st_size, sha256_file(OUTZIP), flush=True)
+          print('TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          print('PDF_COUNT', len(records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: haixi-pharma-reports-package-direct-20260915
+          path: Haixi_Pharma_All_Annual_Reports_Latest_Periodic_Filings_2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: haixi-pharma-direct-validation-diagnostics
+          path: _haixi_pharma_direct_work/
+          if-no-files-found: ignore
+          retention-days: 2
+          compression-level: 6
