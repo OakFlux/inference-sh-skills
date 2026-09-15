@@ -1,0 +1,459 @@
+name: Package Haixi Pharma annual reports and latest periodic filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/haixi-pharma-reports-package-20260915.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pymupdf
+
+      - name: Query HKEX, validate, and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import pymupdf
+          import requests
+
+          AS_OF = '2026-09-15'
+          COMPANY_ZH = '福建海西新药创制股份有限公司'
+          COMPANY_TRAD = '福建海西新藥創制股份有限公司'
+          COMPANY_EN = 'Fujian Haixi Pharmaceuticals Co., Ltd.'
+          STOCK_CODE = '02637.HK'
+          STOCK_ID = '1000273504'
+          ROOT_NAME = '海西医药（海西新药）_全部年报及最新季报_截至2026-09-15'
+          ROOT = Path(ROOT_NAME)
+          WORK = Path('_haixi_pharma_work')
+          RENDERS = WORK / 'renders'
+          OUTZIP = Path('Haixi_Pharma_All_Annual_Reports_Latest_Periodic_Filings_2026-09-15.zip')
+          for p in (ROOT, WORK, RENDERS):
+              p.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'application/json,text/plain,application/pdf,*/*',
+              'Accept-Language': 'zh-CN,zh;q=0.9,zh-TW;q=0.8,en;q=0.6',
+              'Referer': 'https://www1.hkexnews.hk/search/titlesearch.xhtml',
+              'Connection': 'close',
+          }
+
+          def compact(value: str) -> str:
+              return re.sub(r'[^0-9A-Z\u3400-\u9FFF]+', '', str(value).upper())
+
+          def sha256_file(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def parse_result(payload):
+              if isinstance(payload, list):
+                  if all(isinstance(x, dict) for x in payload):
+                      return payload
+                  for x in payload:
+                      found = parse_result(x)
+                      if found:
+                          return found
+              if isinstance(payload, dict):
+                  for key in ('result', 'data', 'rows', 'items'):
+                      if key in payload:
+                          value = payload[key]
+                          if isinstance(value, str):
+                              try:
+                                  value = json.loads(value)
+                              except Exception:
+                                  pass
+                          found = parse_result(value)
+                          if found:
+                              return found
+                  for value in payload.values():
+                      found = parse_result(value)
+                      if found:
+                          return found
+              return []
+
+          def hkex_search(lang: str) -> list[dict]:
+              endpoint = 'https://www1.hkexnews.hk/search/titleSearchServlet.do'
+              params = {
+                  'sortDir': '0',
+                  'sortByOptions': 'DateTime',
+                  'category': '0',
+                  'market': 'SEHK',
+                  'stockId': STOCK_ID,
+                  'documentType': '-1',
+                  'fromDate': '20251001',
+                  'toDate': '20260915',
+                  'title': '',
+                  'searchType': '1',
+                  't1code': '-2',
+                  't2Gcode': '-2',
+                  't2code': '-2',
+                  'rowRange': '500',
+                  'lang': lang,
+              }
+              r = session.get(endpoint, params=params, headers=HEADERS, timeout=(30, 180))
+              print('SEARCH', lang, r.status_code, len(r.content), r.url, flush=True)
+              r.raise_for_status()
+              try:
+                  raw = r.json()
+              except Exception:
+                  raw = json.loads(r.text.lstrip('\ufeff'))
+              rows = parse_result(raw)
+              if not rows:
+                  raise RuntimeError(f'Unable to parse HKEX response for {lang}')
+              normalized = []
+              for row in rows:
+                  title = str(row.get('TITLE') or row.get('title') or row.get('HEADLINE') or row.get('headline') or '')
+                  link = str(row.get('FILE_LINK') or row.get('fileLink') or row.get('link') or row.get('URL') or row.get('url') or '')
+                  release = str(row.get('RELEASE_TIME') or row.get('releaseTime') or row.get('DATE_TIME') or row.get('dateTime') or row.get('DATE') or row.get('date') or '')
+                  category = str(row.get('DOCUMENT_TYPE') or row.get('documentType') or row.get('CATEGORY') or row.get('category') or '')
+                  if link:
+                      link = urljoin('https://www1.hkexnews.hk', link)
+                  normalized.append({
+                      'title': title,
+                      'link': link,
+                      'release': release,
+                      'category': category,
+                      'lang': lang,
+                      'raw': row,
+                  })
+              print('ROWS', lang, len(normalized), flush=True)
+              for row in normalized:
+                  n = compact(row['title'])
+                  if any(x in n for x in (
+                      '2025ANNUALREPORT','2025年報','2025年度報告','2025年报','2025年度报告',
+                      '2026INTERIMREPORT','INTERIMRESULTS','2026年中期報告','2026中期業績','2026中期报告','2026中期业绩',
+                      'FIRSTQUARTEROF2026','2026第一季度','2026首季度','2026一季度'
+                  )):
+                      print('CANDIDATE', json.dumps({k: row[k] for k in ('lang','release','title','link','category')}, ensure_ascii=False), flush=True)
+              return normalized
+
+          rows = hkex_search('en') + hkex_search('zh')
+
+          def language_bonus(row: dict) -> int:
+              return 80 if row['lang'] == 'zh' or '_c.pdf' in row['link'].lower() else 0
+
+          def annual_score(row: dict) -> int:
+              n = compact(row['title'])
+              score = 0
+              if '2025' in n and any(x in n for x in ('ANNUALREPORT','年報','年度報告','年报','年度报告')):
+                  score += 700
+              if any(x in n for x in ('ANNUALRESULTS','年度業績','年度业绩','SUPPLEMENTAL','補充公告','补充公告','ESG','ENVIRONMENTAL')):
+                  score -= 600
+              if row['link'].lower().endswith('.pdf') or '.pdf?' in row['link'].lower():
+                  score += 40
+              return score + language_bonus(row)
+
+          def interim_score(row: dict) -> int:
+              n = compact(row['title'])
+              if '2026' not in n:
+                  return -999
+              score = 0
+              if any(x in n for x in ('INTERIMREPORT','中期報告','中期报告')) and not any(x in n for x in ('RESULTS','業績','业绩')):
+                  score += 1000
+              elif any(x in n for x in ('INTERIMRESULTS','中期業績','中期业绩')):
+                  score += 750
+              if 'JUNE302026' in n or '2026年6月30日' in n:
+                  score += 120
+              if row['link'].lower().endswith('.pdf') or '.pdf?' in row['link'].lower():
+                  score += 40
+              return score + language_bonus(row)
+
+          def q1_score(row: dict) -> int:
+              n = compact(row['title'])
+              if '2026' not in n:
+                  return -999
+              score = 0
+              if any(x in n for x in ('FIRSTQUARTER','FIRSTTHREEMONTHS','第一季度','首季度','一季度','2026年3月31日')):
+                  score += 800
+              if any(x in n for x in ('UNAUDITEDFINANCIALRESULTS','未經審核財務業績','未经审核财务业绩','QUARTERLYRESULTS')):
+                  score += 120
+              if row['link'].lower().endswith('.pdf') or '.pdf?' in row['link'].lower():
+                  score += 40
+              return score + language_bonus(row)
+
+          def select_required(label: str, scorer) -> dict:
+              ranked = sorted(rows, key=scorer, reverse=True)
+              best = ranked[0]
+              best_score = scorer(best)
+              print('SELECT', label, best_score, json.dumps({k: best[k] for k in ('lang','release','title','link','category')}, ensure_ascii=False), flush=True)
+              if best_score < 500 or not best['link']:
+                  raise RuntimeError(f'Unable to select {label}')
+              return best
+
+          def select_optional(label: str, scorer) -> dict | None:
+              ranked = sorted(rows, key=scorer, reverse=True)
+              best = ranked[0]
+              best_score = scorer(best)
+              print('OPTIONAL_SELECT', label, best_score, json.dumps({k: best[k] for k in ('lang','release','title','link','category')}, ensure_ascii=False), flush=True)
+              if best_score < 500 or not best['link']:
+                  return None
+              return best
+
+          annual = select_required('annual-2025', annual_score)
+          interim = select_required('latest-interim-2026', interim_score)
+          q1 = select_optional('latest-quarter-2026-q1', q1_score)
+
+          interim_norm = compact(interim['title'])
+          interim_is_full = any(x in interim_norm for x in ('INTERIMREPORT','中期報告','中期报告')) and not any(x in interim_norm for x in ('RESULTS','業績','业绩'))
+
+          configs = [
+              {
+                  'filename': '01_海西新药_2025年年度报告_完整版.pdf',
+                  'document_type': '2025年年度报告',
+                  'year': '2025',
+                  'title': annual['title'],
+                  'release': annual['release'],
+                  'url': annual['link'],
+                  'lang': annual['lang'],
+                  'min_pages': 100,
+                  'type_markers': ('ANNUALREPORT','年報','年度報告','年报','年度报告'),
+              },
+              {
+                  'filename': '02_海西新药_2026年中期报告_最新完整定期报告.pdf' if interim_is_full else '02_海西新药_2026年中期业绩公告_最新定期财务披露.pdf',
+                  'document_type': '2026年中期报告' if interim_is_full else '2026年中期业绩公告',
+                  'year': '2026',
+                  'title': interim['title'],
+                  'release': interim['release'],
+                  'url': interim['link'],
+                  'lang': interim['lang'],
+                  'min_pages': 40 if interim_is_full else 15,
+                  'type_markers': ('INTERIMREPORT','中期報告','中期报告') if interim_is_full else ('INTERIMRESULTS','中期業績','中期业绩'),
+              },
+          ]
+          if q1 is not None:
+              configs.append({
+                  'filename': '03_海西新药_2026年第一季度未经审核财务业绩_最新严格季度报告.pdf',
+                  'document_type': '2026年第一季度未经审核财务业绩公告',
+                  'year': '2026',
+                  'title': q1['title'],
+                  'release': q1['release'],
+                  'url': q1['link'],
+                  'lang': q1['lang'],
+                  'min_pages': 8,
+                  'type_markers': ('FIRSTQUARTER','第一季度','首季度','一季度','UNAUDITEDFINANCIALRESULTS','未經審核財務業績','未经审核财务业绩'),
+              })
+
+          def url_variants(url: str) -> list[str]:
+              out = [url]
+              if 'www1.hkexnews.hk' in url:
+                  out.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              return list(dict.fromkeys(out))
+
+          def download_pdf(url: str) -> tuple[bytes, str]:
+              errors = []
+              for candidate in url_variants(url):
+                  for attempt in range(1, 4):
+                      try:
+                          r = session.get(candidate, headers={**HEADERS, 'Accept': 'application/pdf,*/*'}, timeout=(30, 900), allow_redirects=True)
+                          print('GET', attempt, r.status_code, len(r.content), r.headers.get('content-type'), candidate, flush=True)
+                          if r.status_code == 200 and r.content.startswith(b'%PDF-') and len(r.content) > 50000:
+                              return r.content, str(r.url)
+                          errors.append(f'{candidate}: {r.status_code}/{len(r.content)}')
+                      except Exception as exc:
+                          errors.append(f'{candidate}: {type(exc).__name__}: {exc}')
+                      time.sleep(attempt)
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors[-10:]))
+
+          def validate_pdf(path: Path, cfg: dict) -> dict:
+              data = path.read_bytes()
+              if not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'{path.name}: invalid PDF signature')
+              doc = pymupdf.open(str(path))
+              pages = len(doc)
+              if pages < cfg['min_pages']:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: page count {pages} < {cfg["min_pages"]}')
+              sample = sorted(set(list(range(min(45, pages))) + [pages // 2, pages - 1]))
+              text = '\n'.join(doc.load_page(i).get_text('text') for i in sample)
+              norm = compact(text)
+              identities = (
+                  COMPANY_ZH, COMPANY_TRAD, COMPANY_EN, 'HAIXIPHARMA',
+                  'STOCKCODE02637', '股份代號02637', '股份代码02637', '02637',
+              )
+              if not any(compact(x) in norm for x in identities):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: company identity marker missing')
+              if cfg['year'] not in norm:
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: year marker {cfg["year"]} missing')
+              if not any(compact(x) in norm for x in cfg['type_markers']):
+                  doc.close()
+                  raise RuntimeError(f'{path.name}: document type marker missing')
+              rendered = []
+              for page_no in sorted(set((0, pages // 2, pages - 1))):
+                  pix = doc.load_page(page_no).get_pixmap(matrix=pymupdf.Matrix(0.9, 0.9), alpha=False)
+                  image = RENDERS / f'{path.stem}_page_{page_no + 1:04d}.png'
+                  pix.save(str(image))
+                  if pix.width < 400 or pix.height < 400 or image.stat().st_size < 3000:
+                      doc.close()
+                      raise RuntimeError(f'{path.name}: render validation failed on page {page_no + 1}')
+                  rendered.append({'page': page_no + 1, 'width': pix.width, 'height': pix.height, 'bytes': image.stat().st_size})
+              doc.close()
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'{path.name}: qpdf check failed: {q.stderr[-1000:]}')
+              return {
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'qpdf_return_code': q.returncode,
+                  'rendered_pages': rendered,
+              }
+
+          records = []
+          seen = set()
+          for cfg in configs:
+              data, actual_url = download_pdf(cfg['url'])
+              path = ROOT / cfg['filename']
+              path.write_bytes(data)
+              meta = validate_pdf(path, cfg)
+              if meta['sha256'] in seen:
+                  raise RuntimeError(f'Duplicate report content: {path.name}')
+              seen.add(meta['sha256'])
+              record = {
+                  'filename': cfg['filename'],
+                  'document_type': cfg['document_type'],
+                  'hkex_title': cfg['title'],
+                  'report_year': cfg['year'],
+                  'release_time': cfg['release'],
+                  'language': '繁体中文' if cfg['lang'] == 'zh' or '_c.pdf' in actual_url.lower() else '英文',
+                  'official_url': actual_url,
+                  **meta,
+              }
+              records.append(record)
+              print('VERIFIED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          with (ROOT / '来源与校验清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['序号','文件名','文档类型','港交所标题','报告年度','发布日期','语言','页数','文件大小_字节','SHA256','官方来源']
+              writer = csv.DictWriter(f, fieldnames=fields)
+              writer.writeheader()
+              for idx, r in enumerate(records, 1):
+                  writer.writerow({
+                      '序号': idx,
+                      '文件名': r['filename'],
+                      '文档类型': r['document_type'],
+                      '港交所标题': r['hkex_title'],
+                      '报告年度': r['report_year'],
+                      '发布日期': r['release_time'],
+                      '语言': r['language'],
+                      '页数': r['pages'],
+                      '文件大小_字节': r['bytes'],
+                      'SHA256': r['sha256'],
+                      '官方来源': r['official_url'],
+                  })
+
+          manifest = {
+              'company': COMPANY_ZH,
+              'traditional_name': COMPANY_TRAD,
+              'english_name': COMPANY_EN,
+              'stock_code': STOCK_CODE,
+              'listing_date': '2025-10-20',
+              'as_of_date': AS_OF,
+              'annual_report_years': [2025],
+              'latest_periodic_financial_disclosure': records[1]['document_type'],
+              'latest_strict_quarterly_disclosure': records[2]['document_type'] if len(records) > 2 else None,
+              'note': '海西新药于2025年10月上市，因此目前上市后可独立取得的完整年度报告只有2025年度。香港主板公司通常不按A股制度强制披露一季报和三季报；如无单独季度业绩，本包以最新中期披露作为“最新季报/最新定期报告”口径。',
+              'files': records,
+          }
+          (ROOT / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (ROOT / 'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records), encoding='utf-8')
+
+          readme = [
+              f'{COMPANY_ZH}（HAIXI PHARMA，{STOCK_CODE}）官方披露文件',
+              f'资料核对日期：{AS_OF}',
+              '',
+              '收录范围：',
+              '1. 2025年度完整年度报告；',
+              f'2. {records[1]["document_type"]}，作为截至核对日最新定期财务披露；',
+          ]
+          if len(records) > 2:
+              readme.append(f'3. {records[2]["document_type"]}，作为最新严格意义上的季度披露。')
+          else:
+              readme.append('3. 截至核对日未发现公司单独披露第一季度或第三季度报告，因此不以非定期公告替代。')
+          readme.extend([
+              '',
+              '海西新药于2025年10月20日在香港联交所上市，因此目前上市后正式完整年报只有2025年度一份。',
+              '香港主板公司通常以年度报告和中期报告/中期业绩公告为主要定期财务披露。',
+              '',
+              f'共{len(records)}份PDF，合计{sum(r["pages"] for r in records)}页，PDF总大小{sum(r["bytes"] for r in records) / 1048576:.2f} MB。',
+              '',
+              '文件清单：',
+          ])
+          for idx, r in enumerate(records, 1):
+              readme.extend([
+                  f'{idx}. {r["filename"]}',
+                  f'   类型：{r["document_type"]}',
+                  f'   港交所标题：{r["hkex_title"]}',
+                  f'   发布日期：{r["release_time"]}',
+                  f'   语言：{r["language"]}',
+                  f'   页数：{r["pages"]}',
+                  f'   大小：{r["bytes"] / 1048576:.2f} MB',
+                  f'   SHA-256：{r["sha256"]}',
+                  '',
+              ])
+          readme.append('校验项目：PDF文件头、公司名称/股份代码、报告年度、文档类型、页数、qpdf结构、首页/中间页/末页渲染、SHA-256及ZIP CRC。')
+          (ROOT / 'README_文件清单与口径说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+
+          with zipfile.ZipFile(OUTZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for path in sorted(ROOT.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, str(path))
+          with zipfile.ZipFile(OUTZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in zf.namelist())
+              if pdf_count != len(records):
+                  raise RuntimeError(f'Expected {len(records)} PDFs in ZIP, got {pdf_count}')
+
+          print('FINAL_ZIP', OUTZIP, OUTZIP.stat().st_size, sha256_file(OUTZIP), flush=True)
+          print('TOTAL_PAGES', sum(r['pages'] for r in records), flush=True)
+          print('PDF_COUNT', len(records), flush=True)
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: haixi-pharma-reports-package-20260915
+          path: Haixi_Pharma_All_Annual_Reports_Latest_Periodic_Filings_2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload validation diagnostics
+        uses: actions/upload-artifact@v4
+        with:
+          name: haixi-pharma-validation-diagnostics
+          path: _haixi_pharma_work/
+          if-no-files-found: ignore
+          retention-days: 2
+          compression-level: 6
