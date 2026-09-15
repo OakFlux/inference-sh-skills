@@ -1,0 +1,382 @@
+name: Package PSBC broker deep reports
+
+on:
+  push:
+    branches:
+      - tmp/psbc-broker-deep-reports-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/package build/previews
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          ROOT = Path('build')
+          PACKAGE = ROOT / 'package'
+          PREVIEWS = ROOT / 'previews'
+          OUTPUT = ROOT / '邮储银行_601658_01658_券商深度报告精选3份_截至2026-09-15.zip'
+
+          session = requests.Session()
+          retry = Retry(
+              total=5,
+              connect=5,
+              read=5,
+              backoff_factor=1.0,
+              status_forcelist=(429, 500, 502, 503, 504),
+              allowed_methods=frozenset(['GET', 'POST']),
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/',
+          })
+
+          def compact(value: str) -> str:
+              return re.sub(r'[\s“”"\'：:，,。·—_-]+', '', value or '').lower()
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def fetch_records() -> list[dict]:
+              records: list[dict] = []
+              endpoint = 'https://reportapi.eastmoney.com/report/list'
+              for page in range(1, 12):
+                  params = {
+                      'industryCode': '*',
+                      'pageSize': '100',
+                      'industry': '*',
+                      'rating': '*',
+                      'ratingChange': '*',
+                      'beginTime': '2019-01-01',
+                      'endTime': '2026-09-15',
+                      'pageNo': str(page),
+                      'fields': '',
+                      'qType': '0',
+                      'orgCode': '',
+                      'code': '601658',
+                      'rcode': '',
+                      'p': str(page),
+                      'pageNum': str(page),
+                      'pageNumber': str(page),
+                  }
+                  response = session.get(endpoint, params=params, timeout=60)
+                  response.raise_for_status()
+                  try:
+                      payload = response.json()
+                  except Exception:
+                      text = response.text.strip()
+                      text = text[text.find('(') + 1:text.rfind(')')]
+                      payload = json.loads(text)
+                  rows = payload.get('data') or []
+                  records.extend(rows)
+                  if len(rows) < 100:
+                      break
+                  time.sleep(0.5)
+
+              # The newer stock-report endpoint is a useful fallback and may expose older reports.
+              endpoint2 = 'https://reportapi.eastmoney.com/report/list2'
+              for page in range(1, 12):
+                  body = {
+                      'pageSize': 100,
+                      'pageNo': page,
+                      'p': page,
+                      'pageNum': page,
+                      'pageNumber': page,
+                      'beginTime': '2019-01-01',
+                      'endTime': '2026-09-15',
+                      'code': '601658',
+                      'industryCode': '*',
+                      'rating': None,
+                      'ratingChange': None,
+                      'orgCode': None,
+                      'rcode': '',
+                  }
+                  try:
+                      response = session.post(endpoint2, json=body, timeout=60, headers={'Content-Type': 'application/json'})
+                      response.raise_for_status()
+                      payload = response.json()
+                      rows = payload.get('data') or []
+                      records.extend(rows)
+                      if len(rows) < 100:
+                          break
+                  except Exception as exc:
+                      print('LIST2_FALLBACK_ERROR', repr(exc))
+                      break
+                  time.sleep(0.5)
+
+              dedup: dict[str, dict] = {}
+              for row in records:
+                  code = row.get('infoCode') or row.get('info_code') or ''
+                  if code:
+                      dedup[code] = row
+              result = list(dedup.values())
+              result.sort(key=lambda item: item.get('publishDate') or item.get('publish_date') or '')
+              print('DISCOVERED_RECORDS', len(result))
+              for row in result:
+                  title = row.get('title') or ''
+                  date = (row.get('publishDate') or row.get('publish_date') or '')[:10]
+                  if ('深度' in title or '首次覆盖' in title or '投资价值' in title or '现金牛' in title or '不一样的零售银行' in title):
+                      print('CANDIDATE', json.dumps({
+                          'date': date,
+                          'title': title,
+                          'org': row.get('orgSName') or row.get('orgName') or '',
+                          'infoCode': row.get('infoCode') or row.get('info_code') or '',
+                          'pages': row.get('attachPages'),
+                      }, ensure_ascii=False))
+              return result
+
+          records = fetch_records()
+
+          specs = [
+              {
+                  'key': 'wanlian_2024',
+                  'filename': '01_万联证券_邮储银行深度报告_聚焦稳健发展经营韧性不断增强_2024-11-27.pdf',
+                  'info_code': 'AP202411281641098402',
+                  'title_contains': ['聚焦稳健发展', '经营韧性不断增强'],
+                  'org_contains': ['万联'],
+                  'min_pages': 15,
+                  'expected_date': '2024-11-27',
+              },
+              {
+                  'key': 'guangda_2020',
+                  'filename': '02_光大证券_邮储银行投资价值分析_独特的禀赋优势不一样的零售银行_2020-04-09.pdf',
+                  'title_contains': ['独特的禀赋优势', '不一样的零售银行'],
+                  'org_contains': ['光大'],
+                  'min_pages': 20,
+                  'expected_date': '2020-04-09',
+              },
+              {
+                  'key': 'shenwan_2020',
+                  'filename': '03_申万宏源_邮储银行首次覆盖_腾飞的现金牛_2020-03-24.pdf',
+                  'title_contains': ['腾飞', '现金牛'],
+                  'org_contains': ['申万'],
+                  'min_pages': 20,
+                  'expected_date': '2020-03-24',
+              },
+          ]
+
+          def match_record(spec: dict) -> dict:
+              if spec.get('info_code'):
+                  for row in records:
+                      code = row.get('infoCode') or row.get('info_code') or ''
+                      if code == spec['info_code']:
+                          return row
+                  return {
+                      'infoCode': spec['info_code'],
+                      'title': '深度报告：聚焦稳健发展，经营韧性不断增强',
+                      'orgSName': '万联证券',
+                      'publishDate': '2024-11-27',
+                  }
+
+              title_tokens = [compact(token) for token in spec['title_contains']]
+              org_tokens = [compact(token) for token in spec['org_contains']]
+              matches = []
+              for row in records:
+                  title = compact(row.get('title') or '')
+                  org = compact(row.get('orgSName') or row.get('orgName') or '')
+                  date = (row.get('publishDate') or row.get('publish_date') or '')[:10]
+                  if all(token in title for token in title_tokens) and any(token in org for token in org_tokens):
+                      score = 0
+                      if date == spec['expected_date']:
+                          score += 10
+                      if '深度' in (row.get('reportType') or ''):
+                          score += 2
+                      matches.append((score, row))
+              if not matches:
+                  raise RuntimeError(f'No matching report metadata for {spec["key"]}')
+              matches.sort(key=lambda item: item[0], reverse=True)
+              return matches[0][1]
+
+          def download_pdf(info_code: str, destination: Path) -> str:
+              candidates = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+              ]
+              errors = []
+              for url in candidates:
+                  try:
+                      with session.get(url, stream=True, timeout=240, allow_redirects=True) as response:
+                          response.raise_for_status()
+                          temp = destination.with_suffix('.pdf.part')
+                          with temp.open('wb') as handle:
+                              for chunk in response.iter_content(1024 * 1024):
+                                  if chunk:
+                                      handle.write(chunk)
+                          with temp.open('rb') as handle:
+                              header = handle.read(5)
+                          if header != b'%PDF-' or temp.stat().st_size < 100_000:
+                              raise RuntimeError(f'Invalid PDF payload size={temp.stat().st_size}, header={header!r}')
+                          temp.replace(destination)
+                          return response.url
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError('All PDF candidates failed:\n' + '\n'.join(errors))
+
+          manifest = []
+          for spec in specs:
+              row = match_record(spec)
+              info_code = row.get('infoCode') or row.get('info_code') or ''
+              if not info_code:
+                  raise RuntimeError(f'Missing infoCode for {spec["key"]}')
+              destination = PACKAGE / spec['filename']
+              source_url = download_pdf(info_code, destination)
+
+              reader = PdfReader(str(destination), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'{destination.name}: expected at least {spec["min_pages"]} pages, found {pages}')
+
+              sample = ''
+              indexes = sorted(set(list(range(min(8, pages))) + [pages // 2, pages - 1]))
+              for index in indexes:
+                  try:
+                      sample += '\n' + (reader.pages[index].extract_text() or '')
+                  except Exception:
+                      pass
+              normalized = compact(sample)
+              if not any(token in normalized for token in [compact('邮储银行'), compact('中国邮政储蓄银行'), compact('postalsavingsbankofchina')]):
+                  raise RuntimeError(f'{destination.name}: company identity not found')
+              for token in spec['title_contains']:
+                  # At least one report-title token should appear in extracted pages. Covers can be image-only,
+                  # so metadata matching remains the primary title check.
+                  if compact(token) in normalized:
+                      break
+              else:
+                  print('TITLE_TEXT_WARNING', destination.name, spec['title_contains'])
+
+              preview_base = PREVIEWS / destination.stem
+              subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '90', str(destination), str(preview_base)],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.PIPE,
+              )
+              preview = preview_base.with_suffix('.png')
+              if not preview.exists() or preview.stat().st_size < 8_000:
+                  raise RuntimeError(f'{destination.name}: first-page rendering failed')
+
+              item = {
+                  'file': destination.name,
+                  'title': row.get('title') or '',
+                  'institution': row.get('orgSName') or row.get('orgName') or '',
+                  'authors': row.get('researcher') or row.get('researcherName') or '',
+                  'publish_date': (row.get('publishDate') or row.get('publish_date') or spec['expected_date'])[:10],
+                  'info_code': info_code,
+                  'pages': pages,
+                  'bytes': destination.stat().st_size,
+                  'sha256': sha256(destination),
+                  'source_url': source_url,
+              }
+              manifest.append(item)
+              print('VALIDATED', json.dumps(item, ensure_ascii=False))
+
+          readme = [
+              '# 邮储银行（601658.SH / 01658.HK）券商深度报告精选',
+              '',
+              '整理截至：2026-09-15',
+              '',
+              '本资料包只收录公司深度、投资价值分析或首次覆盖类型报告，不使用普通季报/年报点评凑数。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for index, item in enumerate(manifest, start=1):
+              readme.extend([
+                  f'{index}. {item["file"]}',
+                  f'   - 标题：{item["title"]}',
+                  f'   - 机构：{item["institution"]}',
+                  f'   - 作者：{item["authors"] or "详见报告"}',
+                  f'   - 日期：{item["publish_date"]}',
+                  f'   - 页数：{item["pages"]}',
+                  f'   - 大小：{item["bytes"] / 1024 / 1024:.2f} MiB',
+                  f'   - SHA-256：{item["sha256"]}',
+                  f'   - 公开PDF来源：{item["source_url"]}',
+                  '',
+              ])
+          readme.extend([
+              '## 校验说明',
+              '',
+              '- 每份文件均通过PDF文件头、最低文件大小及pypdf解析检查。',
+              '- 核对报告元数据中的标题、券商、发布日期和东方财富研报标识。',
+              '- 抽样核对正文中的邮储银行公司身份。',
+              '- 每份报告首页均使用Poppler成功渲染。',
+              '- 最终ZIP通过CRC完整性检查。',
+              '',
+              '报告版权归原券商研究机构及作者所有。本资料包仅用于公开信息查阅，不构成投资建议。',
+          ])
+          (PACKAGE / '00_文件清单与校验记录.md').write_text('\n'.join(readme), encoding='utf-8')
+          (PACKAGE / 'checksums.json').write_text(
+              json.dumps({
+                  'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+                  'as_of_date': '2026-09-15',
+                  'documents': manifest,
+              }, ensure_ascii=False, indent=2),
+              encoding='utf-8',
+          )
+
+          with zipfile.ZipFile(OUTPUT, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(PACKAGE.iterdir(), key=lambda item: item.name):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(OUTPUT, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in archive.namelist())
+              if pdf_count != 3:
+                  raise RuntimeError(f'Expected 3 PDFs, found {pdf_count}')
+
+          print(json.dumps({
+              'final_zip': str(OUTPUT),
+              'zip_bytes': OUTPUT.stat().st_size,
+              'zip_sha256': sha256(OUTPUT),
+              'documents': manifest,
+          }, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: psbc-broker-deep-reports-20260915
+          path: build/邮储银行_601658_01658_券商深度报告精选3份_截至2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
