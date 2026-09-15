@@ -1,0 +1,417 @@
+name: Package Bank of Chongqing reports through 2026 interim
+
+on:
+  push:
+    branches:
+      - tmp/bankofchongqing-reports-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/bankofchongqing-reports-20260915
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Discover, download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/package build/previews
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import urllib.parse
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          ROOT = Path('build')
+          PKG = ROOT / 'package'
+          PREVIEWS = ROOT / 'previews'
+          FINAL_ZIP = ROOT / '重庆银行_601963_01963_2020-2025年报_招股说明书_最新季报及中报_截至2026-09-15.zip'
+          AS_OF = '2026-09-15'
+
+          session = requests.Session()
+          retry = Retry(total=4, connect=4, read=4, backoff_factor=1.0,
+                        status_forcelist=(429, 500, 502, 503, 504),
+                        allowed_methods=frozenset(['GET', 'POST']))
+          session.mount('https://', HTTPAdapter(max_retries=retry))
+          session.mount('http://', HTTPAdapter(max_retries=retry))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/json,application/pdf,*/*;q=0.8',
+          })
+
+          def norm_title(value: str) -> str:
+              value = re.sub(r'<[^>]+>', '', value or '')
+              value = value.replace('&nbsp;', '')
+              return re.sub(r'[\s:：_-]+', '', value).lower()
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def add_candidate(pool: dict[str, list[dict]], title: str, url: str, date: str = '', source: str = '') -> None:
+              if not url:
+                  return
+              url = url.replace('http://static.cninfo.com.cn', 'https://static.cninfo.com.cn')
+              key = norm_title(title)
+              entry = {'title': title, 'url': url, 'date': date, 'source': source}
+              if entry not in pool.setdefault(key, []):
+                  pool[key].append(entry)
+
+          pool: dict[str, list[dict]] = {}
+          discovery_notes: list[str] = []
+
+          # Official CNINFO announcement search. Try both stock-code and company-name modes.
+          cninfo_url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          try:
+              session.get('https://www.cninfo.com.cn/', timeout=30)
+          except Exception:
+              pass
+          query_variants = [
+              {'stock': '601963', 'searchkey': ''},
+              {'stock': '', 'searchkey': '重庆银行'},
+          ]
+          for variant in query_variants:
+              for page in range(1, 16):
+                  data = {
+                      'pageNum': str(page),
+                      'pageSize': '30',
+                      'column': 'sse',
+                      'tabName': 'fulltext',
+                      'plate': 'sh',
+                      'stock': variant['stock'],
+                      'searchkey': variant['searchkey'],
+                      'secid': '',
+                      'category': '',
+                      'trade': '',
+                      'seDate': '2020-01-01~2026-09-15',
+                      'sortName': 'time',
+                      'sortType': 'desc',
+                      'isHLtitle': 'true',
+                  }
+                  try:
+                      r = session.post(cninfo_url, data=data, timeout=60, headers={
+                          'Referer': 'https://www.cninfo.com.cn/new/commonUrl/pageOfSearch?url=disclosure/list/search',
+                          'X-Requested-With': 'XMLHttpRequest',
+                      })
+                      r.raise_for_status()
+                      payload = r.json()
+                      rows = payload.get('announcements') or []
+                      for row in rows:
+                          title = row.get('announcementTitle') or ''
+                          adjunct = row.get('adjunctUrl') or ''
+                          if adjunct:
+                              url = urllib.parse.urljoin('https://static.cninfo.com.cn/', adjunct)
+                              ts = row.get('announcementTime')
+                              date = ''
+                              if isinstance(ts, (int, float)):
+                                  date = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
+                              add_candidate(pool, title, url, date, 'CNINFO')
+                      if not rows or not payload.get('hasMore'):
+                          break
+                  except Exception as exc:
+                      discovery_notes.append(f'CNINFO variant={variant} page={page}: {exc!r}')
+                      break
+
+          # CNINFO full-text GET search as a second official discovery route.
+          for page in range(1, 12):
+              try:
+                  params = {
+                      'searchkey': '重庆银行',
+                      'sdate': '2020-01-01',
+                      'edate': '2026-09-15',
+                      'isfulltext': 'false',
+                      'sortName': 'pubdate',
+                      'sortType': 'desc',
+                      'pageNum': str(page),
+                      'pageSize': '30',
+                  }
+                  r = session.get('https://www.cninfo.com.cn/new/fulltextSearch/full', params=params, timeout=60,
+                                  headers={'Referer': 'https://www.cninfo.com.cn/'})
+                  if r.status_code != 200:
+                      break
+                  payload = r.json()
+                  rows = payload.get('announcements') or payload.get('data') or []
+                  if isinstance(rows, dict):
+                      rows = rows.get('announcements') or rows.get('list') or []
+                  for row in rows:
+                      title = row.get('announcementTitle') or row.get('title') or ''
+                      adjunct = row.get('adjunctUrl') or row.get('adjunct_url') or ''
+                      if adjunct:
+                          add_candidate(pool, title, urllib.parse.urljoin('https://static.cninfo.com.cn/', adjunct), '', 'CNINFO-fulltext')
+                  if not rows:
+                      break
+              except Exception as exc:
+                  discovery_notes.append(f'CNINFO fulltext page={page}: {exc!r}')
+                  break
+
+          # CFi exposes direct CNINFO links and is useful as a discovery fallback.
+          try:
+              cfi = session.get('https://gg.cfi.cn/cbgg/78120/601963.html', timeout=60)
+              cfi.raise_for_status()
+              soup = BeautifulSoup(cfi.content, 'html.parser')
+              for a in soup.find_all('a'):
+                  href = a.get('href') or ''
+                  absolute = urllib.parse.urljoin(cfi.url, href)
+                  if 'static.cninfo.com.cn' not in absolute or '.pdf' not in absolute.lower():
+                      continue
+                  context = ' '.join(a.parent.stripped_strings) if a.parent else a.get_text(' ', strip=True)
+                  add_candidate(pool, context, absolute, '', 'CFi/CNINFO')
+          except Exception as exc:
+              discovery_notes.append(f'CFi discovery: {exc!r}')
+
+          # Eastmoney announcement API supplies PDF mirrors when official discovery is incomplete.
+          for page in range(1, 10):
+              try:
+                  params = {
+                      'sr': '-1', 'page_size': '100', 'page_index': str(page),
+                      'ann_type': 'A', 'client_source': 'web', 'stock_list': '601963'
+                  }
+                  r = session.get('https://np-anotice-stock.eastmoney.com/api/security/ann', params=params, timeout=60)
+                  r.raise_for_status()
+                  payload = r.json()
+                  rows = ((payload.get('data') or {}).get('list') or [])
+                  for row in rows:
+                      title = row.get('title') or ''
+                      art = row.get('art_code') or row.get('artCode') or ''
+                      date = (row.get('notice_date') or row.get('noticeDate') or '')[:10]
+                      if art:
+                          add_candidate(pool, title, f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf', date, 'Eastmoney mirror')
+                  if not rows:
+                      break
+              except Exception as exc:
+                  discovery_notes.append(f'Eastmoney page={page}: {exc!r}')
+                  break
+
+          # Known direct mirrors from the announcement detail pages, used only after official candidates.
+          known = {
+              '2020年度报告': ['https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2021/2021-3/2021-03-31/6998417.PDF'],
+              '2021年度报告': ['https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2022/2022-4/2022-04-01/7948550.PDF'],
+              '2022年度报告': ['https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2023/2023-3/2023-03-31/8933574.PDF'],
+              '2023年度报告': ['https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2024/2024-3/2024-03-28/9905562.PDF'],
+              '2024年度报告': ['https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2025/2025-3/2025-03-22/10799682.PDF'],
+              '2025年度报告': ['https://file.finance.sina.com.cn/211.154.219.97:9494/MRGG/CNSESH_STOCK/2026/2026-3/2026-03-25/12014412.PDF'],
+              '首次公开发行股票招股说明书': ['https://static.cninfo.com.cn/finalpage/2020-12-30/1209017082.PDF'],
+          }
+
+          specs = [
+              {'label': '2020年度报告', 'filename': '01_重庆银行_2020年度报告.pdf', 'include': ['2020年度报告'], 'exclude': ['摘要', '补充', '英文'], 'year': '2020', 'min_pages': 150},
+              {'label': '2021年度报告', 'filename': '02_重庆银行_2021年度报告.pdf', 'include': ['2021年度报告'], 'exclude': ['摘要', '补充', '英文'], 'year': '2021', 'min_pages': 150},
+              {'label': '2022年度报告', 'filename': '03_重庆银行_2022年度报告.pdf', 'include': ['2022年度报告'], 'exclude': ['摘要', '补充', '英文'], 'year': '2022', 'min_pages': 150},
+              {'label': '2023年度报告', 'filename': '04_重庆银行_2023年度报告.pdf', 'include': ['2023年度报告'], 'exclude': ['摘要', '补充', '英文'], 'year': '2023', 'min_pages': 150},
+              {'label': '2024年度报告', 'filename': '05_重庆银行_2024年度报告.pdf', 'include': ['2024年度报告'], 'exclude': ['摘要', '补充', '英文'], 'year': '2024', 'min_pages': 150},
+              {'label': '2025年度报告', 'filename': '06_重庆银行_2025年度报告.pdf', 'include': ['2025年度报告'], 'exclude': ['摘要', '补充', '英文'], 'year': '2025', 'min_pages': 150},
+              {'label': '首次公开发行股票招股说明书', 'filename': '07_重庆银行_A股首次公开发行股票招股说明书_2020-12-30.pdf', 'include': ['首次公开发行股票招股说明书'], 'exclude': ['摘要', '意向书'], 'year': '2020', 'min_pages': 300},
+              {'label': '2026年第一季度报告', 'filename': '08_重庆银行_2026年第一季度报告_最新季报.pdf', 'include': ['2026年第一季度报告'], 'exclude': ['摘要'], 'year': '2026', 'min_pages': 10},
+              {'label': '2026年半年度报告', 'filename': '09_重庆银行_2026年半年度报告_最新完整定期报告.pdf', 'include': ['2026年半年度报告'], 'exclude': ['摘要'], 'year': '2026', 'min_pages': 150},
+          ]
+
+          def candidates_for(spec: dict) -> list[dict]:
+              includes = [norm_title(x) for x in spec['include']]
+              excludes = [norm_title(x) for x in spec['exclude']]
+              out: list[dict] = []
+              for key, entries in pool.items():
+                  if all(token in key for token in includes) and not any(token in key for token in excludes):
+                      out.extend(entries)
+              # Prefer official CNINFO, then other discovered mirrors, then deterministic known fallback.
+              rank = {'CNINFO': 0, 'CNINFO-fulltext': 1, 'CFi/CNINFO': 2, 'Eastmoney mirror': 3}
+              out.sort(key=lambda x: (rank.get(x.get('source', ''), 9), x.get('date', '')), reverse=False)
+              for url in known.get(spec['label'], []):
+                  out.append({'title': spec['label'], 'url': url, 'date': '', 'source': 'Known announcement mirror'})
+              # Deduplicate URLs while preserving order.
+              dedup, seen = [], set()
+              for item in out:
+                  if item['url'] not in seen:
+                      seen.add(item['url'])
+                      dedup.append(item)
+              return dedup
+
+          def download_pdf(candidates: list[dict], dest: Path) -> dict:
+              errors = []
+              for item in candidates:
+                  url = item['url']
+                  try:
+                      headers = {'Referer': 'https://www.cninfo.com.cn/'} if 'cninfo.com.cn' in url else None
+                      with session.get(url, headers=headers, timeout=240, stream=True, allow_redirects=True) as r:
+                          r.raise_for_status()
+                          tmp = dest.with_suffix('.pdf.part')
+                          with tmp.open('wb') as f:
+                              for chunk in r.iter_content(1024 * 1024):
+                                  if chunk:
+                                      f.write(chunk)
+                          size = tmp.stat().st_size
+                          prefix = tmp.read_bytes()[:5]
+                          if prefix != b'%PDF-':
+                              raise RuntimeError(f'not PDF; prefix={prefix!r}, size={size}')
+                          if size < 50_000:
+                              raise RuntimeError(f'file too small: {size}')
+                          tmp.replace(dest)
+                          return {**item, 'resolved_url': r.url, 'bytes': size}
+                  except Exception as exc:
+                      errors.append(f"{url}: {exc!r}")
+                      try:
+                          dest.with_suffix('.pdf.part').unlink(missing_ok=True)
+                      except Exception:
+                          pass
+              raise RuntimeError(f"All candidates failed for {dest.name}:\n" + '\n'.join(errors))
+
+          def validate_pdf(path: Path, spec: dict) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < spec['min_pages']:
+                  raise RuntimeError(f'{path.name}: {pages} pages, expected at least {spec["min_pages"]}')
+              idxs = sorted(set(list(range(min(12, pages))) + [max(0, pages // 2), pages - 1]))
+              text = ''
+              for idx in idxs:
+                  try:
+                      text += '\n' + (reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              compact = norm_title(text)
+              if '重庆银行' not in compact and 'bankofchongqing' not in compact:
+                  raise RuntimeError(f'{path.name}: company identity not found in sampled text')
+              year = spec['year']
+              if year not in compact:
+                  raise RuntimeError(f'{path.name}: expected year {year} not found in sampled text')
+              # Stronger type checks.
+              if '招股说明书' in spec['label']:
+                  if '招股说明书' not in compact and 'prospectus' not in compact:
+                      raise RuntimeError(f'{path.name}: prospectus wording not found')
+              elif '第一季度' in spec['label']:
+                  if '第一季度报告' not in compact:
+                      raise RuntimeError(f'{path.name}: Q1 report wording not found')
+              elif '半年度' in spec['label']:
+                  if '半年度报告' not in compact:
+                      raise RuntimeError(f'{path.name}: interim report wording not found')
+              else:
+                  if '年度报告' not in compact:
+                      raise RuntimeError(f'{path.name}: annual report wording not found')
+              return pages, text[:5000]
+
+          records = []
+          for spec in specs:
+              cand = candidates_for(spec)
+              if not cand:
+                  raise RuntimeError(f'No candidate URLs discovered for {spec["label"]}')
+              dest = PKG / spec['filename']
+              meta = download_pdf(cand, dest)
+              pages, _ = validate_pdf(dest, spec)
+              records.append({
+                  'file': dest.name,
+                  'document_type': spec['label'],
+                  'pages': pages,
+                  'bytes': dest.stat().st_size,
+                  'sha256': sha256(dest),
+                  'source_title': meta.get('title', ''),
+                  'source_kind': meta.get('source', ''),
+                  'source_url': meta.get('resolved_url') or meta.get('url'),
+              })
+              print(f'OK {dest.name}: {pages} pages, {dest.stat().st_size} bytes, source={meta.get("source")}')
+
+          # Render first page of every PDF for a visual/structural sanity check.
+          for rec in records:
+              pdf = PKG / rec['file']
+              outbase = PREVIEWS / pdf.stem
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '90',
+                  str(pdf), str(outbase)
+              ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              png = outbase.with_suffix('.png')
+              if not png.exists() or png.stat().st_size < 8_000:
+                  raise RuntimeError(f'First-page render failed: {pdf.name}')
+
+          readme = [
+              '# 重庆银行（601963.SH / 01963.HK）定期报告及招股说明书',
+              '',
+              f'整理截至：{AS_OF}',
+              '',
+              '说明：压缩包包含2020-2025年度报告、A股首次公开发行股票招股说明书、2026年第一季度报告，以及作为补充的2026年半年度报告。由于截至整理日尚未披露2026年第三季度报告，2026年第一季度报告是当前最新的正式季度报告；2026年半年度报告是当前最新的完整定期财务报告。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for i, rec in enumerate(records, 1):
+              readme += [
+                  f'{i}. {rec["file"]}',
+                  f'   - 类型：{rec["document_type"]}',
+                  f'   - 页数：{rec["pages"]}',
+                  f'   - 大小：{rec["bytes"] / 1024 / 1024:.2f} MiB',
+                  f'   - SHA-256：{rec["sha256"]}',
+                  f'   - 来源类型：{rec["source_kind"]}',
+                  f'   - 来源地址：{rec["source_url"]}',
+                  '',
+              ]
+          readme += [
+              '## 校验', '',
+              '- 检查每个文件的 PDF 文件头。',
+              '- 使用 pypdf 完整解析并核对页数、公司名称、报告年份和文档类型。',
+              '- 使用 Poppler 成功渲染每个文件首页。',
+              '- 对最终 ZIP 执行 CRC 完整性检查。',
+              '',
+              '本资料包仅用于公开信息查阅，不构成投资建议。',
+          ]
+          (PKG / '00_文件清单与校验记录.md').write_text('\n'.join(readme), encoding='utf-8')
+          (PKG / 'checksums.json').write_text(json.dumps({
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+              'as_of_date': AS_OF,
+              'records': records,
+              'discovery_notes': discovery_notes,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          with zipfile.ZipFile(FINAL_ZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(PKG.iterdir(), key=lambda p: p.name):
+                  zf.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(FINAL_ZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdf_count = sum(1 for n in zf.namelist() if n.lower().endswith('.pdf'))
+              if pdf_count != len(specs):
+                  raise RuntimeError(f'Expected {len(specs)} PDFs, found {pdf_count}')
+
+          print(json.dumps({
+              'final_zip': str(FINAL_ZIP),
+              'zip_bytes': FINAL_ZIP.stat().st_size,
+              'zip_sha256': sha256(FINAL_ZIP),
+              'documents': records,
+          }, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: bank-of-chongqing-official-reports-20260915
+          path: build/重庆银行_601963_01963_2020-2025年报_招股说明书_最新季报及中报_截至2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
