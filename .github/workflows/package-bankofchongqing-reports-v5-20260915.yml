@@ -1,0 +1,72 @@
+name: Package Bank of Chongqing reports final
+
+on:
+  push:
+    branches:
+      - tmp/bankofchongqing-reports-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/bankofchongqing-reports-20260915
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+          python -m pip install --quiet requests beautifulsoup4 pypdf fonttools
+
+      - name: Run final packager
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/package build/previews
+          python - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/package-bankofchongqing-reports-20260915.yml').read_text(encoding='utf-8')
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n\n      - name: Upload final archive"
+          body = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in body.splitlines())
+
+          old_identity = "if '重庆银行' not in compact and 'bankofchongqing' not in compact:"
+          new_identity = "if '重庆银行' not in compact and '重慶銀行' not in compact and 'bankofchongqing' not in compact:"
+          if old_identity not in script:
+              raise RuntimeError('Company identity validation expression not found')
+          script = script.replace(old_identity, new_identity)
+
+          year_start = script.index("    year = spec['year']")
+          type_start = script.index('    # Stronger type checks.', year_start)
+          script = script[:year_start] + script[type_start:]
+          type_start = script.index('    # Stronger type checks.')
+          return_line = '    return pages, text[:5000]'
+          type_end = script.index(return_line, type_start)
+          script = script[:type_start] + return_line + script[type_end + len(return_line):]
+
+          # Force the final 2020-12-30 issuance prospectus rather than an earlier 2018 filing draft.
+          old_candidate_block = "    cand = candidates_for(spec)\n    if not cand:"
+          new_candidate_block = "    cand = candidates_for(spec)\n    if spec['label'] == '首次公开发行股票招股说明书':\n        cand = [{'title': '重庆银行:首次公开发行股票招股说明书', 'url': 'https://static.cninfo.com.cn/finalpage/2020-12-30/1209017082.PDF', 'date': '2020-12-30', 'source': 'CNINFO official final prospectus'}]\n    if not cand:"
+          if old_candidate_block not in script:
+              raise RuntimeError('Candidate selection block not found')
+          script = script.replace(old_candidate_block, new_candidate_block)
+
+          exec(compile(script, 'bankofchongqing_packager.py', 'exec'), {'__name__': '__main__'})
+          PY
+
+      - name: Upload final archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: bank-of-chongqing-official-reports-final-20260915
+          path: build/重庆银行_601963_01963_2020-2025年报_招股说明书_最新季报及中报_截至2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
