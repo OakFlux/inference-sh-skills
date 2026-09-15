@@ -1,0 +1,79 @@
+name: Probe Bank of Chongqing final prospectus
+
+on:
+  push:
+    branches:
+      - tmp/bankofchongqing-prospectus-probe-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe announcement APIs and mirrors
+        shell: bash
+        run: |
+          python -m pip install --quiet requests pypdf
+          python - <<'PY'
+          import json, re, requests
+          from pathlib import Path
+          from pypdf import PdfReader
+
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'})
+          hits=[]
+          for page in range(1,30):
+              try:
+                  u='https://np-anotice-stock.eastmoney.com/api/security/ann'
+                  p={'sr':'-1','page_size':'100','page_index':str(page),'ann_type':'A','client_source':'web','stock_list':'601963'}
+                  r=s.get(u,params=p,timeout=60); r.raise_for_status(); data=r.json()
+                  rows=((data.get('data') or {}).get('list') or [])
+                  print('PAGE',page,'ROWS',len(rows))
+                  for row in rows:
+                      title=row.get('title') or ''
+                      if any(k in title for k in ['招股说明书','招股意向书']):
+                          rec={'page':page,'title':title,'art_code':row.get('art_code') or row.get('artCode'),'notice_date':row.get('notice_date') or row.get('noticeDate'),'row':row}
+                          hits.append(rec); print('HIT',json.dumps(rec,ensure_ascii=False))
+                  if not rows: break
+              except Exception as e:
+                  print('ERROR PAGE',page,repr(e)); break
+
+          Path('probe').mkdir(exist_ok=True)
+          results=[]
+          for i,h in enumerate(hits,1):
+              art=h.get('art_code')
+              if not art: continue
+              variants=[
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{art}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{art}.pdf',
+              ]
+              for u in variants:
+                  try:
+                      r=s.get(u,timeout=120,headers={'Referer':'https://data.eastmoney.com/'})
+                      item={'title':h['title'],'date':h.get('notice_date'),'art_code':art,'url':u,'status':r.status_code,'type':r.headers.get('content-type'),'size':len(r.content),'prefix':r.content[:8].hex()}
+                      if r.status_code==200 and r.content[:5]==b'%PDF-' and len(r.content)>50000:
+                          p=Path('probe')/f'{i:02d}_{art}.pdf'; p.write_bytes(r.content)
+                          try:
+                              reader=PdfReader(str(p),strict=False); item['pages']=len(reader.pages)
+                              text=''
+                              for idx in range(min(8,len(reader.pages))):
+                                  try:text+='\n'+(reader.pages[idx].extract_text() or '')
+                                  except:pass
+                              item['text']=re.sub(r'\s+',' ',text)[:2500]
+                          except Exception as e:item['parse_error']=repr(e)
+                          results.append(item); print('PDF',json.dumps(item,ensure_ascii=False)); break
+                      else:
+                          print('TEST',json.dumps(item,ensure_ascii=False))
+                  except Exception as e: print('DLERR',u,repr(e))
+          Path('probe/results.json').write_text(json.dumps({'hits':hits,'results':results},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bankofchongqing-prospectus-probe
+          path: probe
+          if-no-files-found: error
+          retention-days: 3
