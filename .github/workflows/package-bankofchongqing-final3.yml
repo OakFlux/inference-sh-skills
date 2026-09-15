@@ -1,0 +1,305 @@
+name: Build final Bank of Chongqing disclosure archive
+
+on:
+  push:
+    branches:
+      - tmp/bankofchongqing-final3-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+          python -m pip install --quiet requests pypdf fonttools
+
+      - name: Download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/package build/previews
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          ROOT = Path('build')
+          PKG = ROOT / 'package'
+          PREVIEWS = ROOT / 'previews'
+          OUTPUT = ROOT / '重庆银行_601963_01963_2020-2025年报_最终招股说明书_最新季报及中报_截至2026-09-15.zip'
+
+          documents = [
+              {
+                  'filename': '01_重庆银行_2020年度报告.pdf',
+                  'document_type': '2020年度报告',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202103301478551666_1.pdf',
+                  'pages': 382,
+                  'year': '2020',
+                  'type_terms': ['年度报告', '年度報告', '年报', '年報', 'annualreport'],
+              },
+              {
+                  'filename': '02_重庆银行_2021年度报告.pdf',
+                  'document_type': '2021年度报告',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202203311556314735_1.pdf',
+                  'pages': 398,
+                  'year': '2021',
+                  'type_terms': ['年度报告', '年度報告', '年报', '年報', 'annualreport'],
+              },
+              {
+                  'filename': '03_重庆银行_2022年度报告.pdf',
+                  'document_type': '2022年度报告',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202303301584700190_1.pdf',
+                  'pages': 382,
+                  'year': '2022',
+                  'type_terms': ['年度报告', '年度報告', '年报', '年報', 'annualreport'],
+              },
+              {
+                  'filename': '04_重庆银行_2023年度报告.pdf',
+                  'document_type': '2023年度报告',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202403271628310599_1.pdf',
+                  'pages': 402,
+                  'year': '2023',
+                  'type_terms': ['年度报告', '年度報告', '年报', '年報', 'annualreport'],
+              },
+              {
+                  'filename': '05_重庆银行_2024年度报告.pdf',
+                  'document_type': '2024年度报告',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202503211645615267_1.pdf',
+                  'pages': 402,
+                  'year': '2024',
+                  'type_terms': ['年度报告', '年度報告', '年报', '年報', 'annualreport'],
+              },
+              {
+                  'filename': '06_重庆银行_2025年度报告.pdf',
+                  'document_type': '2025年度报告',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202603241820724115_1.pdf',
+                  'pages': 378,
+                  'year': '2025',
+                  'type_terms': ['年度报告', '年度報告', '年报', '年報', 'annualreport'],
+              },
+              {
+                  'filename': '07_重庆银行_A股首次公开发行股票招股说明书_最终发行版_2020-12-30.pdf',
+                  'document_type': 'A股首次公开发行股票招股说明书（最终发行版）',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202012301445018236_1.pdf',
+                  'pages': 866,
+                  'year': '2020',
+                  'type_terms': ['招股说明书', '招股說明書'],
+                  'required_terms': ['10.83', '2021年1月21日'],
+                  'forbidden_terms': ['声明：本行的发行申请尚未得到中国证监会核准'],
+              },
+              {
+                  'filename': '08_重庆银行_2026年第一季度报告_最新季报.pdf',
+                  'document_type': '2026年第一季度报告（截至2026-09-15最新季报）',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202604281821687352_1.pdf',
+                  'pages': 21,
+                  'year': '2026',
+                  'type_terms': ['第一季度报告', '第一季度報告', '第一季度'],
+              },
+              {
+                  'filename': '09_重庆银行_2026年半年度报告_最新完整定期报告.pdf',
+                  'document_type': '2026年半年度报告（截至2026-09-15最新完整定期报告）',
+                  'url': 'https://pdf.dfcfw.com/pdf/H2_AN202608201828212237_1.pdf',
+                  'pages': 266,
+                  'year': '2026',
+                  'type_terms': ['半年度报告', '半年度報告', '中期报告', '中期報告', 'interimreport'],
+              },
+          ]
+
+          session = requests.Session()
+          retries = Retry(
+              total=4,
+              connect=4,
+              read=4,
+              backoff_factor=1.0,
+              status_forcelist=(429, 500, 502, 503, 504),
+              allowed_methods=frozenset(['GET']),
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retries))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Referer': 'https://data.eastmoney.com/',
+          })
+
+          def compact(value: str) -> str:
+              return re.sub(r'\s+', '', value or '').lower()
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open('rb') as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          records = []
+          for document in documents:
+              destination = PKG / document['filename']
+              temporary = destination.with_suffix('.pdf.part')
+
+              with session.get(document['url'], timeout=240, stream=True, allow_redirects=True) as response:
+                  response.raise_for_status()
+                  with temporary.open('wb') as handle:
+                      for chunk in response.iter_content(1024 * 1024):
+                          if chunk:
+                              handle.write(chunk)
+                  resolved_url = response.url
+
+              with temporary.open('rb') as handle:
+                  if handle.read(5) != b'%PDF-':
+                      raise RuntimeError(f'Invalid PDF header: {document["filename"]}')
+              if temporary.stat().st_size < 50_000:
+                  raise RuntimeError(f'PDF unexpectedly small: {document["filename"]}')
+              temporary.replace(destination)
+
+              reader = PdfReader(str(destination), strict=False)
+              actual_pages = len(reader.pages)
+              if actual_pages != document['pages']:
+                  raise RuntimeError(
+                      f'Page mismatch for {document["filename"]}: '
+                      f'{actual_pages} != {document["pages"]}'
+                  )
+
+              indexes = sorted(set(list(range(min(20, actual_pages))) + [actual_pages // 2, actual_pages - 1]))
+              sampled_text = ''
+              for index in indexes:
+                  try:
+                      sampled_text += '\n' + (reader.pages[index].extract_text() or '')
+                  except Exception:
+                      pass
+              normalized = compact(sampled_text)
+
+              company_terms = ['重庆银行', '重慶銀行', 'bankofchongqing']
+              if not any(compact(term) in normalized for term in company_terms):
+                  raise RuntimeError(f'Company identity not found: {document["filename"]}')
+              if compact(document['year']) not in normalized:
+                  raise RuntimeError(f'Expected year not found: {document["filename"]}')
+              if not any(compact(term) in normalized for term in document['type_terms']):
+                  raise RuntimeError(f'Document type not found: {document["filename"]}')
+              for term in document.get('required_terms', []):
+                  if compact(term) not in normalized:
+                      raise RuntimeError(f'Required term {term!r} not found: {document["filename"]}')
+              for term in document.get('forbidden_terms', []):
+                  if compact(term) in normalized:
+                      raise RuntimeError(f'Filing-draft wording found: {document["filename"]}')
+
+              preview_base = PREVIEWS / destination.stem
+              subprocess.run(
+                  [
+                      'pdftoppm', '-f', '1', '-l', '1', '-singlefile',
+                      '-png', '-r', '90', str(destination), str(preview_base),
+                  ],
+                  check=True,
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.PIPE,
+              )
+              preview = preview_base.with_suffix('.png')
+              if not preview.exists() or preview.stat().st_size < 8_000:
+                  raise RuntimeError(f'First-page rendering failed: {document["filename"]}')
+
+              record = {
+                  'file': destination.name,
+                  'document_type': document['document_type'],
+                  'pages': actual_pages,
+                  'bytes': destination.stat().st_size,
+                  'sha256': sha256(destination),
+                  'source_url': resolved_url,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False))
+
+          readme = [
+              '# 重庆银行（601963.SH / 01963.HK）公开披露资料包',
+              '',
+              '整理截至：2026-09-15',
+              '',
+              '本包包含2020—2025年度报告、2020年12月30日最终发行版A股招股说明书、2026年第一季度报告，以及作为补充的2026年半年度报告。',
+              '',
+              '截至整理日，2026年第一季度报告是最新正式季度报告；2026年半年度报告是最新完整定期财务报告。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for index, record in enumerate(records, start=1):
+              readme.extend([
+                  f'{index}. {record["file"]}',
+                  f'   - 类型：{record["document_type"]}',
+                  f'   - 页数：{record["pages"]}',
+                  f'   - 大小：{record["bytes"] / 1024 / 1024:.2f} MiB',
+                  f'   - SHA-256：{record["sha256"]}',
+                  f'   - 来源：{record["source_url"]}',
+                  '',
+              ])
+          readme.extend([
+              '## 校验说明',
+              '',
+              '- 全部文件通过PDF文件头检查和pypdf完整解析。',
+              '- 文件页数与公告平台元数据逐份核对。',
+              '- 抽样核对公司名称、年份和文档类别。',
+              '- 最终招股说明书核对发行价10.83元、预计发行日期2021年1月21日，并排除申报稿声明。',
+              '- 每份文件首页均使用Poppler成功渲染。',
+              '- 最终ZIP通过CRC完整性检查。',
+              '',
+              '本资料包仅用于公开信息查阅，不构成投资建议。',
+          ])
+          (PKG / '00_文件清单与校验记录.md').write_text('\n'.join(readme), encoding='utf-8')
+          (PKG / 'checksums.json').write_text(
+              json.dumps(
+                  {
+                      'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+                      'as_of_date': '2026-09-15',
+                      'records': records,
+                  },
+                  ensure_ascii=False,
+                  indent=2,
+              ),
+              encoding='utf-8',
+          )
+
+          with zipfile.ZipFile(OUTPUT, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(PKG.iterdir(), key=lambda item: item.name):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(OUTPUT, 'r') as archive:
+              failed_member = archive.testzip()
+              if failed_member:
+                  raise RuntimeError(f'ZIP CRC failure: {failed_member}')
+              pdf_count = sum(name.lower().endswith('.pdf') for name in archive.namelist())
+              if pdf_count != 9:
+                  raise RuntimeError(f'Expected 9 PDFs, found {pdf_count}')
+
+          print(json.dumps({
+              'final_zip': str(OUTPUT),
+              'zip_bytes': OUTPUT.stat().st_size,
+              'zip_sha256': sha256(OUTPUT),
+              'records': records,
+          }, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: bank-of-chongqing-final-reports-20260915
+          path: build/重庆银行_601963_01963_2020-2025年报_最终招股说明书_最新季报及中报_截至2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
