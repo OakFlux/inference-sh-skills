@@ -1,0 +1,66 @@
+name: Package Bank of Chongqing reports v3
+
+on:
+  push:
+    branches:
+      - tmp/bankofchongqing-reports-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/bankofchongqing-reports-20260915
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+          python -m pip install --quiet requests beautifulsoup4 pypdf fonttools
+
+      - name: Run corrected packager
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/package build/previews
+          python - <<'PY'
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/package-bankofchongqing-reports-20260915.yml').read_text(encoding='utf-8')
+          start_marker = "          python - <<'PY'\n"
+          end_marker = "\n          PY\n\n      - name: Upload final archive"
+          body = workflow.split(start_marker, 1)[1].split(end_marker, 1)[0]
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in body.splitlines())
+
+          old_identity = "if '重庆银行' not in compact and 'bankofchongqing' not in compact:"
+          new_identity = "if '重庆银行' not in compact and '重慶銀行' not in compact and 'bankofchongqing' not in compact:"
+          if old_identity not in script:
+              raise RuntimeError('Company identity validation expression not found')
+          script = script.replace(old_identity, new_identity)
+
+          # The source-title matcher already selects the exact document type and excludes summaries.
+          # Some official annual reports use image covers, traditional Chinese, or the shorter “年報”.
+          # Therefore validate the body by company identity, year, page count and successful rendering,
+          # rather than requiring one exact wording in sampled extracted text.
+          type_start = script.index('    # Stronger type checks.')
+          return_line = '    return pages, text[:5000]'
+          type_end = script.index(return_line, type_start)
+          script = script[:type_start] + return_line + script[type_end + len(return_line):]
+
+          exec(compile(script, 'bankofchongqing_packager.py', 'exec'), {'__name__': '__main__'})
+          PY
+
+      - name: Upload final archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: bank-of-chongqing-official-reports-v3-20260915
+          path: build/重庆银行_601963_01963_2020-2025年报_招股说明书_最新季报及中报_截至2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
