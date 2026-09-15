@@ -1,0 +1,114 @@
+name: Package validated Bank of Chongqing reports
+
+on:
+  push:
+    branches:
+      - tmp/bankofchongqing-final2-20260915
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+          python -m pip install --quiet requests pypdf fonttools
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/package build/previews
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          ROOT=Path('build'); PKG=ROOT/'package'; PREV=ROOT/'previews'
+          OUT=ROOT/'重庆银行_601963_01963_2020-2025年报_最终招股说明书_最新季报及中报_截至2026-09-15.zip'
+          docs=[
+            {'file':'01_重庆银行_2020年度报告.pdf','type':'2020年度报告','url':'https://pdf.dfcfw.com/pdf/H2_AN202103301478551666_1.pdf','pages':382,'terms':['重庆银行','2020'],'forbid':[]},
+            {'file':'02_重庆银行_2021年度报告.pdf','type':'2021年度报告','url':'https://pdf.dfcfw.com/pdf/H2_AN202203311556314735_1.pdf','pages':398,'terms':['重庆银行','2021'],'forbid':[]},
+            {'file':'03_重庆银行_2022年度报告.pdf','type':'2022年度报告','url':'https://pdf.dfcfw.com/pdf/H2_AN202303301584700190_1.pdf','pages':382,'terms':['重庆银行','2022'],'forbid':[]},
+            {'file':'04_重庆银行_2023年度报告.pdf','type':'2023年度报告','url':'https://pdf.dfcfw.com/pdf/H2_AN202403271628310599_1.pdf','pages':402,'terms':['重庆银行','2023'],'forbid':[]},
+            {'file':'05_重庆银行_2024年度报告.pdf','type':'2024年度报告','url':'https://pdf.dfcfw.com/pdf/H2_AN202503211645615267_1.pdf','pages':402,'terms':['重庆银行','2024'],'forbid':[]},
+            {'file':'06_重庆银行_2025年度报告.pdf','type':'2025年度报告','url':'https://pdf.dfcfw.com/pdf/H2_AN202603241820724115_1.pdf','pages':378,'terms':['重庆银行','2025'],'forbid':[]},
+            {'file':'07_重庆银行_A股首次公开发行股票招股说明书_最终发行版_2020-12-30.pdf','type':'A股首次公开发行股票招股说明书（最终发行版）','url':'https://pdf.dfcfw.com/pdf/H2_AN202012301445018236_1.pdf','pages':866,'terms':['重庆银行','招股说明书','10.83','2021年1月21日'],'forbid':['声明：本行的发行申请尚未得到中国证监会核准']},
+            {'file':'08_重庆银行_2026年第一季度报告_最新季报.pdf','type':'2026年第一季度报告（截至2026-09-15最新季报）','url':'https://pdf.dfcfw.com/pdf/H2_AN202604281821687352_1.pdf','pages':21,'terms':['重庆银行','2026','第一季度'],'forbid':[]},
+            {'file':'09_重庆银行_2026年半年度报告_最新完整定期报告.pdf','type':'2026年半年度报告（截至2026-09-15最新完整定期报告）','url':'https://pdf.dfcfw.com/pdf/H2_AN202608201828212237_1.pdf','pages':266,'terms':['重庆银行','2026','半年度'],'forbid':[]},
+          ]
+          s=requests.Session(); s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://data.eastmoney.com/'})
+
+          def digest(p:Path):
+            h=hashlib.sha256()
+            with p.open('rb') as f:
+              for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+            return h.hexdigest()
+
+          records=[]
+          for d in docs:
+            p=PKG/d['file']; tmp=p.with_suffix('.pdf.part')
+            with s.get(d['url'],timeout=240,stream=True,allow_redirects=True) as r:
+              r.raise_for_status()
+              with tmp.open('wb') as f:
+                for chunk in r.iter_content(1024*1024):
+                  if chunk:f.write(chunk)
+              resolved=r.url
+            if tmp.read_bytes()[:5]!=b'%PDF-': raise RuntimeError(f'Not PDF: {d["file"]}')
+            tmp.replace(p)
+            reader=PdfReader(str(p),strict=False)
+            actual=len(reader.pages)
+            if actual!=d['pages']: raise RuntimeError(f'Page mismatch {d["file"]}: {actual} != {d["pages"]}')
+            sample=''
+            idxs=sorted(set(list(range(min(15,actual)))+[actual//2,actual-1]))
+            for i in idxs:
+              try: sample+='\n'+(reader.pages[i].extract_text() or '')
+              except Exception: pass
+            compact=re.sub(r'\s+','',sample)
+            if '重庆银行' not in compact and '重慶銀行' not in compact and 'BANKOFCHONGQING' not in compact.upper():
+              raise RuntimeError(f'Company name missing: {d["file"]}')
+            for term in d['terms']:
+              if re.sub(r'\s+','',term) not in compact and term.upper() not in compact.upper():
+                raise RuntimeError(f'Term {term!r} missing: {d["file"]}')
+            for term in d['forbid']:
+              if re.sub(r'\s+','',term) in compact:
+                raise RuntimeError(f'Forbidden draft wording found: {d["file"]}')
+            outbase=PREV/p.stem
+            subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','90',str(p),str(outbase)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
+            png=outbase.with_suffix('.png')
+            if not png.exists() or png.stat().st_size<8000: raise RuntimeError(f'Render failure: {d["file"]}')
+            rec={'file':p.name,'document_type':d['type'],'pages':actual,'bytes':p.stat().st_size,'sha256':digest(p),'source_url':resolved}
+            records.append(rec); print('OK',json.dumps(rec,ensure_ascii=False))
+
+          lines=['# 重庆银行（601963.SH / 01963.HK）公开披露资料包','','整理截至：2026-09-15','',
+            '本包包含2020—2025年度报告、2020年12月30日最终发行版A股招股说明书、2026年第一季度报告，以及作为补充的2026年半年度报告。','','## 文件清单','']
+          for i,r in enumerate(records,1):
+            lines += [f'{i}. {r["file"]}',f'   - 类型：{r["document_type"]}',f'   - 页数：{r["pages"]}',f'   - 大小：{r["bytes"]/1024/1024:.2f} MiB',f'   - SHA-256：{r["sha256"]}',f'   - 来源：{r["source_url"]}','']
+          lines += ['## 校验说明','','- 全部文件通过PDF文件头和pypdf完整解析检查。','- 页数与公告平台元数据逐份核对。','- 抽样核对公司名称、年份和文档类别。','- 最终招股说明书核对发行价10.83元、预计发行日期2021年1月21日，并排除申报稿声明。','- 每份文件首页均使用Poppler成功渲染。','- 最终ZIP通过CRC完整性检查。']
+          (PKG/'00_文件清单与校验记录.md').write_text('\n'.join(lines),encoding='utf-8')
+          (PKG/'checksums.json').write_text(json.dumps({'generated_at_utc':datetime.now(timezone.utc).isoformat(),'as_of_date':'2026-09-15','records':records},ensure_ascii=False,indent=2),encoding='utf-8')
+          with zipfile.ZipFile(OUT,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6) as z:
+            for p in sorted(PKG.iterdir(),key=lambda x:x.name): z.write(p,arcname=p.name)
+          with zipfile.ZipFile(OUT) as z:
+            bad=z.testzip()
+            if bad: raise RuntimeError(f'Bad ZIP member: {bad}')
+            if sum(n.lower().endswith('.pdf') for n in z.namelist())!=9: raise RuntimeError('PDF count mismatch')
+          print(json.dumps({'final_zip':str(OUT),'zip_bytes':OUT.stat().st_size,'zip_sha256':digest(OUT),'records':records},ensure_ascii=False,indent=2))
+          PY
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: bank-of-chongqing-final-reports-20260915
+          path: build/重庆银行_601963_01963_2020-2025年报_最终招股说明书_最新季报及中报_截至2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
