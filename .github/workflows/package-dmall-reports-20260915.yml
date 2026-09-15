@@ -1,0 +1,311 @@
+name: Package Dmall official reports through 2026 interim
+
+on:
+  push:
+    branches:
+      - tmp/dmall-reports-20260915
+    paths:
+      - .github/workflows/package-dmall-reports-20260915.yml
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: tmp/dmall-reports-20260915
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils zip
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Download, validate, merge and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf build
+          mkdir -p build/package build/work/prospectus_parts build/work/previews
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import shutil
+          import subprocess
+          import urllib.parse
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader, PdfWriter
+
+          ROOT = Path('build')
+          PKG = ROOT / 'package'
+          WORK = ROOT / 'work'
+          PARTS = WORK / 'prospectus_parts'
+          PREVIEWS = WORK / 'previews'
+          FINAL_ZIP = ROOT / '多点数智_02586_年报_招股章程_最新中报_截至2026-09-15.zip'
+
+          UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36'
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': UA,
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.7',
+              'Accept': 'text/html,application/xhtml+xml,application/pdf,*/*;q=0.8',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download_pdf(urls: list[str], dest: Path, referer: str | None = None) -> tuple[str, int]:
+              errors = []
+              for url in urls:
+                  try:
+                      headers = {'Referer': referer} if referer else None
+                      with session.get(url, headers=headers, timeout=180, stream=True, allow_redirects=True) as r:
+                          r.raise_for_status()
+                          tmp = dest.with_suffix(dest.suffix + '.part')
+                          with tmp.open('wb') as f:
+                              for chunk in r.iter_content(1024 * 1024):
+                                  if chunk:
+                                      f.write(chunk)
+                          size = tmp.stat().st_size
+                          with tmp.open('rb') as f:
+                              prefix = f.read(5)
+                          if prefix != b'%PDF-':
+                              raise RuntimeError(f'not a PDF; prefix={prefix!r}; size={size}')
+                          if size < 50_000:
+                              raise RuntimeError(f'PDF unexpectedly small: {size} bytes')
+                          tmp.replace(dest)
+                          return r.url, size
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError('All PDF download candidates failed:\n' + '\n'.join(errors))
+
+          def validate_pdf(path: Path, expected_terms: list[str], min_pages: int) -> tuple[int, str]:
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{path.name}: only {pages} pages, expected at least {min_pages}')
+              sample_indexes = sorted(set([0, 1, 2, max(0, pages // 2), pages - 1]))
+              text = ''
+              for idx in sample_indexes:
+                  try:
+                      text += '\n' + (reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              normalized = re.sub(r'\s+', '', text).lower()
+              if expected_terms and not any(re.sub(r'\s+', '', t).lower() in normalized for t in expected_terms):
+                  # Some cover pages are image-heavy. Search additional early pages before failing.
+                  for idx in range(min(20, pages)):
+                      try:
+                          text += '\n' + (reader.pages[idx].extract_text() or '')
+                      except Exception:
+                          pass
+                  normalized = re.sub(r'\s+', '', text).lower()
+              if expected_terms and not any(re.sub(r'\s+', '', t).lower() in normalized for t in expected_terms):
+                  raise RuntimeError(f'{path.name}: expected title/company terms not found in extracted sample')
+              return pages, text[:4000]
+
+          records: list[dict] = []
+
+          # 1) Final prospectus. HKEX publishes this as an official chapter-index page;
+          # download every PDF chapter in displayed order and merge them losslessly.
+          prospectus_index = 'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/1128/2024112800055_c.htm'
+          resp = session.get(prospectus_index, timeout=120)
+          resp.raise_for_status()
+          soup = BeautifulSoup(resp.content, 'html.parser')
+          part_urls: list[str] = []
+          for a in soup.find_all('a'):
+              href = a.get('href')
+              if not href:
+                  continue
+              absolute = urllib.parse.urljoin(resp.url, href)
+              if urllib.parse.urlsplit(absolute).path.lower().endswith('.pdf') and absolute not in part_urls:
+                  part_urls.append(absolute)
+          if len(part_urls) < 25:
+              raise RuntimeError(f'Only found {len(part_urls)} prospectus PDF chapters from HKEX index')
+
+          part_paths: list[Path] = []
+          for i, url in enumerate(part_urls, start=1):
+              p = PARTS / f'{i:02d}.pdf'
+              download_pdf([url], p, referer=prospectus_index)
+              # Each part must be parseable; one-page parts are valid.
+              r = PdfReader(str(p), strict=False)
+              if len(r.pages) < 1:
+                  raise RuntimeError(f'Empty prospectus section: {url}')
+              part_paths.append(p)
+
+          prospectus_dest = PKG / '01_多点数智_招股章程_全球发售_2024-11-28.pdf'
+          writer = PdfWriter()
+          total_part_pages = 0
+          for p in part_paths:
+              reader = PdfReader(str(p), strict=False)
+              total_part_pages += len(reader.pages)
+              for page in reader.pages:
+                  writer.add_page(page)
+          writer.add_metadata({
+              '/Title': '多点数智有限公司（02586.HK）全球发售招股章程',
+              '/Author': 'Dmall Inc.',
+              '/Subject': 'HKEX official prospectus chapters merged in official display order',
+          })
+          with prospectus_dest.open('wb') as f:
+              writer.write(f)
+          p_pages, _ = validate_pdf(prospectus_dest, ['全球發售', 'globaloffering', '多点數智', 'dmallinc'], 300)
+          if p_pages != total_part_pages:
+              raise RuntimeError(f'Prospectus merge mismatch: merged={p_pages}, parts={total_part_pages}')
+          records.append({
+              'file': prospectus_dest.name,
+              'document_date': '2024-11-28',
+              'document_type': '最终招股章程（全球发售）',
+              'pages': p_pages,
+              'bytes': prospectus_dest.stat().st_size,
+              'sha256': sha256(prospectus_dest),
+              'source': prospectus_index,
+              'source_note': f'港交所官方招股章程索引页；按页面显示顺序合并 {len(part_urls)} 个官方 PDF 分章',
+          })
+
+          fixed_documents = [
+              {
+                  'filename': '02_多点数智_2024年度报告_2025-04-23.pdf',
+                  'date': '2025-04-23',
+                  'type': '2024年度报告',
+                  'urls': [
+                      'https://cdn.financialreports.eu/financialreports/media/filings/50692/2025/RNS/50692_rns_2025-04-23_3f39c965-13d2-4824-bb3b-c4e2ad5b28df.pdf',
+                  ],
+                  'terms': ['annualreport2024', '2024年度報告', '2024年度报告', 'dmallinc', '多点數智'],
+                  'min_pages': 80,
+              },
+              {
+                  'filename': '03_多点数智_2025年度报告_2026-04-23.pdf',
+                  'date': '2026-04-23',
+                  'type': '2025年度报告',
+                  'urls': [
+                      'https://cdn.financialreports.eu/financialreports/media/filings/50692/2026/RNS/50692_rns_2026-04-23_c8484e1a-aab6-44e3-9491-013c006c9490.pdf',
+                  ],
+                  'terms': ['annualreport2025', '2025年度報告', '2025年度报告', 'dmallinc', '多点數智'],
+                  'min_pages': 80,
+              },
+              {
+                  'filename': '04_多点数智_2026中期报告_2026-09-04.pdf',
+                  'date': '2026-09-04',
+                  'type': '2026中期报告（截至目前最新完整定期财务报告）',
+                  'urls': [
+                      'https://www.hkexnews.hk/listedco/listconews/sehk/2026/0904/2026090401214_c.pdf',
+                      'https://cdn.financialreports.eu/financialreports/media/filings/50692/2026/RNS/50692_rns_2026-09-04_a2d99d60-3977-4d45-83ad-7c3f756aa7d6.pdf',
+                  ],
+                  'terms': ['2026中期報告', '2026interimreport', 'dmallinc', '多点數智'],
+                  'min_pages': 80,
+              },
+          ]
+
+          for doc in fixed_documents:
+              dest = PKG / doc['filename']
+              final_url, _ = download_pdf(doc['urls'], dest)
+              pages, _ = validate_pdf(dest, doc['terms'], doc['min_pages'])
+              records.append({
+                  'file': dest.name,
+                  'document_date': doc['date'],
+                  'document_type': doc['type'],
+                  'pages': pages,
+                  'bytes': dest.stat().st_size,
+                  'sha256': sha256(dest),
+                  'source': final_url,
+                  'source_note': '监管披露文件的完整 PDF 副本' if 'financialreports' in final_url else '港交所官方 PDF',
+              })
+
+          # Render first page of every deliverable as a visual sanity check.
+          for rec in records:
+              pdf = PKG / rec['file']
+              outbase = PREVIEWS / pdf.stem
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '100',
+                  str(pdf), str(outbase)
+              ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              preview = outbase.with_suffix('.png')
+              if not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'First-page render failed visual sanity threshold: {pdf.name}')
+
+          # Add human-readable inventory and machine-readable checksums.
+          readme_lines = [
+              '# 多点数智（02586.HK）年报、招股章程及最新定期报告',
+              '',
+              '整理截至：2026-09-15',
+              '',
+              '说明：多点数智于2024年12月6日在香港联交所上市，因此上市后正式年度报告共有2024年度报告和2025年度报告两份。港股主板发行人通常披露年度报告和中期报告，而非强制季度报告；截至整理日，最新完整定期财务报告为2026年中期报告（报告期截至2026年6月30日）。',
+              '',
+              '## 文件清单',
+              '',
+          ]
+          for i, rec in enumerate(records, start=1):
+              mib = rec['bytes'] / 1024 / 1024
+              readme_lines += [
+                  f"{i}. {rec['file']}",
+                  f"   - 类型：{rec['document_type']}",
+                  f"   - 文件日期：{rec['document_date']}",
+                  f"   - 页数：{rec['pages']}",
+                  f"   - 大小：{mib:.2f} MiB",
+                  f"   - SHA-256：{rec['sha256']}",
+                  f"   - 来源：{rec['source']}",
+                  f"   - 备注：{rec['source_note']}",
+                  '',
+              ]
+          readme_lines += [
+              '## 校验方法',
+              '',
+              '- 每个文件均检查 `%PDF-` 文件头并通过 pypdf 完整解析。',
+              '- 核对页数、公司名称、报告年份或文档标题。',
+              '- 每个文件首页均使用 Poppler 成功渲染，以排除明显损坏。',
+              '- 招股章程由港交所官方分章 PDF 按官方索引顺序无损合并；合并页数与各分章页数之和一致。',
+              '',
+              '本压缩包仅用于资料查阅，不构成投资建议。',
+          ]
+          (PKG / '00_文件清单与校验记录.md').write_text('\n'.join(readme_lines), encoding='utf-8')
+          (PKG / 'checksums.json').write_text(json.dumps({
+              'generated_at_utc': datetime.now(timezone.utc).isoformat(),
+              'as_of_date': '2026-09-15',
+              'records': records,
+          }, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          with zipfile.ZipFile(FINAL_ZIP, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for path in sorted(PKG.iterdir(), key=lambda p: p.name):
+                  zf.write(path, arcname=path.name)
+
+          # Test the archive by reading every member and verifying CRCs.
+          with zipfile.ZipFile(FINAL_ZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              names = zf.namelist()
+              if len([n for n in names if n.lower().endswith('.pdf')]) != 4:
+                  raise RuntimeError(f'Expected 4 PDFs, archive has: {names}')
+
+          print(json.dumps({
+              'final_zip': str(FINAL_ZIP),
+              'zip_bytes': FINAL_ZIP.stat().st_size,
+              'zip_sha256': sha256(FINAL_ZIP),
+              'documents': records,
+          }, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Upload final archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmall-official-reports-20260915
+          path: build/多点数智_02586_年报_招股章程_最新中报_截至2026-09-15.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
