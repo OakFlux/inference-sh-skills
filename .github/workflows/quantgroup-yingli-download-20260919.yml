@@ -1,0 +1,65 @@
+name: Download public Yingli Quantgroup report 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-yingli-download-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+      - name: Download and validate public PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib,json,subprocess
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          landing='https://www.valuelist.cn/871327.html'
+          download='https://www.valuelist.cn/goto?down=ODcxMzI3LTAtZThhMTRkN2ViZg%3D%3D'
+          s=requests.Session();s.trust_env=False
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'application/pdf,application/octet-stream,*/*;q=0.8','Referer':landing}
+          r=s.get(download,headers=headers,timeout=(30,300),allow_redirects=True)
+          print('STATUS',r.status_code,'FINAL',r.url,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'HEAD',r.content[:16])
+          r.raise_for_status()
+          if not r.content.startswith(b'%PDF-'):
+            Path('output/response.bin').write_bytes(r.content)
+            Path('output/response.txt').write_text(r.text[:100000],encoding='utf-8',errors='ignore')
+            raise RuntimeError('public download did not return PDF')
+          p=Path('output/盈立证券_量化派02685_港股首次覆盖报告_AI战略与智能硬件_2026-08-17.pdf')
+          p.write_bytes(r.content)
+          rd=PdfReader(str(p),strict=False);pages=len(rd.pages)
+          text='\n'.join((pg.extract_text() or '') for pg in rd.pages[:15])
+          identity=all(x.lower() in text.lower() for x in ['量化派']) and any(x.lower() in text.lower() for x in ['02685','2685','quantgroup'])
+          institution=any(x in text for x in ['盈立证券','盈立證券'])
+          q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+          manifest={'title':'港股首次覆盖报告：AI战略发展赋能线上消费基本盘，智能硬件打开增长新范式','institution':'盈立证券','date':'2026-08-17','landing':landing,'download_url':download,'final_url':r.url,'pages':pages,'bytes':len(r.content),'sha256':hashlib.sha256(r.content).hexdigest(),'identity_ok':identity,'institution_ok':institution,'qpdf':q.returncode}
+          Path('output/manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('MANIFEST',json.dumps(manifest,ensure_ascii=False))
+          if pages < 35 or not identity or not institution or q.returncode not in (0,3):
+            raise RuntimeError('PDF validation failed')
+          PY
+      - name: Upload validated report
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-yingli-40page-report-20260919
+          path: output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
