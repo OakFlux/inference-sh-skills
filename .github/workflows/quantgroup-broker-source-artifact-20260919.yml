@@ -1,0 +1,112 @@
+name: Build concise Quantgroup broker source artifact 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-broker-source-artifact-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+      - name: Download official report and inspect public landing pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          out=Path('output')
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          # Official Huaan Securities (Hong Kong) PDF
+          pdf_url='https://api.hasc.com.hk/uploads/02685_HK_4281dc2d69.pdf'
+          r=s.get(pdf_url,timeout=(30,240),allow_redirects=True)
+          r.raise_for_status()
+          p=out/'华安证券香港_量化派_02685_研究报告.pdf'
+          p.write_bytes(r.content)
+          if not r.content.startswith(b'%PDF-'): raise RuntimeError('HASC response is not PDF')
+          rd=PdfReader(str(p),strict=False)
+          text='\n'.join((pg.extract_text() or '') for pg in rd.pages[:12])
+          q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+          summary={
+            'url':pdf_url,'final_url':r.url,'content_type':r.headers.get('content-type'),
+            'bytes':len(r.content),'pages':len(rd.pages),'sha256':hashlib.sha256(r.content).hexdigest(),
+            'qpdf_returncode':q.returncode,'metadata':{str(k):str(v) for k,v in (rd.metadata or {}).items()},
+            'first_text':text[:30000]
+          }
+          (out/'huaan_summary.json').write_text(json.dumps(summary,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          pages={
+            'yanbaoke':'https://www.yanbaoke.com/info/6MX8BtbPRRyVQpwC5LWfy9',
+            'sgpjbg':'https://www.sgpjbg.com/info/6MX8BtbPRRyVQpwC5LWfy9.html',
+            'book118':'https://max.book118.com/html/2026/0712/6022231035012200.shtm',
+          }
+          evidence={}
+          for name,url in pages.items():
+            try:
+              rr=s.get(url,timeout=(20,90),allow_redirects=True)
+              html=rr.text
+              soup=BeautifulSoup(html,'lxml')
+              scripts=[urljoin(rr.url,x.get('src')) for x in soup.find_all('script') if x.get('src')]
+              links=[]
+              for a in soup.find_all('a',href=True):
+                href=urljoin(rr.url,a['href']); label=' '.join(a.get_text(' ',strip=True).split())
+                low=(href+' '+label).lower()
+                if any(k in low for k in ['pdf','download','preview','量化派','quantgroup','02685','2685']):
+                  links.append({'label':label[:300],'url':href[:1500]})
+              inline=[]
+              patterns=[
+                r'https?://[^\s"\'<>]+(?:\.pdf|\.PDF)(?:\?[^\s"\'<>]*)?',
+                r'https?://[^\s"\'<>]+(?:download|preview|file)[^\s"\'<>]*',
+                r'[^\s"\'<>]{0,150}(?:6MX8BtbPRRyVQpwC5LWfy9|6022231035012200)[^\s"\'<>]{0,300}',
+              ]
+              for pat in patterns:
+                inline.extend(re.findall(pat,html,re.I)[:100])
+              script_hits=[]
+              for js in scripts[:80]:
+                try:
+                  jr=s.get(js,timeout=(15,60))
+                  if jr.status_code!=200 or len(jr.content)>15_000_000: continue
+                  body=jr.text
+                  if any(k.lower() in body.lower() for k in ['6MX8BtbPRRyVQpwC5LWfy9','6022231035012200','download','pdfurl','fileurl','previewimages']):
+                    contexts=[]
+                    for key in ['6MX8BtbPRRyVQpwC5LWfy9','6022231035012200','download','pdfUrl','fileUrl','previewImages','getReportPreviewImages']:
+                      pos=body.lower().find(key.lower())
+                      if pos>=0: contexts.append(body[max(0,pos-500):pos+1200])
+                    script_hits.append({'url':js,'length':len(body),'contexts':contexts[:12]})
+                except Exception as exc:
+                  script_hits.append({'url':js,'error':repr(exc)})
+              evidence[name]={'url':url,'status':rr.status_code,'final_url':rr.url,'bytes':len(rr.content),'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'scripts':scripts[:100], 'links':links[:100], 'inline':inline[:200], 'script_hits':script_hits[:40]}
+              (out/f'{name}.html').write_text(html,encoding='utf-8',errors='ignore')
+            except Exception as exc:
+              evidence[name]={'url':url,'error':repr(exc)}
+          (out/'landing_page_evidence.json').write_text(json.dumps(evidence,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps({'huaan_pages':summary['pages'],'huaan_bytes':summary['bytes'],'evidence_keys':list(evidence)},ensure_ascii=False))
+          PY
+      - name: Upload inspection artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-broker-source-artifact-20260919
+          path: output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
