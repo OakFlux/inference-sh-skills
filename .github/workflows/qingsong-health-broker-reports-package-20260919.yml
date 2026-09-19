@@ -1,0 +1,287 @@
+name: Build Qingsong Health broker reports package 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qingsong-health-broker-reports-package-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf pillow img2pdf beautifulsoup4
+
+      - name: Download, reconstruct public viewer reports, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import subprocess
+          import time
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '轻松健康_02661_券商研究报告_3份_20260919'
+          out = Path(PACKAGE)
+          out.mkdir(exist_ok=True)
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def validate_pdf(path: Path, min_pages: int = 1, min_bytes: int = 50_000) -> int:
+              data = path.read_bytes()
+              if len(data) < min_bytes or not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'invalid PDF header/size: {path.name}, {len(data)} bytes')
+              pages = len(PdfReader(str(path), strict=False).pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'page count too small: {path.name}, pages={pages}')
+              chk = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if chk.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed: {path.name}: {chk.stderr[-1200:]}')
+              return pages
+
+          def get_bytes(url: str, referer: str | None = None, min_bytes: int = 1_000, tries: int = 4) -> tuple[bytes, str, str]:
+              errors = []
+              headers = {'Referer': referer} if referer else {}
+              for attempt in range(1, tries + 1):
+                  try:
+                      r = s.get(url, headers=headers, timeout=(15, 120), allow_redirects=True)
+                      ctype = r.headers.get('content-type', '')
+                      print('GET', url, 'attempt', attempt, 'status', r.status_code, 'type', ctype, 'bytes', len(r.content), 'final', r.url, flush=True)
+                      r.raise_for_status()
+                      if len(r.content) < min_bytes:
+                          raise RuntimeError(f'response too small: {len(r.content)}')
+                      return r.content, str(r.url), ctype
+                  except Exception as e:
+                      errors.append(repr(e))
+                      time.sleep(attempt)
+              raise RuntimeError(f'download failed: {url}: {errors}')
+
+          records: list[dict] = []
+
+          # 1) Official StarLight Securities PDF.
+          official_url = 'https://www.hkstarlightgroup.com/uploadfile/files/202603/20260326201045SnohP.pdf'
+          official_page = 'https://www.hkstarlightgroup.com/news/id-99.html'
+          p1 = out / '01_星光证券_轻松健康2661.HK_战略转型构筑稀缺壁垒_AI医疗龙头迈入价值收获期_2026-03-26.pdf'
+          data, final_url, ctype = get_bytes(official_url, referer=official_page, min_bytes=500_000)
+          p1.write_bytes(data)
+          pages = validate_pdf(p1, min_pages=10, min_bytes=500_000)
+          sample = ''
+          reader = PdfReader(str(p1), strict=False)
+          for page in reader.pages[:min(6, pages)]:
+              try:
+                  sample += '\n' + (page.extract_text() or '')
+              except Exception:
+                  pass
+          if not any(t.lower() in sample.lower() for t in ('2661', 'qingsong', '輕鬆健康', '轻松健康')):
+              print('WARNING: company text was not extractable from StarLight PDF; source URL and page metadata retained.', flush=True)
+          records.append({
+              'filename': p1.name,
+              'institution': '星光证券（Starlight Securities Limited）',
+              'title': '轻松健康（2661.HK）：战略转型构筑稀缺壁垒，AI医疗龙头迈入价值收获期',
+              'publication_date': '2026-03-26',
+              'document_form': '券商官网发布的原始PDF',
+              'source_page': official_page,
+              'source_url': final_url,
+              'pages': pages,
+              'bytes': p1.stat().st_size,
+              'sha256': sha256(p1),
+          })
+
+          def reconstruct_report(*, report_id: str, date_path: str, filename: str, institution: str,
+                                 title: str, publication_date: str, detail_url: str,
+                                 expected_terms: tuple[str, ...], optional: bool = False) -> dict | None:
+              # Confirm that the public detail page corresponds to the intended report.
+              try:
+                  page_data, detail_final, _ = get_bytes(detail_url, min_bytes=20_000)
+                  page_text = BeautifulSoup(page_data, 'html.parser').get_text(' ', strip=True)
+                  if not any(term.lower() in page_text.lower() for term in expected_terms):
+                      raise RuntimeError('detail-page identity terms not found')
+              except Exception:
+                  if optional:
+                      return None
+                  raise
+
+              img_dir = out / f'_source_pages_{report_id}'
+              img_dir.mkdir(exist_ok=True)
+              image_paths: list[Path] = []
+              image_urls: list[str] = []
+              # Public viewer serves one numbered source image per report page.
+              for i in range(1, 31):
+                  url = f'https://public.fxbaogao.com/report-image/{date_path}/{report_id}-{i}.png'
+                  success = False
+                  last_status = None
+                  for attempt in range(1, 4):
+                      try:
+                          r = s.get(url, headers={'Referer': detail_url, 'Accept': 'image/png,image/*;q=0.9,*/*;q=0.8'}, timeout=(10, 45), allow_redirects=True)
+                          last_status = r.status_code
+                          print('IMAGE', report_id, i, 'attempt', attempt, 'status', r.status_code, 'type', r.headers.get('content-type'), 'bytes', len(r.content), flush=True)
+                          if r.status_code == 404:
+                              break
+                          r.raise_for_status()
+                          if len(r.content) < 20_000:
+                              raise RuntimeError(f'image too small: {len(r.content)}')
+                          raw = r.content
+                          im = Image.open(BytesIO(raw))
+                          im.load()
+                          if im.width < 800 or im.height < 1000:
+                              raise RuntimeError(f'implausible page dimensions: {im.size}')
+                          # Normalize to RGB PNG only when source is not a directly embeddable PNG.
+                          dest = img_dir / f'{i:03d}.png'
+                          if raw.startswith(b'\x89PNG\r\n\x1a\n'):
+                              dest.write_bytes(raw)
+                          else:
+                              if im.mode not in ('RGB', 'L'):
+                                  im = im.convert('RGB')
+                              im.save(dest, format='PNG', optimize=False)
+                          image_paths.append(dest)
+                          image_urls.append(str(r.url))
+                          success = True
+                          break
+                      except Exception as e:
+                          print('IMAGE_ERROR', report_id, i, repr(e), flush=True)
+                          time.sleep(attempt)
+                  if not success:
+                      if i == 1:
+                          if optional:
+                              return None
+                          raise RuntimeError(f'no public page images for report {report_id}')
+                      # A missing next sequential page marks the end of the public report.
+                      break
+
+              if not image_paths:
+                  if optional:
+                      return None
+                  raise RuntimeError(f'no images downloaded for {report_id}')
+
+              pdf_path = out / filename
+              layout = img2pdf.get_layout_fun((img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297)))
+              pdf_path.write_bytes(img2pdf.convert([str(p) for p in image_paths], layout_fun=layout))
+              pages = validate_pdf(pdf_path, min_pages=len(image_paths), min_bytes=100_000)
+              if pages != len(image_paths):
+                  raise RuntimeError(f'reconstructed page mismatch for {report_id}: pdf={pages}, images={len(image_paths)}')
+
+              # Keep the original page images in the package for auditability.
+              rec = {
+                  'filename': pdf_path.name,
+                  'institution': institution,
+                  'title': title,
+                  'publication_date': publication_date,
+                  'document_form': '由报告公开阅读页的完整逐页原图合成PDF；非券商服务器上的原始PDF文件',
+                  'source_page': detail_final,
+                  'source_page_images': image_urls,
+                  'pages': pages,
+                  'bytes': pdf_path.stat().st_size,
+                  'sha256': sha256(pdf_path),
+              }
+              return rec
+
+          r2 = reconstruct_report(
+              report_id='5188870', date_path='2025/12/15',
+              filename='02_国元国际_IPO申购指南_轻松健康_公开逐页原图合成版_2025-12-15.pdf',
+              institution='国元国际（国元证券经纪（香港）有限公司）',
+              title='IPO申购指南：轻松健康', publication_date='2025-12-15',
+              detail_url='https://www.fxbaogao.com/detail/5188870',
+              expected_terms=('IPO申购指南', '轻松健康', '国元国际'), optional=False,
+          )
+          records.append(r2)
+
+          r3 = reconstruct_report(
+              report_id='5188665', date_path='2025/12/15',
+              filename='03_中国光大证券国际_新股预览_轻松健康_公开逐页原图合成版_2025-12-15.pdf',
+              institution='中国光大证券国际',
+              title='新股预览：轻松健康', publication_date='2025-12-15',
+              detail_url='https://www.fxbaogao.com/detail/5188665',
+              expected_terms=('新股预览', '轻松健康', '光大证券'), optional=True,
+          )
+          if r3 is not None:
+              records.append(r3)
+
+          if len(records) < 2:
+              raise RuntimeError(f'not enough verified reports: {len(records)}')
+
+          # Remove no-longer-needed source image folders only from ZIP? Keep them, as an auditable source copy.
+          readme = [
+              '轻松健康集团（02661.HK）券商研究报告资料包',
+              '整理日期：2026-09-19',
+              '',
+              f'本包共收录{len(records)}份可核验的券商研究材料。',
+              '',
+              '文件形式说明：',
+              '1. 星光证券报告来自星光集团官网公开PDF，为原始PDF文件。',
+              '2. 国元国际及中国光大证券国际报告如被收录，来源站点公开展示完整逐页原图但未公开原始PDF下载地址；本包将连续公开页图按原顺序合成为PDF，并保留逐页原图，未改变页面内容。',
+              '3. “逐页原图合成版”不应被误认为券商服务器提供的原始PDF；其用途是便于离线阅读与核验。',
+              '4. 报告中的评级、目标价、申购意见和预测均为相应机构在报告发布日期的观点，不代表整理者的意见，也不构成当前投资建议。',
+              '',
+              '文件清单：',
+          ]
+          for i, rec in enumerate(records, 1):
+              readme.extend([
+                  f"{i}. {rec['institution']}｜{rec['title']}",
+                  f"   文件：{rec['filename']}",
+                  f"   日期：{rec['publication_date']}；页数：{rec['pages']}；大小：{rec['bytes']/1048576:.2f} MB",
+                  f"   形式：{rec['document_form']}",
+                  f"   来源页：{rec['source_page']}",
+                  f"   SHA-256：{rec['sha256']}",
+                  '',
+              ])
+          readme.append('完整性核验：HTTP文件类型与大小、PDF文件头、实际页数、qpdf结构检查、SHA-256、ZIP CRC；逐页合成报告另核对连续页码及源图尺寸。')
+          (out / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (out / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (out / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['filename']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+              for path in sorted(out.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, arcname=f'{PACKAGE}/{path.relative_to(out)}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(records):
+                  raise RuntimeError(f'PDF count mismatch: zip={len(pdfs)}, records={len(records)}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, 'REPORT_COUNT', len(records), 'SHA256', sha256(zip_path), flush=True)
+          print('FINAL_MANIFEST', json.dumps(records, ensure_ascii=False, indent=2), flush=True)
+          PY
+
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: qingsong-health-02661-broker-reports-final
+          path: 轻松健康_02661_券商研究报告_3份_20260919.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
