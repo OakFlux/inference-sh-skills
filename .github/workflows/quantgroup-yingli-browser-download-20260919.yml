@@ -1,0 +1,96 @@
+name: Download public Yingli report through browser 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-yingli-browser-download-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet playwright pypdf requests beautifulsoup4 lxml
+          python -m playwright install chromium
+      - name: Use public download button and validate output
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import asyncio, hashlib, json, subprocess
+          from pathlib import Path
+          from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+          from pypdf import PdfReader
+
+          LANDING='https://www.valuelist.cn/871327.html'
+          async def main():
+            out=Path('output')
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True)
+              ctx=await browser.new_context(locale='zh-CN',accept_downloads=True,user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36')
+              page=await ctx.new_page(); events=[]
+              page.on('response',lambda r: events.append({'url':r.url,'status':r.status,'content_type':r.headers.get('content-type','')}) if any(k in r.url.lower() for k in ['goto','download','pdf','file']) else None)
+              await page.goto(LANDING,wait_until='domcontentloaded',timeout=90000)
+              await page.wait_for_timeout(5000)
+              link=page.get_by_text('立即下载',exact=True)
+              if await link.count()==0:
+                link=page.locator('a[href*="goto?down="]').first
+              href=await link.get_attribute('href')
+              print('DOWNLOAD_LINK',href)
+              download_path=None
+              try:
+                async with page.expect_download(timeout=60000) as di:
+                  await link.click()
+                dl=await di.value
+                download_path=out/'browser_download.bin'
+                await dl.save_as(str(download_path))
+                print('PLAYWRIGHT_DOWNLOAD',dl.suggested_filename,download_path.stat().st_size)
+              except PlaywrightTimeout:
+                print('NO_DIRECT_DOWNLOAD_EVENT')
+                await page.wait_for_timeout(10000)
+                print('AFTER_CLICK_URL',page.url,'TITLE',await page.title())
+                html=await page.content();(out/'after_click.html').write_text(html,encoding='utf-8')
+                text=(await page.locator('body').inner_text())[:100000];(out/'after_click.txt').write_text(text,encoding='utf-8')
+                links=await page.locator('a').evaluate_all("els=>els.map(a=>({text:(a.innerText||'').trim(),href:a.href})).filter(x=>x.href)")
+                (out/'after_click_links.json').write_text(json.dumps(links,ensure_ascii=False,indent=2),encoding='utf-8')
+              (out/'events.json').write_text(json.dumps(events,ensure_ascii=False,indent=2),encoding='utf-8')
+              await browser.close()
+
+            candidates=list(out.glob('*'))
+            pdf_src=None
+            for c in candidates:
+              if c.is_file() and c.read_bytes()[:5]==b'%PDF-':pdf_src=c;break
+            if not pdf_src:
+              print('NO_PDF_CAPTURED')
+              return
+            final=out/'盈立证券_量化派02685_港股首次覆盖报告_AI战略与智能硬件_2026-08-17.pdf'
+            pdf_src.replace(final)
+            rd=PdfReader(str(final),strict=False);pages=len(rd.pages)
+            text='\n'.join((pg.extract_text() or '') for pg in rd.pages[:15])
+            identity='量化派' in text and any(x in text.lower() for x in ['02685','2685','quantgroup'])
+            institution=any(x in text for x in ['盈立证券','盈立證券'])
+            q=subprocess.run(['qpdf','--check',str(final)],capture_output=True,text=True)
+            manifest={'landing':LANDING,'pages':pages,'bytes':final.stat().st_size,'sha256':hashlib.sha256(final.read_bytes()).hexdigest(),'identity_ok':identity,'institution_ok':institution,'qpdf':q.returncode}
+            (out/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+            print('MANIFEST',json.dumps(manifest,ensure_ascii=False))
+            if pages<35 or not identity or not institution or q.returncode not in (0,3):raise RuntimeError('validation failed')
+          asyncio.run(main())
+          PY
+      - name: Upload browser output
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-yingli-browser-download-20260919
+          path: output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
