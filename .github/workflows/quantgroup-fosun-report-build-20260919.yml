@@ -1,0 +1,86 @@
+name: Build public Fosun Quantgroup report PDF 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-fosun-report-build-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pillow img2pdf pypdf
+      - name: Download public report pages and assemble PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output/pages
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, subprocess
+          from io import BytesIO
+          from pathlib import Path
+          import img2pdf, requests
+          from PIL import Image
+          from pypdf import PdfReader
+
+          out=Path('output'); pages_dir=out/'pages'
+          s=requests.Session();s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Referer':'https://www.fxbaogao.com/view?id=5553065'})
+          base='https://public.fxbaogao.com/report-image/2026/07/23/5553065-{}.png'
+          saved=[]; misses=0
+          for n in range(1,101):
+            url=base.format(n)
+            r=s.get(url,timeout=(20,120),allow_redirects=True)
+            ok=False
+            if r.status_code==200 and len(r.content)>10000:
+              try:
+                im=Image.open(BytesIO(r.content)); im.verify()
+                ok=True
+              except Exception:
+                ok=False
+            print('PAGE',n,'STATUS',r.status_code,'BYTES',len(r.content),'OK',ok,url)
+            if ok:
+              p=pages_dir/f'{n:03d}.png';p.write_bytes(r.content);saved.append(p);misses=0
+            else:
+              misses+=1
+              if saved and misses>=3:break
+          if len(saved)<10: raise RuntimeError(f'only {len(saved)} public pages found')
+          pdf=out/'复星财富控股研究所_量化派02685_从线上消费平台到物理AI场景赋能者_2026-07-23.pdf'
+          with pdf.open('wb') as f:
+            f.write(img2pdf.convert([str(p) for p in saved]))
+          rd=PdfReader(str(pdf),strict=False)
+          if len(rd.pages)!=len(saved):raise RuntimeError('page count mismatch')
+          q=subprocess.run(['qpdf','--check',str(pdf)],capture_output=True,text=True)
+          if q.returncode not in (0,3):raise RuntimeError(q.stderr)
+          sha=hashlib.sha256(pdf.read_bytes()).hexdigest()
+          manifest={
+            'title':'量化派（02685.HK）：从线上消费平台到物理AI场景赋能者',
+            'institution':'复星财富控股研究所 / 复星恒利',
+            'date':'2026-07-23','source_landing':'https://www.fxbaogao.com/detail/5553065',
+            'public_viewer':'https://www.fxbaogao.com/view?id=5553065',
+            'page_image_template':base,'pages':len(saved),'bytes':pdf.stat().st_size,'sha256':sha,
+            'qpdf_returncode':q.returncode
+          }
+          (out/'fosun_manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (out/'00_来源说明.txt').write_text('本文件由发现报告页面“点击免费查看完整报告”所公开展示的逐页原图按原顺序合并生成。未使用登录、付费或访问控制绕过。\n来源：https://www.fxbaogao.com/detail/5553065\n',encoding='utf-8')
+          print('FINAL',json.dumps(manifest,ensure_ascii=False))
+          PY
+          rm -rf output/pages
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-fosun-deep-report-20260919
+          path: output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
