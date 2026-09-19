@@ -1,0 +1,68 @@
+name: Probe Qingsong Health research report assets 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qingsong-health-research-assets-probe-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Install requests
+        run: python -m pip install --quiet requests
+      - name: Probe PDFs and page images
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+          import requests
+          S=requests.Session(); S.trust_env=False
+          H={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Referer':'https://www.fxbaogao.com/'}
+          rids=[('5188870','2025/12/15'),('5319486','2026/03/23')]
+          templates=[
+            'https://public.fxbaogao.com/report-pdf/{date}/{rid}.pdf',
+            'https://public.fxbaogao.com/report-pdf/{date}/{rid}/{rid}.pdf',
+            'https://public.fxbaogao.com/report/{date}/{rid}.pdf',
+            'https://public.fxbaogao.com/pdf/{date}/{rid}.pdf',
+            'https://public.fxbaogao.com/report-file/{date}/{rid}.pdf',
+            'https://static.fxbaogao.com/report-pdf/{date}/{rid}.pdf',
+            'https://static.fxbaogao.com/report/{date}/{rid}.pdf',
+            'https://www.fxbaogao.com/api/report/download?id={rid}',
+            'https://www.fxbaogao.com/download?id={rid}',
+            'https://www.fxbaogao.com/report/download/{rid}',
+          ]
+          for rid,date in rids:
+            print('\nPDF CANDIDATES',rid,flush=True)
+            for t in templates:
+              u=t.format(rid=rid,date=date)
+              try:
+                r=S.get(u,headers=H,timeout=(5,12),stream=True,allow_redirects=True)
+                head=next(r.iter_content(24),b'')
+                print('PDFPROBE',rid,r.status_code,r.headers.get('content-type'),r.headers.get('content-length'),head,u,'FINAL',r.url,flush=True)
+              except Exception as e: print('PDFERR',rid,u,repr(e),flush=True)
+
+          def imgprobe(args):
+            rid,date,i=args
+            u=f'https://public.fxbaogao.com/report-image/{date}/{rid}-{i}.png'
+            try:
+              r=requests.get(u,headers=H,timeout=(4,10),stream=True,allow_redirects=True)
+              head=next(r.iter_content(16),b'')
+              return rid,i,r.status_code,r.headers.get('content-type'),r.headers.get('content-length'),head,u
+            except Exception as e: return rid,i,'ERR',None,None,repr(e).encode(),u
+          tasks=[(rid,date,i) for rid,date in rids for i in range(1,81)]
+          rows=[]
+          with ThreadPoolExecutor(max_workers=32) as ex:
+            for f in as_completed([ex.submit(imgprobe,t) for t in tasks]): rows.append(f.result())
+          for rid,date in rids:
+            valid=[]
+            for _,i,status,ctype,cl,head,u in sorted([x for x in rows if x[0]==rid],key=lambda x:x[1]):
+              if status==200 and head.startswith(b'\x89PNG'): valid.append((i,ctype,cl))
+            print('VALID_IMAGES',rid,valid,flush=True)
+          PY
