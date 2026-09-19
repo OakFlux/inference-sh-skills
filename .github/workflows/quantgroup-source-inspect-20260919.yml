@@ -1,0 +1,91 @@
+name: Inspect Quantgroup broker report sources 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-source-inspect-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils qpdf
+          python -m pip install --quiet requests beautifulsoup4 lxml pypdf
+      - name: Inspect sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, html, subprocess, hashlib
+          from pathlib import Path
+          from urllib.parse import urljoin, quote
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          def dlpdf(url,name):
+              r=s.get(url,timeout=(20,180),allow_redirects=True)
+              print('PDFGET',url,r.status_code,r.url,r.headers.get('content-type'),len(r.content))
+              p=Path(name); p.write_bytes(r.content)
+              print('HEAD',r.content[:12])
+              if r.content[:5]==b'%PDF-':
+                  rd=PdfReader(str(p),strict=False)
+                  print('PDFINFO',name,'PAGES',len(rd.pages),'META',rd.metadata,'SHA256',hashlib.sha256(r.content).hexdigest())
+                  txt='\n'.join((pg.extract_text() or '') for pg in rd.pages[:8])
+                  print('PDFTEXT_START\n',txt[:25000],'\nPDFTEXT_END')
+                  cp=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+                  print('QPDF',cp.returncode,cp.stdout[-1000:],cp.stderr[-1000:])
+              return p
+
+          dlpdf('https://api.hasc.com.hk/uploads/02685_HK_4281dc2d69.pdf','huaan_02685.pdf')
+
+          pages=[
+            'https://www.yanbaoke.com/info/6MX8BtbPRRyVQpwC5LWfy9',
+            'https://max.book118.com/html/2026/0712/6022231035012200.shtm',
+            'https://www.fosunwealth.com/',
+          ]
+          for u in pages:
+              try:
+                  r=s.get(u,timeout=(20,60),allow_redirects=True)
+                  print('\nPAGE',u,'STATUS',r.status_code,'FINAL',r.url,'TYPE',r.headers.get('content-type'),'LEN',len(r.content))
+                  print('HEADTEXT',r.text[:2000].replace('\n',' '))
+                  soup=BeautifulSoup(r.text,'lxml')
+                  scripts=[urljoin(r.url,x.get('src')) for x in soup.find_all('script') if x.get('src')]
+                  print('SCRIPTS',scripts[:100])
+                  for a in soup.find_all('a',href=True):
+                      tx=' '.join(a.get_text(' ',strip=True).split()); href=urljoin(r.url,a['href'])
+                      low=(tx+' '+href).lower()
+                      if any(k in low for k in ['pdf','download','在线阅读','下載','报告','research','量化派','quantgroup']):
+                          print('LINK',tx[:200],href[:1000])
+                  for pat in [r'https?://[^\s"\'<>]+(?:\.pdf|\.PDF)(?:\?[^\s"\'<>]*)?',r'https?://[^\s"\'<>]+',r'[A-Za-z0-9_/-]{5,}(?:download|preview|file|pdf)[A-Za-z0-9_?&=/.-]*']:
+                      vals=re.findall(pat,r.text,re.I)
+                      if vals: print('PAT',pat,[html.unescape(v)[:1000] for v in vals[:100]])
+                  for js in scripts[:80]:
+                      try:
+                          rr=s.get(js,timeout=(15,60))
+                          if rr.status_code!=200 or len(rr.content)>15_000_000: continue
+                          body=rr.text
+                          if any(k.lower() in body.lower() for k in ['6MX8BtbPRRyVQpwC5LWfy9','6022231035012200','download','preview','pdf','document']):
+                              print('\nJS',js,'LEN',len(body))
+                              for key in ['6MX8BtbPRRyVQpwC5LWfy9','6022231035012200','download','preview','pdfUrl','fileUrl','docId','documentId','api/']:
+                                  pos=0;c=0
+                                  while True:
+                                      pos=body.lower().find(key.lower(),pos)
+                                      if pos<0 or c>=30: break
+                                      print('JSCTX',key,body[max(0,pos-700):pos+1400].replace('\n',' ')[:2200])
+                                      pos+=len(key);c+=1
+                      except Exception as e: print('JSERR',js,repr(e))
+              except Exception as e: print('PAGEERR',u,repr(e))
+          PY
