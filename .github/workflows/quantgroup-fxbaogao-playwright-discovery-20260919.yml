@@ -1,0 +1,86 @@
+name: Discover public Quantgroup reports with browser 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-fxbaogao-playwright-discovery-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright requests beautifulsoup4
+          python -m playwright install chromium
+      - name: Run public browser discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import asyncio, json, re
+          from pathlib import Path
+          from playwright.async_api import async_playwright
+
+          TARGETS=[
+            ('fx_search_cn','https://www.fxbaogao.com/rp?keywords=%E9%87%8F%E5%8C%96%E6%B4%BE'),
+            ('fx_search_code','https://www.fxbaogao.com/rp?keywords=02685'),
+            ('fx_search_title','https://www.fxbaogao.com/rp?keywords=%E6%99%BA%E8%83%BD%E7%A1%AC%E4%BB%B6%E6%89%93%E5%BC%80%E5%A2%9E%E9%95%BF%E6%96%B0%E8%8C%83%E5%BC%8F'),
+            ('futu_research','https://www.futunn.com/hk/stock/02685-HK/research'),
+          ]
+
+          async def main():
+            out=Path('output')
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True)
+              context=await browser.new_context(locale='zh-CN', user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36')
+              for name,url in TARGETS:
+                page=await context.new_page()
+                responses=[]
+                async def on_response(resp):
+                  u=resp.url
+                  if any(k in u.lower() for k in ['api','search','report','research','detail','stock']):
+                    rec={'url':u,'status':resp.status,'content_type':resp.headers.get('content-type','')}
+                    if any(x in rec['content_type'].lower() for x in ['json','text']) and len(responses)<200:
+                      try:
+                        txt=await resp.text()
+                        rec['body']=txt[:200000]
+                      except Exception as exc:
+                        rec['error']=repr(exc)
+                    responses.append(rec)
+                page.on('response',on_response)
+                try:
+                  await page.goto(url, wait_until='domcontentloaded', timeout=90000)
+                  await page.wait_for_timeout(12000)
+                  title=await page.title()
+                  text=(await page.locator('body').inner_text())[:100000]
+                  html=(await page.content())[:1000000]
+                  links=await page.locator('a').evaluate_all("els => els.map(a => ({text:(a.innerText||'').trim(), href:a.href})).filter(x=>x.href)")
+                  interesting=[x for x in links if any(k in (x['text']+' '+x['href']).lower() for k in ['量化派','quantgroup','02685','2685','报告','report','research','detail'])]
+                  await page.screenshot(path=str(out/f'{name}.png'),full_page=True)
+                  result={'url':url,'final_url':page.url,'title':title,'text':text,'interesting_links':interesting[:300],'responses':responses[:300]}
+                  (out/f'{name}.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+                  (out/f'{name}.html').write_text(html,encoding='utf-8')
+                  print(name, title, page.url, len(text), len(interesting), len(responses))
+                except Exception as exc:
+                  (out/f'{name}.json').write_text(json.dumps({'url':url,'error':repr(exc),'responses':responses},ensure_ascii=False,indent=2),encoding='utf-8')
+                  print(name,'ERROR',repr(exc))
+                await page.close()
+              await browser.close()
+          asyncio.run(main())
+          PY
+      - name: Upload browser discovery
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-public-browser-discovery-20260919
+          path: output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
