@@ -1,0 +1,88 @@
+name: Probe public Quantgroup PDF paths 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-public-pdf-path-probe-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf
+          python -m pip install --quiet requests pypdf
+      - name: Probe and retain valid public PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, subprocess
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          docs={
+            'yingli':('5609436','report/2026/08/17/5609436.pdf','盈立证券_量化派02685_港股首次覆盖报告_2026-08-17.pdf'),
+            'fosun':('5553065','report/2026/07/23/5553065.pdf','复星恒利_量化派02685_从线上消费平台到物理AI场景赋能者_2026-07-23.pdf'),
+          }
+          bases=[
+            'https://public.fxbaogao.com/',
+            'https://pdf.fxbaogao.com/',
+            'https://oss.fxbaogao.com/',
+            'https://api.fxbaogao.com/',
+            'https://www.fxbaogao.com/',
+          ]
+          s=requests.Session();s.trust_env=False
+          headersets=[
+            {'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'application/pdf,*/*;q=0.8'},
+            {'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'application/pdf,*/*;q=0.8','Referer':'https://www.fxbaogao.com/'},
+          ]
+          result={}
+          for key,(docid,path,name) in docs.items():
+            attempts=[];found=False
+            candidates=[]
+            for base in bases:
+              candidates += [base+path,base+'report/'+path.split('report/',1)[-1],base+'mofoun/'+path,base+'file/'+path.split('/')[-1]]
+            candidates=list(dict.fromkeys(candidates))
+            for url in candidates:
+              for headers in headersets:
+                try:
+                  r=s.get(url,headers=headers,timeout=(20,180),allow_redirects=True)
+                  rec={'url':url,'status':r.status_code,'final_url':r.url,'content_type':r.headers.get('content-type'),'content_length':r.headers.get('content-length'),'bytes':len(r.content),'head':r.content[:16].hex()}
+                  attempts.append(rec)
+                  print(key,rec)
+                  if r.status_code==200 and r.content.startswith(b'%PDF-') and len(r.content)>100000:
+                    p=Path('output')/name;p.write_bytes(r.content)
+                    rd=PdfReader(str(p),strict=False)
+                    text='\n'.join((pg.extract_text() or '') for pg in rd.pages[:12])
+                    identity=any(x.lower() in text.lower() for x in ['量化派','Quantgroup','02685','2685'])
+                    q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+                    result[key]={'source_url':url,'final_url':r.url,'pages':len(rd.pages),'bytes':len(r.content),'sha256':hashlib.sha256(r.content).hexdigest(),'identity_ok':identity,'qpdf':q.returncode,'filename':name,'attempts':attempts}
+                    if identity and q.returncode in (0,3):
+                      found=True;break
+                    p.unlink(missing_ok=True)
+                except Exception as exc:
+                  attempts.append({'url':url,'error':repr(exc)})
+              if found:break
+            if not found:result[key]={'found':False,'attempts':attempts}
+          (Path('output')/'probe.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('RESULT',json.dumps(result,ensure_ascii=False)[:20000])
+          PY
+      - name: Upload probe output
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-public-pdf-probe-20260919
+          path: output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
