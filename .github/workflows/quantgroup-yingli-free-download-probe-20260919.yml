@@ -1,0 +1,93 @@
+name: Probe public Yingli Quantgroup report downloads 20260919
+
+on:
+  push:
+    paths:
+      - '.github/workflows/quantgroup-yingli-free-download-probe-20260919.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install tools
+        run: python -m pip install --quiet requests beautifulsoup4 lxml playwright
+      - name: Install Chromium
+        run: python -m playwright install chromium
+      - name: Probe public pages and download controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          from __future__ import annotations
+          import asyncio, json, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
+
+          out=Path('output')
+          urls={
+            'valuelist':'https://www.valuelist.cn/871327.html',
+            'baogaobox':'https://www.baogaobox.com/reports/260817000115529.html',
+          }
+          s=requests.Session();s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+          basic={}
+          for name,u in urls.items():
+            try:
+              r=s.get(u,timeout=(20,90),allow_redirects=True)
+              html=r.text;soup=BeautifulSoup(html,'lxml')
+              links=[]
+              for a in soup.find_all('a',href=True):
+                links.append({'text':' '.join(a.get_text(' ',strip=True).split())[:300],'href':urljoin(r.url,a['href'])})
+              urls_found=re.findall(r'https?://[^\s"\'<>]+',html)
+              basic[name]={'status':r.status_code,'final_url':r.url,'bytes':len(r.content),'title':soup.title.get_text(' ',strip=True) if soup.title else '',
+                           'links':[x for x in links if any(k in (x['text']+' '+x['href']).lower() for k in ['下载','download','pdf','871327','260817000115529','量化派'])][:300],
+                           'url_hits':[x for x in urls_found if any(k in x.lower() for k in ['pdf','download','file','871327','260817000115529'])][:300]}
+              (out/f'{name}.html').write_text(html,encoding='utf-8',errors='ignore')
+            except Exception as exc:basic[name]={'error':repr(exc)}
+          (out/'requests_probe.json').write_text(json.dumps(basic,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          async def browser_probe():
+            results={}
+            async with async_playwright() as p:
+              browser=await p.chromium.launch(headless=True)
+              ctx=await browser.new_context(locale='zh-CN',user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36')
+              for name,u in urls.items():
+                page=await ctx.new_page(); responses=[]; downloads=[]
+                async def resp_cb(resp):
+                  low=resp.url.lower();ct=resp.headers.get('content-type','')
+                  if any(k in low for k in ['pdf','download','file','report']) or 'pdf' in ct.lower():
+                    responses.append({'url':resp.url,'status':resp.status,'content_type':ct})
+                page.on('response',resp_cb)
+                try:
+                  await page.goto(u,wait_until='domcontentloaded',timeout=90000);await page.wait_for_timeout(8000)
+                  title=await page.title();text=(await page.locator('body').inner_text())[:100000]
+                  links=await page.locator('a').evaluate_all("els=>els.map(a=>({text:(a.innerText||'').trim(),href:a.href})).filter(x=>x.href)")
+                  buttons=await page.locator('button').evaluate_all("els=>els.map(b=>({text:(b.innerText||'').trim(),html:b.outerHTML.slice(0,1000)}))")
+                  controls=[x for x in links if any(k in (x['text']+' '+x['href']).lower() for k in ['下载','download','pdf','免费'])]
+                  control_buttons=[x for x in buttons if any(k in x['text'].lower() for k in ['下载','download','pdf','免费'])]
+                  results[name]={'url':u,'final_url':page.url,'title':title,'text':text,'controls':controls[:200],'buttons':control_buttons[:100],'responses':responses[:300]}
+                  await page.screenshot(path=str(out/f'{name}.png'),full_page=True)
+                except Exception as exc:results[name]={'url':u,'error':repr(exc),'responses':responses}
+                await page.close()
+              await browser.close()
+            (out/'browser_probe.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          asyncio.run(browser_probe())
+          print(json.dumps({'basic':basic},ensure_ascii=False)[:5000])
+          PY
+      - name: Upload probe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quantgroup-yingli-free-download-probe-20260919
+          path: output
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
