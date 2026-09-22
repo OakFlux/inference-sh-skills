@@ -1,0 +1,57 @@
+name: Scan Huaxin all bulletin archive pages 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-sina-all-bulletins-scan-20260922.yml'
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - run: python -m pip install --quiet requests beautifulsoup4
+      - name: Scan all archive pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re,time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          s=requests.Session(); s.trust_env=False
+          H={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'}
+          allrows=[]
+          for page in range(1,81):
+              u=f'https://vip.stock.finance.sina.com.cn/corp/view/vCB_AllBulletin.php?stockid=600801&Page={page}'
+              r=s.get(u,headers=H,timeout=(8,25)); r.raise_for_status(); r.encoding=r.apparent_encoding or r.encoding
+              soup=BeautifulSoup(r.text,'html.parser')
+              rows=[]
+              for a in soup.find_all('a',href=True):
+                  href=urljoin(r.url,a['href']); text=' '.join(a.get_text(' ',strip=True).split())
+                  if 'vCB_AllBulletinDetail.php' in href and text:
+                      m=re.search(r'id=(\d+)',href)
+                      rows.append({'text':text,'url':href,'id':int(m.group(1)) if m else None})
+              uniq=[]; seen=set()
+              for x in rows:
+                  if x['url'] in seen: continue
+                  seen.add(x['url']); uniq.append(x)
+              print('PAGE',page,'count',len(uniq),flush=True)
+              if not uniq: break
+              allrows.extend(uniq)
+              if not any('Page='+str(page+1) in (a.get('href') or '') for a in soup.find_all('a',href=True)):
+                  break
+              time.sleep(.15)
+          selected=[]
+          for x in allrows:
+              t=x['text']
+              if any(k in t for k in ['年度报告','年报','招股说明书','上市公告书']) or re.search(r'19(?:9[3-9])年.*报告|2000年.*报告',t):
+                  selected.append(x); print(t,x['url'],flush=True)
+          Path('sina_all_bulletins.json').write_text(json.dumps({'pages_scanned':page,'all_count':len(allrows),'selected':selected},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-sina-all-bulletins-scan
+          path: sina_all_bulletins.json
+          retention-days: 7
