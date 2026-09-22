@@ -1,0 +1,53 @@
+name: Inspect FX report viewer JavaScript APIs 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-fx-js-inspect-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download viewer JavaScript and extract API strings
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fx_js
+          python - <<'PY'
+          import json,re,requests
+          from pathlib import Path
+          urls={
+          'app':'https://www.fxbaogao.com/_fxbg/2609181751/js/app-pages-fxbg-main-js.f03f178440e27d19030a.chunk.js',
+          'common':'https://www.fxbaogao.com/_fxbg/2609181751/js/common.cf2e709861c89481e0f2.chunk.js',
+          'chunk40':'https://www.fxbaogao.com/_fxbg/2609181751/js/40.11e3efe83f5c0ba9ed08.chunk.js',
+          'chunk29':'https://www.fxbaogao.com/_fxbg/2609181751/js/29.cde1f2ce1b0ad15ee456.chunk.js',
+          'vendors':'https://www.fxbaogao.com/_fxbg/2609181751/js/vendors~app-pages-fxbg-main-js.f120ae42822eaabad5b1.chunk.js',
+          'config':'https://static.fxbaogao.com/pub/js/config/production.js',
+          }
+          s=requests.Session();s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://www.fxbaogao.com/view?id=5228577'}
+          out={}
+          for name,u in urls.items():
+              r=s.get(u,headers=h,timeout=(10,90)); print(name,r.status_code,len(r.content),flush=True);r.raise_for_status()
+              p=Path('fx_js')/f'{name}.js';p.write_bytes(r.content)
+              text=r.text
+              strings=[]
+              for pat in [r'[^"\']{0,180}(?:download|Download|report/report|ReportPreview|reportId|pdf|PDF|fileUrl|filePath|attachment)[^"\']{0,300}', r'https?://[^"\'<> ]+']:
+                  for m in re.finditer(pat,text):
+                      s0=m.group(0)
+                      if s0 not in strings: strings.append(s0)
+              out[name]={'url':u,'bytes':len(r.content),'matches':strings[:2000]}
+          Path('fx_js/matches.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          with Path('fx_js/matches.txt').open('w',encoding='utf-8') as f:
+              for name,v in out.items():
+                  f.write('\n===== '+name+' =====\n')
+                  for x in v['matches']: f.write(x+'\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-fx-viewer-js-inspection
+          path: fx_js
+          if-no-files-found: error
+          retention-days: 7
