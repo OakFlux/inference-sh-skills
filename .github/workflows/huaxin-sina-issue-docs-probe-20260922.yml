@@ -1,0 +1,59 @@
+name: Probe Huaxin historical issue documents on Sina 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-sina-issue-docs-probe-20260922.yml'
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - run: python -m pip install --quiet requests beautifulsoup4
+      - name: Fetch issue document pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          urls=[
+            'https://vip.stock.finance.sina.com.cn/corp/go.php/vISSUE_RaiseExplanation/stockid/600801.phtml',
+            'https://money.finance.sina.com.cn/corp/go.php/vISSUE_RaiseExplanation/stockid/600801.phtml',
+            'https://vip.stock.finance.sina.com.cn/corp/go.php/vISSUE_MarketBulletin/stockid/600801.phtml',
+            'https://money.finance.sina.com.cn/corp/go.php/vISSUE_MarketBulletin/stockid/600801.phtml'
+          ]
+          s=requests.Session(); s.trust_env=False
+          H={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'}
+          out={}; base=Path('sina_issue_docs'); base.mkdir(exist_ok=True)
+          for i,u in enumerate(urls):
+            try:
+              r=s.get(u,headers=H,timeout=(8,30),allow_redirects=True); r.raise_for_status()
+              raw=r.content
+              enc=r.apparent_encoding or r.encoding or 'gb18030'
+              try: text=raw.decode(enc,errors='replace')
+              except: text=raw.decode('gb18030',errors='replace')
+              p=base/f'page_{i}.html'; p.write_bytes(raw)
+              soup=BeautifulSoup(text,'html.parser')
+              links=[]
+              for a in soup.find_all('a',href=True):
+                t=' '.join(a.get_text(' ',strip=True).split()); href=urljoin(r.url,a['href'])
+                if t or any(x in href.lower() for x in ['raise','market','issue','detail','bulletin']):
+                  links.append({'text':t,'url':href})
+              print('\nURL',u,'status',r.status_code,'len',len(raw),'enc',enc,'final',r.url,flush=True)
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+              for x in links:
+                if any(k in (x['text']+x['url']) for k in ['招股','上市','说明','公告','Raise','Market','Detail','detail']): print(x,flush=True)
+              out[u]={'status':r.status_code,'final':r.url,'bytes':len(raw),'encoding':enc,'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'links':links,'text_head':soup.get_text('\n',strip=True)[:20000]}
+            except Exception as e:
+              print('ERROR',u,repr(e),flush=True); out[u]={'error':repr(e)}
+          (base/'index.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-sina-issue-docs-probe
+          path: sina_issue_docs
+          retention-days: 7
