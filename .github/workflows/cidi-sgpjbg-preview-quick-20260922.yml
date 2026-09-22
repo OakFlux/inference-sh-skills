@@ -1,0 +1,46 @@
+name: Quickly inspect CIDI SGPJBG preview HTML 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-sgpjbg-preview-quick-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Fetch preview HTML and extract assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p quick_preview
+          python - <<'PY'
+          import json,re,requests
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup
+          u='https://www.sgpjbg.com/baogao/1272831.html'
+          s=requests.Session();s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Referer':'https://www.sgpjbg.com/bgdown/1272831.html'}
+          r=s.get(u,headers=h,timeout=(10,90),allow_redirects=True)
+          print(r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+          r.raise_for_status();Path('quick_preview/page.html').write_bytes(r.content)
+          text=r.text;soup=BeautifulSoup(text,'html.parser');urls=[]
+          for tag in soup.find_all(True):
+            for a in ['src','href','data-src','data-original','data-lazy-src','data-url','data-file']:
+              v=tag.get(a)
+              if isinstance(v,str) and v.strip(): urls.append(urljoin(r.url,v.strip()))
+          for m in re.findall(r'https?://[^\s"\'<>]+',text):urls.append(m)
+          urls=list(dict.fromkeys(urls))
+          filt=[x for x in urls if any(k in x.lower() for k in ['1272831','fileroot','fileupload','preview','.png','.jpg','.jpeg','.webp','.gif','.pdf'])]
+          Path('quick_preview/urls.json').write_text(json.dumps(filt,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('URLS',len(urls),'FILTERED',len(filt),flush=True)
+          for x in filt[:300]:print(x,flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-sgpjbg-preview-quick
+          path: quick_preview
+          if-no-files-found: error
+          retention-days: 7
