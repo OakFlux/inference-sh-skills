@@ -1,0 +1,29 @@
+name: Build final Huaxin filings package v4 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-filings-package-runner-v4-20260922.yml'
+  workflow_dispatch:
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install document tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf reportlab
+      - name: Patch builder
+        run: python scripts/patch_huaxin_builder_for_archive_gaps.py
+      - name: Build and validate package
+        run: python scripts/build_huaxin_filings_package.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-building-materials-filings-final-v4
+          path: 华新建材_600801_06655_1993-2025年报_招股及上市文件_2026最新定期报告.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
