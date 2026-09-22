@@ -1,0 +1,78 @@
+name: Query complete Huaxin CNINFO filing index 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-cninfo-full-index-20260922.yml'
+  workflow_dispatch:
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query CNINFO pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, time
+          from pathlib import Path
+          import requests
+
+          s=requests.Session(); s.trust_env=False
+          h={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            'Accept':'application/json,text/javascript,*/*;q=0.01',
+            'X-Requested-With':'XMLHttpRequest',
+            'Origin':'https://www.cninfo.com.cn',
+            'Referer':'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=600801&orgId=gssh0600801'
+          }
+          url='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          base={
+            'pageSize':'30','column':'sse','tabName':'fulltext','plate':'sh',
+            'stock':'600801,gssh0600801','secid':'','trade':'',
+            'seDate':'1990-01-01~2026-09-22','sortName':'','sortType':'','isHLtitle':'true'
+          }
+          specs=[
+            ('annual','category_ndbg_szsh',''),
+            ('q1','category_yjdbg_szsh',''),
+            ('q3','category_sjdbg_szsh',''),
+            ('semi','category_bndbg_szsh',''),
+            ('prospectus','','招股说明书'),
+            ('listing','','上市公告书'),
+            ('h_listing','','介绍方式上市'),
+            ('conversion','','境内上市外资股转换上市地'),
+            ('share_offering','','发行股票'),
+          ]
+          out={}
+          for label,cat,kw in specs:
+            rows=[]; pages=[]
+            for page in range(1,8):
+              d=base.copy(); d.update({'pageNum':str(page),'category':cat,'searchkey':kw})
+              try:
+                r=s.post(url,headers=h,data=d,timeout=(8,25))
+                print(label,'page',page,'status',r.status_code,'len',len(r.content),flush=True)
+                r.raise_for_status(); j=r.json()
+              except Exception as e:
+                print(label,'page',page,'ERROR',repr(e),flush=True)
+                pages.append({'page':page,'error':repr(e)}); break
+              anns=j.get('announcements') or []
+              pages.append({'page':page,'count':len(anns),'total':j.get('totalAnnouncement')})
+              rows.extend(anns)
+              for a in anns:
+                print(label,page,a.get('announcementTime'),a.get('announcementTitle'),a.get('adjunctUrl'),flush=True)
+              if not anns or len(anns)<30: break
+              time.sleep(.5)
+            # de-duplicate by announcementId/URL
+            seen=set(); clean=[]
+            for a in rows:
+              k=a.get('announcementId') or a.get('adjunctUrl')
+              if not k or k in seen: continue
+              seen.add(k); clean.append(a)
+            out[label]={'pages':pages,'announcements':clean}
+          Path('huaxin_cninfo_full_index.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-cninfo-full-index-20260922
+          path: huaxin_cninfo_full_index.json
+          retention-days: 7
