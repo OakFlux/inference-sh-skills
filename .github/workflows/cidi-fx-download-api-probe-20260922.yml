@@ -1,0 +1,43 @@
+name: Probe anonymous CIDI report download APIs 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-fx-download-api-probe-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Probe public endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p fx_download_probe
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'application/json,text/plain,*/*','Origin':'https://www.fxbaogao.com','Referer':'https://www.fxbaogao.com/view?id=5228577'}
+          eps=['downloadReportByBean','file/downloadReport','report/preDownV2','report/getUrlAfterPay']
+          out={}
+          for rid in ['5228577','5466816','5435964','5238998']:
+            out[rid]={}
+            for ep in eps:
+              u=f'https://api.fxbaogao.com/mofoun/report/report/{ep}?reportId={rid}'
+              try:
+                r=s.get(u,headers=h,timeout=(10,60),allow_redirects=False)
+                rec={'status':r.status_code,'headers':dict(r.headers),'bytes':len(r.content),'text':r.text[:10000]}
+                out[rid][ep]=rec
+                print(rid,ep,r.status_code,r.headers.get('content-type'),len(r.content),r.text[:300],flush=True)
+              except Exception as e:
+                out[rid][ep]={'error':repr(e)};print(rid,ep,'ERROR',repr(e),flush=True)
+          Path('fx_download_probe/results.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-fx-download-api-probe
+          path: fx_download_probe
+          if-no-files-found: error
+          retention-days: 7
