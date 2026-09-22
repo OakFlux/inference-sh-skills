@@ -1,0 +1,80 @@
+name: Discover Huaxin official filings sources 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-filings-discovery-20260922.yml'
+  workflow_dispatch:
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query official disclosure sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, time
+          from pathlib import Path
+          import requests
+
+          out = {}
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept':'application/json, text/javascript, */*; q=0.01',
+              'X-Requested-With':'XMLHttpRequest',
+              'Origin':'https://www.cninfo.com.cn',
+              'Referer':'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=600801&orgId=gssh0600801'
+          }
+
+          def post_cninfo(label, data):
+              url='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+              r=s.post(url, headers=headers, data=data, timeout=90)
+              print('\n###', label, r.status_code, r.headers.get('content-type'), len(r.content), r.url)
+              print(r.text[:1000])
+              r.raise_for_status()
+              j=r.json(); out[label]=j
+              anns=j.get('announcements') or []
+              print('total', j.get('totalAnnouncement'), 'items', len(anns))
+              for a in anns:
+                  print(a.get('announcementTime'), a.get('announcementTitle'), a.get('adjunctUrl'), a.get('announcementId'), a.get('orgId'))
+              return j
+
+          common={
+              'pageNum':'1','pageSize':'100','column':'sse','tabName':'fulltext','plate':'sh',
+              'stock':'600801,gssh0600801','searchkey':'','secid':'','trade':'','seDate':'1990-01-01~2026-09-22',
+              'sortName':'','sortType':'','isHLtitle':'true'
+          }
+          for cat in ['category_ndbg_szsh','category_bndbg_szsh','category_yjdbg_szsh','category_sjdbg_szsh']:
+              d=common.copy(); d['category']=cat
+              post_cninfo('cninfo_'+cat,d)
+
+          for keyword in ['招股说明书','上市公告书','境内上市外资股转换上市地','介绍方式上市','配股说明书']:
+              d=common.copy(); d['category']=''; d['searchkey']=keyword; d['pageSize']='100'
+              post_cninfo('cninfo_keyword_'+keyword,d)
+
+          # SSE search endpoint trials
+          urls=[
+              'https://query.sse.com.cn/security/stock/queryCompanyBulletin.do?isPagination=true&productId=600801&keyWord=&securityType=0101%2C120100%2C020100%2C020200%2C120200&reportType2=DQBG&reportType=YEARLY&pageHelp.pageSize=100&pageHelp.pageCount=50&pageHelp.pageNo=1&pageHelp.beginPage=1&pageHelp.cacheSize=1&pageHelp.endPage=5&_=1',
+              'https://www.huaxincem.com/touziguanxi/gongsigonggao.html',
+              'https://www.huaxincem.com/touziguanxi/dingqibaogao.html',
+              'https://www.huaxincem.com/'
+          ]
+          for i,url in enumerate(urls):
+              try:
+                  hh={'User-Agent':headers['User-Agent'],'Referer':'https://www.sse.com.cn/'}
+                  r=s.get(url,headers=hh,timeout=60)
+                  print('\n### URL',i,r.status_code,r.headers.get('content-type'),len(r.content),r.url)
+                  print(r.text[:3000])
+                  out[f'url_{i}']={'url':url,'status':r.status_code,'final_url':r.url,'headers':dict(r.headers),'text_head':r.text[:20000]}
+              except Exception as e:
+                  print('URL_ERROR',i,repr(e)); out[f'url_{i}']={'error':repr(e),'url':url}
+
+          Path('huaxin_discovery.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-filings-discovery-20260922
+          path: huaxin_discovery.json
+          retention-days: 7
