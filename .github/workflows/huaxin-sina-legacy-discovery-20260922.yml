@@ -9,12 +9,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 6
     steps:
+      - name: Install parser
+        run: python -m pip install --quiet requests beautifulsoup4
       - name: Inspect report index pages
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import json,re
+          import json
           from urllib.parse import urljoin
           from pathlib import Path
           import requests
