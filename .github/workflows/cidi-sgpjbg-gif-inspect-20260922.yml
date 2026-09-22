@@ -1,0 +1,48 @@
+name: Inspect CIDI SGPJBG report GIF 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-sgpjbg-gif-inspect-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download and inspect report GIF
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p gif_inspect
+          python - <<'PY'
+          import json,time,requests
+          from pathlib import Path
+          from PIL import Image,ImageSequence
+          url='https://file.sgpjbg.com/fileroot3/2026-6/30/b38d686c-c9c3-4e65-a64e-2c2719bcb1b0/6d60037eab8c4ceab8ace3490948ebd2.gif'
+          s=requests.Session();s.trust_env=False
+          errors=[]
+          for attempt in range(1,6):
+            try:
+              r=s.get(url,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.sgpjbg.com/bgdown/1272831.html'},timeout=(15,180))
+              print('ATTEMPT',attempt,r.status_code,len(r.content),r.headers.get('content-type'),flush=True)
+              r.raise_for_status();Path('gif_inspect/report.gif').write_bytes(r.content);break
+            except Exception as e:
+              errors.append(repr(e));print('ERROR',attempt,repr(e),flush=True);time.sleep(attempt*3)
+          else: raise RuntimeError(errors)
+          p=Path('gif_inspect/report.gif')
+          im=Image.open(p);frames=[]
+          for i,frame in enumerate(ImageSequence.Iterator(im)):
+            fr=frame.convert('RGB');out=Path(f'gif_inspect/frame_{i+1:03d}.png');fr.save(out,'PNG')
+            frames.append({'index':i+1,'width':fr.width,'height':fr.height,'bytes':out.stat().st_size})
+          meta={'url':url,'gif_bytes':p.stat().st_size,'format':im.format,'n_frames':getattr(im,'n_frames',1),'frames':frames}
+          Path('gif_inspect/manifest.json').write_text(json.dumps(meta,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(meta,ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-sgpjbg-gif-inspection
+          path: gif_inspect
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
