@@ -1,0 +1,39 @@
+name: Query CIDI reports with exact Sdyanbao client payload 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-sdy-search-fast-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Search reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          s=requests.Session();s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json, text/plain, */*','Content-Type':'application/json;charset=UTF-8','Origin':'https://www.sdyanbao.com','Referer':'https://www.sdyanbao.com/report','Device':'1','X-Token':''}
+          base={'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':1,'pageSize':100,'pageCount':0,'dateRange':0,'startTime':'','endTime':'','typeIds':'','industryIds':'','opFrom':1}
+          out={}
+          for q in ['希迪智驾','深耕商用车智能驾驶']:
+            p=dict(base,keyword=q)
+            try:
+              r=s.post('https://api.sdyanbao.com/api/file/search',json=p,headers=h,timeout=(8,20))
+              out[q]={'status':r.status_code,'headers':dict(r.headers),'text':r.text}
+              print(q,r.status_code,len(r.content),r.text[:5000],flush=True)
+            except Exception as e:
+              out[q]={'error':repr(e)};print(q,'ERROR',repr(e),flush=True)
+          Path('results.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-sdy-search-fast-results
+          path: results.json
+          if-no-files-found: error
+          retention-days: 7
