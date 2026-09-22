@@ -1,0 +1,50 @@
+name: Scan all legacy Huaxin announcements 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-legacy-all-announcements-20260922.yml'
+  workflow_dispatch:
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Scan archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re,time
+          from pathlib import Path
+          import requests
+          s=requests.Session(); s.trust_env=False
+          U='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          H={'User-Agent':'Mozilla/5.0','X-Requested-With':'XMLHttpRequest','Origin':'https://www.cninfo.com.cn','Referer':'https://www.cninfo.com.cn/'}
+          out={}
+          for code in ['600801','900933']:
+            rows=[]; pages=[]
+            for p in range(1,31):
+              d={'pageNum':str(p),'pageSize':'30','column':'sse','tabName':'fulltext','plate':'sh','stock':code+',gssh0600801','searchkey':'','secid':'','category':'','trade':'','seDate':'1990-01-01~2002-12-31','sortName':'','sortType':'','isHLtitle':'true'}
+              try:
+                r=s.post(U,headers=H,data=d,timeout=(8,20)); r.raise_for_status(); j=r.json()
+              except Exception as e:
+                pages.append({'page':p,'error':repr(e)}); break
+              anns=j.get('announcements') or []
+              pages.append({'page':p,'count':len(anns),'total':j.get('totalAnnouncement')})
+              rows.extend(anns)
+              print(code,p,'count',len(anns),'total',j.get('totalAnnouncement'),flush=True)
+              if not anns or len(anns)<30: break
+              time.sleep(.2)
+            keep=[]
+            for a in rows:
+              t=re.sub(r'<[^>]+>','',a.get('announcementTitle') or '')
+              if any(x in t for x in ['年度报告','年报','招股','上市公告书','中期报告','半年度报告']):
+                keep.append(a); print(code,t,a.get('adjunctUrl'),flush=True)
+            out[code]={'pages':pages,'all_count':len(rows),'filtered':keep}
+          Path('legacy_all.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-legacy-all-announcements
+          path: legacy_all.json
+          retention-days: 7
