@@ -1,0 +1,54 @@
+name: Fix Huaxin package workflow indentation
+on:
+  push:
+    paths:
+      - '.github/workflows/fix-huaxin-package-workflow-20260922.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repair embedded Python string indentation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('.github/workflows/huaxin-filings-package-20260922.yml')
+          lines = p.read_text(encoding='utf-8').splitlines()
+          out = []
+          mode = False
+          indent = ''
+          for line in lines:
+              stripped = line.lstrip()
+              if not mode and (stripped.startswith("gap_text = '''") or stripped.startswith("readme = f'''")):
+                  indent = line[:len(line)-len(stripped)]
+                  out.append(line)
+                  mode = True
+                  continue
+              if mode:
+                  if line.strip() == "'''":
+                      out.append(indent + "'''")
+                      mode = False
+                  elif line.startswith(indent) and line.strip():
+                      out.append(line)
+                  else:
+                      out.append(indent + line)
+                  continue
+              out.append(line)
+          if mode:
+              raise SystemExit('unterminated embedded string')
+          p.write_text('\n'.join(out) + '\n', encoding='utf-8')
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/huaxin-filings-package-20260922.yml
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo 'No repair needed'
+          else
+            git commit -m 'Fix Huaxin package workflow indentation'
+            git push
+          fi
