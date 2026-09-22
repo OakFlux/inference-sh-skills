@@ -1,0 +1,48 @@
+name: Probe Huaxin report pagination 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-sina-pagination-probe-20260922.yml'
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - run: python -m pip install --quiet requests beautifulsoup4
+      - shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          base='https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/600801/page_type/ndbg.phtml'
+          urls=[base]
+          for p in range(2,6):
+            urls += [base+f'?Page={p}',base+f'?page={p}',base.replace('.phtml',f'/page/{p}.phtml'),base.replace('.phtml',f'/page/{p}.phtml?num=20')]
+          s=requests.Session(); s.trust_env=False
+          H={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'}
+          out={}
+          for u in urls:
+            try:
+              r=s.get(u,headers=H,timeout=(8,20),allow_redirects=True); r.raise_for_status(); r.encoding=r.apparent_encoding or r.encoding
+              soup=BeautifulSoup(r.text,'html.parser')
+              titles=[]
+              for a in soup.find_all('a',href=True):
+                t=' '.join(a.get_text(' ',strip=True).split())
+                if '年度报告' in t or '年年度报告' in t:
+                  titles.append({'text':t,'url':urljoin(r.url,a['href'])})
+              print('\n',u,'status',r.status_code,'len',len(r.content),'final',r.url,'titles',len(titles),flush=True)
+              for x in titles: print(x['text'],x['url'],flush=True)
+              out[u]={'status':r.status_code,'final':r.url,'length':len(r.content),'titles':titles}
+            except Exception as e:
+              print('ERROR',u,repr(e),flush=True); out[u]={'error':repr(e)}
+          Path('probe.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-sina-pagination-probe
+          path: probe.json
+          retention-days: 7
