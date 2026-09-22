@@ -1,0 +1,62 @@
+name: Inspect public Sdyanbao search APIs 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-sdyanbao-api-inspect-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch JavaScript and probe API
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sdy_api
+          python - <<'PY'
+          import json,re,requests
+          from pathlib import Path
+          s=requests.Session();s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://www.sdyanbao.com/detail/943185'}
+          scripts=['0bec462.js','7ff3a18.js','359ac1f.js','a94fdf1.js']
+          out={}
+          for x in scripts:
+            u='https://www.sdyanbao.com/_nuxt/'+x
+            r=s.get(u,headers=h,timeout=(10,60));print(x,r.status_code,len(r.content),flush=True);r.raise_for_status()
+            Path('sdy_api/'+x).write_bytes(r.content)
+            text=r.text
+            matches=[]
+            for term in ['homelist','similarlist','sameOrganizationlist','/api/file/','search','keyword','getHotWords','page_url','download']:
+              pos=0
+              while True:
+                i=text.find(term,pos)
+                if i<0:break
+                matches.append(text[max(0,i-500):i+1000]);pos=i+len(term)
+            out[x]=matches[:1000]
+          Path('sdy_api/js_contexts.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          api='https://api.sdyanbao.com/api/file/homelist'
+          tests=[]
+          payloads=[
+            {'keyword':'希迪智驾'}, {'key':'希迪智驾'}, {'search':'希迪智驾'},
+            {'name':'希迪智驾'}, {'page':1,'page_size':100,'keyword':'希迪智驾'},
+            {'page':1,'limit':100,'keyword':'希迪智驾'},
+          ]
+          for method in ['get','post']:
+            for p in payloads:
+              try:
+                if method=='get':r=s.get(api,params=p,headers={**h,'Accept':'application/json'},timeout=(10,45))
+                else:r=s.post(api,json=p,headers={**h,'Accept':'application/json','Content-Type':'application/json'},timeout=(10,45))
+                rec={'method':method,'payload':p,'status':r.status_code,'url':r.url,'text':r.text[:20000]}
+                tests.append(rec);print(method,p,r.status_code,len(r.content),r.text[:200],flush=True)
+              except Exception as e:tests.append({'method':method,'payload':p,'error':repr(e)})
+          Path('sdy_api/probes.json').write_text(json.dumps(tests,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-sdyanbao-api-inspection
+          path: sdy_api
+          if-no-files-found: error
+          retention-days: 7
