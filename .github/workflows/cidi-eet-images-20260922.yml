@@ -1,0 +1,25 @@
+name: Download CIDI EET report article images 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-eet-images-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 pillow
+      - name: Download article images
+        run: python scripts/download_cidi_eet_article_images.py
+      - name: Upload article images
+        uses: actions/upload-artifact@v4
+        with:
+          name: cidi-eet-report-images
+          path: cidi_eet_images
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
