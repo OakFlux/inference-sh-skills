@@ -1,0 +1,41 @@
+name: Extract Huaxin package builder script
+on:
+  push:
+    paths:
+      - '.github/workflows/extract-huaxin-package-script-20260922.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract embedded Python builder
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import py_compile
+          src = Path('.github/workflows/huaxin-filings-package-20260922.yml')
+          lines = src.read_text(encoding='utf-8').splitlines()
+          start = next(i for i, line in enumerate(lines) if line.strip() == "python - <<'PY'") + 1
+          end = next(i for i in range(start, len(lines)) if lines[i].strip() == 'PY')
+          body = []
+          for line in lines[start:end]:
+              body.append(line[10:] if line.startswith('          ') else line)
+          out = Path('scripts/build_huaxin_filings_package.py')
+          out.parent.mkdir(parents=True, exist_ok=True)
+          out.write_text('\n'.join(body) + '\n', encoding='utf-8')
+          py_compile.compile(str(out), doraise=True)
+          print('extracted lines', len(body), 'bytes', out.stat().st_size)
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/build_huaxin_filings_package.py
+          if git diff --cached --quiet; then
+            echo 'Script already current'
+          else
+            git commit -m 'Extract Huaxin filings package builder script'
+            git push
+          fi
