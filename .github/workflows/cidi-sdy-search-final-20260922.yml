@@ -1,0 +1,53 @@
+name: Query Sdyanbao for CIDI deep reports 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-sdy-search-final-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Search reports
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sdy_search
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          s=requests.Session();s.trust_env=False
+          h={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept':'application/json,text/plain,*/*',
+            'Content-Type':'application/json;charset=UTF-8',
+            'Origin':'https://www.sdyanbao.com',
+            'Referer':'https://www.sdyanbao.com/report?keyword=%E5%B8%8C%E8%BF%AA%E6%99%BA%E9%A9%BE',
+            'Device':'1',
+            'X-Token':'',
+          }
+          queries=['希迪智驾','无人驾驶矿卡领先企业','深耕商用车智能驾驶','无人矿卡拓疆域','深耕无人矿卡的智能驾驶平台型企业']
+          out={}
+          for q in queries:
+            payload={
+              'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':1,'pageSize':100,
+              'keyword':q,'pageCount':0,'dateRange':0,'startTime':'','endTime':'',
+              'typeIds':'','industryIds':''
+            }
+            try:
+              r=s.post('https://api.sdyanbao.com/api/file/search',json=payload,headers=h,timeout=(10,60))
+              print('\nQUERY',q,'STATUS',r.status_code,'LEN',len(r.content),flush=True)
+              print(r.text[:3000],flush=True)
+              r.raise_for_status();out[q]=r.json()
+            except Exception as e:
+              out[q]={'error':repr(e),'status':getattr(locals().get('r',None),'status_code',None),'text':getattr(locals().get('r',None),'text','')[:10000]}
+          Path('sdy_search/results.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-sdy-search-results
+          path: sdy_search
+          if-no-files-found: error
+          retention-days: 7
