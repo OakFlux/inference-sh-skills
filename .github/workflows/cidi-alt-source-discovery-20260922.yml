@@ -1,0 +1,26 @@
+name: Discover alternative CIDI report sources 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-alt-source-discovery-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 playwright
+          python -m playwright install chromium
+      - name: Discover assets
+        run: python scripts/discover_cidi_alt_sources.py
+      - name: Upload discovery bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: cidi-alt-source-discovery
+          path: cidi_alt_sources
+          if-no-files-found: error
+          retention-days: 7
