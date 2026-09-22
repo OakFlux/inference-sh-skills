@@ -1,0 +1,35 @@
+name: Quick query Huaxin CNINFO 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-cninfo-quick-20260922.yml'
+  workflow_dispatch:
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Query
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Accept':'application/json,text/javascript,*/*;q=0.01','X-Requested-With':'XMLHttpRequest','Origin':'https://www.cninfo.com.cn','Referer':'https://www.cninfo.com.cn/'}
+          payload={'pageNum':'1','pageSize':'100','column':'sse','tabName':'fulltext','plate':'sh','stock':'600801,gssh0600801','searchkey':'','secid':'','category':'category_ndbg_szsh','trade':'','seDate':'1990-01-01~2026-09-22','sortName':'','sortType':'','isHLtitle':'true'}
+          try:
+              r=s.post('https://www.cninfo.com.cn/new/hisAnnouncement/query',headers=h,data=payload,timeout=(8,20))
+              print('STATUS',r.status_code,'LEN',len(r.content),'TYPE',r.headers.get('content-type'))
+              print(r.text[:5000])
+              r.raise_for_status(); j=r.json()
+          except Exception as e:
+              print('ERROR',repr(e)); j={'error':repr(e)}
+          Path('result.json').write_text(json.dumps(j,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-cninfo-quick-result
+          path: result.json
+          retention-days: 7
