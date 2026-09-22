@@ -1,0 +1,53 @@
+name: Discover Huaxin legacy report mirrors 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-sina-legacy-discovery-20260922.yml'
+  workflow_dispatch:
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Inspect report index pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re
+          from urllib.parse import urljoin
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          s=requests.Session(); s.trust_env=False
+          H={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36'}
+          urls=[
+            'https://finance.sina.com.cn/stock/company/sh/600801/9_11.shtml',
+            'https://finance.sina.com.cn/stock/company/sh/900933/9_13.shtml',
+            'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/600801/page_type/ndbg.phtml',
+            'https://vip.stock.finance.sina.com.cn/corp/go.php/vCB_Bulletin/stockid/900933/page_type/ndbg.phtml'
+          ]
+          out={}
+          for u in urls:
+            try:
+              r=s.get(u,headers=H,timeout=(8,25),allow_redirects=True)
+              print('\nURL',u,'status',r.status_code,'len',len(r.content),'final',r.url,flush=True)
+              r.raise_for_status(); r.encoding=r.apparent_encoding or r.encoding
+              soup=BeautifulSoup(r.text,'html.parser')
+              links=[]
+              for a in soup.find_all('a',href=True):
+                text=' '.join(a.get_text(' ',strip=True).split())
+                href=urljoin(r.url,a['href'])
+                if any(k in text for k in ['年度报告','年报','1993','1994','1995','1996','1997','1998','1999','2000','2001']) or 'ndbg' in href.lower() or 'bulletin' in href.lower():
+                  links.append({'text':text,'url':href})
+                  print(text,href,flush=True)
+              out[u]={'status':r.status_code,'final_url':r.url,'title':soup.title.get_text(' ',strip=True) if soup.title else '', 'links':links, 'html_head':r.text[:10000]}
+            except Exception as e:
+              print('ERROR',u,repr(e),flush=True); out[u]={'error':repr(e)}
+          Path('sina_discovery.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-sina-legacy-discovery
+          path: sina_discovery.json
+          retention-days: 7
