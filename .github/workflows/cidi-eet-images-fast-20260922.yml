@@ -1,0 +1,25 @@
+name: Download CIDI EET images quickly 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-eet-images-fast-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pillow
+      - name: Download images
+        run: python scripts/download_cidi_eet_images_fast.py
+      - name: Upload images
+        uses: actions/upload-artifact@v4
+        with:
+          name: cidi-eet-report-images-fast
+          path: cidi_eet_fast
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
