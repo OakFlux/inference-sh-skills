@@ -1,0 +1,28 @@
+name: Build final CIDI broker report package 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-two-public-reports-package-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install document tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow img2pdf pypdf
+      - name: Download, compile, and validate reports
+        run: python scripts/build_cidi_two_public_reports.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: cidi-03881-broker-reports-final
+          path: 希迪智驾_03881_券商深度报告_2份_20260922.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
