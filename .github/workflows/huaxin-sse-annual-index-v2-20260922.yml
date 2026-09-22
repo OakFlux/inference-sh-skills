@@ -1,0 +1,46 @@
+name: Query full Huaxin SSE annual report index v2 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-sse-annual-index-v2-20260922.yml'
+  workflow_dispatch:
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query SSE annual report index
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          s=requests.Session(); s.trust_env=False
+          headers={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            'Referer':'https://www.sse.com.cn/disclosure/listedinfo/regular/'
+          }
+          url='https://query.sse.com.cn/security/stock/queryCompanyBulletin.do'
+          params={
+            'isPagination':'true','productId':'600801','keyWord':'',
+            'securityType':'0101,120100,020100,020200,120200',
+            'reportType2':'DQBG','reportType':'YEARLY',
+            'pageHelp.pageSize':'200','pageHelp.pageCount':'50','pageHelp.pageNo':'1',
+            'pageHelp.beginPage':'1','pageHelp.cacheSize':'1','pageHelp.endPage':'10','_':'1'
+          }
+          r=s.get(url,params=params,headers=headers,timeout=(10,60))
+          print('STATUS',r.status_code,'LEN',len(r.content),'TYPE',r.headers.get('content-type'),flush=True)
+          print(r.text[:3000],flush=True)
+          r.raise_for_status(); j=r.json()
+          data=((j.get('pageHelp') or {}).get('data') or [])
+          print('ROWS',len(data),'TOTAL',(j.get('pageHelp') or {}).get('total'),flush=True)
+          for x in data:
+            print(x.get('SSEDATE'),x.get('BULLETIN_TYPE'),x.get('TITLE'),x.get('URL'),flush=True)
+          Path('huaxin_sse_annual_index.json').write_text(json.dumps(j,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-sse-annual-index-v2-20260922
+          path: huaxin_sse_annual_index.json
+          retention-days: 7
