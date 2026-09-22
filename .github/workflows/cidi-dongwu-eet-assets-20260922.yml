@@ -1,0 +1,21 @@
+name: Download public CIDI Dongwu report assets 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-dongwu-eet-assets-20260922.yml'
+  workflow_dispatch:
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests pillow
+      - run: python scripts/download_cidi_dongwu_eet_assets.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-dongwu-eet-assets
+          path: cidi_dongwu_eet_assets
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
