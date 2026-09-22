@@ -1,0 +1,47 @@
+name: Run corrected quick CIDI preview inspection 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-sgpjbg-preview-quick-v2-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - run: python -m pip install --quiet requests beautifulsoup4
+      - name: Fetch and inspect preview page
+        shell: bash
+        run: |
+          mkdir -p quick_preview
+          python - <<'PY'
+          import json, re, requests
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup
+          url = 'https://www.sgpjbg.com/baogao/1272831.html'
+          session = requests.Session(); session.trust_env = False
+          response = session.get(url, headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.sgpjbg.com/bgdown/1272831.html'}, timeout=(10,90))
+          print(response.status_code, len(response.content), response.url, flush=True)
+          response.raise_for_status()
+          Path('quick_preview/page.html').write_bytes(response.content)
+          soup = BeautifulSoup(response.text, 'html.parser')
+          urls=[]
+          for tag in soup.find_all(True):
+              for attr in ('src','href','data-src','data-original','data-lazy-src','data-url','data-file'):
+                  value=tag.get(attr)
+                  if isinstance(value,str) and value.strip(): urls.append(urljoin(response.url,value.strip()))
+          for match in re.findall(r'https?://[^\s"\'<>]+', response.text): urls.append(match)
+          urls=list(dict.fromkeys(urls))
+          filtered=[u for u in urls if any(k in u.lower() for k in ('1272831','fileroot','fileupload','preview','.png','.jpg','.jpeg','.webp','.gif','.pdf'))]
+          Path('quick_preview/urls.json').write_text(json.dumps(filtered,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FILTERED',len(filtered),flush=True)
+          for u in filtered[:300]: print(u,flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-sgpjbg-preview-quick-v2
+          path: quick_preview
+          if-no-files-found: error
+          retention-days: 7
