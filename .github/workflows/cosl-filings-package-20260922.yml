@@ -1,0 +1,370 @@
+name: Build COSL complete filings package 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cosl-filings-package-20260922.yml'
+  workflow_dispatch:
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+      - name: Download, merge, validate and package official filings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import shutil
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader, PdfWriter
+
+          PACKAGE = '中海油田服务_02883_601808_2002-2025全部年报_招股说明书_2026最新定期报告'
+          root = Path(PACKAGE)
+          annual_dir = root / '01_年度报告_2002-2025'
+          prospectus_dir = root / '02_招股说明书'
+          periodic_dir = root / '03_2026最新定期报告'
+          for d in (annual_dir, prospectus_dir, periodic_dir):
+              d.mkdir(parents=True, exist_ok=True)
+          work = Path('_cosl_work')
+          work.mkdir(exist_ok=True)
+          render_dir = work / 'renders'
+          render_dir.mkdir(exist_ok=True)
+
+          HEADERS = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/pdf,text/html,application/xhtml+xml,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'zh-HK,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://www1.hkexnews.hk/',
+          }
+
+          def variants(url: str) -> list[str]:
+              vals = [url]
+              if 'www1.hkexnews.hk' in url:
+                  vals.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  vals.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              return list(dict.fromkeys(vals))
+
+          def get_response(url: str, *, stream: bool = False, timeout=(25, 240)) -> requests.Response:
+              errors = []
+              for candidate in variants(url):
+                  for attempt in range(1, 6):
+                      try:
+                          s = requests.Session()
+                          s.trust_env = False
+                          r = s.get(candidate, headers=HEADERS, timeout=timeout, allow_redirects=True, stream=stream)
+                          print('GET', candidate, 'attempt', attempt, 'status', r.status_code, 'type', r.headers.get('content-type'), 'len', r.headers.get('content-length'), 'final', r.url, flush=True)
+                          r.raise_for_status()
+                          return r
+                      except Exception as exc:
+                          errors.append(f'{candidate} attempt {attempt}: {exc!r}')
+                          time.sleep(min(attempt * 2, 8))
+              raise RuntimeError(f'failed request {url}: {errors[-8:]}')
+
+          def download_pdf(url: str, dest: Path, min_bytes: int = 30_000) -> str:
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              tmp = dest.with_suffix(dest.suffix + '.part')
+              tmp.unlink(missing_ok=True)
+              r = get_response(url, stream=True)
+              try:
+                  with tmp.open('wb') as fh:
+                      for chunk in r.iter_content(1024 * 1024):
+                          if chunk:
+                              fh.write(chunk)
+                  final_url = str(r.url)
+              finally:
+                  r.close()
+              size = tmp.stat().st_size
+              head = tmp.read_bytes()[:8]
+              if size < min_bytes or not head.startswith(b'%PDF-'):
+                  tmp.unlink(missing_ok=True)
+                  raise RuntimeError(f'invalid PDF download: {url}; size={size}; head={head!r}')
+              tmp.replace(dest)
+              return final_url
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def count_pages(path: Path) -> int:
+              return len(PdfReader(str(path), strict=False).pages)
+
+          def merge_parts(parts: list[Path], dest: Path) -> None:
+              cmd = ['qpdf', '--empty', '--pages', *[str(p) for p in parts], '--', str(dest)]
+              run = subprocess.run(cmd, capture_output=True, text=True)
+              if run.returncode == 0 and dest.exists() and dest.stat().st_size > 30_000:
+                  return
+              print('QPDF_MERGE_FALLBACK', run.returncode, run.stderr[-2000:], flush=True)
+              writer = PdfWriter()
+              for p in parts:
+                  writer.append(str(p))
+              with dest.open('wb') as f:
+                  writer.write(f)
+              writer.close()
+
+          def download_multifile(container_url: str, dest: Path) -> tuple[str, list[dict], int]:
+              r = get_response(container_url, stream=False, timeout=(25, 180))
+              try:
+                  html_bytes = r.content
+                  final_container = str(r.url)
+              finally:
+                  r.close()
+              soup = BeautifulSoup(html_bytes, 'html.parser')
+              links: list[tuple[str, str]] = []
+              seen = set()
+              for a in soup.find_all('a', href=True):
+                  href = urljoin(final_container, a['href'])
+                  if not href.lower().split('?', 1)[0].endswith('.pdf'):
+                      continue
+                  if href in seen:
+                      continue
+                  seen.add(href)
+                  label = ' '.join(a.get_text(' ', strip=True).split())
+                  links.append((label, href))
+              if not links:
+                  raise RuntimeError(f'no PDF components in {container_url}')
+              part_dir = work / ('parts_' + hashlib.sha1(container_url.encode()).hexdigest()[:12])
+              part_dir.mkdir(exist_ok=True)
+              parts: list[Path] = []
+              part_records: list[dict] = []
+              total_pages = 0
+              for idx, (label, href) in enumerate(links, 1):
+                  part = part_dir / f'{idx:03d}.pdf'
+                  final_url = download_pdf(href, part, min_bytes=2_000)
+                  pages = count_pages(part)
+                  if pages < 1:
+                      raise RuntimeError(f'empty component {href}')
+                  total_pages += pages
+                  parts.append(part)
+                  part_records.append({'order': idx, 'label': label, 'source_url': final_url, 'pages': pages, 'bytes': part.stat().st_size, 'sha256': sha256(part)})
+              merge_parts(parts, dest)
+              merged_pages = count_pages(dest)
+              if merged_pages != total_pages:
+                  raise RuntimeError(f'merged page mismatch for {dest.name}: merged={merged_pages}, parts={total_pages}')
+              shutil.rmtree(part_dir)
+              return final_container, part_records, merged_pages
+
+          def render_check(path: Path, pages: int) -> bool:
+              checks = [('first', 1)]
+              if pages > 1:
+                  checks.append(('last', pages))
+              for suffix, page in checks:
+                  prefix = render_dir / f'{hashlib.sha1(str(path).encode()).hexdigest()}_{suffix}'
+                  cmd = ['pdftoppm', '-f', str(page), '-l', str(page), '-r', '72', '-png', '-singlefile', str(path), str(prefix)]
+                  run = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+                  png = Path(str(prefix) + '.png')
+                  if run.returncode != 0 or not png.exists() or png.stat().st_size < 1_000 or not png.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'):
+                      raise RuntimeError(f'render check failed for {path.name} page {page}: rc={run.returncode}; stderr={run.stderr[-1200:]}')
+                  png.unlink()
+              return True
+
+          records: list[dict] = []
+          seen_hashes: set[str] = set()
+
+          def validate_and_record(*, path: Path, fiscal_year: int | None, title: str, doc_type: str,
+                                  publication_date: str, source_url: str, source_form: str,
+                                  source_parts: list[dict] | None = None, min_pages: int = 1,
+                                  notes: str = '') -> dict:
+              if not path.exists() or path.stat().st_size < 30_000 or not path.read_bytes()[:8].startswith(b'%PDF-'):
+                  raise RuntimeError(f'bad final PDF: {path}')
+              pages = count_pages(path)
+              if pages < min_pages:
+                  raise RuntimeError(f'page count too small for {path.name}: {pages} < {min_pages}')
+              check = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {path.name}: {check.stderr[-1500:]}')
+              render_check(path, pages)
+              digest = sha256(path)
+              if digest in seen_hashes:
+                  raise RuntimeError(f'duplicate final PDF: {path.name}')
+              seen_hashes.add(digest)
+              identity_ok = False
+              try:
+                  reader = PdfReader(str(path), strict=False)
+                  sample = ''
+                  for p in list(reader.pages[:min(8, pages)]) + ([reader.pages[-1]] if pages > 8 else []):
+                      sample += '\n' + (p.extract_text() or '')
+                  identity_ok = any(t.lower() in sample.lower() for t in ('中海油田服务', '中海油田服務', 'china oilfield services', 'cosl', '02883', '601808'))
+              except Exception as exc:
+                  print('TEXT_SAMPLE_WARNING', path.name, repr(exc), flush=True)
+              rec = {
+                  'relative_path': str(path.relative_to(root)),
+                  'filename': path.name,
+                  'fiscal_year': fiscal_year,
+                  'title': title,
+                  'document_type': doc_type,
+                  'language': '中文（港交所官方披露版本）',
+                  'publication_date': publication_date,
+                  'source': '香港交易所披露易（HKEXnews）',
+                  'source_url': source_url,
+                  'source_form': source_form,
+                  'source_parts': source_parts or [],
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': digest,
+                  'qpdf_return_code': check.returncode,
+                  'render_verified_first_and_last_page': True,
+                  'identity_text_verified_when_extractable': identity_ok,
+                  'notes': notes,
+              }
+              records.append(rec)
+              print('VALIDATED', json.dumps(rec, ensure_ascii=False), flush=True)
+              return rec
+
+          # Direct full H-share annual reports, one Chinese official report for each fiscal year 2007-2025.
+          direct_annuals = [
+              (2025, '2026-04-14', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0414/2026041400343_c.pdf'),
+              (2024, '2025-04-16', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2025/0416/2025041600328_c.pdf'),
+              (2023, '2024-04-17', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2024/0417/2024041700641_c.pdf'),
+              (2022, '2023-04-12', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2023/0412/2023041200300_c.pdf'),
+              (2021, '2022-04-11', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2022/0411/2022041100763_c.pdf'),
+              (2020, '2021-04-14', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2021/0414/2021041400574_c.pdf'),
+              (2019, '2020-04-08', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2020/0408/2020040800541_c.pdf'),
+              (2018, '2019-04-11', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2019/0411/ltn20190411463_c.pdf'),
+              (2017, '2018-04-17', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2018/0417/ltn20180417496_c.pdf'),
+              (2016, '2017-04-11', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2017/0411/ltn20170411984_c.pdf'),
+              (2015, '2016-04-14', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2016/0414/ltn20160414339_c.pdf'),
+              (2014, '2015-04-17', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2015/0417/ltn20150417368_c.pdf'),
+              (2013, '2014-04-15', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2014/0415/ltn20140415558_c.pdf'),
+              (2012, '2013-03-22', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2013/0322/ltn201303221000_c.pdf'),
+              (2011, '2012-03-20', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2012/0320/ltn20120320857_c.pdf'),
+              (2010, '2011-03-30', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2011/0330/ltn20110330480_c.pdf'),
+              (2009, '2010-04-23', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2010/0423/ltn20100423860_c.pdf'),
+              (2008, '2009-04-29', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2009/0429/ltn200904291846_c.pdf'),
+              (2007, '2008-04-28', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2008/0428/ltn200804281141_c.pdf'),
+          ]
+          for year, pubdate, url in direct_annuals:
+              dest = annual_dir / f'{year}_中海油田服务_{year}年度报告_港交所中文版.pdf'
+              final_url = download_pdf(url, dest, min_bytes=250_000)
+              validate_and_record(path=dest, fiscal_year=year, title=f'中海油田服务{year}年度报告', doc_type='年度报告', publication_date=pubdate, source_url=final_url, source_form='港交所单一PDF原件', min_pages=20)
+
+          # Legacy reports were officially disclosed as ordered multi-file pages. Merge without altering page content.
+          legacy_annuals = [
+              (2006, '2007-04-25', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2007/0425/ltn20070425244_c.htm', '完整年度报告'),
+              (2005, '2006-04-19', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2006/0419/ltn20060419258_c.htm', '完整年度报告'),
+              (2004, '2005-05-05', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2005/0505/ltn20050505106_c.htm', '完整年度报告（后续完整披露版本）'),
+              (2003, '2004-04-14', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2004/0414/ltn20040414101_c.htm', '完整年度报告'),
+              (2002, '2003-04-25', 'https://www1.hkexnews.hk/listedco/listconews/sehk/2003/0425/ltn20030425110_c.htm', '完整年度报告'),
+          ]
+          for year, pubdate, container, note in legacy_annuals:
+              dest = annual_dir / f'{year}_中海油田服务_{year}年度报告_港交所多文件合并版.pdf'
+              final_container, parts, merged_pages = download_multifile(container, dest)
+              validate_and_record(path=dest, fiscal_year=year, title=f'中海油田服务{year}年度报告', doc_type='年度报告', publication_date=pubdate, source_url=final_container, source_form='港交所多文件官方披露，按网页原顺序无损合并', source_parts=parts, min_pages=20, notes=note)
+
+          # The 2004 annual report also had an earlier shorter official disclosure; retain it as a supplement for completeness.
+          early_2004 = annual_dir / '2004_中海油田服务_2004年年报_初始财务披露版_港交所多文件合并.pdf'
+          final_container, parts, merged_pages = download_multifile('https://www1.hkexnews.hk/listedco/listconews/sehk/2005/0414/ltn20050414103_c.htm', early_2004)
+          validate_and_record(path=early_2004, fiscal_year=2004, title='中海油田服务2004年年报（初始财务披露版）', doc_type='年度报告补充版本', publication_date='2005-04-14', source_url=final_container, source_form='港交所多文件官方披露，按网页原顺序无损合并', source_parts=parts, min_pages=10, notes='2005年5月5日另有内容更完整的2004年度报告，已作为该年度主文件收录；本文件作为早期官方披露补充保留。')
+
+          # 2002 H-share listing prospectus (31 official parts) and 2007 A-share final prospectus.
+          h_prosp = prospectus_dir / '2002_中海油田服务_H股全球发售招股章程_港交所多文件合并版.pdf'
+          final_container, parts, merged_pages = download_multifile('https://www1.hkexnews.hk/listedco/listconews/sehk/2002/1111/ltn20021111060_c.htm', h_prosp)
+          validate_and_record(path=h_prosp, fiscal_year=None, title='中海油田服务H股全球发售招股章程', doc_type='H股招股章程', publication_date='2002-11-11', source_url=final_container, source_form='港交所多文件官方披露，按网页原顺序无损合并', source_parts=parts, min_pages=100)
+
+          a_prosp = prospectus_dir / '2007_中海油田服务_首次公开发行A股股票招股说明书.pdf'
+          a_url = download_pdf('https://www1.hkexnews.hk/listedco/listconews/sehk/2007/0926/ltn20070926020_c.pdf', a_prosp, min_bytes=500_000)
+          validate_and_record(path=a_prosp, fiscal_year=None, title='中海油田服务首次公开发行A股股票招股说明书', doc_type='A股招股说明书', publication_date='2007-09-26', source_url=a_url, source_form='港交所转载的A股最终招股说明书PDF原件', min_pages=50)
+
+          # “最新季报”按A股口径为2026年第一季度报告；同时保留日期更晚的完整2026中期报告。
+          q1 = periodic_dir / '2026Q1_中海油田服务_2026年第一季度报告.pdf'
+          q1_url = download_pdf('https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0422/2026042200488_c.pdf', q1, min_bytes=100_000)
+          validate_and_record(path=q1, fiscal_year=2026, title='中海油田服务2026年第一季度报告', doc_type='季度报告', publication_date='2026-04-22', source_url=q1_url, source_form='港交所官方PDF原件', min_pages=5)
+
+          interim = periodic_dir / '2026H1_中海油田服务_二零二六年中期报告.pdf'
+          interim_url = download_pdf('https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0907/2026090700461_c.pdf', interim, min_bytes=500_000)
+          validate_and_record(path=interim, fiscal_year=2026, title='中海油田服务二零二六年中期报告', doc_type='中期报告', publication_date='2026-09-07', source_url=interim_url, source_form='港交所官方PDF原件', min_pages=20)
+
+          # Scope assertions.
+          main_annual_years = sorted({r['fiscal_year'] for r in records if r['document_type'] == '年度报告'})
+          expected_years = list(range(2002, 2026))
+          if main_annual_years != expected_years:
+              raise RuntimeError(f'annual year coverage mismatch: {main_annual_years}')
+          if len([r for r in records if r['document_type'] in ('H股招股章程', 'A股招股说明书')]) != 2:
+              raise RuntimeError('prospectus coverage mismatch')
+          if len(records) != 29:
+              raise RuntimeError(f'final document count mismatch: {len(records)}')
+
+          records.sort(key=lambda r: (r['relative_path'], r['publication_date']))
+          readme = [
+              '中海油田服务股份有限公司（02883.HK / 601808.SH）官方定期报告与招股文件资料包',
+              '整理日期：2026-09-22',
+              '',
+              '收录范围：',
+              '1. 2002—2025会计年度的全部24个年度报告主文件，均采用港交所中文官方披露版本；',
+              '2. 2004年度报告另保留一份2005年4月14日发布的初始财务披露版，主文件为2005年5月5日发布的内容更完整版本；',
+              '3. 2002年H股全球发售招股章程，以及2007年首次公开发行A股股票招股说明书；',
+              '4. 截至整理日最新A股口径季度报告：2026年第一季度报告；',
+              '5. 同时收录日期更晚的完整2026年中期报告，便于获得最新阶段性财务信息。',
+              '',
+              '文件形式说明：',
+              '2002—2006年度报告、2004年初始披露版及2002年H股招股章程，港交所原始披露采用多个章节PDF。本包严格按官方网页列示顺序无损合并为单一PDF，未修改页面内容；每个原始章节的来源、页数、大小及SHA-256均保存在manifest.json。',
+              '其余文件均为港交所直接提供的单一PDF原件。为控制体积，本包收录中文官方版本，不重复收录内容对应的英文版本。',
+              '',
+              f'最终PDF数量：{len(records)}份（24个年度报告主文件 + 1份2004年补充版本 + 2份招股文件 + 2份2026定期报告）。',
+              '',
+              '文件清单：',
+          ]
+          for idx, rec in enumerate(records, 1):
+              readme.extend([
+                  f"{idx}. {rec['title']}",
+                  f"   路径：{rec['relative_path']}",
+                  f"   类型：{rec['document_type']}；披露日期：{rec['publication_date']}",
+                  f"   页数：{rec['pages']}；大小：{rec['bytes']/1048576:.2f} MB",
+                  f"   形式：{rec['source_form']}",
+                  f"   来源：{rec['source_url']}",
+                  f"   SHA-256：{rec['sha256']}",
+                  (f"   说明：{rec['notes']}" if rec['notes'] else ''),
+                  '',
+              ])
+          readme.extend([
+              '完整性核验：PDF文件头、实际页数、qpdf结构检查、首末页渲染、去重、SHA-256以及ZIP CRC。',
+              '多文件合并项另核验合并后页数等于所有官方章节页数之和。',
+          ])
+          (root / '00_文件清单与范围说明.txt').write_text('\n'.join(x for x in readme if x is not None), encoding='utf-8')
+          (root / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (root / 'SHA256SUMS.txt').write_text(''.join(f"{r['sha256']}  {r['relative_path']}\n" for r in records), encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
+              for path in sorted(root.rglob('*')):
+                  if path.is_file():
+                      zf.write(path, arcname=f'{PACKAGE}/{path.relative_to(root)}')
+          with zipfile.ZipFile(zip_path) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError('ZIP CRC failure: ' + bad)
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != len(records):
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)} != {len(records)}')
+          zip_digest = sha256(zip_path)
+          print('FINAL_ZIP', zip_path, 'BYTES', zip_path.stat().st_size, 'PDF_COUNT', len(records), 'SHA256', zip_digest, flush=True)
+          print('ANNUAL_YEARS', main_annual_years, flush=True)
+          shutil.rmtree(work, ignore_errors=True)
+          PY
+      - name: Upload final ZIP package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosl-02883-601808-complete-filings-final
+          path: 中海油田服务_02883_601808_2002-2025全部年报_招股说明书_2026最新定期报告.zip
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
