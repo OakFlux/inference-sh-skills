@@ -1,0 +1,25 @@
+name: Inspect CIDI SGPJBG preview assets 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/cidi-sgpjbg-preview-inspect-20260922.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          python -m pip install --quiet requests beautifulsoup4 playwright
+          python -m playwright install chromium
+      - name: Inspect preview
+        run: python scripts/inspect_sgpjbg_cidi_preview.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cidi-sgpjbg-preview-assets
+          path: cidi_sgpjbg_preview
+          if-no-files-found: error
+          retention-days: 7
