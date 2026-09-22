@@ -1,0 +1,40 @@
+name: Query legacy Huaxin annual reports 20260922
+on:
+  push:
+    paths:
+      - '.github/workflows/huaxin-legacy-annual-query-20260922.yml'
+  workflow_dispatch:
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 6
+    steps:
+      - name: Query archive
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, requests, time
+          from pathlib import Path
+          s=requests.Session(); s.trust_env=False
+          url='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          headers={'User-Agent':'Mozilla/5.0','X-Requested-With':'XMLHttpRequest','Origin':'https://www.cninfo.com.cn','Referer':'https://www.cninfo.com.cn/'}
+          base={'pageNum':'1','pageSize':'30','column':'sse','tabName':'fulltext','plate':'sh','stock':'600801,gssh0600801','secid':'','category':'','trade':'','seDate':'1990-01-01~2002-12-31','sortName':'','sortType':'','isHLtitle':'true'}
+          terms=[f'{y}年年度报告' for y in range(1993,2002)]
+          result={}
+          for term in terms:
+              data=base.copy(); data['searchkey']=term
+              try:
+                  r=s.post(url,headers=headers,data=data,timeout=(8,20)); r.raise_for_status(); j=r.json()
+                  result[term]=j
+                  print(term,j.get('totalAnnouncement'),flush=True)
+                  for a in j.get('announcements') or []: print(a.get('announcementTitle'),a.get('adjunctUrl'),flush=True)
+              except Exception as e:
+                  result[term]={'error':repr(e)}
+              time.sleep(.2)
+          Path('result.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huaxin-legacy-annual-query
+          path: result.json
+          retention-days: 7
