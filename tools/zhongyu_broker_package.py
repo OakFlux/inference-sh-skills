@@ -1,0 +1,417 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import subprocess
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+from playwright.sync_api import sync_playwright
+from pypdf import PdfReader
+
+PACKAGE = "中裕能源_03633_券商深度报告_2份"
+ROOT = Path(PACKAGE)
+REPORTS = ROOT / "01_券商报告"
+NOTES = ROOT / "02_资料说明"
+PREVIEWS = Path("_previews")
+for folder in (REPORTS, NOTES, PREVIEWS):
+    folder.mkdir(parents=True, exist_ok=True)
+
+TARGETS = [
+    {
+        "index": 1,
+        "institution": "华盛证券（华盛前哨）",
+        "institution_marker": "华盛证券",
+        "title": "疫情逆势增长，中裕燃气未来可期",
+        "date": "2020-10-16",
+        "filename": "01_华盛证券_疫情逆势增长中裕燃气未来可期_20201016.pdf",
+        "urls": [
+            "https://www.hstong.com/news/detail/20101609390477757",
+            "https://k.sina.com.cn/article_6352197120_17a9ed60001900remw.html",
+        ],
+        "minimum_chars": 3200,
+        "minimum_pages": 3,
+        "note": "公司专题深度分析，涵盖公司业务、天然气行业、业绩及增长逻辑。",
+    },
+    {
+        "index": 2,
+        "institution": "汇业证券",
+        "institution_marker": "汇业证券",
+        "title": "板块拆局：中裕燃气值搏 天伦燃气利钱高",
+        "date": "2014-01-03",
+        "filename": "02_汇业证券_板块拆局中裕燃气值搏天伦燃气利钱高_20140103.pdf",
+        "urls": [
+            "https://finance.sina.cn/sa/2014-01-03/detail-iiznezxt2145798.d.html",
+        ],
+        "minimum_chars": 850,
+        "minimum_pages": 1,
+        "note": "燃气板块比较分析，重点讨论中裕燃气与天伦燃气。",
+    },
+]
+
+
+def compact(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").upper()
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def capture_report(browser, target: dict) -> dict:
+    errors: list[str] = []
+    for source_url in target["urls"]:
+        context = browser.new_context(
+            locale="zh-CN",
+            timezone_id="Asia/Hong_Kong",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/151.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1440, "height": 1200},
+        )
+        page = context.new_page()
+        try:
+            response = page.goto(source_url, wait_until="domcontentloaded", timeout=120_000)
+            status = response.status if response else None
+            page.wait_for_timeout(6500)
+            extracted = page.evaluate(
+                r"""
+                ({expectedTitle}) => {
+                  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+                  const textLen = el => norm(el && el.innerText).length;
+                  const needle = norm(expectedTitle).replace(/[：:，,。.!！?？\s]/g, '').slice(0, 18);
+                  const headings = [...document.querySelectorAll('h1,h2,h3')];
+                  let heading = headings.find(el => norm(el.innerText).replace(/[：:，,。.!！?？\s]/g, '').includes(needle));
+                  if (!heading) heading = headings.sort((a,b) => textLen(b) - textLen(a))[0] || null;
+
+                  const candidates = [];
+                  if (heading) {
+                    let node = heading;
+                    for (let i = 0; i < 9 && node && node !== document.body; i++, node = node.parentElement) {
+                      const length = textLen(node);
+                      const paragraphs = node.querySelectorAll('p').length;
+                      const images = node.querySelectorAll('img').length;
+                      if (length > 650 && (paragraphs >= 3 || images >= 2)) {
+                        candidates.push({node, length, paragraphs, images, distance: i});
+                      }
+                    }
+                  }
+
+                  const selectors = [
+                    'article','main','[role="main"]','[class*="article"]','[id*="article"]',
+                    '[class*="detail"]','[id*="detail"]','[class*="content"]','[id*="content"]'
+                  ];
+                  for (const selector of selectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                      const length = textLen(node);
+                      const paragraphs = node.querySelectorAll('p').length;
+                      const images = node.querySelectorAll('img').length;
+                      if (length > 650 && length < 100000 && (paragraphs >= 3 || images >= 2)) {
+                        candidates.push({node, length, paragraphs, images, distance: 20});
+                      }
+                    }
+                  }
+
+                  const unique = [];
+                  const seen = new Set();
+                  for (const item of candidates) {
+                    if (!seen.has(item.node)) {
+                      seen.add(item.node);
+                      unique.push(item);
+                    }
+                  }
+                  unique.sort((a,b) => {
+                    const sa = a.distance * 100 + Math.abs(a.length - 12000) / 180 - a.paragraphs * 3 - a.images * 2;
+                    const sb = b.distance * 100 + Math.abs(b.length - 12000) / 180 - b.paragraphs * 3 - b.images * 2;
+                    return sa - sb;
+                  });
+                  let best = unique[0] && unique[0].node;
+                  if (!best) best = document.body;
+                  const clone = best.cloneNode(true);
+
+                  const removeSelectors = [
+                    'script','style','noscript','iframe','video','audio','canvas','form','button','input','textarea','select',
+                    'nav','footer','aside','header','[class*="comment"]','[id*="comment"]',
+                    '[class*="share"]','[id*="share"]','[class*="advert"]','[id*="advert"]',
+                    '[class*="recommend"]','[id*="recommend"]','[class*="related"]','[id*="related"]',
+                    '[class*="download"]','[id*="download"]','[class*="toolbar"]','[class*="breadcrumb"]',
+                    '[class*="pagination"]','[class*="login"]','[class*="app-download"]','[class*="qrcode"]'
+                  ];
+                  for (const selector of removeSelectors) {
+                    for (const node of clone.querySelectorAll(selector)) node.remove();
+                  }
+
+                  for (const img of clone.querySelectorAll('img')) {
+                    const lazy = img.getAttribute('data-original') || img.getAttribute('data-src') || img.getAttribute('data-lazy-src');
+                    if (lazy) img.setAttribute('src', lazy);
+                    const raw = img.getAttribute('src') || '';
+                    try { img.setAttribute('src', new URL(raw, location.href).href); } catch (e) {}
+                    img.removeAttribute('srcset');
+                    img.removeAttribute('loading');
+                    img.removeAttribute('width');
+                    img.removeAttribute('height');
+                  }
+                  for (const a of clone.querySelectorAll('a')) {
+                    const href = a.getAttribute('href') || '';
+                    try { a.setAttribute('href', new URL(href, location.href).href); } catch (e) {}
+                  }
+
+                  const articleText = norm(clone.innerText);
+                  return {
+                    html: clone.outerHTML,
+                    articleText,
+                    articleChars: articleText.length,
+                    pageTitle: document.title,
+                    finalUrl: location.href,
+                    headingText: heading ? norm(heading.innerText) : ''
+                  };
+                }
+                """,
+                {"expectedTitle": target["title"]},
+            )
+            print(
+                "CAPTURE_ATTEMPT",
+                json.dumps(
+                    {
+                        "title": target["title"],
+                        "url": source_url,
+                        "status": status,
+                        "final_url": extracted.get("finalUrl"),
+                        "chars": extracted.get("articleChars"),
+                        "heading": extracted.get("headingText"),
+                        "page_title": extracted.get("pageTitle"),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            if status and status >= 400:
+                raise RuntimeError(f"HTTP {status}")
+            if extracted["articleChars"] < target["minimum_chars"]:
+                raise RuntimeError(f"article text too short: {extracted['articleChars']}")
+            if compact("中裕") not in compact(extracted["articleText"]):
+                raise RuntimeError("company marker 中裕 not found")
+
+            clean_html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<base href="{extracted['finalUrl']}">
+<style>
+@page {{ size: A4; margin: 16mm 15mm 18mm 15mm; }}
+html,body {{ margin:0; padding:0; background:#fff; color:#111; }}
+body {{ font-family:'Noto Sans CJK SC','Noto Sans CJK TC','Microsoft YaHei',sans-serif; font-size:10.5pt; line-height:1.72; }}
+.archive-meta {{ border:1px solid #bbb; padding:12px 15px; margin-bottom:18px; background:#f7f7f7; page-break-inside:avoid; }}
+.archive-meta h1 {{ font-size:18pt; line-height:1.35; margin:0 0 10px; font-weight:700; }}
+.archive-meta p {{ margin:3px 0; font-size:9pt; line-height:1.5; }}
+.archive-note {{ margin-top:8px !important; color:#555; }}
+.article-archive h1 {{ font-size:17pt; line-height:1.4; margin:18px 0 12px; }}
+.article-archive h2 {{ font-size:14.5pt; line-height:1.45; margin:18px 0 8px; }}
+.article-archive h3 {{ font-size:12.5pt; line-height:1.45; margin:15px 0 6px; }}
+.article-archive p {{ margin:8px 0; text-align:justify; }}
+.article-archive img {{ display:block; max-width:100% !important; height:auto !important; margin:10px auto; page-break-inside:avoid; }}
+.article-archive table {{ width:100%; border-collapse:collapse; margin:10px 0; font-size:9pt; page-break-inside:avoid; }}
+.article-archive td,.article-archive th {{ border:1px solid #999; padding:5px; }}
+.article-archive a {{ color:inherit; text-decoration:none; }}
+.article-archive ul,.article-archive ol {{ padding-left:1.6em; }}
+.article-archive blockquote {{ margin:10px 0; padding-left:12px; border-left:3px solid #aaa; color:#444; }}
+[style*='position: fixed'],[style*='position:fixed'] {{ position:static !important; }}
+</style>
+</head>
+<body>
+<section class="archive-meta">
+<h1>{target['title']}</h1>
+<p><strong>发布机构：</strong>{target['institution']}</p>
+<p><strong>发布日期：</strong>{target['date']}</p>
+<p><strong>原始公开页面：</strong>{extracted['finalUrl']}</p>
+<p class="archive-note">{target['note']} 本文件为公开网页存档PDF，并非证券机构原始排版PDF。正文版权归原作者及发布机构所有，仅作资料归档。</p>
+</section>
+<main class="article-archive">{extracted['html']}</main>
+</body>
+</html>"""
+            page.set_content(clean_html, wait_until="domcontentloaded", timeout=120_000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=25_000)
+            except Exception:
+                pass
+            page.wait_for_timeout(3500)
+            destination = REPORTS / target["filename"]
+            page.pdf(
+                path=str(destination),
+                format="A4",
+                print_background=True,
+                prefer_css_page_size=True,
+                display_header_footer=True,
+                header_template="<div></div>",
+                footer_template=(
+                    "<div style='font-size:8px;width:100%;padding:0 15mm;"
+                    "font-family:Arial,sans-serif;color:#777;text-align:right;'>"
+                    "<span class='pageNumber'></span> / <span class='totalPages'></span></div>"
+                ),
+                margin={"top": "16mm", "right": "15mm", "bottom": "18mm", "left": "15mm"},
+            )
+            context.close()
+            return {
+                "source_url_requested": source_url,
+                "source_url_final": extracted["finalUrl"],
+                "http_status": status,
+                "article_chars": extracted["articleChars"],
+                "page_title": extracted["pageTitle"],
+                "output_path": str(destination),
+            }
+        except Exception as exc:
+            errors.append(f"{source_url}: {exc!r}")
+            print("CAPTURE_ERROR", source_url, repr(exc), flush=True)
+            context.close()
+    raise RuntimeError("All source URLs failed: " + " | ".join(errors))
+
+
+def validate_pdf(path: Path, target: dict) -> dict:
+    if not path.exists() or path.stat().st_size < 25_000:
+        raise RuntimeError(f"PDF missing or too small: {path}")
+    with path.open("rb") as handle:
+        if handle.read(5) != b"%PDF-":
+            raise RuntimeError(f"PDF header missing: {path}")
+    reader = PdfReader(str(path), strict=False)
+    pages = len(reader.pages)
+    if pages < target["minimum_pages"]:
+        raise RuntimeError(f"Unexpected page count {pages}: {path}")
+    check = subprocess.run(["qpdf", "--check", str(path)], capture_output=True, text=True)
+    if check.returncode not in (0, 3):
+        raise RuntimeError(f"qpdf check failed: {path}: {check.stderr[-1500:]}")
+    sample_parts: list[str] = []
+    for pdf_page in reader.pages[: min(8, pages)]:
+        try:
+            sample_parts.append(pdf_page.extract_text() or "")
+        except Exception:
+            pass
+    sample = compact("\n".join(sample_parts))
+    if compact("中裕") not in sample:
+        raise RuntimeError(f"Company marker missing in PDF text: {path}")
+    if compact(target["institution_marker"]) not in sample:
+        raise RuntimeError(f"Institution marker missing in PDF text: {path}")
+
+    rendered: list[str] = []
+    for label, page_number in (("first", 1), ("last", pages)):
+        prefix = PREVIEWS / f"{target['index']:02d}_{label}"
+        result = subprocess.run(
+            [
+                "pdftoppm",
+                "-f",
+                str(page_number),
+                "-l",
+                str(page_number),
+                "-singlefile",
+                "-png",
+                "-r",
+                "110",
+                str(path),
+                str(prefix),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        png = Path(str(prefix) + ".png")
+        if result.returncode != 0 or not png.exists() or png.stat().st_size < 2000:
+            raise RuntimeError(f"PDF render failed: {path}: {result.stderr[-1000:]}")
+        rendered.append(str(png))
+    return {
+        "pages": pages,
+        "bytes": path.stat().st_size,
+        "sha256": sha256(path),
+        "qpdf_return_code": check.returncode,
+        "rendered_previews": rendered,
+    }
+
+
+def main() -> None:
+    captures: list[dict] = []
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        for target in TARGETS:
+            capture = capture_report(browser, target)
+            pdf_path = Path(capture["output_path"])
+            validation = validate_pdf(pdf_path, target)
+            record = {
+                "filename": pdf_path.name,
+                "institution": target["institution"],
+                "title": target["title"],
+                "publication_date": target["date"],
+                "document_form": "公开网页存档PDF",
+                "scope": target["note"],
+                **capture,
+                **validation,
+            }
+            captures.append(record)
+            print("VERIFIED", json.dumps(record, ensure_ascii=False), flush=True)
+        browser.close()
+
+    if len(captures) != 2:
+        raise RuntimeError(f"Expected 2 broker reports, got {len(captures)}")
+    if len({item["sha256"] for item in captures}) != 2:
+        raise RuntimeError("Duplicate report PDFs detected")
+
+    note_lines = [
+        "中裕能源（03633.HK）券商资料说明",
+        "",
+        "本资料包收录2份可在公开网页中完整获取的证券机构研究材料：",
+        "",
+        "1. 华盛证券（华盛前哨），《疫情逆势增长，中裕燃气未来可期》，2020-10-16。",
+        "   类型：公司专题深度分析；包含公司业务、天然气行业、业绩及增长逻辑等内容。",
+        "",
+        "2. 汇业证券，《板块拆局：中裕燃气值搏 天伦燃气利钱高》，2014-01-03。",
+        "   类型：燃气板块比较分析；重点讨论中裕燃气与天伦燃气的盈利能力和估值。",
+        "",
+        "公开评级记录补充：同花顺机构评级页面显示，中裕能源/中裕燃气历史上还曾获得华盛证券、元大证券（香港）、新华汇富金融及京华山一（香港）的评级；但相关完整原始研报当前未发现稳定、无需登录且可公开下载的全文版本，因此没有用摘要、付费页面或不明转载文件冒充完整研报。",
+        "",
+        "文件口径：两份PDF均由公开网页生成存档版本，并非证券机构原始排版PDF。正文未作实质改写，首页增加了来源、日期和存档说明。资料仅供研究，不构成投资建议。",
+        "",
+        "评级索引来源：https://stockpage.10jqka.com.cn/HK3633/",
+        "制作日期：" + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
+    ]
+    (NOTES / "资料范围与来源说明.txt").write_text("\n".join(note_lines) + "\n", encoding="utf-8")
+    (NOTES / "manifest.json").write_text(
+        json.dumps(captures, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    (NOTES / "SHA256SUMS.txt").write_text(
+        "".join(f"{item['sha256']}  {item['filename']}\n" for item in captures),
+        encoding="utf-8",
+    )
+
+    archive = Path(PACKAGE + ".zip")
+    with zipfile.ZipFile(
+        archive,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+        allowZip64=True,
+    ) as bundle:
+        for file in sorted(ROOT.rglob("*")):
+            if file.is_file():
+                bundle.write(file, arcname=f"{ROOT.name}/{file.relative_to(ROOT)}")
+    with zipfile.ZipFile(archive) as bundle:
+        bad = bundle.testzip()
+        if bad:
+            raise RuntimeError(f"ZIP CRC failure: {bad}")
+        pdfs = [name for name in bundle.namelist() if name.lower().endswith(".pdf")]
+        if len(pdfs) != 2:
+            raise RuntimeError(f"Expected 2 PDFs in ZIP, got {len(pdfs)}")
+        print("ZIP_MEMBERS", json.dumps(bundle.namelist(), ensure_ascii=False, indent=2), flush=True)
+    print("FINAL_ZIP", archive.name, archive.stat().st_size, sha256(archive), flush=True)
+
+
+if __name__ == "__main__":
+    main()
