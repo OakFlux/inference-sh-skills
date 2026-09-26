@@ -1,0 +1,28 @@
+name: Build CNBM 2020-2025 reports package 20260926
+on:
+  push:
+    paths:
+      - '.github/workflows/cnbm-reports-package-20260926.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install document tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+      - name: Build and validate package
+        run: python scripts/build_cnbm_reports_package_20260926.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cnbm-03323-2020-2025-reports-final
+          path: 中国建材_03323_2020-2025年报_2026最新季报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
