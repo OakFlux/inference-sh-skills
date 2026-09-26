@@ -1,0 +1,44 @@
+name: Extract CNBM attachment links 20260926
+on:
+  push:
+    paths:
+      - '.github/workflows/cnbm-jina-link-extract-20260926.yml'
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Fetch report pages through text proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          urls=(
+            'https://www.cnbmltd.com/art/2021/4/8/art_1193_74772.html'
+            'https://www.cnbmltd.com/art/2023/1/30/art_1379_77616.html'
+            'https://www.cnbmltd.com/art/2023/4/4/art_1356_77764.html'
+            'https://www.cnbmltd.com/art/2024/3/28/art_1356_78357.html'
+            'https://www.cnbmltd.com/art/2025/4/9/art_1356_78731.html'
+            'https://www.cnbmltd.com/art/2026/3/31/art_1193_79450.html'
+          )
+          years=(2020 2021 2022 2023 2024 2025)
+          : > output/all_links.txt
+          for i in "${!urls[@]}"; do
+            target="https://r.jina.ai/http://${urls[$i]#https://}"
+            echo "FETCH ${years[$i]} $target"
+            curl -L --fail --retry 2 --connect-timeout 10 --max-time 60 \
+              -A 'Mozilla/5.0' "$target" -o "output/${years[$i]}.md" || true
+            echo "===== ${years[$i]} =====" >> output/all_links.txt
+            if [ -f "output/${years[$i]}.md" ]; then
+              cat "output/${years[$i]}.md" >> output/all_links.txt
+              grep -Eo 'https?://[^ )]+' "output/${years[$i]}.md" | grep -Ei 'pdf|download|attach|upload' >> output/all_links.txt || true
+            fi
+          done
+          sed -n '1,300p' output/all_links.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnbm-jina-link-extract-20260926
+          path: output
+          retention-days: 7
