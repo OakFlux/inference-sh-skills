@@ -1,0 +1,115 @@
+name: Scrape CNBM annual report links from HKEX 20260926
+on:
+  push:
+    paths:
+      - '.github/workflows/cnbm-hkex-annual-scrape-20260926.yml'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install Python dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 selenium
+      - name: Scrape filtered HKEX title-search page
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          url = ('https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0'
+                 '&from=20210101&lang=EN&market=SEHK&stockId=10899'
+                 '&t1code=40000&t2Gcode=-1&t2code=40100&to=20260926')
+          out = {'url': url, 'requests': {}, 'selenium': {}, 'records': []}
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Referer': 'https://www1.hkexnews.hk/'
+          }
+          try:
+              s=requests.Session(); s.trust_env=False
+              r=s.get(url,headers=headers,timeout=(10,60),allow_redirects=True)
+              out['requests']={'status':r.status_code,'bytes':len(r.content),'type':r.headers.get('content-type'),'final_url':r.url}
+              print('REQUESTS',out['requests'],flush=True)
+              Path('hkex_requests.html').write_bytes(r.content)
+              if r.ok:
+                  soup=BeautifulSoup(r.content,'html.parser')
+                  for a in soup.find_all('a',href=True):
+                      txt=' '.join(a.get_text(' ',strip=True).split())
+                      href=urljoin(r.url,a['href'])
+                      if '.pdf' in href.lower() and 'annual report' in txt.lower():
+                          out['records'].append({'text':txt,'href':href,'method':'requests'})
+                  print('REQUESTS_RECORDS',json.dumps(out['records'],ensure_ascii=False),flush=True)
+          except Exception as e:
+              out['requests_error']=repr(e); print('REQUESTS_ERROR',repr(e),flush=True)
+
+          if len(out['records']) < 6:
+              from selenium import webdriver
+              from selenium.webdriver.chrome.options import Options
+              from selenium.webdriver.common.by import By
+              from selenium.webdriver.support.ui import WebDriverWait
+              from selenium.webdriver.support import expected_conditions as EC
+              opts=Options()
+              opts.add_argument('--headless=new')
+              opts.add_argument('--no-sandbox')
+              opts.add_argument('--disable-dev-shm-usage')
+              opts.add_argument('--disable-gpu')
+              opts.add_argument('--window-size=1920,3000')
+              opts.add_argument('--lang=en-US')
+              opts.add_argument('--user-agent='+headers['User-Agent'])
+              driver=webdriver.Chrome(options=opts)
+              try:
+                  driver.get(url)
+                  WebDriverWait(driver,60).until(lambda d: 'CNBM' in d.page_source or 'Annual Report' in d.page_source or len(d.find_elements(By.TAG_NAME,'a'))>50)
+                  time.sleep(5)
+                  # Click LOAD MORE until absent, although annual-report filtering should yield fewer than 100 rows.
+                  for _ in range(10):
+                      buttons=driver.find_elements(By.XPATH,"//*[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LOAD MORE')]")
+                      visible=[b for b in buttons if b.is_displayed() and b.is_enabled()]
+                      if not visible: break
+                      before=len(driver.find_elements(By.CSS_SELECTOR,"a[href*='.pdf']"))
+                      driver.execute_script('arguments[0].click();',visible[0])
+                      time.sleep(3)
+                      after=len(driver.find_elements(By.CSS_SELECTOR,"a[href*='.pdf']"))
+                      if after<=before: break
+                  html=driver.page_source
+                  Path('hkex_selenium.html').write_text(html,encoding='utf-8')
+                  records=[]
+                  for a in driver.find_elements(By.TAG_NAME,'a'):
+                      href=a.get_attribute('href') or ''
+                      txt=' '.join((a.text or '').split())
+                      if '.pdf' in href.lower() and 'annual report' in txt.lower():
+                          records.append({'text':txt,'href':href,'method':'selenium'})
+                  out['selenium']={'title':driver.title,'current_url':driver.current_url,'pdf_links':len(driver.find_elements(By.CSS_SELECTOR,"a[href*='.pdf']")),'records':records}
+                  out['records']=records
+                  print('SELENIUM',json.dumps(out['selenium'],ensure_ascii=False),flush=True)
+              finally:
+                  driver.quit()
+
+          # Dedupe and require six annual reports covering 2020-2025.
+          clean=[]; seen=set()
+          for x in out['records']:
+              if x['href'] in seen: continue
+              seen.add(x['href']); clean.append(x)
+          out['records']=clean
+          Path('cnbm_hkex_annual_links.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('FINAL_RECORDS',json.dumps(clean,ensure_ascii=False),flush=True)
+          if len(clean) < 6:
+              raise SystemExit(f'only found {len(clean)} annual-report PDF links')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnbm-hkex-annual-links-20260926
+          path: |
+            cnbm_hkex_annual_links.json
+            hkex_requests.html
+            hkex_selenium.html
+          if-no-files-found: error
+          retention-days: 7
