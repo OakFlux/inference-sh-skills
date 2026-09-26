@@ -1,0 +1,28 @@
+name: Build final CNBM 2020-2025 reports package 20260926
+on:
+  push:
+    paths:
+      - '.github/workflows/cnbm-hkex-final-package-20260926.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Download, validate, and package reports
+        run: python scripts/build_cnbm_hkex_final_20260926.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: cnbm-03323-2020-2025-annual-latest-reports-final
+          path: 中国建材_03323_2020-2025年报_2026最新定期报告.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
