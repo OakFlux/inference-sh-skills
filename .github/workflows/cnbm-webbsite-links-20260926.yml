@@ -1,0 +1,52 @@
+name: Extract CNBM HKEX document links from Webb-site 20260926
+on:
+  push:
+    paths:
+      - '.github/workflows/cnbm-webbsite-links-20260926.yml'
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install parser
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Fetch and parse
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          url='https://webbsite.0xmd.com/dbpub/docs.asp?p=32904&sort=spdup'
+          s=requests.Session(); s.trust_env=False
+          r=s.get(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,*/*'},timeout=(10,60))
+          print('STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'BYTES',len(r.content),'FINAL',r.url,flush=True)
+          r.raise_for_status()
+          Path('webbsite_cnbm.html').write_bytes(r.content)
+          soup=BeautifulSoup(r.content,'html.parser')
+          rows=[]
+          for tr in soup.find_all('tr'):
+            cells=[' '.join(td.get_text(' ',strip=True).split()) for td in tr.find_all(['td','th'])]
+            links=[]
+            for a in tr.find_all('a',href=True):
+              links.append({'text':' '.join(a.get_text(' ',strip=True).split()),'href':urljoin(r.url,a['href'])})
+            if cells or links:
+              row={'cells':cells,'links':links}
+              rows.append(row)
+              if any(y in ' '.join(cells) for y in ('2020-12-31','2021-12-31','2022-12-31','2023-12-31','2024-12-31','2025-12-31','2026-03-31','2026-06-30')):
+                print('MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+          Path('webbsite_cnbm_rows.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cnbm-webbsite-links-20260926
+          path: |
+            webbsite_cnbm.html
+            webbsite_cnbm_rows.json
+          retention-days: 7
