@@ -1,0 +1,33 @@
+name: Inspect CSSC Shipping report portals
+
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect_fxbaogao_cssc_20260927.yml'
+      - 'tools/inspect_fxbaogao_cssc.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+      - name: Inspect pages
+        run: python tools/inspect_fxbaogao_cssc.py
+      - name: Upload inspection
+        uses: actions/upload-artifact@v4
+        with:
+          name: cssc-report-portal-inspection
+          path: _inspect_cssc
+          if-no-files-found: error
+          retention-days: 2
+          compression-level: 6
