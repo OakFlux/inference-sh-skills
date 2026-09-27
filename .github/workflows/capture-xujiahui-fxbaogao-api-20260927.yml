@@ -1,0 +1,28 @@
+name: Capture Xujiahui fxbaogao API 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/capture-xujiahui-fxbaogao-api-20260927.yml'
+      - 'scripts/capture_xujiahui_fxbaogao_api_20260927.py'
+  workflow_dispatch:
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Playwright
+        run: |
+          python -m pip install --quiet playwright
+          playwright install chromium --with-deps
+      - name: Capture API
+        run: python scripts/capture_xujiahui_fxbaogao_api_20260927.py
+      - name: Upload capture
+        uses: actions/upload-artifact@v4
+        with:
+          name: xujiahui-fxbaogao-api-capture
+          path: xujiahui_fxbaogao_api_capture
+          if-no-files-found: error
+          retention-days: 7
