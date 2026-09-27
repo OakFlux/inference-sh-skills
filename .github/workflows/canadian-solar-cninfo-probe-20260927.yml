@@ -1,0 +1,76 @@
+name: Probe CNINFO Canadian Solar filings 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/canadian-solar-cninfo-probe-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query CNINFO APIs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          import json,re,requests,time
+          from pathlib import Path
+          from urllib.parse import quote
+          S='688472'; NAME='阿特斯'; END='2026-09-27'
+          session=requests.Session()
+          session.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.cninfo.com.cn/','Origin':'https://www.cninfo.com.cn','X-Requested-With':'XMLHttpRequest'})
+          orgs=[]
+          for kw in (NAME,'阿特斯阳光电力集团股份有限公司',S):
+            try:
+              r=session.get('https://www.cninfo.com.cn/new/information/topSearch/query',params={'keyWord':kw,'maxNum':20},timeout=60)
+              print('TOP',kw,r.status_code,len(r.content),r.text[:500],flush=True)
+              if r.ok:
+                d=r.json(); arr=d if isinstance(d,list) else (d.get('keyBoardList') or d.get('data') or d.get('records') or [])
+                for x in arr:
+                  if str(x.get('code') or x.get('secCode') or x.get('stockCode') or '')==S:
+                    oid=x.get('orgId') or x.get('orgid')
+                    if oid:orgs.append(str(oid))
+            except Exception as e:print('TOPERR',kw,repr(e),flush=True)
+          orgs=list(dict.fromkeys(orgs))
+          print('ORGS',orgs,flush=True)
+          stocks=[S]+[f'{S},{o}' for o in orgs]
+          cats=['category_ndbg_szsh;','category_yjdbg_szsh;','category_sjdbg_szsh;','']
+          allrows=[]
+          for stock in stocks:
+            for col,plate in [('sse','sh'),('szse','sh')]:
+              for cat in cats:
+                for search in ('','招股说明书') if cat=='' else ('',):
+                  payload={'pageNum':'1','pageSize':'30','column':col,'tabName':'fulltext','plate':plate,'stock':stock,'searchkey':search,'secid':'','category':cat,'trade':'','seDate':f'2023-01-01~{END}','sortName':'time','sortType':'desc','isHLtitle':'false'}
+                  try:
+                    r=session.post('https://www.cninfo.com.cn/new/hisAnnouncement/query',data=payload,timeout=90)
+                    print('Q',stock,col,cat or 'ALL',search or '-',r.status_code,len(r.content),r.text[:100],flush=True)
+                    if not r.ok:continue
+                    d=r.json(); rows=d.get('announcements') or []
+                    for x in rows:
+                      x['_stockArg']=stock;x['_column']=col;x['_category']=cat;x['_search']=search
+                    allrows.extend(rows)
+                  except Exception as e:print('QERR',stock,col,cat,search,repr(e),flush=True)
+          dedup={}
+          for x in allrows:
+            key=str(x.get('announcementId') or x.get('adjunctUrl') or json.dumps(x,sort_keys=True,ensure_ascii=False))
+            dedup[key]=x
+          rows=list(dedup.values())
+          Path('output/cninfo_candidates.json').write_text(json.dumps({'orgs':orgs,'rows':rows},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('COUNT',len(rows),flush=True)
+          for x in rows:
+            title=re.sub(r'<[^>]+>','',str(x.get('announcementTitle') or ''))
+            print('ROW',title,x.get('adjunctUrl'),x.get('announcementTime'),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: canadian-solar-cninfo-probe-20260927
+          path: output/cninfo_candidates.json
+          retention-days: 7
+          if-no-files-found: error
