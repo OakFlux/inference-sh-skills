@@ -1,0 +1,91 @@
+name: Inspect public 2021 China Energy Engineering deep report 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-sgpjbg-2021-report-inspect-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install browser parser
+        run: python -m pip install --quiet selenium beautifulsoup4 requests
+      - name: Find and inspect report page
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, shutil, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+
+          title_key='中国能建-新型电力开路人回A开启新征程'
+          label='https://www.sgpjbg.com/labels/huibojizhi.html'
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept':'text/html,*/*'}
+          r=s.get(label,headers=h,timeout=(15,120)); print('LABEL',r.status_code,len(r.content),r.url,flush=True); r.raise_for_status()
+          Path('label_page.html').write_bytes(r.content)
+          soup=BeautifulSoup(r.text,'html.parser')
+          matches=[]
+          for a in soup.find_all('a',href=True):
+            text=' '.join(a.get_text(' ',strip=True).split())
+            if '中国能建' in text and ('新型电力' in text or '回A开启新征程' in text):
+              matches.append({'text':text,'url':urljoin(r.url,a['href'])})
+          print('MATCHES',json.dumps(matches,ensure_ascii=False),flush=True)
+          if not matches: raise RuntimeError('target report link not found')
+          report_url=matches[0]['url']
+
+          chrome=shutil.which('google-chrome') or shutil.which('chromium')
+          opts=Options(); opts.binary_location=chrome
+          for arg in ('--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1440,2200','--lang=zh-CN'):
+            opts.add_argument(arg)
+          opts.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36')
+          opts.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          d=webdriver.Chrome(options=opts)
+          out={'label_matches':matches,'report_url':report_url}
+          try:
+            d.get(report_url); time.sleep(10)
+            source=d.page_source
+            Path('report_page.html').write_text(source,encoding='utf-8')
+            d.save_screenshot('report_page.png')
+            psoup=BeautifulSoup(source,'html.parser')
+            assets=[]
+            for tag in psoup.find_all(True):
+              for attr in ('href','src','data-src','data-url','data-file','data-pdf','onclick'):
+                val=tag.get(attr)
+                if not val: continue
+                text=' '.join(tag.get_text(' ',strip=True).split())[:300]
+                low=(str(val)+' '+text).lower()
+                if any(k in low for k in ('pdf','fileroot','download','file.sgpjbg','中国能建','新型电力')):
+                  assets.append({'tag':tag.name,'attr':attr,'value':str(val)[:5000],'full':urljoin(d.current_url,str(val)) if attr!='onclick' else '', 'text':text})
+            network=[]
+            for entry in d.get_log('performance'):
+              try:
+                msg=json.loads(entry['message'])['message']
+                if msg.get('method') in ('Network.responseReceived','Network.requestWillBeSent'):
+                  item=msg.get('params',{}).get('response') or msg.get('params',{}).get('request') or {}
+                  u=item.get('url','')
+                  if any(k in u.lower() for k in ('pdf','fileroot','sgpjbg','download','view')):
+                    network.append({'method':msg.get('method'),'url':u,'status':item.get('status'),'mimeType':item.get('mimeType')})
+              except Exception: pass
+            out.update({'title':d.title,'current_url':d.current_url,'source_bytes':len(source.encode()),'assets':assets,'network':network})
+            print('OUT',json.dumps(out,ensure_ascii=False)[:150000],flush=True)
+          finally:
+            d.quit()
+          Path('ceec_sgpjbg_2021_inspection.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-sgpjbg-2021-inspection
+          path: |
+            ceec_sgpjbg_2021_inspection.json
+            label_page.html
+            report_page.html
+            report_page.png
+          retention-days: 7
