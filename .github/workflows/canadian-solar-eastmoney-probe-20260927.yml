@@ -1,0 +1,63 @@
+name: Probe Eastmoney Canadian Solar filings 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/canadian-solar-eastmoney-probe-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query Eastmoney announcements and test PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          import json,re,requests
+          from pathlib import Path
+          s=requests.Session()
+          s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Referer':'https://data.eastmoney.com/notices/stock/688472.html','Accept-Language':'zh-CN,zh;q=0.9'})
+          rows=[]
+          for page in range(1,10):
+            params={'page_size':100,'page_index':page,'ann_type':'A','client_source':'web','stock_list':'688472'}
+            r=s.get('https://np-anotice-stock.eastmoney.com/api/security/ann',params=params,timeout=60)
+            print('API',page,r.status_code,len(r.content),r.text[:200],flush=True)
+            r.raise_for_status(); d=r.json(); batch=((d.get('data') or {}).get('list') or (d.get('data') or {}).get('data') or d.get('list') or [])
+            print('BATCH',len(batch),flush=True); rows.extend(batch)
+            if len(batch)<100:break
+          selected=[]
+          wanted=['2023年年度报告','2024年年度报告','2025年年度报告','招股说明书','2026年第一季度报告']
+          for x in rows:
+            title=re.sub(r'<[^>]+>','',str(x.get('title') or x.get('notice_title') or x.get('announcement_title') or '')).replace(' ', '')
+            code=str(x.get('art_code') or x.get('info_code') or x.get('infoCode') or x.get('announcement_id') or '')
+            date=str(x.get('notice_date') or x.get('display_time') or x.get('date') or '')
+            if any(w in title for w in wanted):
+              urls=[]
+              for prefix in ('H2','H3','H1'):
+                for suffix in ('_1.pdf','.pdf'):
+                  urls.append(f'https://pdf.dfcfw.com/pdf/{prefix}_{code}{suffix}')
+              tests=[]
+              for url in urls:
+                try:
+                  rr=s.get(url,headers={'Referer':'https://data.eastmoney.com/'},timeout=(20,60),stream=True)
+                  head=next(rr.iter_content(64),b'')
+                  tests.append({'url':url,'status':rr.status_code,'content_type':rr.headers.get('Content-Type'),'content_length':rr.headers.get('Content-Length'),'head':head[:16].hex()})
+                  rr.close()
+                except Exception as e:tests.append({'url':url,'error':repr(e)})
+              rec={'title':title,'code':code,'date':date,'raw':x,'tests':tests}
+              selected.append(rec);print('SELECT',json.dumps({'title':title,'code':code,'date':date,'tests':tests},ensure_ascii=False),flush=True)
+          Path('output/eastmoney_probe.json').write_text(json.dumps({'total':len(rows),'selected':selected},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: canadian-solar-eastmoney-probe-20260927
+          path: output/eastmoney_probe.json
+          retention-days: 7
+          if-no-files-found: error
