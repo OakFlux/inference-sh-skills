@@ -1,0 +1,22 @@
+name: Inspect HKEX CSSC annual titles
+
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect_hkex_annual_titles_20260927.yml'
+      - 'tools/inspect_hkex_annual_titles_20260927.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install parser
+        run: python -m pip install --quiet 'httpx[http2]' beautifulsoup4
+      - name: Inspect HKEX title search
+        run: python tools/inspect_hkex_annual_titles_20260927.py
