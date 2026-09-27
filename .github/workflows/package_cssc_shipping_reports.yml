@@ -1,0 +1,33 @@
+name: Package CSSC Shipping reports
+on:
+  push:
+    paths:
+      - '.github/workflows/package_cssc_shipping_reports.yml'
+      - 'tools/package_cssc_shipping_broker_reports.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils fonts-noto-cjk
+          python -m pip install --quiet playwright pypdf
+          python -m playwright install --with-deps chromium
+      - name: Build package
+        run: python tools/package_cssc_shipping_broker_reports.py
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: cssc-shipping-broker-reports
+          path: |
+            中国船舶租赁_03877_券商研究报告_3份.zip
+            _previews_cssc_shipping/*.png
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
