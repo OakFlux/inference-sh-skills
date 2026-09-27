@@ -1,0 +1,26 @@
+name: Search Eastmoney Air China Cargo Zhejiang report
+
+on:
+  push:
+    paths:
+      - '.github/workflows/search_eastmoney_air_china_cargo_zhejiang_20260927.yml'
+      - 'tools/search_eastmoney_air_china_cargo_zhejiang_20260927.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python tools/search_eastmoney_air_china_cargo_zhejiang_20260927.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eastmoney-air-china-cargo-search
+          path: eastmoney_air_china_cargo_search.json
+          if-no-files-found: error
+          retention-days: 3
