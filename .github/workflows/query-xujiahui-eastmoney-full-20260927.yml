@@ -4,7 +4,7 @@ on:
   push:
     paths:
       - '.github/workflows/query-xujiahui-eastmoney-full-20260927.yml'
-      - 'scripts/build_xujiahui_broker_reports_package_20260927.py'
+      - 'scripts/build_xujiahui_broker_reports_package_v2_20260927.py'
   workflow_dispatch:
 
 jobs:
@@ -17,9 +17,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils
-          python -m pip install --quiet requests pypdf
+          python -m pip install --quiet requests pypdf pillow img2pdf
       - name: Download validate and package reports
-        run: python scripts/build_xujiahui_broker_reports_package_20260927.py
+        run: python scripts/build_xujiahui_broker_reports_package_v2_20260927.py
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
