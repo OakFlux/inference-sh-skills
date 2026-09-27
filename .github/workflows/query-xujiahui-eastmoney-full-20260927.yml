@@ -1,0 +1,26 @@
+name: Query Xujiahui Eastmoney full history 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/query-xujiahui-eastmoney-full-20260927.yml'
+      - 'scripts/query_xujiahui_eastmoney_full_20260927.py'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install requests
+        run: python -m pip install --quiet requests
+      - name: Query reports
+        run: python scripts/query_xujiahui_eastmoney_full_20260927.py
+      - name: Upload JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: xujiahui-eastmoney-full-history
+          path: xujiahui_eastmoney_full.json
+          if-no-files-found: error
+          retention-days: 7
