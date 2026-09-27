@@ -1,0 +1,68 @@
+name: Search public web for complete China Energy Engineering deep reports 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-deep-report-web-search-20260927.yml'
+  workflow_dispatch:
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Search public engines
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re, urllib.parse, time
+          from pathlib import Path
+          import requests
+          from bs4 import BeautifulSoup
+          queries=[
+            '"火然泉达风光盛" pdf',
+            '"全球能源建设龙头" "风光火氢储" pdf',
+            '"能源电力建设龙头" "布局新能源发电" pdf',
+            '"中国能建" "公司深度报告" pdf',
+            '"中国能建" "首次覆盖" pdf 券商',
+            '"中国能建" "投资价值分析报告" pdf',
+            '"中国能源建设" "深度报告" filetype:pdf',
+            '"中国能建" filetype:pdf site:pdf.dfcfw.com',
+          ]
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          out=[]
+          for q in queries:
+            rec={'query':q,'bing':[],'duck':[]}
+            print('\nQUERY',q,flush=True)
+            try:
+              u='https://www.bing.com/search?'+urllib.parse.urlencode({'q':q,'count':50,'setlang':'zh-hans'})
+              r=s.get(u,headers=h,timeout=(10,60)); print('BING',r.status_code,len(r.content),r.url,flush=True)
+              soup=BeautifulSoup(r.text,'html.parser')
+              for li in soup.select('li.b_algo'):
+                a=li.select_one('h2 a')
+                if not a: continue
+                item={'title':' '.join(a.get_text(' ',strip=True).split()),'url':a.get('href'),'snippet':' '.join((li.select_one('.b_caption') or li).get_text(' ',strip=True).split())[:1000]}
+                rec['bing'].append(item); print('B',json.dumps(item,ensure_ascii=False),flush=True)
+            except Exception as e: rec['bing_error']=repr(e); print('BING_ERROR',repr(e),flush=True)
+            try:
+              u='https://html.duckduckgo.com/html/?'+urllib.parse.urlencode({'q':q})
+              r=s.get(u,headers=h,timeout=(10,60)); print('DUCK',r.status_code,len(r.content),r.url,flush=True)
+              soup=BeautifulSoup(r.text,'html.parser')
+              for res in soup.select('.result'):
+                a=res.select_one('.result__a')
+                if not a: continue
+                href=a.get('href')
+                if href and 'uddg=' in href:
+                  qs=urllib.parse.parse_qs(urllib.parse.urlparse(href).query); href=qs.get('uddg',[href])[0]
+                item={'title':' '.join(a.get_text(' ',strip=True).split()),'url':href,'snippet':' '.join((res.select_one('.result__snippet') or res).get_text(' ',strip=True).split())[:1000]}
+                rec['duck'].append(item); print('D',json.dumps(item,ensure_ascii=False),flush=True)
+            except Exception as e: rec['duck_error']=repr(e); print('DUCK_ERROR',repr(e),flush=True)
+            out.append(rec); time.sleep(1)
+          Path('ceec_deep_report_web_search.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-deep-report-web-search
+          path: ceec_deep_report_web_search.json
+          retention-days: 7
