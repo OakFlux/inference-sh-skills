@@ -1,0 +1,45 @@
+name: Find China Energy Engineering deep report on Fhyanbao 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-fhyanbao-deep-link-20260927.yml'
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch page and parse related report links
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          url='https://www.fhyanbao.com/rpview/1583835'
+          r=requests.get(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/html,*/*','Referer':'https://www.fhyanbao.com/'},timeout=90)
+          print('STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'BYTES',len(r.content),'FINAL',r.url,flush=True)
+          print(r.text[:2000],flush=True)
+          r.raise_for_status()
+          Path('fhyanbao_page.html').write_bytes(r.content)
+          soup=BeautifulSoup(r.text,'html.parser')
+          links=[]
+          for a in soup.find_all('a',href=True):
+            text=' '.join(a.get_text(' ',strip=True).split())
+            href=urljoin(str(r.url),a['href'])
+            if '中国能建' in text or '电力建设龙头' in text or '新能源蝶变' in text or 'rpview' in href:
+              item={'text':text,'href':href,'html':str(a)[:2000]}
+              links.append(item); print('LINK',json.dumps(item,ensure_ascii=False),flush=True)
+          Path('fhyanbao_links.json').write_text(json.dumps(links,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-fhyanbao-deep-link
+          path: |
+            fhyanbao_page.html
+            fhyanbao_links.json
+          retention-days: 7
