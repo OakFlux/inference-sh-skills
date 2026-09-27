@@ -1,0 +1,138 @@
+name: Discover full public BrainAurora SPDBI report sources 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/brainaura-full-report-discovery-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Install parsers
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Probe public sources and Eastmoney mappings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('brainaura_full_discovery'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          logs=[]
+
+          def fetch(label,url,referer=None):
+              hh=dict(h)
+              if referer: hh['Referer']=referer
+              try:
+                  r=s.get(url,headers=hh,timeout=(15,90),allow_redirects=True)
+                  print('FETCH',label,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                  rec={'label':label,'url':url,'status':r.status_code,'content_type':r.headers.get('content-type'),'bytes':len(r.content),'final_url':str(r.url)}
+                  logs.append(rec)
+                  (out/f'{label}.bin').write_bytes(r.content)
+                  return r
+              except Exception as e:
+                  print('ERROR',label,repr(e),flush=True); logs.append({'label':label,'url':url,'error':repr(e)}); return None
+
+          pages={
+            'sgpjbg_label':'https://www.sgpjbg.com/labels/naodongjiguangshehuizerenbaogao.html',
+            'vzkoo_doc':'https://passport.vzkoo.com/document/20250513a13393d3e2ec3d7f094cfb65.html',
+            'hibor':'https://www.hibor.com.cn/repinfodetail_4129429.html',
+            'fx_detail':'https://www.fxbaogao.com/detail/4832942',
+            'fx_view':'https://www.fxbaogao.com/view?id=4832942',
+          }
+          discovered=[]
+          for label,url in pages.items():
+              r=fetch(label,url)
+              if not r: continue
+              text=r.text
+              soup=BeautifulSoup(text,'html.parser')
+              links=[]
+              for a in soup.find_all('a',href=True):
+                  u=urljoin(str(r.url),a['href']); t=' '.join(a.get_text(' ',strip=True).split())
+                  if any(k.lower() in (t+' '+u).lower() for k in ('脑动极光','naodong','brainaura','4832942','4129429','20250513a13393')) or '.pdf' in u.lower() or 'download' in u.lower():
+                      links.append({'text':t,'url':u})
+              scripts=[]
+              for sc in soup.find_all('script'):
+                  src=sc.get('src')
+                  if src: scripts.append(urljoin(str(r.url),src))
+                  body=sc.string or sc.get_text() or ''
+                  for m in re.findall(r'https?://[^\s"\'<>]+',body):
+                      if any(x in m.lower() for x in ('.pdf','download','report','4832942','brainaura')):
+                          links.append({'text':'script-url','url':m})
+              # all strings around PDF/download/id
+              snippets=[]
+              for pat in ('pdf','download','4832942','fileUrl','oss','report-image'):
+                  for m in re.finditer(pat,text,re.I):
+                      snippets.append(text[max(0,m.start()-250):min(len(text),m.end()+500)])
+                      if len(snippets)>120: break
+              result={'label':label,'final_url':str(r.url),'links':links,'scripts':scripts,'snippets':snippets}
+              discovered.append(result)
+              (out/f'{label}_parsed.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+              print('PARSED',label,'links',len(links),'scripts',len(scripts),flush=True)
+              for x in links[:100]: print('LINK',label,json.dumps(x,ensure_ascii=False),flush=True)
+
+          # Probe candidate links from SGPJBG label page one level deep.
+          sg = next((x for x in discovered if x['label']=='sgpjbg_label'),None)
+          if sg:
+              for i,x in enumerate(sg['links'][:30]):
+                  if '脑动极光' in x['text'] or 'baogao' in x['url'] or 'report' in x['url']:
+                      rr=fetch(f'sgpjbg_candidate_{i}',x['url'],pages['sgpjbg_label'])
+                      if rr:
+                          txt=rr.text
+                          print('SGPAGE',i,txt[:1000],flush=True)
+                          for m in re.findall(r'https?://[^\s"\'<>]+',txt):
+                              if '.pdf' in m.lower() or 'download' in m.lower(): print('SGPDFLINK',m,flush=True)
+
+          # Try Eastmoney API permutations.
+          api='https://reportapi.eastmoney.com/report/list'
+          variants=[]
+          for code in ('06681','6681','HK06681','116.06681'):
+            for qtype in ('0','1'):
+              params={'industryCode':'*','pageSize':'200','industry':'*','rating':'*','ratingchange':'*','beginTime':'2025-04-01','endTime':'2025-06-30','fields':'','qType':qtype,'orgCode':'','code':code,'pageNo':'1'}
+              try:
+                r=s.get(api,params=params,headers={**h,'Referer':'https://data.eastmoney.com/report/'},timeout=(10,60))
+                print('EM',code,qtype,r.status_code,len(r.content),r.url,flush=True)
+                text=r.text.strip(); j=None
+                if text.startswith('{'): j=r.json()
+                else:
+                  mm=re.search(r'\((\{.*\})\)\s*;?$',text,re.S)
+                  if mm: j=json.loads(mm.group(1))
+                rows=[]
+                if j:
+                  data=j.get('data') or j.get('result') or []
+                  if isinstance(data,dict): data=data.get('data') or data.get('list') or data.get('items') or []
+                  rows=data if isinstance(data,list) else []
+                variants.append({'code':code,'qType':qtype,'url':r.url,'status':r.status_code,'rows':rows,'raw_head':text[:1000]})
+                for item in rows:
+                  title=str(item.get('title') or item.get('reportTitle') or '')
+                  if any(k in title for k in ('脑动极光','认知障碍数字疗法','AI赋能')):
+                    print('EMMATCH',code,qtype,json.dumps(item,ensure_ascii=False),flush=True)
+              except Exception as e:
+                variants.append({'code':code,'qType':qtype,'error':repr(e)})
+          (out/'eastmoney_variants.json').write_text(json.dumps(variants,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # Try common direct file/download paths inferred from identifiers.
+          direct=[
+            'https://pdf.dfcfw.com/pdf/H3_AP202505121672000000000000_1.pdf',
+            'https://www.sgpjbg.com/baogao/000000.html',
+            'https://passport.vzkoo.com/api/document/download/20250513a13393d3e2ec3d7f094cfb65',
+            'https://www.hibor.com.cn/webdownload.asp?id=4129429',
+          ]
+          for i,u in enumerate(direct): fetch(f'direct_{i}',u)
+
+          (out/'summary.json').write_text(json.dumps({'logs':logs,'discovered':discovered},ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brainaura-full-report-discovery-20260927
+          path: brainaura_full_discovery
+          retention-days: 7
