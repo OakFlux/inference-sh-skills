@@ -1,0 +1,73 @@
+name: Search Fhyanbao for China Energy Engineering deep report 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-fhyanbao-browser-search-20260927.yml'
+  workflow_dispatch:
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Search public report site
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet selenium beautifulsoup4
+          python - <<'PY'
+          import json, shutil, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.common.keys import Keys
+
+          chrome=shutil.which('google-chrome') or shutil.which('chromium')
+          opts=Options(); opts.binary_location=chrome
+          for arg in ('--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1440,2200','--lang=zh-CN'):
+            opts.add_argument(arg)
+          opts.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36')
+          opts.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          d=webdriver.Chrome(options=opts)
+          queries=['中国能建 电力建设龙头 传统业务优势稳固 新兴产业蝶变可期','中国能建 公司深度','中国能建 首次覆盖']
+          results=[]
+          try:
+            for qi,q in enumerate(queries):
+              d.get('https://www.fhyanbao.com/rp'); time.sleep(4)
+              inp=d.find_element(By.CSS_SELECTOR,'input[placeholder*="搜索关键词"]')
+              inp.clear(); inp.send_keys(q); inp.send_keys(Keys.ENTER); time.sleep(8)
+              source=d.page_source
+              Path(f'fh_search_{qi}.html').write_text(source,encoding='utf-8')
+              soup=BeautifulSoup(source,'html.parser')
+              links=[]
+              for a in soup.find_all('a',href=True):
+                text=' '.join(a.get_text(' ',strip=True).split())
+                href=urljoin(d.current_url,a['href'])
+                if '/rpview/' in href or '中国能建' in text:
+                  links.append({'text':text[:1000],'href':href})
+              network=[]
+              for entry in d.get_log('performance'):
+                try:
+                  msg=json.loads(entry['message'])['message']
+                  if msg.get('method') in ('Network.responseReceived','Network.requestWillBeSent'):
+                    item=msg.get('params',{}).get('response') or msg.get('params',{}).get('request') or {}
+                    u=item.get('url','')
+                    if 'fhyanbao.com' in u and any(k in u for k in ('api','search','report','rp')):
+                      network.append({'method':msg.get('method'),'url':u,'status':item.get('status'),'mimeType':item.get('mimeType')})
+                except Exception: pass
+              rec={'query':q,'current_url':d.current_url,'title':d.title,'links':links[:300],'network':network[-500:]}
+              results.append(rec)
+              print('RESULT',json.dumps(rec,ensure_ascii=False)[:120000],flush=True)
+          finally:
+            d.quit()
+          Path('ceec_fhyanbao_search.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-fhyanbao-search
+          path: |
+            ceec_fhyanbao_search.json
+            fh_search_*.html
+          retention-days: 7
