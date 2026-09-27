@@ -1,0 +1,110 @@
+name: Extract China Energy Engineering report detail links with Selenium 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-sgpjbg-label-selenium-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install browser parser
+        run: python -m pip install --quiet selenium beautifulsoup4
+      - name: Load label and inspect matching report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, shutil, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+
+          chrome=shutil.which('google-chrome') or shutil.which('chromium')
+          if not chrome: raise RuntimeError('Chrome not found')
+          opts=Options(); opts.binary_location=chrome
+          for arg in ('--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1440,5000','--lang=zh-CN'):
+            opts.add_argument(arg)
+          opts.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36')
+          opts.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          d=webdriver.Chrome(options=opts)
+          label='https://www.sgpjbg.com/labels/zhongguonengjian.html'
+          out={'label_url':label,'matches':[],'details':[]}
+          try:
+            d.get(label); time.sleep(12)
+            print('LABEL_TITLE',d.title,'URL',d.current_url,flush=True)
+            # scroll to force lazy content
+            for frac in (0.25,0.5,0.75,1.0):
+              d.execute_script(f'window.scrollTo(0, document.body.scrollHeight*{frac});'); time.sleep(2)
+            source=d.page_source
+            Path('ceec_label.html').write_text(source,encoding='utf-8')
+            d.save_screenshot('ceec_label.png')
+            soup=BeautifulSoup(source,'html.parser')
+            seen=set()
+            targets=('中国能建-电力工程建设龙头享行业发展机遇','中国能建-新型电力开路人回A开启新征程','中国能建-碳中和央企新贵意气正风华','中国能建-能源电力综合服务龙头','中国能建-吸收合并葛洲坝能源建设龙头再起航','中国能建-深度报告：全球能源电力建设巨头两地上市助力业务新发展','中国能建-领跑双碳战略锻造能源产业新格局')
+            for a in soup.find_all('a',href=True):
+              text=' '.join(a.get_text(' ',strip=True).split())
+              href=urljoin(d.current_url,a['href'])
+              if ('中国能建' in text and ('/baogao/' in href or 'bgdown' in href)) or any(t in text for t in targets):
+                key=(text,href)
+                if key in seen: continue
+                seen.add(key)
+                item={'text':text,'href':href,'html':str(a)[:3000]}
+                out['matches'].append(item)
+                print('MATCH',json.dumps(item,ensure_ascii=False),flush=True)
+            # Also capture report URLs from page source regex/context.
+            for m in re.finditer(r'href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',source,re.I|re.S):
+              href=urljoin(d.current_url,m.group(1)); txt=' '.join(BeautifulSoup(m.group(2),'html.parser').get_text(' ',strip=True).split())
+              if '中国能建' in txt and '/baogao/' in href:
+                key=(txt,href)
+                if key not in seen:
+                  seen.add(key); item={'text':txt,'href':href,'html':'regex'}; out['matches'].append(item); print('REGEX_MATCH',json.dumps(item,ensure_ascii=False),flush=True)
+
+            detail_urls=[]
+            for x in out['matches']:
+              if '/baogao/' in x['href'] and x['href'] not in detail_urls:
+                detail_urls.append(x['href'])
+            for idx,url in enumerate(detail_urls[:20]):
+              try:
+                d.get(url); time.sleep(8)
+                for frac in (0.5,1.0): d.execute_script(f'window.scrollTo(0, document.body.scrollHeight*{frac});'); time.sleep(1)
+                src=d.page_source
+                Path(f'detail_{idx}.html').write_text(src,encoding='utf-8')
+                ds=BeautifulSoup(src,'html.parser')
+                data={'url':url,'current_url':d.current_url,'title':d.title,'h1':' '.join((ds.find('h1').get_text(' ',strip=True) if ds.find('h1') else '').split()),'meta':{},'assets':[],'hidden':[]}
+                for prop in ('og:title','og:image','og:description'):
+                  tag=ds.find('meta',attrs={'property':prop}) or ds.find('meta',attrs={'name':prop})
+                  if tag: data['meta'][prop]=tag.get('content')
+                for tag in ds.find_all(True):
+                  if tag.get('id') in ('dp','documentId','reportId','pageCount') or tag.get('name') in ('dp','documentId','reportId','pageCount'):
+                    data['hidden'].append({'tag':tag.name,'id':tag.get('id'),'name':tag.get('name'),'value':tag.get('value'),'text':tag.get_text(' ',strip=True)[:500]})
+                  for attr in ('href','src','data-src','data-url','data-file','data-pdf','value'):
+                    val=tag.get(attr)
+                    if not val: continue
+                    text=' '.join(tag.get_text(' ',strip=True).split())[:200]
+                    low=(str(val)+' '+text).lower()
+                    if any(k in low for k in ('fileroot','file.sgpjbg','pdf','bgdown','download','report-image')):
+                      data['assets'].append({'tag':tag.name,'attr':attr,'value':str(val)[:4000],'full':urljoin(d.current_url,str(val)),'text':text})
+                out['details'].append(data)
+                print('DETAIL',json.dumps(data,ensure_ascii=False)[:100000],flush=True)
+              except Exception as e:
+                print('DETAIL_ERROR',url,repr(e),flush=True)
+                out['details'].append({'url':url,'error':repr(e)})
+          finally:
+            d.quit()
+          Path('ceec_sgpjbg_label_details.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-sgpjbg-label-details
+          path: |
+            ceec_sgpjbg_label_details.json
+            ceec_label.html
+            ceec_label.png
+            detail_*.html
+          retention-days: 7
