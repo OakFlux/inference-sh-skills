@@ -1,0 +1,80 @@
+name: Discover public source for CITIC Everbright Securities deep report 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/everbright-securities-citic-report-source-discovery-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install parsers
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Fetch and inspect report pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json,re,html
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          out=Path('everbright_citic_source_discovery'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'text/html,application/xhtml+xml,*/*','Accept-Language':'zh-CN,zh;q=0.9'}
+          urls=[
+            'https://www.nxny.com/report/view_4940962.html',
+            'https://www.sgpjbg.com/labels/yiyaoxinlingshouyewu.html',
+            'https://www.sgpjbg.com/baogao/289190.html',
+            'https://www.sdyanbao.com/search?keyword=%E5%85%89%E5%A4%A7%E8%AF%81%E5%88%B8',
+            'https://www.fhyanbao.com/search?keyword=%E5%85%89%E5%A4%A7%E8%AF%81%E5%88%B8',
+          ]
+          results={}
+          for i,url in enumerate(urls):
+            try:
+              r=s.get(url,headers=headers,timeout=(10,80),allow_redirects=True)
+              print('GET',i,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              text=r.text
+              (out/f'page_{i}.html').write_bytes(r.content)
+              soup=BeautifulSoup(text,'html.parser')
+              links=[]
+              for tag in soup.find_all(['a','iframe','embed','source','img','script'],src=True):
+                links.append({'tag':tag.name,'attr':'src','text':' '.join(tag.get_text(' ',strip=True).split()),'url':urljoin(r.url,tag.get('src'))})
+              for tag in soup.find_all('a',href=True):
+                links.append({'tag':'a','attr':'href','text':' '.join(tag.get_text(' ',strip=True).split()),'url':urljoin(r.url,tag.get('href'))})
+              # Capture URLs and likely attachment variables directly from source.
+              regexes=[
+                r'https?://[^\s"\'<>]+',
+                r'[^\s"\'<>]+\.pdf(?:\?[^\s"\'<>]*)?',
+                r'[^\s"\'<>]+\.(?:jpg|jpeg|png|webp)(?:\?[^\s"\'<>]*)?',
+                r'(?:pdf|file|download|attach|url)[A-Za-z0-9_]*\s*[:=]\s*["\'][^"\']+["\']',
+              ]
+              hits=[]
+              for pat in regexes:
+                for m in re.findall(pat,text,flags=re.I):
+                  if isinstance(m,tuple): m=' '.join(m)
+                  hits.append(html.unescape(str(m)))
+              keep=[]; seen=set()
+              for x in links:
+                u=x['url']
+                if u not in seen and any(k in (u+' '+x['text']).lower() for k in ('pdf','download','attach','file','report','4940962','光大证券','零售业务')):
+                  seen.add(u); keep.append(x)
+              results[url]={'status':r.status_code,'final_url':r.url,'links':keep,'source_hits':list(dict.fromkeys(hits))[:1000]}
+              print('KEEP_LINKS',json.dumps(keep[:100],ensure_ascii=False),flush=True)
+              for h in results[url]['source_hits']:
+                if any(k in h.lower() for k in ('pdf','download','attach','4940962','零售业务')):
+                  print('HIT',h[:1000],flush=True)
+            except Exception as e:
+              print('ERROR',url,repr(e),flush=True); results[url]={'error':repr(e)}
+          (out/'results.json').write_text(json.dumps(results,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: everbright-securities-citic-source-discovery-20260927
+          path: everbright_citic_source_discovery
+          retention-days: 7
