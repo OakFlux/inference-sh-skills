@@ -1,0 +1,70 @@
+name: Diagnose CNINFO Huayu 600741 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diagnose-cninfo-huayu-600741-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Probe stock list and announcement query
+        run: |
+          python - <<'PY'
+          import json
+          import requests
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+          url = 'https://www.cninfo.com.cn/new/data/szse_stock.json'
+          response = session.get(url, headers=headers, timeout=60)
+          print('STOCK_LIST', response.status_code, response.headers.get('content-type'), len(response.content))
+          payload = response.json()
+          matches = [row for row in payload.get('stockList', []) if str(row.get('code')) == '600741']
+          print('MATCHES', json.dumps(matches, ensure_ascii=False))
+          org_id = str(matches[0].get('orgId')) if matches else ''
+
+          query_url = 'https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          post_headers = dict(headers)
+          post_headers.update({
+              'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+              'Origin': 'https://www.cninfo.com.cn',
+              'Referer': 'https://www.cninfo.com.cn/',
+              'X-Requested-With': 'XMLHttpRequest',
+          })
+          stock_values = [f'600741,{org_id}', '600741,sh', '600741'] if org_id else ['600741,sh', '600741']
+          for column in ['sse', 'szse']:
+              for plate in ['sh', '']:
+                  for stock in stock_values:
+                      form = {
+                          'pageNum': '1',
+                          'pageSize': '30',
+                          'column': column,
+                          'tabName': 'fulltext',
+                          'plate': plate,
+                          'stock': stock,
+                          'searchkey': '2020年年度报告',
+                          'secid': '',
+                          'category': 'category_ndbg_szsh;',
+                          'trade': '',
+                          'seDate': '2021-01-01~2021-06-30',
+                          'sortName': 'time',
+                          'sortType': 'desc',
+                          'isHLtitle': 'false',
+                      }
+                      r = session.post(query_url, data=form, headers=post_headers, timeout=60)
+                      try:
+                          data = r.json()
+                      except Exception:
+                          print('QUERY_NONJSON', column, plate, stock, r.status_code, r.text[:300])
+                          continue
+                      anns = data.get('announcements') or []
+                      titles = [a.get('announcementTitle') for a in anns[:5]]
+                      print('QUERY', column, repr(plate), stock, 'status', r.status_code, 'count', len(anns), 'total', data.get('totalAnnouncement'), 'titles', json.dumps(titles, ensure_ascii=False))
+          PY
