@@ -1,0 +1,23 @@
+name: Paginate Eastmoney Air China Cargo Zhejiang report
+on:
+  push:
+    paths:
+      - '.github/workflows/paginate_eastmoney_air_china_cargo_zhejiang_20260927.yml'
+      - 'tools/paginate_eastmoney_air_china_cargo_zhejiang_20260927.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python tools/paginate_eastmoney_air_china_cargo_zhejiang_20260927.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eastmoney-air-china-cargo-paginated
+          path: eastmoney_air_china_cargo_paginated.json
+          if-no-files-found: error
+          retention-days: 3
