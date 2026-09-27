@@ -1,0 +1,117 @@
+name: Discover public Daqin Railway broker research PDFs 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/daqin-railway-broker-discovery-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+      - name: Query Eastmoney and validate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, time, hashlib
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          out = Path('daqin_discovery')
+          pdf_dir = out / 'pdfs'
+          pdf_dir.mkdir(parents=True, exist_ok=True)
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept': 'application/json,text/plain,*/*',
+              'Referer': 'https://data.eastmoney.com/report/601006.html',
+          }
+          api = 'https://reportapi.eastmoney.com/report/list'
+          params = {
+              'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingchange':'*',
+              'beginTime':'2019-01-01','endTime':'2026-09-27','fields':'','qType':'0',
+              'orgCode':'','code':'601006','pageNo':'1'
+          }
+          errors=[]
+          j=None
+          for attempt in range(1,6):
+              try:
+                  r=s.get(api,params=params,headers=headers,timeout=(10,60))
+                  print('API',attempt,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                  print(r.text[:800],flush=True)
+                  r.raise_for_status()
+                  text=r.text.strip()
+                  if text.startswith('{'):
+                      j=r.json()
+                  else:
+                      m=re.search(r'\((\{.*\})\)\s*;?$',text,re.S)
+                      if not m: raise RuntimeError('not JSON/JSONP')
+                      j=json.loads(m.group(1))
+                  break
+              except Exception as e:
+                  errors.append(repr(e)); time.sleep(attempt*2)
+          if j is None:
+              raise RuntimeError(errors)
+          (out/'eastmoney_raw.json').write_text(json.dumps(j,ensure_ascii=False,indent=2),encoding='utf-8')
+          data = j.get('data') or j.get('result') or []
+          if isinstance(data,dict):
+              data = data.get('data') or data.get('list') or data.get('items') or []
+          print('ITEMS',len(data),flush=True)
+          rows=[]
+          for idx,item in enumerate(data):
+              title=str(item.get('title') or item.get('reportTitle') or '')
+              info=str(item.get('infoCode') or item.get('infocode') or item.get('reportId') or '')
+              org=str(item.get('orgSName') or item.get('orgName') or '')
+              date=str(item.get('publishDate') or item.get('publishTime') or '')
+              print('ROW',idx,org,date,info,title,flush=True)
+              row={'index':idx,'title':title,'infoCode':info,'org':org,'publishDate':date,'raw':item}
+              rows.append(row)
+          (out/'normalized_rows.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          def safe_name(x):
+              x=re.sub(r'[\\/:*?"<>|]+','_',x).strip()
+              return x[:120] or 'report'
+          candidates=[]
+          keyphrases=('深度','黑金动脉','大秦线需求高位维稳','西煤东运核心资产','西天取煤','大秦觉醒')
+          for row in rows:
+              title=row['title']; info=row['infoCode']
+              if not info: continue
+              # Try all records; page count later identifies full deep reports.
+              urls=[]
+              if info.startswith('AP'):
+                  urls += [f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf', f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf']
+              else:
+                  urls += [f'https://pdf.dfcfw.com/pdf/H3_AP{info}_1.pdf', f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf']
+              dest=pdf_dir/(safe_name(f"{row['publishDate'][:10]}_{row['org']}_{title}_{info}")+'.pdf')
+              success=None
+              for url in urls:
+                  try:
+                      rr=s.get(url,headers={**headers,'Accept':'application/pdf,*/*'},timeout=(10,90))
+                      print('PDFTRY',rr.status_code,len(rr.content),rr.headers.get('content-type'),url,flush=True)
+                      if rr.status_code==200 and len(rr.content)>20000 and rr.content[:5]==b'%PDF-':
+                          dest.write_bytes(rr.content)
+                          pages=len(PdfReader(str(dest),strict=False).pages)
+                          sha=hashlib.sha256(rr.content).hexdigest()
+                          success={'url':url,'file':str(dest),'pages':pages,'bytes':len(rr.content),'sha256':sha}
+                          print('PDFOK',pages,dest.name,flush=True)
+                          break
+                  except Exception as e:
+                      print('PDFERR',url,repr(e),flush=True)
+              if success:
+                  candidates.append({**row,**success,'keyword_match':any(k in title for k in keyphrases)})
+          (out/'downloaded_candidates.json').write_text(json.dumps(candidates,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('DOWNLOADED',len(candidates),flush=True)
+          for c in sorted(candidates,key=lambda x:(x['pages'],x['publishDate']),reverse=True):
+              print('CANDIDATE',c['pages'],c['org'],c['publishDate'],c['title'],c['url'],flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daqin-railway-broker-discovery-20260927
+          path: daqin_discovery
+          retention-days: 7
