@@ -45,7 +45,7 @@ if len(raw_html) < 1_000_000:
 raw_html_path.write_bytes(raw_html)
 
 html_text = raw_html.decode("utf-8", errors="replace")
-base_and_print_css = f'''
+base_and_print_css = f"""
 <base href="{sec_base_url}">
 <style id="openai-print-normalization">
 @media print {{
@@ -55,7 +55,7 @@ base_and_print_css = f'''
   * {{ max-height: none !important; }}
 }}
 </style>
-'''
+"""
 if re.search(r"<head[^>]*>", html_text, flags=re.I):
     html_text = re.sub(
         r"(<head[^>]*>)",
