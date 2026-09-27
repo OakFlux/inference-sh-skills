@@ -1,0 +1,38 @@
+name: Inspect public SGPJBG viewer JavaScript 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/sgpjbg-viewer-js-inspect-20260927.yml'
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch viewer scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import requests
+          from pathlib import Path
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://www.sgpjbg.com/baogao/106562.html','Accept':'*/*'}
+          urls={
+            'view-mini-fz.js':'https://cache.sgpjbg.com/Master/view/view-mini-fz.js',
+            'encoder.js':'https://cache.sgpjbg.com/css/view/encoder.js',
+          }
+          for name,url in urls.items():
+            r=s.get(url,headers=h,timeout=(10,60))
+            print(name,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+            print(r.text[:3000],flush=True)
+            r.raise_for_status()
+            Path(name).write_bytes(r.content)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sgpjbg-viewer-js
+          path: |
+            view-mini-fz.js
+            encoder.js
+          retention-days: 7
