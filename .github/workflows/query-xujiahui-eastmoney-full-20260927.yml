@@ -1,26 +1,30 @@
-name: Query Xujiahui Eastmoney full history 20260927
+name: Build Xujiahui broker reports package 20260927
 
 on:
   push:
     paths:
       - '.github/workflows/query-xujiahui-eastmoney-full-20260927.yml'
-      - 'scripts/query_xujiahui_eastmoney_full_20260927.py'
+      - 'scripts/build_xujiahui_broker_reports_package_20260927.py'
   workflow_dispatch:
 
 jobs:
-  query:
+  package:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install requests
-        run: python -m pip install --quiet requests
-      - name: Query reports
-        run: python scripts/query_xujiahui_eastmoney_full_20260927.py
-      - name: Upload JSON
+      - name: Install PDF tools and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Download validate and package reports
+        run: python scripts/build_xujiahui_broker_reports_package_20260927.py
+      - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: xujiahui-eastmoney-full-history
-          path: xujiahui_eastmoney_full.json
+          name: xujiahui-002561-broker-reports-3
+          path: 徐家汇_002561_券商研究报告精选_3份.zip
           if-no-files-found: error
-          retention-days: 7
+          compression-level: 0
+          retention-days: 30
