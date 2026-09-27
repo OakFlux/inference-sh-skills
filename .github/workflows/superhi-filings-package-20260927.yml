@@ -1,0 +1,437 @@
+name: Build Super Hi filings package 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/superhi-filings-package-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+      - name: Download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin, quote
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '特海国际_09658_HDL_2022-2025全部年报_上市及招股文件_2026最新定期报告'
+          root = Path(PACKAGE)
+          annual_dir = root / '01_年度报告'
+          prospectus_dir = root / '02_上市及招股文件'
+          latest_dir = root / '03_最新定期报告'
+          notes_dir = root / '04_说明与校验'
+          work = Path('_superhi_work')
+          render_dir = work / 'renders'
+          for d in (annual_dir, prospectus_dir, latest_dir, notes_dir, render_dir):
+              d.mkdir(parents=True, exist_ok=True)
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def request(url: str, *, referer: str | None = None, stream: bool = False, timeout=(15, 180)) -> requests.Response:
+              errors = []
+              variants = [url]
+              if 'www1.hkexnews.hk' in url:
+                  variants.append(url.replace('www1.hkexnews.hk', 'www.hkexnews.hk'))
+              elif 'www.hkexnews.hk' in url:
+                  variants.append(url.replace('www.hkexnews.hk', 'www1.hkexnews.hk'))
+              for u in dict.fromkeys(variants):
+                  for attempt in range(1, 5):
+                      try:
+                          h = {}
+                          if referer:
+                              h['Referer'] = referer
+                          elif 'hkexnews.hk' in u:
+                              h['Referer'] = 'https://www1.hkexnews.hk/'
+                          elif 'sec.gov' in u:
+                              h['User-Agent'] = 'OpenAI research contact superhi_ir@superhi-inc.com'
+                          else:
+                              h['Referer'] = 'https://ir.superhiinternational.com/'
+                          r = s.get(u, headers=h, timeout=timeout, allow_redirects=True, stream=stream)
+                          print('GET', u, 'attempt', attempt, 'status', r.status_code,
+                                'type', r.headers.get('content-type'), 'len', r.headers.get('content-length'),
+                                'final', r.url, flush=True)
+                          r.raise_for_status()
+                          return r
+                      except Exception as exc:
+                          errors.append(f'{u} attempt {attempt}: {exc!r}')
+                          time.sleep(min(2 * attempt, 6))
+              raise RuntimeError(f'request failed for {url}: {errors[-8:]}')
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def get_html(url: str) -> tuple[str, str]:
+              r = request(url, timeout=(15, 120))
+              try:
+                  raw = r.content
+                  final = str(r.url)
+                  enc = r.apparent_encoding or r.encoding or 'utf-8'
+              finally:
+                  r.close()
+              return raw.decode(enc, errors='replace'), final
+
+          def collect_links(urls: list[str]) -> list[dict]:
+              rows = []
+              for url in urls:
+                  try:
+                      html, final = get_html(url)
+                  except Exception as exc:
+                      print('PAGE_ERROR', url, repr(exc), flush=True)
+                      continue
+                  soup = BeautifulSoup(html, 'html.parser')
+                  for a in soup.find_all('a', href=True):
+                      text = ' '.join(a.get_text(' ', strip=True).split())
+                      href = urljoin(final, a['href'])
+                      rows.append({'page': final, 'text': text, 'href': href})
+              return rows
+
+          def norm(text: str) -> str:
+              return re.sub(r'\s+', ' ', text or '').strip().lower()
+
+          def choose_link(rows: list[dict], required_all: tuple[str, ...], excluded: tuple[str, ...] = ()) -> dict | None:
+              matches = []
+              for row in rows:
+                  t = norm(row['text'])
+                  if all(x.lower() in t for x in required_all) and not any(x.lower() in t for x in excluded):
+                      matches.append(row)
+              if not matches:
+                  return None
+              # Prefer direct static/PDF links and longer descriptive labels.
+              matches.sort(key=lambda r: (('.pdf' in r['href'].lower()) or ('static-files' in r['href']), len(r['text'])), reverse=True)
+              return matches[0]
+
+          annual_pages = [
+              'https://ir.superhiinternational.com/financial-information/annual-reports',
+              'https://ir.superhiinternational.com/financial-information/annual-reports?page=1',
+              'https://ir.superhiinternational.com/financial-information/annual-reports?page=2',
+              'https://ir.superhiinternational.com/zh-hant/financial-information/annual-reports',
+              'https://ir.superhiinternational.com/zh-hant/financial-information/annual-reports?page=1',
+              'https://ir.superhiinternational.com/zh-hans/financial-information/annual-reports',
+              'https://ir.superhiinternational.com/',
+              'https://ir.superhiinternational.com/zh-hant',
+          ]
+          annual_links = collect_links(annual_pages)
+          Path(work / 'annual_links.json').write_text(json.dumps(annual_links, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          annual_fallbacks = {
+              2025: 'https://ir.superhiinternational.com/static-files/6bc00940-9e5c-4e91-a460-608a4124d124',
+              2024: 'https://ir.superhiinternational.com/static-files/6b9c33ed-b88d-4015-9cd1-d924c581dc84',
+              2023: 'https://ir.superhiinternational.com/static-files/b8f31775-61bb-4eca-afce-7615cdff1d5e',
+          }
+
+          def find_ir_report(year: int, kind: str) -> tuple[str, str]:
+              year_s = str(year)
+              candidates = []
+              for row in annual_links:
+                  t = norm(row['text'])
+                  if year_s not in t:
+                      continue
+                  if kind == 'annual':
+                      ok = (('annual report' in t) or ('年度報告' in row['text']) or ('年度报告' in row['text']))
+                      bad = ('annual results' in t or '全年業績' in row['text'] or '全年业绩' in row['text'])
+                  else:
+                      ok = (('interim report' in t) or ('中期報告' in row['text']) or ('中期报告' in row['text']))
+                      bad = ('interim results' in t or '中期業績' in row['text'] or '中期业绩' in row['text'])
+                  if ok and not bad:
+                      candidates.append(row)
+              if candidates:
+                  candidates.sort(key=lambda r: (('static-files' in r['href']) or ('.pdf' in r['href'].lower()), len(r['text'])), reverse=True)
+                  return candidates[0]['href'], candidates[0]['page']
+              if kind == 'annual' and year in annual_fallbacks:
+                  return annual_fallbacks[year], 'https://ir.superhiinternational.com/financial-information/annual-reports'
+              raise RuntimeError(f'IR report link not found: {year} {kind}')
+
+          def download_pdf(url: str, dest: Path, *, referer: str | None = None, min_bytes: int = 30000) -> str:
+              tmp = dest.with_suffix(dest.suffix + '.part')
+              tmp.unlink(missing_ok=True)
+              r = request(url, referer=referer, stream=True, timeout=(20, 300))
+              try:
+                  with tmp.open('wb') as f:
+                      for chunk in r.iter_content(1024 * 1024):
+                          if chunk:
+                              f.write(chunk)
+                  final = str(r.url)
+              finally:
+                  r.close()
+              data_head = tmp.read_bytes()[:8]
+              if tmp.stat().st_size < min_bytes or not data_head.startswith(b'%PDF-'):
+                  raise RuntimeError(f'not a valid PDF download: {dest.name}, size={tmp.stat().st_size}, head={data_head!r}, url={final}')
+              tmp.replace(dest)
+              return final
+
+          def validate_pdf(path: Path, *, min_pages: int = 1, identity_terms: tuple[str, ...] = ('super hi', '特海')) -> dict:
+              if not path.exists() or path.stat().st_size < 10000 or not path.read_bytes()[:8].startswith(b'%PDF-'):
+                  raise RuntimeError(f'invalid PDF: {path}')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'page count too small: {path.name}: {pages}')
+              q = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if q.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed: {path.name}: {q.stderr[-1200:]}')
+              check_pages = sorted(set([1, pages]))
+              for pg in check_pages:
+                  prefix = render_dir / f'{hashlib.sha1(str(path).encode()).hexdigest()}_{pg}'
+                  run = subprocess.run(['pdftoppm', '-f', str(pg), '-l', str(pg), '-r', '72', '-png', '-singlefile', str(path), str(prefix)], capture_output=True, text=True, timeout=180)
+                  png = Path(str(prefix) + '.png')
+                  if run.returncode != 0 or not png.exists() or png.stat().st_size < 1000:
+                      raise RuntimeError(f'render failed: {path.name} page {pg}: {run.stderr[-1000:]}')
+              sample = ''
+              sample_indices = list(range(min(6, pages)))
+              if pages > 6:
+                  sample_indices.append(pages - 1)
+              for idx in sample_indices:
+                  try:
+                      sample += '\n' + (reader.pages[idx].extract_text() or '')
+                  except Exception:
+                      pass
+              identity_ok = any(term.lower() in sample.lower() for term in identity_terms)
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'qpdf_return_code': q.returncode,
+                  'render_verified_first_and_last_page': True,
+                  'identity_text_verified_when_extractable': identity_ok,
+              }
+
+          records = []
+          hashes = set()
+          def register(path: Path, *, title: str, doc_type: str, date: str, source: str, source_url: str, notes: str = '', min_pages: int = 1, terms: tuple[str, ...] = ('super hi', '特海')):
+              meta = validate_pdf(path, min_pages=min_pages, identity_terms=terms)
+              if meta['sha256'] in hashes:
+                  raise RuntimeError(f'duplicate PDF: {path.name}')
+              hashes.add(meta['sha256'])
+              rec = {
+                  'relative_path': str(path.relative_to(root)),
+                  'filename': path.name,
+                  'title': title,
+                  'document_type': doc_type,
+                  'publication_date': date,
+                  'source': source,
+                  'source_url': source_url,
+                  'notes': notes,
+                  **meta,
+              }
+              records.append(rec)
+              print('REGISTERED', json.dumps(rec, ensure_ascii=False), flush=True)
+
+          # Annual reports 2022-2025.
+          annual_dates = {2022: '2023-03-30', 2023: '2024-04-25', 2024: '2025-04-24', 2025: '2026-04-13'}
+          for year in (2022, 2023, 2024, 2025):
+              url, referer = find_ir_report(year, 'annual')
+              dest = annual_dir / f'{year}_特海国际_年度报告_官方双语版.pdf'
+              final = download_pdf(url, dest, referer=referer, min_bytes=200000)
+              register(dest, title=f'特海国际{year}年度报告', doc_type='年度报告', date=annual_dates[year], source='特海国际投资者关系网站/港交所披露文件', source_url=final, min_pages=100)
+
+          # Latest formal interim report.
+          interim_url, interim_ref = find_ir_report(2026, 'interim')
+          interim_path = latest_dir / '2026_特海国际_中期报告_截至2026年6月30日止六个月.pdf'
+          interim_final = download_pdf(interim_url, interim_path, referer=interim_ref, min_bytes=100000)
+          register(interim_path, title='特海国际2026年中期报告', doc_type='中期报告', date='2026-09-22', source='特海国际投资者关系网站/港交所披露文件', source_url=interim_final, min_pages=40)
+
+          # Latest quarterly results filed on Form 6-K (Q2 2026).
+          def find_pdf_on_filing_page(url: str) -> tuple[str, str]:
+              html, final = get_html(url)
+              soup = BeautifulSoup(html, 'html.parser')
+              candidates = []
+              for a in soup.find_all('a', href=True):
+                  text = ' '.join(a.get_text(' ', strip=True).split())
+                  href = urljoin(final, a['href'])
+                  low = href.lower()
+                  if low.endswith('.pdf') or '.pdf?' in low or 'download pdf' in text.lower() or re.search(r'\d{10}-\d{2}-\d{6}\.pdf', text):
+                      candidates.append((href, text))
+              # Prefer accession-number PDF rather than exhibits or unrelated links.
+              candidates.sort(key=lambda x: (bool(re.search(r'\d{10}-\d{2}-\d{6}\.pdf', x[0] + x[1])), x[0].lower().endswith('.pdf')), reverse=True)
+              if not candidates:
+                  raise RuntimeError(f'no PDF link on filing page {url}')
+              return candidates[0][0], final
+
+          q2_filing_page = 'https://ir.superhiinternational.com/sec-filings/sec-filing/6-k/0001104659-26-101041'
+          q2_url, q2_ref = find_pdf_on_filing_page(q2_filing_page)
+          q2_path = latest_dir / '2026_Q2_特海国际_第二季度未经审核财务业绩_Form6-K.pdf'
+          q2_final = download_pdf(q2_url, q2_path, referer=q2_ref, min_bytes=50000)
+          register(q2_path, title='特海国际2026年第二季度未经审核财务业绩（Form 6-K）', doc_type='最新季度业绩', date='2026-08-26', source='特海国际投资者关系网站/美国SEC申报', source_url=q2_final, min_pages=5, terms=('super hi', 'second quarter', '2026'))
+
+          # US final prospectus (Form 424B4).
+          us_filing_page = 'https://ir.superhiinternational.com/sec-filings/sec-filing/424b4/0001104659-24-062760'
+          us_url, us_ref = find_pdf_on_filing_page(us_filing_page)
+          us_path = prospectus_dir / '2024_特海国际_美国ADS首次公开发行最终招股说明书_Form424B4.pdf'
+          us_final = download_pdf(us_url, us_path, referer=us_ref, min_bytes=500000)
+          register(us_path, title='特海国际美国ADS首次公开发行最终招股说明书（Form 424B4）', doc_type='美国IPO最终招股说明书', date='2024-05-17', source='特海国际投资者关系网站/美国SEC申报', source_url=us_final, notes='NASDAQ代码HDL', min_pages=100, terms=('super hi', 'prospectus', 'american depositary'))
+
+          # Locate the 2022 Hong Kong Listing Document. The HK listing was by way of introduction.
+          def discover_stock_id() -> str:
+              endpoints = []
+              for cb in ('callback', 'jsonCallback'):
+                  for name in ('09658', '9658', 'SUPER HI'):
+                      endpoints.append(f'https://www1.hkexnews.hk/search/prefix.do?callback={cb}&lang=EN&type=A&name={quote(name)}&market=SEHK')
+              for url in endpoints:
+                  try:
+                      r = request(url, timeout=(10, 60))
+                      try:
+                          text = r.text
+                      finally:
+                          r.close()
+                      m = re.search(r'\((\[.*\]|\{.*\})\)\s*;?$', text.strip(), re.S)
+                      payload = m.group(1) if m else text.strip()
+                      data = json.loads(payload)
+                      rows = data if isinstance(data, list) else data.get('data') or data.get('result') or []
+                      for row in rows:
+                          code = str(row.get('stockCode') or row.get('code') or '').zfill(5)
+                          name = str(row.get('name') or row.get('stockName') or '')
+                          sid = row.get('stockId') or row.get('id')
+                          print('PREFIX_ROW', code, name, sid, flush=True)
+                          if code == '09658' and sid:
+                              return str(sid)
+                  except Exception as exc:
+                      print('PREFIX_ERROR', url, repr(exc), flush=True)
+              raise RuntimeError('could not discover HKEX stockId for 09658')
+
+          hk_listing_found = False
+          try:
+              stock_id = discover_stock_id()
+              search_urls = [
+                  f'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId={stock_id}&from=20221201&to=20230115',
+                  f'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=ZH&market=SEHK&stockId={stock_id}&from=20221201&to=20230115',
+              ]
+              rows = collect_links(search_urls)
+              Path(work / 'hkex_listing_links.json').write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding='utf-8')
+              candidates = []
+              for row in rows:
+                  t = norm(row['text'])
+                  h = row['href'].lower()
+                  if ('listing document' in t or '上市文件' in row['text']) and ('.pdf' in h or 'listconews' in h):
+                      candidates.append(row)
+              # Prefer the full listing document, not a display-document index page.
+              candidates.sort(key=lambda r: ('.pdf' in r['href'].lower(), len(r['text'])), reverse=True)
+              for cand in candidates:
+                  try:
+                      path = prospectus_dir / '2022_特海国际_香港联交所以介绍方式上市文件.pdf'
+                      final = download_pdf(cand['href'], path, referer=cand['page'], min_bytes=500000)
+                      meta = validate_pdf(path, min_pages=100, identity_terms=('super hi', 'listing document', '特海'))
+                      if meta['pages'] < 100:
+                          path.unlink(missing_ok=True)
+                          continue
+                      register(path, title='特海国际香港联交所以介绍方式上市文件', doc_type='香港上市文件（介绍方式）', date='2022-12-19', source='香港交易所披露易', source_url=final, notes='公司在香港以介绍方式上市，不涉及公开发售；该文件是港股上市文件而非募集资金招股书', min_pages=100, terms=('super hi', 'listing document', '特海'))
+                      hk_listing_found = True
+                      break
+                  except Exception as exc:
+                      print('LISTING_CANDIDATE_ERROR', cand, repr(exc), flush=True)
+          except Exception as exc:
+              print('HK_LISTING_DISCOVERY_ERROR', repr(exc), flush=True)
+
+          if not hk_listing_found:
+              # Transparent fallback note; the US final prospectus remains included as the formal prospectus.
+              (notes_dir / '香港上市文件检索说明.txt').write_text(
+                  '特海国际于2022年12月30日以介绍方式在香港联交所上市，上市文件日期为2022年12月19日。\n'
+                  '本次自动检索未能从港交所接口稳定取得该历史PDF原件，因此未使用来源不明的第三方文件替代。\n'
+                  '压缩包已收录2024年美国ADS首次公开发行最终招股说明书（Form 424B4）。\n',
+                  encoding='utf-8'
+              )
+
+          # Coverage checks.
+          annual_years = sorted(int(re.match(r'(\d{4})_', Path(r['filename']).name).group(1)) for r in records if r['document_type'] == '年度报告')
+          if annual_years != [2022, 2023, 2024, 2025]:
+              raise RuntimeError(f'annual-report coverage incomplete: {annual_years}')
+          if not any(r['document_type'] == '美国IPO最终招股说明书' for r in records):
+              raise RuntimeError('US prospectus missing')
+          if not any(r['document_type'] == '中期报告' for r in records):
+              raise RuntimeError('latest interim report missing')
+          if not any(r['document_type'] == '最新季度业绩' for r in records):
+              raise RuntimeError('latest quarterly results missing')
+
+          summary = {
+              'issuer': 'SUPER HI INTERNATIONAL HOLDING LTD. / 特海国际控股有限公司',
+              'hk_ticker': '09658',
+              'nasdaq_ticker': 'HDL',
+              'checked_as_of': '2026-09-27',
+              'annual_report_coverage': '2022-2025',
+              'latest_formal_periodic_report': '2026年中期报告（截至2026年6月30日止六个月）',
+              'latest_quarterly_results': '2026年第二季度未经审核财务业绩（2026-08-26）',
+              'hk_listing_document_included': hk_listing_found,
+              'records': records,
+          }
+          (root / 'manifest.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          with (root / '文件清单.csv').open('w', newline='', encoding='utf-8-sig') as f:
+              w = csv.writer(f)
+              w.writerow(['相对路径', '文件类型', '发布日期', '页数', '字节数', 'SHA-256', '来源', '来源网址', '备注'])
+              for r in records:
+                  w.writerow([r['relative_path'], r['document_type'], r['publication_date'], r['pages'], r['bytes'], r['sha256'], r['source'], r['source_url'], r['notes']])
+
+          readme = [
+              '特海国际控股有限公司（09658.HK / NASDAQ: HDL）官方披露文件包',
+              '核对日期：2026年9月27日',
+              '',
+              '收录范围：',
+              '- 2022、2023、2024、2025年度报告，共4份。公司于2022年12月30日在港交所上市，因此2022年为首份上市后年度报告。',
+              '- 2024年美国ADS首次公开发行最终招股说明书（Form 424B4）。',
+              '- 2022年香港以介绍方式上市文件：' + ('已收录。' if hk_listing_found else '港交所历史接口未能稳定取得原件，详见说明文件。'),
+              '- 最新正式阶段性报告：2026年中期报告。',
+              '- 最新季度业绩：2026年第二季度未经审核财务业绩（Form 6-K）。',
+              '',
+              '口径说明：',
+              '香港上市采用“介绍方式”，并非公开发售，因此对应文件名称为“上市文件”，不是募集资金招股章程。2024年NASDAQ ADS发行对应正式最终招股说明书。',
+              '',
+              '校验：每份PDF均核对文件头、实际页数、qpdf结构，并渲染首末页；manifest.json及SHA256SUMS.txt记录来源和校验值。',
+          ]
+          (root / '00_文件清单与范围说明.txt').write_text('\n'.join(readme) + '\n', encoding='utf-8')
+
+          sums = []
+          for p in sorted(root.rglob('*')):
+              if p.is_file() and p.name != 'SHA256SUMS.txt':
+                  sums.append(f'{sha256(p)}  {p.relative_to(root)}')
+          (root / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as z:
+              for p in sorted(root.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=str(Path(PACKAGE) / p.relative_to(root)))
+          with zipfile.ZipFile(zip_path, 'r') as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, sha256(zip_path), flush=True)
+          print('RECORD_COUNT', len(records), 'HK_LISTING_FOUND', hk_listing_found, flush=True)
+          PY
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhi-09658-hdl-filings-package-20260927
+          path: 特海国际_09658_HDL_2022-2025全部年报_上市及招股文件_2026最新定期报告.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
