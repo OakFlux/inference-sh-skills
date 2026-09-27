@@ -102,7 +102,6 @@ with sync_playwright() as playwright:
         prefer_css_page_size=False,
         scale=0.82,
         margin={"top": "7mm", "bottom": "7mm", "left": "6mm", "right": "6mm"},
-        timeout=300000,
     )
     browser.close()
 
