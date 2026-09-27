@@ -1,0 +1,40 @@
+name: Package China Chemical filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_china_chemical_filings_20260927.yml'
+      - 'tools/package_china_chemical_filings_20260927.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PDF and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet 'httpx[http2]' pypdf
+
+      - name: Download validate and package filings
+        run: python tools/package_china_chemical_filings_20260927.py
+
+      - name: Upload package and validation previews
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-chemical-filings-2020-2025-latest
+          path: |
+            中国化学_601117_2020-2025年报及2026年最新财务报告.zip
+            china_chemical_filings_result.json
+            _previews_china_chemical_filings/*.png
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
