@@ -1,0 +1,296 @@
+name: Build BrainAurora broker research reports package 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/brainaura-broker-reports-package-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf pillow img2pdf beautifulsoup4
+
+      - name: Reconstruct public report pages, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from io import BytesIO
+          from pathlib import Path
+
+          import img2pdf
+          import requests
+          from PIL import Image
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE = '脑动极光_06681_券商研究报告_2份_20260927'
+          out = Path(PACKAGE)
+          render_dir = Path('_brainaura_render_check')
+          out.mkdir(exist_ok=True)
+          render_dir.mkdir(exist_ok=True)
+
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def get_bytes(url: str, referer: str | None = None, min_bytes: int = 1000, tries: int = 4):
+              errors = []
+              headers = {'Referer': referer} if referer else {}
+              for attempt in range(1, tries + 1):
+                  try:
+                      r = s.get(url, headers=headers, timeout=(15, 120), allow_redirects=True)
+                      print('GET', url, 'attempt', attempt, 'status', r.status_code,
+                            'type', r.headers.get('content-type'), 'bytes', len(r.content),
+                            'final', r.url, flush=True)
+                      r.raise_for_status()
+                      if len(r.content) < min_bytes:
+                          raise RuntimeError(f'response too small: {len(r.content)}')
+                      return r.content, str(r.url), r.headers.get('content-type', '')
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      time.sleep(attempt)
+              raise RuntimeError(f'download failed: {url}: {errors}')
+
+          def validate_pdf(path: Path, expected_pages: int, expected_terms: tuple[str, ...]) -> dict:
+              data = path.read_bytes()
+              if len(data) < 80_000 or not data.startswith(b'%PDF-'):
+                  raise RuntimeError(f'invalid PDF: {path.name}, {len(data)} bytes')
+              reader = PdfReader(str(path), strict=False)
+              pages = len(reader.pages)
+              if pages != expected_pages:
+                  raise RuntimeError(f'page mismatch: {path.name}: {pages} != {expected_pages}')
+              chk = subprocess.run(['qpdf', '--check', str(path)], capture_output=True, text=True)
+              if chk.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed: {path.name}: {chk.stderr[-1200:]}')
+
+              # Render first and last pages to ensure the reconstructed PDF is readable.
+              for page_no in sorted(set([1, pages])):
+                  prefix = render_dir / f'{path.stem}_{page_no}'
+                  p = subprocess.run([
+                      'pdftoppm', '-f', str(page_no), '-l', str(page_no), '-r', '72',
+                      '-png', '-singlefile', str(path), str(prefix)
+                  ], capture_output=True, text=True, timeout=180)
+                  png = Path(str(prefix) + '.png')
+                  if p.returncode != 0 or not png.exists() or png.stat().st_size < 1000:
+                      raise RuntimeError(f'render failed: {path.name} page {page_no}: {p.stderr[-1000:]}')
+
+              sample = ''
+              for page in reader.pages[:min(5, pages)]:
+                  try:
+                      sample += '\n' + (page.extract_text() or '')
+                  except Exception:
+                      pass
+              identity_ok = any(term.lower() in sample.lower() for term in expected_terms)
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'qpdf_return_code': chk.returncode,
+                  'render_verified_first_and_last_page': True,
+                  'identity_text_verified_when_extractable': identity_ok,
+              }
+
+          def reconstruct_report(*, report_id: str, date_path: str, filename: str,
+                                 institution: str, title: str, publication_date: str,
+                                 report_type: str, detail_url: str,
+                                 detail_terms: tuple[str, ...], expected_pages: int,
+                                 pdf_terms: tuple[str, ...]) -> dict:
+              page_data, detail_final, _ = get_bytes(detail_url, min_bytes=15_000)
+              page_text = BeautifulSoup(page_data, 'html.parser').get_text(' ', strip=True)
+              if not all(term.lower() in page_text.lower() for term in detail_terms):
+                  raise RuntimeError(f'detail page identity check failed for {report_id}')
+
+              img_dir = out / f'_公开逐页原图_{report_id}'
+              img_dir.mkdir(exist_ok=True)
+              image_paths = []
+              image_urls = []
+              for i in range(1, expected_pages + 1):
+                  url = f'https://public.fxbaogao.com/report-image/{date_path}/{report_id}-{i}.png'
+                  raw = None
+                  final_url = None
+                  last_error = None
+                  for attempt in range(1, 4):
+                      try:
+                          r = s.get(
+                              url,
+                              headers={
+                                  'Referer': detail_url,
+                                  'Accept': 'image/png,image/*;q=0.9,*/*;q=0.8',
+                              },
+                              timeout=(10, 60),
+                              allow_redirects=True,
+                          )
+                          print('IMAGE', report_id, i, 'attempt', attempt, 'status', r.status_code,
+                                'type', r.headers.get('content-type'), 'bytes', len(r.content), flush=True)
+                          r.raise_for_status()
+                          if len(r.content) < 20_000:
+                              raise RuntimeError(f'image too small: {len(r.content)}')
+                          im = Image.open(BytesIO(r.content))
+                          im.load()
+                          if im.width < 800 or im.height < 1000:
+                              raise RuntimeError(f'implausible dimensions: {im.size}')
+                          raw = r.content
+                          final_url = str(r.url)
+                          break
+                      except Exception as exc:
+                          last_error = exc
+                          time.sleep(attempt)
+                  if raw is None:
+                      raise RuntimeError(f'page image missing report={report_id} page={i}: {last_error!r}')
+                  dest = img_dir / f'{i:03d}.png'
+                  if raw.startswith(b'\x89PNG\r\n\x1a\n'):
+                      dest.write_bytes(raw)
+                  else:
+                      im = Image.open(BytesIO(raw)).convert('RGB')
+                      im.save(dest, format='PNG')
+                  image_paths.append(dest)
+                  image_urls.append(final_url)
+
+              pdf_path = out / filename
+              layout = img2pdf.get_layout_fun((img2pdf.mm_to_pt(210), img2pdf.mm_to_pt(297)))
+              pdf_path.write_bytes(img2pdf.convert([str(p) for p in image_paths], layout_fun=layout))
+              meta = validate_pdf(pdf_path, expected_pages=expected_pages, expected_terms=pdf_terms)
+              return {
+                  'filename': pdf_path.name,
+                  'institution': institution,
+                  'title': title,
+                  'publication_date': publication_date,
+                  'report_type': report_type,
+                  'document_form': '由公开阅读页的完整逐页原图按原顺序合成PDF；并保留逐页原图',
+                  'source_page': detail_final,
+                  'source_page_images': image_urls,
+                  **meta,
+              }
+
+          records = []
+          records.append(reconstruct_report(
+              report_id='4832942',
+              date_path='2025/05/09',
+              filename='01_浦银国际_脑动极光6681.HK_AI赋能全面布局认知障碍数字疗法_首次覆盖买入_2025-05-09.pdf',
+              institution='浦银国际',
+              title='脑动极光（6681.HK）：AI赋能，全面布局认知障碍数字疗法',
+              publication_date='2025-05-09',
+              report_type='首次覆盖深度报告',
+              detail_url='https://www.fxbaogao.com/detail/4832942',
+              detail_terms=('AI赋能', '脑动极光', '浦银国际'),
+              expected_pages=29,
+              pdf_terms=('脑动极光', '6681', 'BrainAurora'),
+          ))
+          records.append(reconstruct_report(
+              report_id='4651035',
+              date_path='2024/12/30',
+              filename='02_国元国际_IPO申购指南_脑动极光B_谨慎申购_2024-12-30.pdf',
+              institution='国元国际',
+              title='IPO申购指南：脑动极光-B',
+              publication_date='2024-12-30',
+              report_type='新股申购研究',
+              detail_url='https://www.fxbaogao.com/detail/4651035',
+              detail_terms=('IPO申购指南', '脑动极光', '国元国际'),
+              expected_pages=2,
+              pdf_terms=('脑动极光', '6681', '国元'),
+          ))
+
+          # Human-readable inventory.
+          lines = [
+              '脑动极光医疗科技有限公司（06681.HK）券商研究报告资料包',
+              '整理日期：2026-09-27',
+              '',
+              '覆盖情况说明：',
+              '公开可核验的公司级卖方覆盖较少。本包收录2份完整券商材料：1份29页首次覆盖深度报告，以及1份IPO申购指南。',
+              '其中只有浦银国际报告属于严格意义上的长篇深度覆盖；国元国际报告用于补充上市时估值与申购判断。',
+              '',
+              '文件形式说明：',
+              '报告来源页面公开展示完整逐页原图，但未提供可直接核验的券商服务器原始PDF地址。',
+              '本包将连续公开页图按原顺序合成为PDF，并保留全部逐页原图；页面内容未被修改。',
+              '',
+              '文件清单：',
+          ]
+          for idx, rec in enumerate(records, 1):
+              lines.extend([
+                  f"{idx}. {rec['institution']}｜{rec['title']}",
+                  f"   类型：{rec['report_type']}",
+                  f"   日期：{rec['publication_date']}；页数：{rec['pages']}；大小：{rec['bytes']/1048576:.2f} MB",
+                  f"   文件：{rec['filename']}",
+                  f"   来源页：{rec['source_page']}",
+                  f"   SHA-256：{rec['sha256']}",
+                  '',
+              ])
+          lines.extend([
+              '核验项目：报告详情页身份、逐页原图连续性及尺寸、PDF文件头、实际页数、qpdf结构、首末页渲染、SHA-256和ZIP CRC。',
+              '报告中的评级、目标价、申购建议及预测均为机构在报告发布日期的观点，不构成当前投资建议。',
+          ])
+          (out / '00_文件清单与来源说明.txt').write_text('\n'.join(lines), encoding='utf-8')
+
+          with (out / '文件清单.csv').open('w', newline='', encoding='utf-8-sig') as f:
+              w = csv.writer(f)
+              w.writerow(['机构', '报告名称', '报告类型', '发布日期', '页数', '字节数', 'SHA-256', '文件名', '来源页', '文件形式'])
+              for rec in records:
+                  w.writerow([
+                      rec['institution'], rec['title'], rec['report_type'], rec['publication_date'],
+                      rec['pages'], rec['bytes'], rec['sha256'], rec['filename'],
+                      rec['source_page'], rec['document_form'],
+                  ])
+
+          manifest = {
+              'issuer': '脑动极光医疗科技有限公司',
+              'ticker': '06681.HK',
+              'checked_as_of': '2026-09-27',
+              'report_count': len(records),
+              'coverage_note': '1份首次覆盖深度报告 + 1份IPO申购研究；公开卖方覆盖有限',
+              'records': records,
+          }
+          (out / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          sums = []
+          for p in sorted(out.rglob('*')):
+              if p.is_file() and p.name != 'SHA256SUMS.txt':
+                  sums.append(f'{sha256(p)}  {p.relative_to(out)}')
+          (out / 'SHA256SUMS.txt').write_text('\n'.join(sums) + '\n', encoding='utf-8')
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as z:
+              for p in sorted(out.rglob('*')):
+                  if p.is_file():
+                      z.write(p, arcname=str(Path(PACKAGE) / p.relative_to(out)))
+          with zipfile.ZipFile(zip_path, 'r') as z:
+              bad = z.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+          print('FINAL_ZIP', zip_path, zip_path.stat().st_size, sha256(zip_path), flush=True)
+          print('REPORTS', json.dumps(records, ensure_ascii=False), flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: brainaura-06681-broker-reports-final
+          path: 脑动极光_06681_券商研究报告_2份_20260927.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
