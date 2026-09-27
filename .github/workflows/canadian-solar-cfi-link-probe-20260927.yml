@@ -1,0 +1,42 @@
+name: Extract Canadian Solar CFI links 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/canadian-solar-cfi-link-probe-20260927.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Fetch and parse CFI page
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          import json,re,requests
+          from html import unescape
+          from pathlib import Path
+          from urllib.parse import urljoin
+          url='https://gg.cfi.cn/cbgg/168527/688472.html'
+          s=requests.Session();s.headers.update({'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Referer':'https://gg.cfi.cn/'})
+          r=s.get(url,timeout=60);print('HTTP',r.status_code,len(r.content),r.encoding,r.apparent_encoding,flush=True);r.raise_for_status()
+          r.encoding=r.apparent_encoding or 'gb2312';text=r.text
+          Path('output/page.html').write_text(text,encoding='utf-8')
+          links=[]
+          for m in re.finditer(r'<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',text,re.I|re.S):
+            href=urljoin(url,unescape(m.group(1)));label=re.sub(r'<[^>]+>','',unescape(m.group(2)));label=re.sub(r'\s+','',label)
+            if '2023-06-06' in text[max(0,m.start()-600):m.end()+600] or '招股说明书' in text[max(0,m.start()-600):m.end()+600] or 'static.cninfo' in href:
+              links.append({'href':href,'label':label,'context':re.sub(r'\s+',' ',text[max(0,m.start()-250):m.end()+250])})
+          Path('output/links.json').write_text(json.dumps(links,ensure_ascii=False,indent=2),encoding='utf-8')
+          for x in links:print(json.dumps(x,ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: canadian-solar-cfi-link-probe-20260927
+          path: output
+          retention-days: 7
+          if-no-files-found: error
