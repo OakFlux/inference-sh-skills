@@ -1,0 +1,28 @@
+name: Build verified China Energy Engineering broker reports package 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-broker-reports-2-public-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF and image tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf img2pdf
+      - name: Build and validate package
+        run: python scripts/build_ceec_broker_reports_2_public_20260927.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ceec-601868-broker-deep-reports-2-final
+          path: 中国能源建设_中国能建_601868_券商深度报告_2份_20260927.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
