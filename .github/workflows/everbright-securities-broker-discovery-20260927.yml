@@ -1,0 +1,131 @@
+name: Discover Everbright Securities broker deep reports 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/everbright-securities-broker-discovery-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install PDF parser
+        run: python -m pip install --quiet requests pypdf
+      - name: Query Eastmoney and validate candidate PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import json, re, hashlib, time
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+
+          OUT = Path('everbright_securities_discovery')
+          PDFDIR = OUT / 'candidate_pdfs'
+          PDFDIR.mkdir(parents=True, exist_ok=True)
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer':'https://data.eastmoney.com/report/601788.html',
+              'Accept':'application/json,text/plain,*/*',
+          })
+          api='https://reportapi.eastmoney.com/report/list'
+          rows=[]
+          for page in range(1,8):
+              params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':'2017-01-01','endTime':'2026-09-27','pageNo':str(page),'fields':'',
+                  'qType':'0','orgCode':'','code':'601788','rcode':'','p':str(page),
+                  'pageNum':str(page),'pageNumber':str(page),
+              }
+              r=s.get(api,params=params,timeout=(10,60))
+              print('API',page,r.status_code,len(r.content),r.url,flush=True)
+              r.raise_for_status()
+              j=r.json()
+              data=j.get('data') or j.get('Data') or []
+              print('ROWS',len(data),'HITS',j.get('hits') or j.get('Hits'),flush=True)
+              if not data: break
+              rows.extend(data)
+              if len(data)<100: break
+              time.sleep(.4)
+
+          def textval(x,*keys):
+              for k in keys:
+                  v=x.get(k)
+                  if v not in (None,''):
+                      return str(v)
+              return ''
+          seen=set(); clean=[]
+          for x in rows:
+              info=textval(x,'infoCode','info_code','reportId')
+              if not info or info in seen: continue
+              seen.add(info)
+              rec={
+                  'infoCode':info,
+                  'title':textval(x,'title','reportTitle'),
+                  'publishDate':textval(x,'publishDate','pubDate'),
+                  'orgSName':textval(x,'orgSName','orgName'),
+                  'researcher':textval(x,'researcher','researcherName'),
+                  'rating':textval(x,'emRatingName','ratingName'),
+                  'attachPages':textval(x,'attachPages','attach_pages'),
+                  'attachSize':textval(x,'attachSize','attach_size'),
+                  'raw':x,
+              }
+              clean.append(rec)
+          clean.sort(key=lambda x:x['publishDate'],reverse=True)
+          print('TOTAL_CLEAN',len(clean),flush=True)
+          for rec in clean:
+              print('META',json.dumps({k:rec[k] for k in ('publishDate','orgSName','title','attachPages','infoCode')},ensure_ascii=False),flush=True)
+
+          keywords=('深度','首次覆盖','公司深度','公司研究','价值重估','转型','集团优势','协同','财富管理')
+          candidates=[]
+          for rec in clean:
+              try: ap=int(float(rec['attachPages'])) if rec['attachPages'] else 0
+              except: ap=0
+              title=rec['title']
+              score=(50 if any(k in title for k in keywords) else 0) + min(ap,40)
+              if '点评' in title or '快报' in title or '一季报' in title or '三季报' in title or '中报' in title or '年报' in title:
+                  score-=25
+              # Keep a broad pool; true page count is checked after download.
+              if score>=12 or ap>=10:
+                  rec['metadata_score']=score
+                  candidates.append(rec)
+          candidates.sort(key=lambda x:(x['metadata_score'],x['publishDate']),reverse=True)
+          candidates=candidates[:30]
+
+          validated=[]
+          for idx,rec in enumerate(candidates,1):
+              info=rec['infoCode']
+              url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              try:
+                  rr=s.get(url,headers={'User-Agent':s.headers['User-Agent'],'Referer':'https://data.eastmoney.com/'},timeout=(10,90))
+                  print('PDF',idx,rr.status_code,len(rr.content),url,flush=True)
+                  if rr.status_code!=200 or len(rr.content)<50000 or not rr.content.startswith(b'%PDF-'):
+                      continue
+                  safe=re.sub(r'[\\/:*?"<>|]+','_',f"{rec['publishDate'][:10]}_{rec['orgSName']}_{rec['title']}")[:150]
+                  path=PDFDIR/f'{safe}_{info}.pdf'
+                  path.write_bytes(rr.content)
+                  reader=PdfReader(str(path),strict=False)
+                  pages=len(reader.pages)
+                  sample='\n'.join((p.extract_text() or '') for p in list(reader.pages[:min(5,pages)]) + ([reader.pages[-1]] if pages>5 else []))
+                  identity=any(t in sample for t in ('光大证券','601788','Everbright Securities'))
+                  sha=hashlib.sha256(rr.content).hexdigest()
+                  rec2={k:v for k,v in rec.items() if k!='raw'}
+                  rec2.update({'pdf_url':url,'local_file':str(path),'pages':pages,'bytes':len(rr.content),'sha256':sha,'identity_text_verified':identity})
+                  validated.append(rec2)
+                  print('VALID',json.dumps(rec2,ensure_ascii=False),flush=True)
+              except Exception as e:
+                  print('PDF_ERROR',info,repr(e),flush=True)
+
+          (OUT/'all_reports.json').write_text(json.dumps(clean,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'validated_candidates.json').write_text(json.dumps(validated,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: everbright-securities-broker-discovery-20260927
+          path: everbright_securities_discovery
+          retention-days: 7
