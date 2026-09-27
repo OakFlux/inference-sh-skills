@@ -1,0 +1,57 @@
+name: Locate SGPJBG Everbright Securities report page 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/everbright-securities-sgpjbg-search-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  locate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Install parser
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Search report title
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          out=Path('sgpjbg_everbright_search'); out.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'text/html,*/*','Referer':'https://www.sgpjbg.com/'}
+          queries=['以零售业务为核心的中上游券商','光大证券 601788 中信证券','轻装上阵 受益于光大集团协同生态圈','光大证券 深度报告']
+          allrows=[]
+          for i,q in enumerate(queries):
+            urls=[
+              'https://www.sgpjbg.com/search.html?q='+requests.utils.quote(q),
+              'https://www.sgpjbg.com/Search.html?q='+requests.utils.quote(q),
+              'https://www.sgpjbg.com/yanbaokulist.html?q='+requests.utils.quote(q),
+            ]
+            for j,u in enumerate(urls):
+              try:
+                r=s.get(u,headers=h,timeout=(10,60),allow_redirects=True)
+                print('GET',i,j,r.status_code,len(r.content),r.url,flush=True)
+                (out/f'q{i}_{j}.html').write_bytes(r.content)
+                soup=BeautifulSoup(r.content,'html.parser')
+                for a in soup.find_all('a',href=True):
+                  text=' '.join(a.get_text(' ',strip=True).split())
+                  url=urljoin(r.url,a['href'])
+                  if any(k in text for k in ('光大证券','以零售业务为核心','轻装上阵')) or ('/baogao/' in url and any(k in str(a) for k in ('光大证券','零售业务','轻装上阵'))):
+                    row={'query':q,'text':text,'url':url}
+                    if row not in allrows: allrows.append(row)
+                    print('MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+              except Exception as e:
+                print('ERROR',u,repr(e),flush=True)
+          (out/'matches.json').write_text(json.dumps(allrows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: everbright-securities-sgpjbg-search-20260927
+          path: sgpjbg_everbright_search
+          retention-days: 7
