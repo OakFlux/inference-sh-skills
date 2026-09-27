@@ -1,0 +1,204 @@
+name: Build targeted Super Hi filings package v2 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/superhi-filings-package-v2-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+      - name: Build package from official sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import csv, hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PKG='特海国际_09658_HDL_2022-2025全部年报_上市及招股文件_2026最新定期报告'
+          root=Path(PKG)
+          annual=root/'01_年度报告'; offering=root/'02_上市及招股文件'; latest=root/'03_最新定期报告'; notes=root/'04_说明与校验'; renders=Path('_superhi_v2_renders')
+          for d in (annual,offering,latest,notes,renders): d.mkdir(parents=True,exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'en-US,en;q=0.9,zh-CN;q=0.8'})
+
+          def sha256(p):
+            h=hashlib.sha256()
+            with open(p,'rb') as f:
+              for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+            return h.hexdigest()
+
+          def get(url,referer=None,stream=False,timeout=(12,120)):
+            h={'Referer':referer} if referer else {}
+            errs=[]
+            variants=[url]
+            if 'www1.hkexnews.hk' in url: variants.append(url.replace('www1.hkexnews.hk','www.hkexnews.hk'))
+            for u in variants:
+              for a in range(1,4):
+                try:
+                  r=s.get(u,headers=h,timeout=timeout,allow_redirects=True,stream=stream)
+                  print('GET',a,r.status_code,r.headers.get('content-type'),r.headers.get('content-length'),r.url,flush=True)
+                  r.raise_for_status(); return r
+                except Exception as e:
+                  errs.append(repr(e)); time.sleep(a)
+            raise RuntimeError(f'GET failed {url}: {errs}')
+
+          def download(url,dest,referer=None,min_bytes=30000):
+            tmp=dest.with_suffix(dest.suffix+'.part'); tmp.unlink(missing_ok=True)
+            r=get(url,referer=referer,stream=True,timeout=(15,300))
+            try:
+              with open(tmp,'wb') as f:
+                for c in r.iter_content(1024*1024):
+                  if c: f.write(c)
+              final=str(r.url)
+            finally: r.close()
+            head=tmp.read_bytes()[:8]
+            if tmp.stat().st_size<min_bytes or not head.startswith(b'%PDF-'): raise RuntimeError(f'bad PDF {dest.name} {tmp.stat().st_size} {head!r}')
+            tmp.replace(dest); return final
+
+          def hkex_links(start,end):
+            base=f'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang=EN&market=SEHK&stockId=1000179492&from={start}&to={end}'
+            r=get(base,referer='https://www1.hkexnews.hk/',timeout=(10,60)); raw=r.content; final=str(r.url); r.close()
+            soup=BeautifulSoup(raw,'html.parser'); rows=[]
+            for a in soup.find_all('a',href=True):
+              text=' '.join(a.get_text(' ',strip=True).split()); href=urljoin(final,a['href'])
+              if 'listconews' in href and ('.pdf' in href.lower() or '.htm' in href.lower()): rows.append({'text':text,'href':href,'page':final})
+            print('HKEX_ROWS',start,end,len(rows),flush=True)
+            for x in rows: print('HKEX_LINK',json.dumps(x,ensure_ascii=False),flush=True)
+            return rows
+
+          def pick(rows,required,excluded=()):
+            c=[]
+            for x in rows:
+              t=x['text'].lower()
+              if all(k.lower() in t for k in required) and not any(k.lower() in t for k in excluded): c.append(x)
+            c.sort(key=lambda x:(x['href'].lower().endswith('.pdf'),len(x['text'])),reverse=True)
+            if not c: raise RuntimeError(f'no HKEX match required={required}')
+            return c[0]
+
+          def pdf_link_from_ir_filing(url):
+            r=get(url,timeout=(10,60)); raw=r.content; final=str(r.url); r.close(); soup=BeautifulSoup(raw,'html.parser')
+            links=[]
+            for a in soup.find_all('a',href=True):
+              text=' '.join(a.get_text(' ',strip=True).split()); href=urljoin(final,a['href'])
+              if 'pdf' in text.lower() or href.lower().endswith('.pdf'): links.append((text,href))
+            for text,href in links:
+              if 'download pdf' in text.lower() or re.search(r'\d{10}-\d{2}-\d{6}\.pdf$',href,re.I):
+                print('IR_PDF',text,href,flush=True); return href,final
+            if links: return links[0][1],final
+            raise RuntimeError(f'PDF link missing on {url}')
+
+          records=[]; hashes=set()
+          def validate(path,min_pages=1,terms=('super hi','特海')):
+            data=path.read_bytes()
+            if len(data)<10000 or not data.startswith(b'%PDF-'): raise RuntimeError(f'invalid {path}')
+            reader=PdfReader(str(path),strict=False); n=len(reader.pages)
+            if n<min_pages: raise RuntimeError(f'too few pages {path.name}: {n}')
+            q=subprocess.run(['qpdf','--check',str(path)],capture_output=True,text=True)
+            if q.returncode not in (0,3): raise RuntimeError(q.stderr[-1000:])
+            for pg in sorted({1,n}):
+              pref=renders/f'{hashlib.sha1(str(path).encode()).hexdigest()}_{pg}'
+              run=subprocess.run(['pdftoppm','-f',str(pg),'-l',str(pg),'-r','72','-png','-singlefile',str(path),str(pref)],capture_output=True,text=True,timeout=180)
+              png=Path(str(pref)+'.png')
+              if run.returncode or not png.exists() or png.stat().st_size<1000: raise RuntimeError(f'render failed {path.name} p{pg}')
+            sample=''
+            idxs=list(range(min(5,n)))+([n-1] if n>5 else [])
+            for i in idxs:
+              try: sample+='\n'+(reader.pages[i].extract_text() or '')
+              except: pass
+            return {'pages':n,'bytes':path.stat().st_size,'sha256':sha256(path),'qpdf_return_code':q.returncode,'first_last_page_rendered':True,'identity_text_verified_when_extractable':any(t.lower() in sample.lower() for t in terms)}
+
+          def add(path,title,dtype,date,source,url,notes_text='',min_pages=1,terms=('super hi','特海')):
+            m=validate(path,min_pages,terms)
+            if m['sha256'] in hashes: raise RuntimeError(f'duplicate {path.name}')
+            hashes.add(m['sha256']); rec={'relative_path':str(path.relative_to(root)),'filename':path.name,'title':title,'document_type':dtype,'publication_date':date,'source':source,'source_url':url,'notes':notes_text,**m}; records.append(rec); print('ADDED',json.dumps(rec,ensure_ascii=False),flush=True)
+
+          # 2022 annual report from HKEX.
+          rows=hkex_links('20230320','20230415'); x=pick(rows,('2022','annual report'))
+          p=annual/'2022_特海国际_年度报告_港交所官方.pdf'; u=download(x['href'],p,x['page'],500000); add(p,'特海国际2022年度报告','年度报告','2023-03-30','香港交易所披露易',u,min_pages=150)
+
+          # Later annual reports from official IR direct files.
+          direct=[
+            (2023,'2024-04-25','https://ir.superhiinternational.com/static-files/b8f31775-61bb-4eca-afce-7615cdff1d5e',500000),
+            (2024,'2025-04-24','https://ir.superhiinternational.com/system/files-encrypted/nasdaq_kms/assets/2025/04/25/4-08-20/2024%20Annual%20Report.pdf',500000),
+            (2025,'2026-04-13','https://ir.superhiinternational.com/static-files/6bc00940-9e5c-4e91-a460-608a4124d124',500000),
+          ]
+          for y,date,url,minb in direct:
+            p=annual/f'{y}_特海国际_年度报告_官方双语版.pdf'; u=download(url,p,'https://ir.superhiinternational.com/financial-information/annual-reports',minb); add(p,f'特海国际{y}年度报告','年度报告',date,'特海国际投资者关系网站',u,min_pages=150)
+
+          # HK listing document by way of introduction.
+          rows=hkex_links('20221215','20221231'); x=pick(rows,('listing document',),('display document',))
+          p=offering/'2022_特海国际_香港联交所以介绍方式上市文件.pdf'; u=download(x['href'],p,x['page'],500000); add(p,'特海国际香港联交所以介绍方式上市文件','香港上市文件（介绍方式）','2022-12-19','香港交易所披露易',u,'香港上市采用介绍方式，不涉及公开发售',min_pages=200,terms=('super hi','listing document','特海'))
+
+          # US final prospectus.
+          fpage='https://ir.superhiinternational.com/sec-filings/sec-filing/424b4/0001104659-24-062760'
+          furl,fref=pdf_link_from_ir_filing(fpage)
+          p=offering/'2024_特海国际_美国ADS首次公开发行最终招股说明书_Form424B4.pdf'; u=download(furl,p,fref,500000); add(p,'特海国际美国ADS首次公开发行最终招股说明书（Form 424B4）','美国IPO最终招股说明书','2024-05-17','特海国际投资者关系网站/美国SEC申报',u,'NASDAQ代码HDL',min_pages=150,terms=('super hi','prospectus','american depositary'))
+
+          # Formal 2026 interim report from HKEX.
+          rows=hkex_links('20260915','20260925'); x=pick(rows,('2026','interim report'))
+          p=latest/'2026_特海国际_中期报告_截至2026年6月30日止六个月.pdf'; u=download(x['href'],p,x['page'],100000); add(p,'特海国际2026年中期报告','中期报告','2026-09-22','香港交易所披露易',u,min_pages=50)
+
+          # Latest Q2 quarterly results from HKEX.
+          rows=hkex_links('20260820','20260830'); x=pick(rows,('second quarter','2026','unaudited financial results'))
+          p=latest/'2026_Q2_特海国际_第二季度未经审核财务业绩.pdf'; u=download(x['href'],p,x['page'],50000); add(p,'特海国际2026年第二季度未经审核财务业绩','最新季度业绩','2026-08-26','香港交易所披露易',u,min_pages=5,terms=('super hi','second quarter','2026'))
+
+          yrs=sorted(int(r['title'].split('特海国际')[1][:4]) for r in records if r['document_type']=='年度报告')
+          if yrs!=[2022,2023,2024,2025]: raise RuntimeError(f'annual coverage {yrs}')
+          required={'香港上市文件（介绍方式）','美国IPO最终招股说明书','中期报告','最新季度业绩'}
+          have={r['document_type'] for r in records}
+          if not required.issubset(have): raise RuntimeError(f'missing {required-have}')
+
+          manifest={'issuer':'SUPER HI INTERNATIONAL HOLDING LTD. / 特海国际控股有限公司','hk_ticker':'09658','nasdaq_ticker':'HDL','checked_as_of':'2026-09-27','record_count':len(records),'records':records}
+          (root/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          with (root/'文件清单.csv').open('w',newline='',encoding='utf-8-sig') as f:
+            w=csv.writer(f); w.writerow(['相对路径','文件类型','发布日期','页数','字节数','SHA-256','来源','来源网址','备注'])
+            for r in records: w.writerow([r['relative_path'],r['document_type'],r['publication_date'],r['pages'],r['bytes'],r['sha256'],r['source'],r['source_url'],r['notes']])
+          text='''特海国际控股有限公司（09658.HK / NASDAQ: HDL）官方披露文件包
+核对日期：2026年9月27日
+
+收录：
+1. 2022—2025年度报告，共4份。
+2. 2022年香港联交所以介绍方式上市文件。香港上市不涉及公开发售，因此文件名称为“上市文件”。
+3. 2024年美国ADS首次公开发行最终招股说明书（Form 424B4）。
+4. 最新正式阶段性报告：2026年中期报告。
+5. 最新季度业绩：2026年第二季度未经审核财务业绩。
+
+每份PDF均完成文件头、实际页数、qpdf结构和首末页渲染检查。来源、页数、大小及SHA-256见manifest.json和文件清单.csv。
+'''
+          (root/'00_文件清单与范围说明.txt').write_text(text,encoding='utf-8')
+          sums=[]
+          for p in sorted(root.rglob('*')):
+            if p.is_file() and p.name!='SHA256SUMS.txt': sums.append(f'{sha256(p)}  {p.relative_to(root)}')
+          (root/'SHA256SUMS.txt').write_text('\n'.join(sums)+'\n',encoding='utf-8')
+          zpath=Path(PKG+'.zip')
+          with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as z:
+            for p in sorted(root.rglob('*')):
+              if p.is_file(): z.write(p,arcname=str(Path(PKG)/p.relative_to(root)))
+          with zipfile.ZipFile(zpath) as z:
+            bad=z.testzip()
+            if bad: raise RuntimeError(f'ZIP CRC failure {bad}')
+          print('FINAL_ZIP',zpath,zpath.stat().st_size,sha256(zpath),flush=True)
+          print('RECORDS',json.dumps(records,ensure_ascii=False),flush=True)
+          PY
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: superhi-09658-hdl-filings-package-v2
+          path: 特海国际_09658_HDL_2022-2025全部年报_上市及招股文件_2026最新定期报告.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
