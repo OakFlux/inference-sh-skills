@@ -1,0 +1,44 @@
+name: Search alternate Everbright Securities report mappings 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/everbright-securities-alt-report-search-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query alternate Eastmoney mappings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          from pathlib import Path
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/'})
+          api='https://reportapi.eastmoney.com/report/list'
+          searches=[
+            ('code_06178',{'code':'06178'}),
+            ('code_SH601788',{'code':'SH601788'}),
+            ('keyword_cn',{'keyword':'光大证券'}),
+            ('keyword_en',{'keyword':'Everbright Securities'}),
+          ]
+          out={}
+          for label,extra in searches:
+            params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':'2017-01-01','endTime':'2026-09-27','pageNo':'1','fields':'','qType':'0','orgCode':'','rcode':''}
+            params.update(extra)
+            r=s.get(api,params=params,timeout=(10,60)); print(label,r.status_code,len(r.content),r.url,flush=True); r.raise_for_status()
+            j=r.json(); rows=j.get('data') or []
+            out[label]={'hits':j.get('hits'),'rows':rows}
+            for x in rows:
+              print(label,x.get('publishDate'),x.get('orgSName'),x.get('attachPages'),x.get('title'),x.get('infoCode'),flush=True)
+          Path('everbright_alt_search.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: everbright-securities-alt-report-search-20260927
+          path: everbright_alt_search.json
+          retention-days: 7
