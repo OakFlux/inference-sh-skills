@@ -1,0 +1,63 @@
+name: Inspect Fhyanbao public APIs 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/fhyanbao-api-inspect-20260927.yml'
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Fetch preview endpoint and frontend scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+          import requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Referer':'https://www.fhyanbao.com/rpview/1583835','Accept':'*/*'}
+          urls={
+            'preview':'https://api.fhyanbao.com/api/report/preview/1583835?resize=0',
+            'rpview_js':'https://www.fhyanbao.com/_next/static/chunks/pages/rpview/%5Bid%5D-4ae703460cf49130.js',
+            'build_manifest':'https://www.fhyanbao.com/_next/static/wCjMt68xUzxAHpGemB-HE/_buildManifest.js',
+          }
+          out={}
+          for name,url in urls.items():
+            try:
+              r=s.get(url,headers=h,timeout=(10,90),allow_redirects=True)
+              rec={'status':r.status_code,'content_type':r.headers.get('content-type'),'bytes':len(r.content),'final_url':str(r.url),'headers':dict(r.headers)}
+              out[name]=rec
+              print('\n###',name,json.dumps(rec,ensure_ascii=False),flush=True)
+              print(r.text[:3000] if 'text' in (r.headers.get('content-type') or '') or 'javascript' in (r.headers.get('content-type') or '') or 'json' in (r.headers.get('content-type') or '') else r.content[:80],flush=True)
+              suffix='.bin'
+              ct=(r.headers.get('content-type') or '').lower()
+              if 'javascript' in ct or name.endswith('_js') or name=='build_manifest': suffix='.js'
+              elif 'json' in ct: suffix='.json'
+              elif 'pdf' in ct or r.content.startswith(b'%PDF-'): suffix='.pdf'
+              elif 'image' in ct: suffix='.img'
+              Path(name+suffix).write_bytes(r.content)
+              if suffix in ('.js','.json'):
+                text=r.text
+                for pat in ('api/report','download','preview','search','report/list','report/search'):
+                  hits=[]
+                  for m in re.finditer(pat,text,re.I):
+                    hits.append(text[max(0,m.start()-300):m.start()+1000])
+                    if len(hits)>=5: break
+                  if hits:
+                    print('PATTERN',pat,'\n---\n'.join(hits),flush=True)
+            except Exception as e:
+              out[name]={'error':repr(e)}; print('ERROR',name,repr(e),flush=True)
+          Path('fhyanbao_api_inspection.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fhyanbao-api-inspection
+          path: |
+            fhyanbao_api_inspection.json
+            preview*
+            rpview_js*
+            build_manifest*
+          retention-days: 7
