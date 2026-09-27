@@ -1,0 +1,75 @@
+name: Inspect public SGPJBG viewer loaded pages 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/sgpjbg-viewer-click-inspect-20260927.yml'
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Load and expand public viewer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet selenium beautifulsoup4
+          python - <<'PY'
+          import json, shutil, time
+          from pathlib import Path
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+
+          chrome=shutil.which('google-chrome') or shutil.which('chromium')
+          opts=Options(); opts.binary_location=chrome
+          for arg in ('--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1440,2000','--lang=zh-CN'):
+            opts.add_argument(arg)
+          opts.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36')
+          opts.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          d=webdriver.Chrome(options=opts)
+          out={'snapshots':[],'network':[]}
+          try:
+            d.get('https://www.sgpjbg.com/baogao/106562.html')
+            time.sleep(5)
+            for step in range(8):
+              imgs=[]
+              for el in d.find_elements(By.CSS_SELECTOR,'#pageContainer img'):
+                src=el.get_attribute('src') or el.get_attribute('data-src') or ''
+                alt=el.get_attribute('alt') or ''
+                if src: imgs.append({'src':src,'alt':alt})
+              out['snapshots'].append({'step':step,'url':d.current_url,'title':d.title,'images':imgs,'page_elements':len(d.find_elements(By.CSS_SELECTOR,'.outer_page')),'body_text':d.find_element(By.TAG_NAME,'body').text[-3000:]})
+              print('SNAP',step,'PAGES',out['snapshots'][-1]['page_elements'],'IMGS',len(imgs),flush=True)
+              buttons=d.find_elements(By.CSS_SELECTOR,'#ntip')
+              if not buttons:
+                print('NO_BUTTON',flush=True); break
+              try:
+                d.execute_script('arguments[0].scrollIntoView({block:"center"});',buttons[0]); time.sleep(1)
+                d.execute_script('arguments[0].click();',buttons[0]); time.sleep(5)
+              except Exception as e:
+                print('CLICK_ERROR',repr(e),flush=True); break
+            for entry in d.get_log('performance'):
+              try:
+                msg=json.loads(entry['message'])['message']
+                if msg.get('method') in ('Network.responseReceived','Network.requestWillBeSent'):
+                  item=(msg.get('params',{}).get('response') or msg.get('params',{}).get('request') or {})
+                  u=item.get('url','')
+                  if any(k in u.lower() for k in ('sgpjbg','106562','fileroot','page','view')):
+                    out['network'].append({'method':msg.get('method'),'url':u,'status':item.get('status'),'mimeType':item.get('mimeType')})
+              except Exception: pass
+            Path('viewer_after.html').write_text(d.page_source,encoding='utf-8')
+            d.save_screenshot('viewer_after.png')
+          finally:
+            d.quit()
+          Path('viewer_click_inspection.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          print('NETWORK_COUNT',len(out['network']),flush=True)
+          for x in out['network'][-300:]: print('NET',json.dumps(x,ensure_ascii=False),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sgpjbg-viewer-click-inspection
+          path: |
+            viewer_click_inspection.json
+            viewer_after.html
+            viewer_after.png
+          retention-days: 7
