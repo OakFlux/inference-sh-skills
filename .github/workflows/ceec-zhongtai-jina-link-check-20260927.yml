@@ -1,0 +1,36 @@
+name: Check Zhongtai report link through text proxy 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-zhongtai-jina-link-check-20260927.yml'
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch public text proxy
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import requests
+          url='https://r.jina.ai/https://www.sgpjbg.com/zhuanti/chuqingguan.html'
+          r=requests.get(url,headers={'User-Agent':'Mozilla/5.0','Accept':'text/plain,*/*'},timeout=180)
+          print('STATUS',r.status_code,'BYTES',len(r.content),'TYPE',r.headers.get('content-type'))
+          print(r.text[:1000])
+          r.raise_for_status()
+          lines=r.text.splitlines()
+          matches=[]
+          for i,line in enumerate(lines):
+            if '中国能建' in line or '风光火氢储' in line or '转型蝶变' in line:
+              block='\n'.join(lines[max(0,i-8):min(len(lines),i+15)])
+              matches.append({'line':i+1,'block':block})
+              print('MATCH_BLOCK\n'+block)
+          Path('ceec_zhongtai_jina_matches.json').write_text(json.dumps(matches,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-zhongtai-jina-matches
+          path: ceec_zhongtai_jina_matches.json
+          retention-days: 7
