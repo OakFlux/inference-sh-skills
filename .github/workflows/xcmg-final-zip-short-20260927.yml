@@ -1,0 +1,92 @@
+name: Build XCMG official filings ZIP 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/xcmg-final-zip-short-20260927.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+      - name: Download and validate official PDFs
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR='徐工机械_000425.SZ_2020-2025年报及最新季报'
+          mkdir -p "$DIR" verify
+          names=(
+            '01_徐工机械_2020年年度报告.pdf'
+            '02_徐工机械_2021年年度报告.pdf'
+            '03_徐工机械_2022年年度报告.pdf'
+            '04_徐工机械_2023年年度报告.pdf'
+            '05_徐工机械_2024年年度报告.pdf'
+            '06_徐工机械_2025年年度报告.pdf'
+            '07_徐工机械_2026年第一季度报告.pdf'
+          )
+          urls=(
+            'https://static.cninfo.com.cn/finalpage/2021-04-30/1209868913.PDF'
+            'https://static.cninfo.com.cn/finalpage/2022-04-19/1212958957.PDF'
+            'https://static.cninfo.com.cn/finalpage/2023-04-29/1216698987.PDF'
+            'https://static.cninfo.com.cn/finalpage/2024-04-30/1219914131.PDF'
+            'https://static.cninfo.com.cn/finalpage/2025-04-29/1223367769.PDF'
+            'https://static.cninfo.com.cn/finalpage/2026-04-29/1225240627.PDF'
+            'https://static.cninfo.com.cn/finalpage/2026-04-29/1225240635.PDF'
+          )
+          mins=(80 80 80 80 80 80 8)
+          for i in "${!names[@]}"; do
+            f="$DIR/${names[$i]}"
+            curl -L --fail --retry 4 --retry-delay 2 --connect-timeout 30 --max-time 300 \
+              -A 'Mozilla/5.0 Chrome/152 Safari/537.36' -e 'https://www.cninfo.com.cn/' \
+              -o "$f" "${urls[$i]}"
+            test "$(head -c 4 "$f")" = '%PDF'
+            test "$(stat -c%s "$f")" -gt 100000
+            qpdf --check "$f" >/dev/null
+            pages=$(pdfinfo "$f" | awk '/^Pages:/ {print $2}')
+            test -n "$pages" && test "$pages" -ge "${mins[$i]}"
+            pdftoppm -f 1 -l 1 -singlefile -png -r 80 "$f" "verify/$i" >/dev/null 2>&1
+            test -s "verify/$i.png"
+            echo "VALID ${names[$i]} pages=$pages bytes=$(stat -c%s "$f")"
+          done
+          (cd "$DIR" && sha256sum ./*.pdf > SHA256SUMS.txt)
+          cat > "$DIR/00_文件清单与官方来源.txt" <<'EOF'
+          徐工机械（000425.SZ）2020-2025年报及最新季报
+          整理日期：2026-09-27
+
+          本包包含：
+          1. 2020年年度报告（公告日期：2021-04-30）
+          2. 2021年年度报告（公告日期：2022-04-19）
+          3. 2022年年度报告（公告日期：2023-04-29）
+          4. 2023年年度报告（公告日期：2024-04-30）
+          5. 2024年年度报告（公告日期：2025-04-29）
+          6. 2025年年度报告（公告日期：2026-04-29）
+          7. 2026年第一季度报告（公告日期：2026-04-29）
+
+          全部文件均为巨潮资讯网官方披露PDF原件。已排除年度报告摘要、英文版、单独审计附件、提示性公告及半年度报告。
+          已执行PDF文件头、文件大小、qpdf结构、页数、首页渲染、SHA-256及ZIP完整性检查。
+          EOF
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          urls=[
+          'https://static.cninfo.com.cn/finalpage/2021-04-30/1209868913.PDF','https://static.cninfo.com.cn/finalpage/2022-04-19/1212958957.PDF','https://static.cninfo.com.cn/finalpage/2023-04-29/1216698987.PDF','https://static.cninfo.com.cn/finalpage/2024-04-30/1219914131.PDF','https://static.cninfo.com.cn/finalpage/2025-04-29/1223367769.PDF','https://static.cninfo.com.cn/finalpage/2026-04-29/1225240627.PDF','https://static.cninfo.com.cn/finalpage/2026-04-29/1225240635.PDF']
+          files=sorted(Path('徐工机械_000425.SZ_2020-2025年报及最新季报').glob('*.pdf'))
+          rows=[{'filename':p.name,'source_url':u,'bytes':p.stat().st_size} for p,u in zip(files,urls)]
+          Path('徐工机械_000425.SZ_2020-2025年报及最新季报/manifest.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+          zip -j -9 '徐工机械_000425.SZ_2020-2025年报及最新季报.zip' "$DIR"/*
+          unzip -t '徐工机械_000425.SZ_2020-2025年报及最新季报.zip'
+          test "$(unzip -Z1 '徐工机械_000425.SZ_2020-2025年报及最新季报.zip' | grep -ci '\.pdf$')" -eq 7
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcmg-final-official-filings-20260927
+          path: 徐工机械_000425.SZ_2020-2025年报及最新季报.zip
+          retention-days: 7
+          if-no-files-found: error
