@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/package_air_china_cargo_filings_20260927.yml'
       - 'tools/package_air_china_cargo_filings_20260927.py'
+      - 'tools/patch_air_china_cargo_pagination_20260927.py'
   workflow_dispatch:
 
 permissions:
@@ -23,6 +24,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet 'httpx[http2]' pypdf
+
+      - name: Patch CNINFO pagination
+        run: python tools/patch_air_china_cargo_pagination_20260927.py
 
       - name: Download validate and package filings
         run: python tools/package_air_china_cargo_filings_20260927.py
