@@ -1,0 +1,33 @@
+name: Build Huayu Auto broker deep reports package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/huayu-auto-broker-deep-reports-20260927.yml'
+      - 'scripts/build_huayu_auto_broker_deep_reports_20260927.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        run: python scripts/build_huayu_auto_broker_deep_reports_20260927.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: huayu-auto-600741-broker-deep-reports
+          path: 华域汽车_600741_券商深度报告_2份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
