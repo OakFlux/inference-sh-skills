@@ -1,0 +1,130 @@
+name: Build Canadian Solar 688472 official filings ZIP 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/canadian-solar-688472-final-package-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils zip unzip
+
+      - name: Download official PDFs and build verified ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          DIR='阿特斯_688472.SH_全部年报_招股说明书_最新季报'
+          mkdir -p "$DIR" verify
+
+          names=(
+            '01_阿特斯_2023年年度报告.pdf'
+            '02_阿特斯_2024年年度报告.pdf'
+            '03_阿特斯_2025年年度报告.pdf'
+            '04_阿特斯_首次公开发行股票并在科创板上市招股说明书_2023-06-06.pdf'
+            '05_阿特斯_2026年第一季度报告.pdf'
+          )
+          paths=(
+            '/disclosure/listedinfo/announcement/c/new/2024-04-27/688472_20240427_UD13.pdf'
+            '/disclosure/listedinfo/announcement/c/new/2025-04-29/688472_20250429_JCDA.pdf'
+            '/disclosure/listedinfo/announcement/c/new/2026-04-28/688472_20260428_28E3.pdf'
+            '/disclosure/listedinfo/announcement/c/new/2023-06-06/688472_20230606_HEGP.pdf'
+            '/disclosure/listedinfo/announcement/c/new/2026-04-28/688472_20260428_8CEA.pdf'
+          )
+          mins=(100 100 100 300 8)
+          terms=('2023年年度报告' '2024年年度报告' '2025年年度报告' '招股说明书' '2026年第一季度报告')
+
+          download_one() {
+            local path="$1" out="$2"
+            local hosts=('https://static.sse.com.cn' 'https://www.sse.com.cn')
+            for host in "${hosts[@]}"; do
+              echo "TRY $host$path"
+              if curl -L --fail --retry 4 --retry-delay 2 --connect-timeout 30 --max-time 360 \
+                -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36' \
+                -e 'https://www.sse.com.cn/' -o "$out.part" "$host$path"; then
+                if test "$(head -c 4 "$out.part")" = '%PDF'; then
+                  mv "$out.part" "$out"
+                  echo "$host$path" > "$out.url"
+                  return 0
+                fi
+              fi
+              rm -f "$out.part"
+            done
+            return 1
+          }
+
+          : > "$DIR/00_文件清单与官方来源.txt"
+          echo '阿特斯阳光电力集团股份有限公司（688472.SH）全部年报、正式招股说明书及最新季报' >> "$DIR/00_文件清单与官方来源.txt"
+          echo '整理日期：2026-09-27' >> "$DIR/00_文件清单与官方来源.txt"
+          echo >> "$DIR/00_文件清单与官方来源.txt"
+          echo '口径：上市以来全部完整年度报告（2023-2025）、2023-06-06正式招股说明书，以及截至整理日最新季度报告（2026年第一季度报告）。' >> "$DIR/00_文件清单与官方来源.txt"
+          echo '已排除年报摘要、招股意向书、提示性公告、上市公告书及半年度报告。' >> "$DIR/00_文件清单与官方来源.txt"
+          echo >> "$DIR/00_文件清单与官方来源.txt"
+
+          for i in "${!names[@]}"; do
+            file="$DIR/${names[$i]}"
+            download_one "${paths[$i]}" "$file"
+            test "$(stat -c%s "$file")" -gt 150000
+            qpdf --check "$file" >/dev/null
+            pages=$(pdfinfo "$file" | awk '/^Pages:/ {print $2}')
+            test -n "$pages" && test "$pages" -ge "${mins[$i]}"
+
+            txt="verify/$i.txt"
+            pdftotext -f 1 -l 20 "$file" "$txt" || true
+            compact=$(tr -d '[:space:]' < "$txt" || true)
+            echo "$compact" | grep -q '阿特斯'
+            echo "$compact" | grep -q "${terms[$i]}"
+
+            pdftoppm -f 1 -l 1 -singlefile -png -r 90 "$file" "verify/$i" >/dev/null 2>&1
+            test -s "verify/$i.png"
+            bytes=$(stat -c%s "$file")
+            sha=$(sha256sum "$file" | awk '{print $1}')
+            url=$(cat "$file.url")
+            rm -f "$file.url"
+
+            {
+              echo "$((i+1)). ${names[$i]}"
+              echo "   页数：$pages"
+              echo "   大小：$bytes bytes"
+              echo "   官方来源：$url"
+              echo "   SHA-256：$sha"
+              echo
+            } >> "$DIR/00_文件清单与官方来源.txt"
+            echo "VALID ${names[$i]} pages=$pages bytes=$bytes"
+          done
+
+          (cd "$DIR" && sha256sum ./*.pdf > SHA256SUMS.txt)
+          python - <<'PY'
+          import hashlib,json,re,subprocess
+          from pathlib import Path
+          d=Path('阿特斯_688472.SH_全部年报_招股说明书_最新季报')
+          rows=[]
+          for p in sorted(d.glob('*.pdf')):
+              info=subprocess.check_output(['pdfinfo',str(p)],text=True,errors='ignore')
+              m=re.search(r'^Pages:\s+(\d+)',info,re.M)
+              rows.append({'filename':p.name,'pages':int(m.group(1)) if m else None,'bytes':p.stat().st_size,'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'source':'上海证券交易所官方披露原件'})
+          (d/'manifest.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+
+          OUT='阿特斯_688472.SH_全部年报_招股说明书_最新季报.zip'
+          (cd "$DIR" && zip -9 -q "../$OUT" ./*)
+          unzip -t "$OUT" >/dev/null
+          test "$(unzip -Z1 "$OUT" | grep -ci '\.pdf$')" -eq 5
+          echo "FINAL_ZIP bytes=$(stat -c%s "$OUT") sha256=$(sha256sum "$OUT" | awk '{print $1}')"
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: canadian-solar-688472-official-filings-20260927
+          path: 阿特斯_688472.SH_全部年报_招股说明书_最新季报.zip
+          retention-days: 7
+          if-no-files-found: error
