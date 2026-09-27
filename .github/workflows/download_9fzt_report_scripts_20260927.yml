@@ -1,0 +1,43 @@
+name: Download 9fzt report scripts
+
+on:
+  push:
+    paths:
+      - '.github/workflows/download_9fzt_report_scripts_20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download relevant JavaScript bundles
+        run: |
+          mkdir -p _9fzt_scripts
+          python - <<'PY'
+          import requests, pathlib
+          urls = {
+            'report-page.js': 'https://www.9fzt.com/_next/static/chunks/pages/others/report-b2bb48c45ef22d46.js',
+            'chunk-8272.js': 'https://www.9fzt.com/_next/static/chunks/8272-c8970bd900650eff.js',
+            'chunk-7234.js': 'https://www.9fzt.com/_next/static/chunks/7234-f198f4a230c869b1.js',
+            'chunk-5182.js': 'https://www.9fzt.com/_next/static/chunks/5182-773dc7671c254890.js',
+            'detailArticle.js': 'https://www.9fzt.com/js/detailArticle.js',
+          }
+          headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152.0.0.0 Safari/537.36'}
+          out=pathlib.Path('_9fzt_scripts')
+          for name,url in urls.items():
+              r=requests.get(url,headers=headers,timeout=120)
+              print(name,r.status_code,len(r.content),r.headers.get('content-type'),url,flush=True)
+              r.raise_for_status()
+              (out/name).write_bytes(r.content)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 9fzt-report-scripts
+          path: _9fzt_scripts/*
+          if-no-files-found: error
+          retention-days: 3
