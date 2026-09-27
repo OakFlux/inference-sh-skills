@@ -26,3 +26,5 @@ jobs:
           path: xujiahui_fxbaogao_pages
           if-no-files-found: error
           retention-days: 7
+
+# Trigger after registration.
