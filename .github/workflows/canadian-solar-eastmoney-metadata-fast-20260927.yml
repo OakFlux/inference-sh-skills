@@ -1,0 +1,41 @@
+name: Fetch Canadian Solar Eastmoney metadata fast 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/canadian-solar-eastmoney-metadata-fast-20260927.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Query metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          import json,re,requests
+          from pathlib import Path
+          s=requests.Session();s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Referer':'https://data.eastmoney.com/notices/stock/688472.html'})
+          all=[]
+          for p in range(1,8):
+            r=s.get('https://np-anotice-stock.eastmoney.com/api/security/ann',params={'page_size':100,'page_index':p,'ann_type':'A','client_source':'web','stock_list':'688472'},timeout=60)
+            print('HTTP',p,r.status_code,len(r.content),r.text[:120],flush=True);r.raise_for_status();d=r.json();rows=((d.get('data') or {}).get('list') or [])
+            all+=rows
+            if len(rows)<100:break
+          out=[]
+          for x in all:
+            t=re.sub(r'<[^>]+>','',str(x.get('title') or '')).replace(' ','')
+            if any(k in t for k in ('2023年年度报告','2024年年度报告','2025年年度报告','招股说明书','2026年第一季度报告')):
+              rec={'title':t,'art_code':x.get('art_code'),'notice_date':x.get('notice_date'),'raw':x};out.append(rec);print(json.dumps(rec,ensure_ascii=False),flush=True)
+          Path('output/metadata.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: canadian-solar-eastmoney-metadata-fast-20260927
+          path: output/metadata.json
+          retention-days: 7
+          if-no-files-found: error
