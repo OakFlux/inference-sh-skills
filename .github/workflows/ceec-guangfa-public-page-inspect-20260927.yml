@@ -1,0 +1,81 @@
+name: Inspect public pages for China Energy Engineering Guangfa report 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-guangfa-public-page-inspect-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Inspect public pages and linked assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json, re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          urls=[
+            'https://www.baogaobox.com/reports/260127000092163.html',
+            'https://www.sgpjbg.com/info/16f1878ea1ab0d4c3c566574f762dbc1.html',
+            'https://www.vzkoo.com/read/4630434719761174528.html',
+            'https://r.jina.ai/https://www.baogaobox.com/reports/260127000092163.html',
+            'https://r.jina.ai/https://www.sgpjbg.com/info/16f1878ea1ab0d4c3c566574f762dbc1.html',
+            'https://r.jina.ai/https://www.vzkoo.com/read/4630434719761174528.html',
+          ]
+          s=requests.Session(); s.trust_env=False
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/json,*/*;q=0.8'}
+          out=[]
+          for i,url in enumerate(urls):
+            rec={'url':url}
+            try:
+              r=s.get(url,headers=headers,timeout=(15,120),allow_redirects=True)
+              rec.update(status=r.status_code,content_type=r.headers.get('content-type'),bytes=len(r.content),final_url=str(r.url),headers=dict(r.headers))
+              body=r.text
+              Path(f'page_{i}.txt').write_text(body,encoding='utf-8',errors='replace')
+              print('\n###',i,url,'STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'BYTES',len(r.content),'FINAL',r.url,flush=True)
+              print(body[:1500],flush=True)
+              links=[]
+              if 'html' in (r.headers.get('content-type') or '').lower() or '<html' in body[:1000].lower():
+                soup=BeautifulSoup(body,'html.parser')
+                for tag in soup.find_all(True):
+                  for attr in ('href','src','data-src','data-url','data-file','data-pdf','content'):
+                    val=tag.get(attr)
+                    if val:
+                      full=urljoin(str(r.url),val)
+                      if any(k in full.lower() for k in ('pdf','download','report','file','attach','oss','cdn')):
+                        links.append({'tag':tag.name,'attr':attr,'value':val,'full':full,'text':' '.join(tag.get_text(' ',strip=True).split())[:200]})
+              for m in re.finditer(r'https?://[^\s\"\'<>]+',body):
+                u=m.group(0).rstrip('),.;')
+                if any(k in u.lower() for k in ('pdf','download','report','file','attach','oss','cdn')):
+                  links.append({'regex':u})
+              # include lines mentioning key terms or numeric IDs
+              clues=[]
+              for line in body.splitlines():
+                ll=line.lower()
+                if any(k in ll for k in ('.pdf','download','下载','4630434719761174528','16f1878ea1ab0d4c3c566574f762dbc1','260127000092163','全球能源建设领军者')):
+                  clues.append(line[:2000])
+              rec['links']=links[:500]
+              rec['clues']=clues[:500]
+              print('LINKS',json.dumps(links[:80],ensure_ascii=False),flush=True)
+              print('CLUES',json.dumps(clues[:40],ensure_ascii=False),flush=True)
+            except Exception as e:
+              rec['error']=repr(e)
+              print('ERROR',url,repr(e),flush=True)
+            out.append(rec)
+          Path('ceec_guangfa_public_page_inspection.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-guangfa-public-page-inspection
+          path: |
+            ceec_guangfa_public_page_inspection.json
+            page_*.txt
+          retention-days: 7
