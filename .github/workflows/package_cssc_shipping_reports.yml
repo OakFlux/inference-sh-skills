@@ -19,12 +19,42 @@ jobs:
           sudo apt-get install -y -qq qpdf poppler-utils fonts-noto-cjk
           python -m pip install --quiet playwright pypdf
           python -m playwright install --with-deps chromium
+      - name: Patch article boundary detection
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('tools/package_cssc_shipping_broker_reports_v2.py')
+          text = path.read_text(encoding='utf-8')
+          old = """            const text = norm(clone.innerText);
+            return {node, clone, selector, priority, text, length: text.length};"""
+          new = """            const stop = [...clone.querySelectorAll('*')].find(el => {
+              const value = norm(el.innerText);
+              return value.length > 0 && value.length < 120 && (
+                value.startsWith('责任编辑') ||
+                value.startsWith('海量资讯、精准解读') ||
+                value.startsWith('打开新浪财经APP')
+              );
+            });
+            if (stop) {
+              let current = stop;
+              while (current && current !== clone) {
+                while (current.nextSibling) current.nextSibling.remove();
+                current = current.parentNode;
+              }
+              stop.remove();
+            }
+            const text = norm(clone.innerText);
+            return {node, clone, selector, priority, text, length: text.length};"""
+          if old not in text:
+              raise SystemExit('Patch anchor not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
       - name: Build package
         run: python tools/package_cssc_shipping_broker_reports_v2.py
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: cssc-shipping-broker-reports-v2
+          name: cssc-shipping-broker-reports-clean
           path: |
             中国船舶租赁_03877_券商研究报告_3份.zip
             _previews_cssc_shipping/*.png
