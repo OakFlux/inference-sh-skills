@@ -1,0 +1,100 @@
+name: Quick discover Super Hi filing links 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/superhi-links-discovery-quick-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Install parser
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Discover links
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re
+          from pathlib import Path
+          from urllib.parse import urljoin,quote
+          import requests
+          from bs4 import BeautifulSoup
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          out={}
+          pages=[
+            'https://ir.superhiinternational.com/financial-information/annual-reports',
+            'https://ir.superhiinternational.com/financial-information/annual-reports?page=1',
+            'https://ir.superhiinternational.com/zh-hant/financial-information/annual-reports',
+            'https://ir.superhiinternational.com/zh-hant/financial-information/annual-reports?page=1',
+            'https://ir.superhiinternational.com/',
+          ]
+          for u in pages:
+            try:
+              r=s.get(u,headers=h,timeout=(8,25),allow_redirects=True)
+              print('PAGE',r.status_code,len(r.content),r.url,u,flush=True)
+              soup=BeautifulSoup(r.content,'html.parser')
+              links=[]
+              for a in soup.find_all('a',href=True):
+                t=' '.join(a.get_text(' ',strip=True).split())
+                href=urljoin(r.url,a['href'])
+                if any(x in t.lower() for x in ('annual report','interim report')) or any(x in t for x in ('年度報告','年度报告','中期報告','中期报告')):
+                  links.append({'text':t,'href':href})
+                  print('REPORTLINK',t,href,flush=True)
+              out[u]={'status':r.status_code,'final':r.url,'links':links}
+            except Exception as e:
+              print('PAGEERR',u,repr(e),flush=True); out[u]={'error':repr(e)}
+          # SEC filing pages
+          for label,u in {
+            'us424b4':'https://ir.superhiinternational.com/sec-filings/sec-filing/424b4/0001104659-24-062760',
+            'q2_2026':'https://ir.superhiinternational.com/sec-filings/sec-filing/6-k/0001104659-26-101041',
+          }.items():
+            try:
+              r=s.get(u,headers=h,timeout=(8,25)); print('SEC',label,r.status_code,len(r.content),r.url,flush=True)
+              soup=BeautifulSoup(r.content,'html.parser'); links=[]
+              for a in soup.find_all('a',href=True):
+                t=' '.join(a.get_text(' ',strip=True).split()); href=urljoin(r.url,a['href'])
+                if '.pdf' in href.lower() or 'pdf' in t.lower():
+                  links.append({'text':t,'href':href}); print('SECLINK',label,t,href,flush=True)
+              out[label]={'status':r.status_code,'final':r.url,'links':links}
+            except Exception as e:
+              out[label]={'error':repr(e)}
+          # HKEX prefix and title search
+          stock_id=None
+          for cb in ('callback','jsonCallback'):
+            for name in ('09658','9658','SUPER HI'):
+              u=f'https://www1.hkexnews.hk/search/prefix.do?callback={cb}&lang=EN&type=A&name={quote(name)}&market=SEHK'
+              try:
+                r=s.get(u,headers=h,timeout=(8,25)); print('PREFIX',r.status_code,len(r.content),r.url,r.text[:500],flush=True)
+                text=r.text.strip(); m=re.search(r'\((\[.*\]|\{.*\})\)\s*;?$',text,re.S); data=json.loads(m.group(1) if m else text)
+                rows=data if isinstance(data,list) else data.get('data') or data.get('result') or []
+                for row in rows:
+                  print('PREFIXROW',row,flush=True)
+                  code=str(row.get('stockCode') or row.get('code') or '').zfill(5)
+                  if code=='09658': stock_id=str(row.get('stockId') or row.get('id'))
+                if stock_id: break
+              except Exception as e: print('PREFIXERR',repr(e),flush=True)
+            if stock_id: break
+          out['stock_id']=stock_id
+          if stock_id:
+            for lang in ('EN','ZH'):
+              u=f'https://www1.hkexnews.hk/search/titlesearch.xhtml?category=0&lang={lang}&market=SEHK&stockId={stock_id}&from=20221201&to=20230115'
+              try:
+                r=s.get(u,headers={**h,'Referer':'https://www1.hkexnews.hk/'},timeout=(8,30)); print('TITLE',lang,r.status_code,len(r.content),r.url,flush=True)
+                soup=BeautifulSoup(r.content,'html.parser'); links=[]
+                for a in soup.find_all('a',href=True):
+                  t=' '.join(a.get_text(' ',strip=True).split()); href=urljoin(r.url,a['href'])
+                  if 'listing' in t.lower() or '上市' in t or '.pdf' in href.lower():
+                    links.append({'text':t,'href':href}); print('TITLELINK',lang,t,href,flush=True)
+                out[f'title_{lang}']={'status':r.status_code,'links':links}
+              except Exception as e: out[f'title_{lang}']={'error':repr(e)}
+          Path('superhi_links.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: superhi-links-discovery-quick-20260927
+          path: superhi_links.json
+          retention-days: 7
