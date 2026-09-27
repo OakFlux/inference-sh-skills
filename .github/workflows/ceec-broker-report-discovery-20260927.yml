@@ -1,0 +1,76 @@
+name: Discover China Energy Engineering broker reports 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-broker-report-discovery-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query Eastmoney report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, re, time
+          from pathlib import Path
+          import requests
+
+          s=requests.Session(); s.trust_env=False
+          h={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
+            'Accept':'application/json,text/javascript,*/*;q=0.01',
+            'Referer':'https://data.eastmoney.com/report/stock.jshtml?stockcode=601868'
+          }
+          url='https://reportapi.eastmoney.com/report/list'
+          out={'responses':[],'items':[]}
+          seen=set()
+          for page in range(1,8):
+            params={
+              'pageSize':'100','industryCode':'*','pageNo':str(page),'fields':'',
+              'qType':'0','orgCode':'','code':'601868','rcode':'','p':str(page),
+              'pageNum':str(page),'pageNumber':str(page),'_':str(int(time.time()*1000))
+            }
+            try:
+              r=s.get(url,params=params,headers=h,timeout=(10,60))
+              print('PAGE',page,'STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'BYTES',len(r.content),'URL',r.url,flush=True)
+              print(r.text[:500],flush=True)
+              r.raise_for_status()
+              text=r.text.strip()
+              if text.startswith(('datatable','jQuery')):
+                text=text[text.find('(')+1:text.rfind(')')]
+              j=json.loads(text)
+              out['responses'].append({'page':page,'keys':list(j) if isinstance(j,dict) else None,'status':r.status_code})
+              rows=[]
+              if isinstance(j,dict):
+                rows=j.get('data') or j.get('result') or j.get('reports') or []
+                if isinstance(rows,dict):
+                  rows=rows.get('data') or rows.get('items') or []
+              if not isinstance(rows,list): rows=[]
+              print('ROWS',len(rows),flush=True)
+              for x in rows:
+                if not isinstance(x,dict): continue
+                code=str(x.get('stockCode') or x.get('code') or x.get('secuCode') or '')
+                title=str(x.get('title') or x.get('reportTitle') or '')
+                if code and '601868' not in code and '中国能建' not in title and '中国能源建设' not in title:
+                  continue
+                info=str(x.get('infoCode') or x.get('reportId') or x.get('id') or '')
+                key=info or json.dumps(x,sort_keys=True,ensure_ascii=False)
+                if key in seen: continue
+                seen.add(key); out['items'].append(x)
+                print('ITEM',json.dumps(x,ensure_ascii=False),flush=True)
+              if len(rows)<100: break
+            except Exception as e:
+              print('ERROR',page,repr(e),flush=True)
+              out['responses'].append({'page':page,'error':repr(e)})
+              break
+          Path('ceec_eastmoney_reports.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-eastmoney-report-discovery
+          path: ceec_eastmoney_reports.json
+          retention-days: 7
