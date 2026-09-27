@@ -1,0 +1,36 @@
+name: Inspect Microbell public report JavaScript 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/microbell-docdetail-js-inspect-20260927.yml'
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and inspect script
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          import requests
+          url='https://www.microbell.com/hiborweb/DocDetailNew/js?v=JhJG5MdT9wDoAQX8-xy-bc9qho_6DU5Ailv07PYCEEg1'
+          r=requests.get(url,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.microbell.com/repinfodetail_4932770.html'},timeout=90)
+          print('STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'BYTES',len(r.content),'FINAL',r.url,flush=True)
+          r.raise_for_status()
+          Path('microbell_docdetail.js').write_bytes(r.content)
+          text=r.text
+          for pat in ('download','loginLayer','pdf','CheckMd5File','doc-open','doc-download','original','ajax','5019795','DocDetail'):
+            print('\nPATTERN',pat,flush=True)
+            for m in re.finditer(pat,text,re.I):
+              print(text[max(0,m.start()-400):m.start()+800],flush=True)
+              break
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: microbell-docdetail-js
+          path: microbell_docdetail.js
+          retention-days: 7
