@@ -1,0 +1,71 @@
+name: Inspect public China Energy Engineering report page 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-microbell-inspect-simple-20260927.yml'
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Inspect page assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet selenium beautifulsoup4
+          python - <<'PY'
+          import json, shutil, time
+          from pathlib import Path
+          from urllib.parse import urljoin
+          from bs4 import BeautifulSoup
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+
+          chrome=shutil.which('google-chrome') or shutil.which('chromium')
+          opts=Options(); opts.binary_location=chrome
+          for arg in ('--headless=new','--no-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1440,2200','--lang=zh-CN'):
+            opts.add_argument(arg)
+          opts.add_argument('--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36')
+          opts.set_capability('goog:loggingPrefs',{'performance':'ALL','browser':'ALL'})
+          d=webdriver.Chrome(options=opts)
+          url='https://www.microbell.com/repinfodetail_4932770.html'
+          try:
+            d.get(url); time.sleep(12)
+            source=d.page_source
+            Path('microbell_page.html').write_text(source,encoding='utf-8')
+            d.save_screenshot('microbell_page.png')
+            soup=BeautifulSoup(source,'html.parser')
+            links=[]
+            for tag in soup.find_all(True):
+              for attr in ('href','src','data-src','data-url','data-file','data-pdf','onclick','value'):
+                val=tag.get(attr)
+                if not val: continue
+                text=' '.join(tag.get_text(' ',strip=True).split())[:300]
+                low=(str(val)+' '+text).lower()
+                if any(k in low for k in ('pdf','report','download','file','4932770','601868','中国能建','火水风光储氢')):
+                  links.append({'tag':tag.name,'attr':attr,'value':str(val)[:5000],'full':urljoin(d.current_url,str(val)) if attr not in ('onclick','value') else '', 'text':text})
+            network=[]
+            for entry in d.get_log('performance'):
+              try:
+                msg=json.loads(entry['message'])['message']
+                if msg.get('method') in ('Network.responseReceived','Network.requestWillBeSent'):
+                  item=msg.get('params',{}).get('response') or msg.get('params',{}).get('request') or {}
+                  u=item.get('url','')
+                  if any(k in u.lower() for k in ('pdf','report','download','file','4932770','601868')):
+                    network.append({'method':msg.get('method'),'url':u,'status':item.get('status'),'mimeType':item.get('mimeType')})
+              except Exception: pass
+            out={'title':d.title,'current_url':d.current_url,'source_bytes':len(source.encode()),'links':links,'network':network}
+            print('RESULT',json.dumps(out,ensure_ascii=False)[:100000],flush=True)
+          finally:
+            d.quit()
+          Path('ceec_microbell_inspection.json').write_text(json.dumps(out,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-microbell-inspection
+          path: |
+            ceec_microbell_inspection.json
+            microbell_page.html
+            microbell_page.png
+          retention-days: 7
