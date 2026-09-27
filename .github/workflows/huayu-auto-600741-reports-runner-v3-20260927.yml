@@ -1,0 +1,54 @@
+name: Build Huayu Auto 600741 reports package v3 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/huayu-auto-600741-reports-runner-v3-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Extract and patch downloader
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          import re
+          from pathlib import Path
+
+          source = Path('.github/workflows/huayu-auto-600741-reports-package-20260927.yml').read_text(encoding='utf-8')
+          match = re.search(r"payload = '''([A-Za-z0-9+/=]+)'''", source)
+          if not match:
+              raise RuntimeError('embedded downloader payload not found')
+          script = gzip.decompress(base64.b64decode(match.group(1))).decode('utf-8')
+          script = script.replace(
+              'https://www.cninfo.com.cn/new/data/shse_stock.json',
+              'https://www.cninfo.com.cn/new/data/szse_stock.json',
+          )
+          destination = Path('scripts/build_huayu_auto_600741_reports_20260927.py')
+          destination.write_text(script, encoding='utf-8')
+          print('materialized and patched', destination, 'chars', len(script))
+          PY
+
+      - name: Download validate and package reports
+        run: python scripts/build_huayu_auto_600741_reports_20260927.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: huayu-auto-600741-reports-2020-2026-v3
+          path: 华域汽车_600741_2020-2025年报_2026最新定期报告.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
