@@ -1,0 +1,40 @@
+name: Check public Zhongtai report page links 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/ceec-zhongtai-link-check-20260927.yml'
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and inspect public topic page
+        run: |
+          python -m pip install --quiet requests beautifulsoup4
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+          url='https://www.sgpjbg.com/zhuanti/chuqingguan.html'
+          r=requests.get(url,headers={'User-Agent':'Mozilla/5.0'},timeout=90)
+          print('STATUS',r.status_code,'BYTES',len(r.content),'TYPE',r.headers.get('content-type'))
+          r.raise_for_status()
+          soup=BeautifulSoup(r.text,'html.parser')
+          rows=[]
+          for a in soup.find_all('a',href=True):
+            text=' '.join(a.get_text(' ',strip=True).split())
+            if '中国能建' in text or '风光火氢储' in text or '转型蝶变' in text:
+              parent=a.parent
+              item={'text':text,'href':urljoin(r.url,a['href']),'parent_html':str(parent)[:10000]}
+              rows.append(item)
+              print('MATCH',json.dumps(item,ensure_ascii=False))
+          Path('ceec_zhongtai_links.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ceec-zhongtai-links
+          path: ceec_zhongtai_links.json
+          retention-days: 7
