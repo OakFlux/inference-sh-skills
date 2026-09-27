@@ -1,0 +1,159 @@
+name: Package public BrainAurora research materials 20260927
+on:
+  push:
+    paths:
+      - '.github/workflows/brainaura-public-research-package-20260927.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pillow img2pdf pypdf playwright
+          python -m playwright install chromium
+      - name: Capture public preview pages and build package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/build_brainaura.py <<'PY'
+          from __future__ import annotations
+          import asyncio, csv, hashlib, json, subprocess, time, zipfile
+          from io import BytesIO
+          from pathlib import Path
+          import img2pdf, requests
+          from PIL import Image
+          from pypdf import PdfReader
+          from playwright.async_api import async_playwright
+
+          PKG='脑动极光_06681_券商研究资料_2份_20260927'
+          out=Path(PKG); out.mkdir(exist_ok=True)
+          render=Path('_render'); render.mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/151 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'})
+
+          def sha256(p:Path):
+              h=hashlib.sha256()
+              with p.open('rb') as f:
+                  for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
+              return h.hexdigest()
+
+          def validate_pdf(p:Path, pages:int):
+              data=p.read_bytes()
+              if not data.startswith(b'%PDF-') or len(data)<50000: raise RuntimeError(f'invalid PDF {p}')
+              n=len(PdfReader(str(p),strict=False).pages)
+              if n!=pages: raise RuntimeError(f'page count mismatch {p}: {n} vs {pages}')
+              q=subprocess.run(['qpdf','--check',str(p)],capture_output=True,text=True)
+              if q.returncode not in (0,3): raise RuntimeError(q.stderr[-1000:])
+              for pg in sorted({1,n}):
+                  pref=render/f'{p.stem}_{pg}'
+                  r=subprocess.run(['pdftoppm','-f',str(pg),'-l',str(pg),'-r','72','-png','-singlefile',str(p),str(pref)],capture_output=True,text=True,timeout=180)
+                  img=Path(str(pref)+'.png')
+                  if r.returncode or not img.exists() or img.stat().st_size<1000: raise RuntimeError(f'render failed {p} {pg}')
+              return {'pages':n,'bytes':p.stat().st_size,'sha256':sha256(p),'qpdf_return_code':q.returncode}
+
+          async def capture_spdbi_preview():
+              page_url='https://www.sgpjbg.com/baogao/652208.html'
+              img_dir=out/'_浦银国际公开预览逐页图'; img_dir.mkdir(exist_ok=True)
+              async with async_playwright() as pw:
+                  browser=await pw.chromium.launch(headless=True)
+                  page=await browser.new_page(viewport={'width':1440,'height':1600}, device_scale_factor=1)
+                  await page.goto(page_url,wait_until='domcontentloaded',timeout=120000)
+                  await page.wait_for_timeout(5000)
+                  # The report page publicly permits 15 preview pages. Trigger its public load-more function only.
+                  await page.evaluate("typeof showmorepage==='function' && showmorepage()")
+                  await page.wait_for_timeout(7000)
+                  selectors=['.outer_page','.inner_page']
+                  elems=[]
+                  for sel in selectors:
+                      loc=page.locator(sel)
+                      cnt=await loc.count()
+                      if cnt>=15:
+                          elems=[loc.nth(i) for i in range(15)]
+                          break
+                  if len(elems)<15:
+                      # Fallback to distinct page images in the reader area.
+                      loc=page.locator('#boxleft img')
+                      cnt=await loc.count()
+                      candidates=[]
+                      for i in range(cnt):
+                          el=loc.nth(i)
+                          box=await el.bounding_box()
+                          if box and box['width']>700 and box['height']>900:
+                              candidates.append(el)
+                      elems=candidates[:15]
+                  if len(elems)<15:
+                      html=await page.content(); Path('/tmp/brainaura_page.html').write_text(html,encoding='utf-8')
+                      raise RuntimeError(f'only found {len(elems)} public preview pages')
+                  paths=[]
+                  for i,el in enumerate(elems,1):
+                      p=img_dir/f'{i:02d}.png'
+                      await el.screenshot(path=str(p))
+                      im=Image.open(p); im.load()
+                      if im.width<700 or im.height<900: raise RuntimeError(f'bad screenshot {i} {im.size}')
+                      paths.append(p)
+                  await browser.close()
+              pdf=out/'01_浦银国际_脑动极光6681.HK_AI赋能全面布局认知障碍数字疗法_公开预览15页_原报告29页_2025-05-09.pdf'
+              layout=img2pdf.get_layout_fun((img2pdf.mm_to_pt(210),img2pdf.mm_to_pt(297)))
+              pdf.write_bytes(img2pdf.convert([str(p) for p in paths],layout_fun=layout))
+              meta=validate_pdf(pdf,15)
+              return {'filename':pdf.name,'institution':'浦银国际','title':'脑动极光（6681.HK）：AI赋能，全面布局认知障碍数字疗法','publication_date':'2025-05-09','report_type':'首次覆盖深度报告（公开预览）','document_form':'报告原件共29页；本文件仅收录来源网站公开展示的前15页预览，非完整全文','source_page':page_url,**meta}
+
+          def build_guoyuan():
+              rid='4651035'; date='2024/12/30'; detail='https://www.fxbaogao.com/detail/4651035'
+              img_dir=out/'_国元国际公开逐页原图'; img_dir.mkdir(exist_ok=True)
+              paths=[]
+              for i in (1,2):
+                  url=f'https://public.fxbaogao.com/report-image/{date}/{rid}-{i}.png'
+                  r=s.get(url,headers={'Referer':detail,'Accept':'image/png,image/*'},timeout=(10,60)); r.raise_for_status()
+                  if len(r.content)<20000: raise RuntimeError(f'image too small {i}')
+                  im=Image.open(BytesIO(r.content)); im.load()
+                  if im.width<800 or im.height<1000: raise RuntimeError(f'bad image {i} {im.size}')
+                  p=img_dir/f'{i:02d}.png'; p.write_bytes(r.content); paths.append(p)
+              pdf=out/'02_国元国际_IPO申购指南_脑动极光B_完整2页_2024-12-30.pdf'
+              layout=img2pdf.get_layout_fun((img2pdf.mm_to_pt(210),img2pdf.mm_to_pt(297)))
+              pdf.write_bytes(img2pdf.convert([str(p) for p in paths],layout_fun=layout))
+              meta=validate_pdf(pdf,2)
+              return {'filename':pdf.name,'institution':'国元国际','title':'IPO申购指南：脑动极光-B','publication_date':'2024-12-30','report_type':'新股申购研究','document_form':'公开阅读页完整2页原图按原顺序合成PDF','source_page':detail,**meta}
+
+          records=[asyncio.run(capture_spdbi_preview()),build_guoyuan()]
+          lines=['脑动极光医疗科技有限公司（06681.HK）券商研究资料包','整理日期：2026-09-27','',
+                 '收录口径：公开可核验的公司级卖方覆盖较少。本包共收录2份材料：浦银国际首次覆盖深度报告的公开15页预览，以及国元国际完整2页IPO申购指南。','',
+                 '重要说明：浦银国际报告原件共29页，来源网站仅公开展示前15页。本包没有绕过登录、积分、会员或付费限制，文件名已明确标注“公开预览15页”，不可视为完整报告。','',
+                 '文件清单：']
+          for i,r in enumerate(records,1):
+              lines += [f"{i}. {r['institution']}｜{r['title']}",f"   类型：{r['report_type']}",f"   日期：{r['publication_date']}；页数：{r['pages']}；大小：{r['bytes']/1048576:.2f} MB",f"   文件：{r['filename']}",f"   文件形式：{r['document_form']}",f"   来源页：{r['source_page']}",f"   SHA-256：{r['sha256']}",'']
+          lines += ['核验项目：PDF文件头、实际页数、qpdf结构、首末页渲染、逐页图尺寸、SHA-256及ZIP CRC。','报告中的评级、目标价和申购意见均为机构在报告发布时的观点，不构成当前投资建议。']
+          (out/'00_文件清单与来源说明.txt').write_text('\n'.join(lines),encoding='utf-8')
+          with (out/'文件清单.csv').open('w',newline='',encoding='utf-8-sig') as f:
+              w=csv.writer(f); w.writerow(['机构','报告名称','报告类型','发布日期','页数','字节数','SHA-256','文件名','来源页','文件形式'])
+              for r in records: w.writerow([r['institution'],r['title'],r['report_type'],r['publication_date'],r['pages'],r['bytes'],r['sha256'],r['filename'],r['source_page'],r['document_form']])
+          (out/'manifest.json').write_text(json.dumps({'issuer':'脑动极光医疗科技有限公司','ticker':'06681.HK','checked_as_of':'2026-09-27','report_count':2,'records':records},ensure_ascii=False,indent=2),encoding='utf-8')
+          sums=[]
+          for p in sorted(out.rglob('*')):
+              if p.is_file() and p.name!='SHA256SUMS.txt': sums.append(f'{sha256(p)}  {p.relative_to(out)}')
+          (out/'SHA256SUMS.txt').write_text('\n'.join(sums)+'\n',encoding='utf-8')
+          zpath=Path(PKG+'.zip')
+          with zipfile.ZipFile(zpath,'w',compression=zipfile.ZIP_DEFLATED,compresslevel=6,allowZip64=True) as z:
+              for p in sorted(out.rglob('*')):
+                  if p.is_file(): z.write(p,arcname=str(Path(PKG)/p.relative_to(out)))
+          with zipfile.ZipFile(zpath) as z:
+              bad=z.testzip()
+              if bad: raise RuntimeError(f'ZIP CRC failure: {bad}')
+          print('FINAL_ZIP',zpath,zpath.stat().st_size,sha256(zpath),flush=True)
+          print('RECORDS',json.dumps(records,ensure_ascii=False),flush=True)
+          PY
+          python /tmp/build_brainaura.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: brainaura-06681-public-research-package
+          path: 脑动极光_06681_券商研究资料_2份_20260927.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
