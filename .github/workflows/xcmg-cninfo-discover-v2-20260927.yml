@@ -1,0 +1,73 @@
+name: Discover official XCMG annual and quarter URLs v2 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/xcmg-cninfo-discover-v2-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query CNINFO
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p output
+          python - <<'PY'
+          import html,json,re,requests
+          from urllib.parse import urljoin
+          from pathlib import Path
+          CODE='000425';NAME='徐工机械';ORG='gssz0000425';ASOF='2026-09-27'
+          s=requests.Session();s.trust_env=False;s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.cninfo.com.cn/','Origin':'https://www.cninfo.com.cn','X-Requested-With':'XMLHttpRequest'})
+          def clean(t):
+            t=html.unescape(t or '');t=re.sub(r'<[^>]+>','',t);return re.sub(r'\s+','',t)
+          def q(cat,start):
+            out=[]
+            for p in range(1,8):
+              payload={'pageNum':p,'pageSize':30,'column':'szse','tabName':'fulltext','plate':'sz','stock':f'{CODE},{ORG}','searchkey':'','secid':'','category':cat,'trade':'','seDate':f'{start}~{ASOF}','sortName':'','sortType':'','isHLtitle':'true'}
+              r=s.post('https://www.cninfo.com.cn/new/hisAnnouncement/query',data=payload,headers={'Referer':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={CODE}&orgId={ORG}'},timeout=60);r.raise_for_status();batch=r.json().get('announcements') or []
+              out+=batch;print(cat,p,len(batch),[clean(x.get('announcementTitle')) for x in batch],flush=True)
+              if len(batch)<30:break
+            return out
+          annual=q('category_ndbg_szsh;','2021-01-01')
+          quarters=q('category_yjdbg_szsh;','2025-01-01')+q('category_sjdbg_szsh;','2025-01-01')
+          excluded=('摘要','英文','审计报告','鉴证报告','提示性公告','董事会决议','监事会决议','取消')
+          chosen=[]
+          for y in range(2020,2026):
+            c=[]
+            for x in annual:
+              t=clean(x.get('announcementTitle'))
+              if f'{y}年年度报告' in t and not any(z in t for z in excluded):
+                score=(100 if re.fullmatch(rf'(?:{NAME}[:：])?{y}年年度报告',t) else 0)+(30 if ('修订' in t or '更新' in t) else 0)
+                c.append((score,int(x.get('announcementTime') or 0),x,t))
+            if not c:raise SystemExit(f'MISSING ANNUAL {y}')
+            c.sort(key=lambda z:(z[0],z[1]),reverse=True);x=c[0][2];t=c[0][3]
+            chosen.append({'type':'annual','year':y,'title':t,'announcementTime':x.get('announcementTime'),'announcementId':x.get('announcementId'),'url':urljoin('https://static.cninfo.com.cn/',str(x.get('adjunctUrl')).lstrip('/'))})
+          c=[];seen=set()
+          pat=r'20\d{2}年(?:第一|第三|一|三)季度报告'
+          for x in quarters:
+            key=str(x.get('announcementId') or x.get('adjunctUrl'))
+            if key in seen:continue
+            seen.add(key);t=clean(x.get('announcementTitle'))
+            if re.search(pat,t) and not any(z in t for z in excluded):
+              score=(100 if re.fullmatch(rf'(?:{NAME}[:：])?{pat}',t) else 0)+(30 if ('修订' in t or '更新' in t) else 0)
+              c.append((int(x.get('announcementTime') or 0),score,x,t))
+          if not c:raise SystemExit(f'MISSING QUARTER: {[clean(x.get("announcementTitle")) for x in quarters]}')
+          c.sort(key=lambda z:(z[0],z[1]),reverse=True);x=c[0][2];t=c[0][3]
+          m=re.search(r'(20\d{2})年(第一|第三|一|三)季度报告',t)
+          chosen.append({'type':'quarter','year':int(m.group(1)),'quarter':m.group(2),'title':t,'announcementTime':x.get('announcementTime'),'announcementId':x.get('announcementId'),'url':urljoin('https://static.cninfo.com.cn/',str(x.get('adjunctUrl')).lstrip('/'))})
+          Path('output/selected.json').write_text(json.dumps({'orgId':ORG,'asOf':ASOF,'files':chosen},ensure_ascii=False,indent=2),encoding='utf-8')
+          print('SELECTED',json.dumps(chosen,ensure_ascii=False,indent=2),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcmg-cninfo-selected-urls-v2-20260927
+          path: output/selected.json
+          retention-days: 7
+          if-no-files-found: error
