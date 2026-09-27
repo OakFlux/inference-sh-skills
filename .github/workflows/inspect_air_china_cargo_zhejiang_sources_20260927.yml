@@ -1,0 +1,29 @@
+name: Inspect Air China Cargo Zhejiang report sources
+
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect_air_china_cargo_zhejiang_sources_20260927.yml'
+      - 'tools/inspect_air_china_cargo_zhejiang_sources_20260927.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Inspect public sources
+        run: python tools/inspect_air_china_cargo_zhejiang_sources_20260927.py
+      - name: Upload source inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: air-china-cargo-zhejiang-source-inventory
+          path: air_china_cargo_zhejiang_source_inventory.json
+          if-no-files-found: error
+          retention-days: 3
