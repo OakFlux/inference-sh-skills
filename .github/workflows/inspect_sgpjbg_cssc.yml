@@ -1,0 +1,26 @@
+name: Inspect public CSSC Shipping report pages
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect_sgpjbg_cssc.yml'
+      - 'tools/inspect_sgpjbg_cssc.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install parser
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Inspect pages
+        run: python tools/inspect_sgpjbg_cssc.py
+      - name: Upload inspection output
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspect-sgpjbg-cssc
+          path: _inspect_sgpjbg_cssc
+          if-no-files-found: error
+          retention-days: 2
