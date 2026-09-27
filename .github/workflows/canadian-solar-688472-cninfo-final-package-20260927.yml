@@ -1,0 +1,255 @@
+name: Build Canadian Solar 688472 CNINFO final package 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/canadian-solar-688472-cninfo-final-package-20260927.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download official PDFs, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          PACKAGE = '阿特斯_688472.SH_全部年报_招股说明书_最新季报'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(exist_ok=True)
+          VERIFY = Path('_verify')
+          VERIFY.mkdir(exist_ok=True)
+
+          docs = [
+              {
+                  'filename': '01_阿特斯_2023年年度报告.pdf',
+                  'title': '阿特斯阳光电力集团股份有限公司2023年年度报告',
+                  'period': '2023年度',
+                  'announcement_date': '2024-04-27',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2024-04-27/1219886385.PDF',
+                  'term': '2023年年度报告',
+                  'min_pages': 350,
+                  'min_bytes': 3_000_000,
+              },
+              {
+                  'filename': '02_阿特斯_2024年年度报告.pdf',
+                  'title': '阿特斯阳光电力集团股份有限公司2024年年度报告',
+                  'period': '2024年度',
+                  'announcement_date': '2025-04-29',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2025-04-29/1223391888.PDF',
+                  'term': '2024年年度报告',
+                  'min_pages': 300,
+                  'min_bytes': 2_000_000,
+              },
+              {
+                  'filename': '03_阿特斯_2025年年度报告.pdf',
+                  'title': '阿特斯阳光电力集团股份有限公司2025年年度报告',
+                  'period': '2025年度',
+                  'announcement_date': '2026-04-28',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2026-04-28/1225222664.PDF',
+                  'term': '2025年年度报告',
+                  'min_pages': 300,
+                  'min_bytes': 2_000_000,
+              },
+              {
+                  'filename': '04_阿特斯_首次公开发行股票并在科创板上市招股说明书_2023-06-06.pdf',
+                  'title': '阿特斯阳光电力集团股份有限公司首次公开发行股票并在科创板上市招股说明书',
+                  'period': '首次公开发行正式招股说明书',
+                  'announcement_date': '2023-06-06',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2023-06-06/1216994275.PDF',
+                  'term': '招股说明书',
+                  'min_pages': 800,
+                  'min_bytes': 8_000_000,
+              },
+              {
+                  'filename': '05_阿特斯_2026年第一季度报告.pdf',
+                  'title': '阿特斯阳光电力集团股份有限公司2026年第一季度报告',
+                  'period': '2026年第一季度',
+                  'announcement_date': '2026-04-28',
+                  'url': 'https://static.cninfo.com.cn/finalpage/2026-04-28/1225222667.PDF',
+                  'term': '2026年第一季度报告',
+                  'min_pages': 8,
+                  'min_bytes': 100_000,
+              },
+          ]
+
+          session = requests.Session()
+          retry = Retry(
+              total=7, connect=7, read=7, status=7,
+              backoff_factor=1.2,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'],
+              raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=5, pool_maxsize=5))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://www.cninfo.com.cn/',
+          })
+
+          def download(doc: dict, dest: Path) -> str:
+              variants = [doc['url'], doc['url'].replace('https://', 'http://', 1)]
+              errors = []
+              for url in variants:
+                  for attempt in range(1, 6):
+                      tmp = dest.with_suffix(dest.suffix + '.part')
+                      try:
+                          with session.get(url, stream=True, allow_redirects=True, timeout=(35, 600)) as response:
+                              print('DOWNLOAD', dest.name, 'attempt', attempt, 'status', response.status_code, 'url', url, 'final', response.url, flush=True)
+                              response.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          fh.write(chunk)
+                          data = tmp.read_bytes()
+                          if len(data) < doc['min_bytes'] or not data.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF body: bytes={len(data)}, head={data[:80]!r}')
+                          tmp.replace(dest)
+                          return str(response.url)
+                      except Exception as exc:
+                          tmp.unlink(missing_ok=True)
+                          errors.append(f'{url} attempt {attempt}: {exc!r}')
+                          time.sleep(attempt)
+              raise RuntimeError(f'download failed for {dest.name}: {errors}')
+
+          records = []
+          hashes = set()
+          for index, doc in enumerate(docs, 1):
+              dest = OUT / doc['filename']
+              final_url = download(doc, dest)
+              data = dest.read_bytes()
+
+              check = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if check.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf failed for {dest.name}: {check.stderr[-2000:]}')
+
+              reader = PdfReader(str(dest), strict=False)
+              pages = len(reader.pages)
+              if pages < doc['min_pages']:
+                  raise RuntimeError(f'page count too small for {dest.name}: {pages} < {doc["min_pages"]}')
+
+              text_path = VERIFY / f'{index:02d}.txt'
+              subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(pages, 25)), str(dest), str(text_path)],
+                  capture_output=True, text=True,
+              )
+              text = text_path.read_text(encoding='utf-8', errors='ignore') if text_path.exists() else ''
+              compact = re.sub(r'\s+', '', text)
+              if '阿特斯' not in compact or doc['term'] not in compact:
+                  raise RuntimeError(
+                      f'identity check failed for {dest.name}: company={"阿特斯" in compact}, period={doc["term"] in compact}'
+                  )
+
+              preview_base = VERIFY / f'{index:02d}_page1'
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '90', str(dest), str(preview_base)],
+                  capture_output=True, text=True,
+              )
+              preview = Path(str(preview_base) + '.png')
+              if render.returncode != 0 or not preview.exists() or preview.stat().st_size < 10_000:
+                  raise RuntimeError(f'page-1 render failed for {dest.name}: {render.stderr[-1500:]}')
+
+              digest = hashlib.sha256(data).hexdigest()
+              if digest in hashes:
+                  raise RuntimeError(f'duplicate PDF detected: {dest.name}')
+              hashes.add(digest)
+
+              record = {
+                  'filename': dest.name,
+                  'title': doc['title'],
+                  'period': doc['period'],
+                  'announcement_date': doc['announcement_date'],
+                  'source': '巨潮资讯网（中国证监会指定信息披露网站）公开PDF原件',
+                  'source_url': final_url,
+                  'pages': pages,
+                  'bytes': len(data),
+                  'sha256': digest,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 5:
+              raise RuntimeError(f'expected 5 PDFs, got {len(records)}')
+
+          readme = [
+              '阿特斯阳光电力集团股份有限公司（688472.SH）全部年报、正式招股说明书及最新季报',
+              '整理与核验日期：2026-09-27',
+              '',
+              '收录口径：',
+              '1. 公司于2023年6月上市，上市以来完整年度报告为2023、2024、2025年，共3份。',
+              '2. 招股说明书收录2023年6月6日正式发行版本，不收录招股意向书、提示性公告和早期申报稿。',
+              '3. 截至整理日尚未披露2026年第三季度报告，因此最新季报为2026年第一季度报告；2026年半年度报告不作为“季报”重复收录。',
+              '4. 已排除年度报告摘要、上市公告书及其他提示性公告。',
+              '5. 全部PDF均来自巨潮资讯网公开原件，并完成文件头、大小、页数、公司/期间文本、qpdf结构、首页渲染、SHA-256及ZIP CRC检查。',
+              '',
+              '文件清单：',
+          ]
+          for i, record in enumerate(records, 1):
+              readme.extend([
+                  f"{i}. {record['title']}",
+                  f"   文件：{record['filename']}",
+                  f"   公告日期：{record['announcement_date']}；报告期：{record['period']}",
+                  f"   页数：{record['pages']}；大小：{record['bytes'] / 1048576:.2f} MB",
+                  f"   官方公开地址：{record['source_url']}",
+                  f"   SHA-256：{record['sha256']}",
+                  '',
+              ])
+
+          (OUT / '00_文件清单与官方来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f"{record['sha256']}  {record['filename']}\n" for record in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=path.name)
+
+          with zipfile.ZipFile(zip_path) as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 5:
+                  raise RuntimeError(f'ZIP PDF count mismatch: {len(pdfs)}')
+
+          print(
+              'FINAL_ZIP', zip_path.name,
+              'bytes', zip_path.stat().st_size,
+              'pdf_count', len(records),
+              'sha256', hashlib.sha256(zip_path.read_bytes()).hexdigest(),
+              flush=True,
+          )
+          PY
+
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: canadian-solar-688472-cninfo-final-package-20260927
+          path: 阿特斯_688472.SH_全部年报_招股说明书_最新季报.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
