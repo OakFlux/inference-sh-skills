@@ -1,0 +1,26 @@
+name: Discover all Xujiahui fxbaogao reports 20260927
+
+on:
+  push:
+    paths:
+      - '.github/workflows/discover-xujiahui-fxbaogao-all-20260927.yml'
+      - 'scripts/discover_xujiahui_fxbaogao_all_20260927.py'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests
+      - name: Discover reports
+        run: python scripts/discover_xujiahui_fxbaogao_all_20260927.py
+      - name: Upload discovery JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: xujiahui-fxbaogao-all
+          path: xujiahui_fxbaogao_all.json
+          if-no-files-found: error
+          retention-days: 7
