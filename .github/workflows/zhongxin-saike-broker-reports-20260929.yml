@@ -1,0 +1,34 @@
+name: Build Zhongxin Saike broker deep reports package 20260929
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/zhongxin-saike-broker-reports-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Build verified report package
+        run: python scripts/build_zhongxin_saike_broker_reports_20260929.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongxin-saike-002912-broker-deep-reports-20260929
+          path: 中新赛克_002912_券商深度报告_3份_20260929.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
