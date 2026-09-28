@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/inspect_jiejiaweic_eastmoney_reports_20260928.yml'
       - 'tools/inspect_jiejiaweic_eastmoney_reports_20260928.py'
+      - 'tools/inspect_jiejiaweic_yearly_reports_20260928.py'
   workflow_dispatch:
 
 permissions:
@@ -17,10 +18,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python -m pip install --quiet requests
-      - run: python tools/inspect_jiejiaweic_eastmoney_reports_20260928.py
+      - run: python tools/inspect_jiejiaweic_yearly_reports_20260928.py
       - uses: actions/upload-artifact@v4
         with:
-          name: jiejiaweic-eastmoney-report-inventory
-          path: jiejiaweic_eastmoney_report_inventory.json
+          name: jiejiaweic-yearly-report-inventory
+          path: jiejiaweic_yearly_report_inventory.json
           if-no-files-found: error
           retention-days: 3
