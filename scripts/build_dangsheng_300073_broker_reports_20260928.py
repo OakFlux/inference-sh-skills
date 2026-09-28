@@ -93,31 +93,57 @@ def parse_date(value: Any) -> datetime:
 
 
 def fetch_reports() -> list[dict[str, Any]]:
-    params = {
+    base_params = {
         "industryCode": "*",
-        "pageSize": "5000",
+        "pageSize": "100",
         "industry": "*",
         "rating": "*",
         "ratingChange": "*",
         "beginTime": "2000-01-01",
         "endTime": "2027-01-01",
-        "pageNo": "1",
         "fields": "",
         "qType": "0",
         "orgCode": "",
         "code": STOCK_CODE,
         "rcode": "",
-        "p": "1",
-        "pageNum": "1",
-        "pageNumber": "1",
     }
-    response = request(API, params=params, timeout=(25, 180))
-    try:
-        payload = response.json()
-    finally:
-        response.close()
-    rows = payload.get("data") or []
-    if not isinstance(rows, list) or not rows:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    total_pages = 1
+    page = 1
+    while page <= total_pages and page <= 50:
+        params = dict(base_params)
+        params.update({
+            "pageNo": str(page),
+            "p": str(page),
+            "pageNum": str(page),
+            "pageNumber": str(page),
+        })
+        response = request(API, params=params, timeout=(25, 180))
+        try:
+            payload = response.json()
+        finally:
+            response.close()
+        if page == 1:
+            total_pages = parse_int(payload.get("TotalPage") or payload.get("totalPage") or payload.get("totalPages")) or 1
+            total_count = parse_int(payload.get("TotalCount") or payload.get("totalCount") or payload.get("count"))
+            print("REPORT_API_TOTAL", {"pages": total_pages, "count": total_count}, flush=True)
+        page_rows = payload.get("data") or []
+        if not isinstance(page_rows, list):
+            raise RuntimeError(f"Eastmoney report API returned invalid data on page {page}")
+        if not page_rows:
+            break
+        for row in page_rows:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("infoCode") or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            rows.append(row)
+        print("REPORT_PAGE", page, "ROWS", len(page_rows), "ACCUMULATED", len(rows), flush=True)
+        page += 1
+    if not rows:
         raise RuntimeError("Eastmoney report API returned no data")
     print("REPORT_COUNT", len(rows), flush=True)
     return rows
@@ -177,13 +203,12 @@ def choose_reports(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "infoCode": item.get("infoCode"),
             "reportType": item.get("reportType"),
         }
-        for item in candidates[:25]
+        for item in candidates[:30]
     ], ensure_ascii=False, indent=2), flush=True)
 
     selected: list[dict[str, Any]] = []
     used_orgs: set[str] = set()
 
-    # Prefer one known classic company-deep report when available.
     preferred_patterns = [
         "高镍东风已至",
         "突围曙光已现",
@@ -195,7 +220,6 @@ def choose_reports(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             used_orgs.add(str(item.get("orgSName") or item.get("orgName") or ""))
             break
 
-    # Then select the strongest recent, long, company-deep reports from distinct institutions.
     for item in candidates:
         if item in selected:
             continue
