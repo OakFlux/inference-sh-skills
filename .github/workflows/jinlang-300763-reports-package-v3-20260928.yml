@@ -1,0 +1,123 @@
+name: Build Jinlang Technology 300763 reports package v3 20260928
+
+on:
+  push:
+    paths:
+      - '.github/workflows/jinlang-300763-reports-package-v3-20260928.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Patch and compile quarterly-report discovery
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          path = Path('scripts/build_jinlang_300763_reports_20260928.py')
+          source = path.read_text(encoding='utf-8')
+
+          start = source.index('def choose_quarter() -> dict[str, Any]:')
+          end = source.index('\ndef download_pdf(', start)
+
+          replacement = dedent('''
+          def choose_quarter() -> dict[str, Any]:
+              candidates: list[dict[str, Any]] = []
+              seen: set[str] = set()
+              probes = [
+                  ("2026年第一季度报告", "category_yjdbg_szsh;"),
+                  ("2026年第一季度报告", ""),
+                  ("第一季度报告", ""),
+                  ("", ""),
+              ]
+              for search_key, category in probes:
+                  found = query_announcements(
+                      search_key=search_key,
+                      start_date="2026-04-01",
+                      end_date="2026-07-31",
+                      category=category,
+                  )
+                  for item in found:
+                      marker = item.get("announcement_id") or item["url"]
+                      if marker not in seen:
+                          seen.add(marker)
+                          candidates.append(item)
+              valid = [
+                  item
+                  for item in candidates
+                  if ("2026年第一季度报告" in item["title"] or "2026年一季度报告" in item["title"])
+                  and not any(term in item["title"] for term in ("摘要", "英文版", "取消", "更正公告", "提示性公告"))
+              ]
+              if not valid:
+                  raise RuntimeError("No 2026 first-quarter report found after broad issuer search")
+              valid.sort(key=lambda x: x["announcement_time"], reverse=True)
+              chosen = valid[0]
+              print("CHOSEN_Q1", json.dumps(chosen, ensure_ascii=False), flush=True)
+              return chosen
+
+
+          def choose_interim() -> dict[str, Any] | None:
+              candidates: list[dict[str, Any]] = []
+              seen: set[str] = set()
+              probes = [
+                  ("2026年半年度报告", "category_bndbg_szsh;"),
+                  ("2026年半年度报告", ""),
+                  ("半年度报告", ""),
+                  ("", ""),
+              ]
+              for search_key, category in probes:
+                  found = query_announcements(
+                      search_key=search_key,
+                      start_date="2026-07-01",
+                      end_date=CHECKED_AS_OF,
+                      category=category,
+                  )
+                  for item in found:
+                      marker = item.get("announcement_id") or item["url"]
+                      if marker not in seen:
+                          seen.add(marker)
+                          candidates.append(item)
+              valid = [
+                  item
+                  for item in candidates
+                  if "2026年半年度报告" in item["title"]
+                  and not any(term in item["title"] for term in ("摘要", "英文版", "取消", "更正公告", "提示性公告"))
+              ]
+              if not valid:
+                  print("NO_2026_INTERIM_FOUND", flush=True)
+                  return None
+              valid.sort(key=lambda x: x["announcement_time"], reverse=True)
+              chosen = valid[0]
+              print("CHOSEN_INTERIM", json.dumps(chosen, ensure_ascii=False), flush=True)
+              return chosen
+
+          ''').lstrip()
+
+          source = source[:start] + replacement + source[end + 1:]
+          path.write_text(source, encoding='utf-8')
+          print('patched', path)
+          PY
+          python -m py_compile scripts/build_jinlang_300763_reports_20260928.py
+
+      - name: Download validate and package reports
+        run: python scripts/build_jinlang_300763_reports_20260928.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinlang-300763-reports-2020-2026-v3
+          path: 锦浪科技_300763_2020-2025年报_2026最新定期报告.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
