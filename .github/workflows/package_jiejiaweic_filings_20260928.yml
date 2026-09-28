@@ -6,6 +6,7 @@ on:
       - '.github/workflows/package_jiejiaweic_filings_20260928.yml'
       - 'tools/package_jiejiaweic_filings_20260928.py'
       - 'tools/patch_jiejiaweic_filings_20260928.py'
+      - 'tools/patch_jiejiaweic_quarter_pattern_20260928.py'
   workflow_dispatch:
 
 permissions:
@@ -24,6 +25,8 @@ jobs:
           python -m pip install --quiet requests pypdf
       - name: Patch CNINFO compatibility
         run: python tools/patch_jiejiaweic_filings_20260928.py
+      - name: Patch quarterly title compatibility
+        run: python tools/patch_jiejiaweic_quarter_pattern_20260928.py
       - name: Download, validate and organize filings
         run: python tools/package_jiejiaweic_filings_20260928.py
       - name: Upload final package
