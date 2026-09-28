@@ -1,0 +1,33 @@
+name: Build Kema Technology 301611 broker deep reports package 20260928
+
+on:
+  push:
+    paths:
+      - '.github/workflows/kema-301611-broker-deep-reports-package-20260928.yml'
+      - 'scripts/build_kema_301611_broker_deep_reports_20260928.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        run: python scripts/build_kema_301611_broker_deep_reports_20260928.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kema-301611-broker-deep-reports
+          path: 珂玛科技_301611_券商深度报告_3份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
