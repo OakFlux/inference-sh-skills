@@ -1,0 +1,30 @@
+name: Build Jinlang broker deep reports package v2 20260928
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-jinlang-broker-deep-reports-package-20260928-v2.yml'
+      - 'scripts/build_jinlang_broker_deep_reports_20260928.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Download validate and package reports
+        run: python scripts/build_jinlang_broker_deep_reports_20260928.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: jinlang-300763-broker-deep-reports-v2
+          path: 锦浪科技_300763_券商深度报告_3份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
