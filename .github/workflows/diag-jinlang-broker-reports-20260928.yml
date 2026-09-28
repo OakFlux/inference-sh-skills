@@ -1,0 +1,72 @@
+name: Diagnose Jinlang broker reports 20260928
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-jinlang-broker-reports-20260928.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query Eastmoney report API
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import requests
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/300763.html',
+              'Accept': '*/*',
+          }
+          url = 'https://reportapi.eastmoney.com/report/list'
+          params = {
+              'cb': 'datatable',
+              'qType': '0',
+              'orgCode': '',
+              'author': '',
+              'p': '1',
+              'pageNo': '1',
+              'pageNum': '1',
+              'pageSize': '500',
+              'code': '300763',
+              'industryCode': '',
+              'industry': '',
+              'rating': '',
+              'ratingChange': '',
+              'beginTime': '2019-01-01',
+              'endTime': '2026-09-28',
+              'fields': '',
+          }
+          r = session.get(url, params=params, headers=headers, timeout=60)
+          print('STATUS', r.status_code, r.headers.get('content-type'), len(r.content), r.url)
+          print('BODY_HEAD', r.text[:1000])
+          r.raise_for_status()
+          text = r.text.strip()
+          if text.startswith('datatable(') and text.endswith(')'):
+              text = text[len('datatable('):-1]
+          data = json.loads(text)
+          print('TOP_KEYS', list(data.keys()))
+          records = data.get('data') or data.get('result', {}).get('data') or []
+          print('COUNT', len(records))
+          for item in records:
+              title = item.get('title') or item.get('TITLE') or ''
+              info = item.get('infoCode') or item.get('INFO_CODE') or item.get('infocode') or ''
+              org = item.get('orgSName') or item.get('orgName') or item.get('ORG_SNAME') or item.get('ORG_NAME') or ''
+              date = item.get('publishDate') or item.get('noticeDate') or item.get('PUBLISH_DATE') or item.get('NOTICE_DATE') or ''
+              if any(k in title for k in ['首次覆盖', '深度', '龙头', '后疫情', '乘储能', '第二增长极', '涌立潮头']):
+                  print('CANDIDATE', json.dumps({'date': date, 'org': org, 'title': title, 'infoCode': info}, ensure_ascii=False))
+          print('ALL_REPORTS_START')
+          for item in records:
+              title = item.get('title') or item.get('TITLE') or ''
+              info = item.get('infoCode') or item.get('INFO_CODE') or item.get('infocode') or ''
+              org = item.get('orgSName') or item.get('orgName') or item.get('ORG_SNAME') or item.get('ORG_NAME') or ''
+              date = item.get('publishDate') or item.get('noticeDate') or item.get('PUBLISH_DATE') or item.get('NOTICE_DATE') or ''
+              print(json.dumps({'date': date, 'org': org, 'title': title, 'infoCode': info}, ensure_ascii=False))
+          PY
