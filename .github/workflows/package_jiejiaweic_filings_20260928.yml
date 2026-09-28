@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/package_jiejiaweic_filings_20260928.yml'
       - 'tools/package_jiejiaweic_filings_20260928.py'
+      - 'tools/patch_jiejiaweic_filings_20260928.py'
   workflow_dispatch:
 
 permissions:
@@ -21,6 +22,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet requests pypdf
+      - name: Patch CNINFO compatibility
+        run: python tools/patch_jiejiaweic_filings_20260928.py
       - name: Download, validate and organize filings
         run: python tools/package_jiejiaweic_filings_20260928.py
       - name: Upload final package
