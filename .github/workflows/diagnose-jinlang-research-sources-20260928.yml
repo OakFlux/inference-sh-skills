@@ -1,0 +1,19 @@
+name: Diagnose Jinlang research sources 20260928
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diagnose-jinlang-research-sources-20260928.yml'
+      - 'scripts/diagnose_jinlang_research_sources_20260928.py'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests
+      - name: Probe report sources
+        run: python scripts/diagnose_jinlang_research_sources_20260928.py
