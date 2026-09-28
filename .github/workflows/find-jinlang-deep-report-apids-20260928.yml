@@ -1,0 +1,19 @@
+name: Find Jinlang deep report IDs 20260928
+
+on:
+  push:
+    paths:
+      - '.github/workflows/find-jinlang-deep-report-apids-20260928.yml'
+      - 'scripts/find_jinlang_deep_report_apids_20260928.py'
+  workflow_dispatch:
+
+jobs:
+  find:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests
+      - name: Query Eastmoney report metadata
+        run: python scripts/find_jinlang_deep_report_apids_20260928.py
