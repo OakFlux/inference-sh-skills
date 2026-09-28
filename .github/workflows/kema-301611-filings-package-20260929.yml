@@ -1,0 +1,33 @@
+name: Build Kema Technology 301611 filings package 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/kema-301611-filings-package-20260929.yml'
+      - 'scripts/build_kema_301611_filings_20260929.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package filings
+        run: python scripts/build_kema_301611_filings_20260929.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: kema-301611-filings-2024-2026
+          path: 珂玛科技_301611_全部年报_招股说明书_2026最新定期报告.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
