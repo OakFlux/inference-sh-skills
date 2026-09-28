@@ -1,0 +1,26 @@
+name: Inspect FxBaogao Guoxin Health page images
+
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect_fxbaogao_page_images_guoxin_health_20260929.yml'
+      - 'tools/inspect_fxbaogao_page_images_guoxin_health_20260929.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests pillow
+      - run: python tools/inspect_fxbaogao_page_images_guoxin_health_20260929.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-guoxin-health-page-images
+          path: fxbaogao_guoxin_health_page_images.json
+          if-no-files-found: error
+          retention-days: 3
