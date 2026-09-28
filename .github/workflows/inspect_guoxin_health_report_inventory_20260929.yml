@@ -1,0 +1,26 @@
+name: Inspect Guoxin Health report inventory
+
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect_guoxin_health_report_inventory_20260929.yml'
+      - 'tools/inspect_guoxin_health_report_inventory_20260929.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python tools/inspect_guoxin_health_report_inventory_20260929.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guoxin-health-report-inventory
+          path: guoxin_health_report_inventory.json
+          if-no-files-found: error
+          retention-days: 3
