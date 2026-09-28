@@ -1,0 +1,33 @@
+name: Package Jiejia Weichuang filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_jiejiaweic_filings_20260928.yml'
+      - 'tools/package_jiejiaweic_filings_20260928.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Download, validate and organize filings
+        run: python tools/package_jiejiaweic_filings_20260928.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiejiaweic-300724-2020-2025-annual-latest-quarter
+          path: 捷佳伟创_300724_2020-2025年报及最新季报/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 7
