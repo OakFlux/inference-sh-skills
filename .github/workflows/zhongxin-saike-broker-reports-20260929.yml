@@ -23,13 +23,13 @@ jobs:
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet requests pypdf
       - name: Build verified report package
-        run: python scripts/build_zhongxin_saike_broker_reports_20260929.py
+        run: python scripts/run_zhongxin_saike_broker_reports_v2_20260929.py
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: zhongxin-saike-002912-broker-deep-reports-20260929
+          name: zhongxin-saike-002912-broker-deep-reports-3-v2-20260929
           path: 中新赛克_002912_券商深度报告_3份_20260929.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
-# trigger: 2026-09-29
+# trigger: v2-2026-09-29
