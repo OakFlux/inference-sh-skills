@@ -1,0 +1,52 @@
+name: Discover cement industry reports for Fujian Cement 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-industry-metadata-discovery-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query Eastmoney industry report metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests, time
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Referer':'https://data.eastmoney.com/report/','Accept-Language':'zh-CN,zh;q=0.9'})
+          terms=('水泥','建材','非金属','华东','福建','基建')
+          seen=set(); out=[]
+          for year in range(2015,2026):
+              for page in range(1,31):
+                  params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':f'{year}-01-01','endTime':f'{year}-12-31','pageNo':str(page),'fields':'','qType':'1','orgCode':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+                  r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(30,180))
+                  print('HTTP',year,page,r.status_code,len(r.content),flush=True); r.raise_for_status()
+                  d=r.json(); rows=d.get('data') or d.get('Data') or d.get('list') or []
+                  if isinstance(rows,dict): rows=rows.get('list') or rows.get('data') or []
+                  print('COUNT',year,page,len(rows),flush=True)
+                  if not rows: break
+                  for x in rows:
+                      title=str(x.get('title') or x.get('reportTitle') or x.get('REPORT_TITLE') or '')
+                      industry=str(x.get('industryName') or x.get('industry') or x.get('INDUSTRY_NAME') or '')
+                      if not any(t in title or t in industry for t in terms):
+                          continue
+                      info=str(x.get('infoCode') or x.get('INFO_CODE') or '')
+                      if not info or info in seen: continue
+                      seen.add(info)
+                      rec={'title':title,'infoCode':info,'org':x.get('orgSName') or x.get('orgName') or x.get('ORG_SNAME'),'date':x.get('publishDate') or x.get('PUBLIC_DATE'),'researcher':x.get('researcher') or x.get('RESEARCHER'),'pages':x.get('attachPages') or x.get('ATTACH_PAGES'),'industry':industry}
+                      out.append(rec)
+                  if len(rows)<100: break
+                  time.sleep(0.1)
+          out.sort(key=lambda x:str(x.get('date') or ''),reverse=True)
+          print('MATCHES',len(out),flush=True)
+          for rec in out:
+              print('CANDIDATE',json.dumps(rec,ensure_ascii=False),flush=True)
+          PY
