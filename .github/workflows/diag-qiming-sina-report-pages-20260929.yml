@@ -1,0 +1,44 @@
+name: Diagnose Qiming Sina report pages 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-qiming-sina-report-pages-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect report detail pages
+        run: |
+          python - <<'PY'
+          import json, re, html
+          from urllib.parse import urljoin
+          import requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'}
+          ids=['517649270188','515693035082','367169929937','367146219453','360083914295','354372890217','349515226406','345635071030','345195125142','344431206139','342602829781','341055094187','340185347018','335278934623','335265798636','324550008390','324457417515','324401002718','323426784031','322665143859','318509416859','317748460280','316777994920','316691743967','311242396265','304695173375','303290206828','295081017780','290764673842','290185955264','290006985999','289986568343','289913407125','289907134670']
+          for rid in ids:
+            url=f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml'
+            try:
+              r=s.get(url,headers=h,timeout=35,allow_redirects=True)
+              r.encoding=r.apparent_encoding or 'gbk'
+              text=r.text
+              print('\n===RID===',rid,'STATUS',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              title=''
+              m=re.search(r'<title>(.*?)</title>',text,re.I|re.S)
+              if m: title=re.sub('<[^>]+>','',m.group(1)).strip()
+              print('TITLE',title,flush=True)
+              links=[]
+              for m in re.finditer(r'''(?:href|src)\s*=\s*["']([^"']+)["']''',text,re.I):
+                raw=html.unescape(m.group(1)); full=urljoin(r.url,raw)
+                if any(k in full.lower() for k in ['pdf','download','attach','file.finance','report']): links.append(full)
+              print('LINKS',json.dumps(list(dict.fromkeys(links)),ensure_ascii=False),flush=True)
+              for pat in ['报告摘要','报告正文','下载','pdf','启明信息','机构','作者','发布日期','报告页数']:
+                pos=text.find(pat)
+                if pos>=0: print('AROUND',pat,re.sub(r'\s+',' ',text[max(0,pos-500):pos+2000]),flush=True)
+            except Exception as e:
+              print('\n===RID===',rid,'ERROR',repr(e),flush=True)
+          PY
