@@ -1,0 +1,31 @@
+name: Build final Fujian Cement deep reports package v2 20260929
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fujian-cement-broker-deep-reports-v2-20260929.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Build verified report package
+        run: python scripts/build_fujian_cement_broker_deep_reports_v2_20260929.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: fujian-cement-600802-broker-deep-reports-2-v2-20260929
+          path: 福建水泥_600802_券商深度报告_2份_20260929.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
