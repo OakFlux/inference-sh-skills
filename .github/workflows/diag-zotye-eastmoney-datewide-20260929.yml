@@ -1,0 +1,136 @@
+name: Recover Zotye 2017 deep reports from Eastmoney feeds 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zotye-eastmoney-datewide-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  recover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Query exact dates without stock-code filtering
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import requests
+
+          dates = ['2017-10-18', '2017-03-29', '2017-03-03', '2017-03-01']
+          keys = ['众泰', '金马股份', '从模仿到原创', '双轮驱动', '自主品牌后起之秀', 'OPPO', 'VIVO']
+          s = requests.Session(); s.trust_env = False
+          base_headers = {
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept': 'application/json,text/plain,*/*',
+          }
+
+          matches = {}
+
+          def is_match(row):
+              combined = ' '.join(str(row.get(k) or '') for k in [
+                  'title', 'stockName', 'stockCode', 'researcher', 'orgName', 'orgSName'
+              ])
+              return row.get('stockCode') == '000980' or any(k in combined for k in keys)
+
+          def collect(rows, source):
+              for row in rows:
+                  if is_match(row):
+                      info = str(row.get('infoCode') or row.get('INFO_CODE') or '')
+                      key = info or source + ':' + str(row.get('title'))
+                      matches[key] = row
+                      print('MATCH', source, json.dumps(row, ensure_ascii=False, default=str), flush=True)
+
+          for date in dates:
+              print('\n===== DATE', date, '=====', flush=True)
+              variants = [
+                  {},
+                  {'code': '*'},
+                  {'code': ''},
+                  {'code': '000980'},
+              ]
+              for variant in variants:
+                  for page in range(1, 8):
+                      body = {
+                          'pageSize': 500,
+                          'pageNo': page,
+                          'p': page,
+                          'pageNum': page,
+                          'pageNumber': page,
+                          'beginTime': date,
+                          'endTime': date,
+                          'industryCode': '*',
+                          'rating': None,
+                          'ratingChange': None,
+                          'orgCode': None,
+                          'rcode': '',
+                          **variant,
+                      }
+                      try:
+                          r = s.post(
+                              'https://reportapi.eastmoney.com/report/list2',
+                              json=body,
+                              headers={**base_headers, 'Content-Type': 'application/json'},
+                              timeout=75,
+                          )
+                          print('LIST2', date, variant, page, r.status_code, len(r.content), flush=True)
+                          r.raise_for_status()
+                          data = r.json()
+                          rows = data.get('data') or []
+                          print('LIST2_META', data.get('hits'), data.get('TotalPage'), len(rows), flush=True)
+                          collect(rows, f'list2:{date}:{variant}:p{page}')
+                          total_pages = int(data.get('TotalPage') or 0)
+                          if not rows or page >= max(1, total_pages):
+                              break
+                      except Exception as exc:
+                          print('LIST2_ERROR', date, variant, page, repr(exc), flush=True)
+                          break
+
+              for code_value in [None, '*', '', '000980']:
+                  for page in range(1, 8):
+                      params = {
+                          'industryCode': '*', 'pageSize': '500', 'industry': '*',
+                          'rating': '*', 'ratingChange': '*',
+                          'beginTime': date, 'endTime': date,
+                          'pageNo': str(page), 'fields': '', 'qType': '0',
+                          'orgCode': '', 'rcode': '',
+                          'p': str(page), 'pageNum': str(page), 'pageNumber': str(page),
+                      }
+                      if code_value is not None:
+                          params['code'] = code_value
+                      try:
+                          r = s.get('https://reportapi.eastmoney.com/report/list', params=params, headers=base_headers, timeout=75)
+                          print('LIST', date, code_value, page, r.status_code, len(r.content), flush=True)
+                          r.raise_for_status()
+                          data = r.json()
+                          rows = data.get('data') or []
+                          print('LIST_META', data.get('hits'), data.get('TotalPage'), len(rows), flush=True)
+                          collect(rows, f'list:{date}:{code_value}:p{page}')
+                          total_pages = int(data.get('TotalPage') or 0)
+                          if not rows or page >= max(1, total_pages):
+                              break
+                      except Exception as exc:
+                          print('LIST_ERROR', date, code_value, page, repr(exc), flush=True)
+                          break
+
+          print('\n===== ALL MATCHES', len(matches), '=====', flush=True)
+          for info, row in matches.items():
+              print('FINAL_MATCH', info, json.dumps(row, ensure_ascii=False, default=str), flush=True)
+              if not info.startswith('AP'):
+                  continue
+              for template in [
+                  'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',
+                  'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+              ]:
+                  url = template.format(info=info)
+                  try:
+                      p = s.get(url, headers={**base_headers, 'Accept':'application/pdf,*/*'}, timeout=120, stream=True, allow_redirects=True)
+                      head = next(p.iter_content(64), b'')
+                      print('PDF_PROBE', info, p.status_code, p.headers.get('content-type'), p.headers.get('content-length'), p.url, repr(head[:20]), flush=True)
+                      p.close()
+                  except Exception as exc:
+                      print('PDF_ERROR', info, url, repr(exc), flush=True)
+          PY
