@@ -1,0 +1,45 @@
+name: Resolve Qiming Sina report PDF redirects 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-qiming-sina-pdf-redirects-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Resolve report downloads
+        run: |
+          python - <<'PY'
+          import json, re
+          from urllib.parse import urljoin
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept': 'text/html,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+              'Referer': 'https://stock.finance.sina.com.cn/',
+          }
+          ids = ['515693035082','517649270188','345195125142','344431206139','323426784031','322665143859','345635071030','340185347018']
+          for rid in ids:
+              url = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/url'
+              print('\n===', rid, url, '===', flush=True)
+              try:
+                  r = s.get(url, headers=headers, timeout=60, allow_redirects=True)
+                  print('STATUS', r.status_code, 'FINAL', r.url, 'TYPE', r.headers.get('content-type'), 'LEN', len(r.content), flush=True)
+                  print('HISTORY', [(x.status_code, x.url, x.headers.get('location')) for x in r.history], flush=True)
+                  print('HEAD', repr(r.content[:32]), flush=True)
+                  if not r.content.startswith(b'%PDF'):
+                      text = r.text[:5000]
+                      print('BODY', re.sub(r'\s+', ' ', text)[:3000], flush=True)
+                      for pat in [r'location\.href\s*=\s*["\']([^"\']+)', r'url=([^"\'> ]+)', r'href=["\']([^"\']+\.pdf[^"\']*)']:
+                          m = re.search(pat, text, re.I)
+                          if m:
+                              print('PARSED', urljoin(r.url, m.group(1)), flush=True)
+              except Exception as exc:
+                  print('ERROR', repr(exc), flush=True)
+          PY
