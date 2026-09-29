@@ -1,0 +1,23 @@
+name: Save Hibor docdetail JS
+on:
+  push:
+    paths:
+      - '.github/workflows/save_hibor_docdetail_js.yml'
+      - 'tools/save_hibor_docdetail_js.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  save:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python tools/save_hibor_docdetail_js.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hibor-docdetail-js
+          path: hibor_bundle_*.js
+          if-no-files-found: error
+          retention-days: 3
