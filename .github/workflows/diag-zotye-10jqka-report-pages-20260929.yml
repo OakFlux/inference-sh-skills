@@ -1,0 +1,51 @@
+name: Inspect 10jqka Zotye report pages 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zotye-10jqka-report-pages-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect public report pages
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+
+          urls = [
+              'https://news.10jqka.com.cn/field/sr/20171018/12207097.shtml',
+              'https://news.10jqka.com.cn/field/sr/20171109/12437017.shtml',
+              'https://news.10jqka.com.cn/field/sr/20180502/15445485.shtml',
+          ]
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9',
+          }
+          for url in urls:
+              print('\n===', url, '===', flush=True)
+              try:
+                  r = s.get(url, headers=headers, timeout=60, allow_redirects=True)
+                  r.encoding = r.apparent_encoding or r.encoding or 'utf-8'
+                  text = r.text
+                  print('STATUS', r.status_code, r.headers.get('content-type'), len(r.content), r.url, r.encoding, flush=True)
+                  tm = re.search(r'<title[^>]*>(.*?)</title>', text, re.I | re.S)
+                  print('TITLE', re.sub(r'<[^>]+>', '', tm.group(1)).strip() if tm else '', flush=True)
+                  links=[]
+                  for m in re.finditer(r'''(?:href|src)\s*=\s*["']([^"']+)["']''', text, re.I):
+                      full=urljoin(r.url,html.unescape(m.group(1)).replace('\\/','/'))
+                      if any(k in full.lower() for k in ['pdf','download','attach','report','yanbao','research','12207097','12437017','15445485']):
+                          links.append(full)
+                  print('LINKS', json.dumps(list(dict.fromkeys(links)), ensure_ascii=False, indent=2), flush=True)
+                  for key in ['PDF','pdf','下载','附件','研报','报告原文','原文','安信证券','国投证券','众泰汽车','金马股份']:
+                      for m in list(re.finditer(re.escape(key),text,re.I))[:10]:
+                          print('AROUND',key,re.sub(r'\s+',' ',text[max(0,m.start()-500):m.start()+1800]),flush=True)
+              except Exception as exc:
+                  print('ERROR', repr(exc), flush=True)
+          PY
