@@ -1,0 +1,151 @@
+name: Build Daye 603278 broker research ZIP 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/daye-603278-broker-research-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Query, download and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          STOCK='603278'; COMPANY='大业股份'
+          OUT=Path('大业股份_603278_券商深度报告_3份'); OUT.mkdir(exist_ok=True)
+          VERIFY=Path('_verify'); VERIFY.mkdir(exist_ok=True)
+
+          s=requests.Session(); s.trust_env=False
+          retry=Retry(total=6,connect=6,read=6,status=6,backoff_factor=1.2,
+                      status_forcelist=[429,500,502,503,504],allowed_methods=['GET'],raise_on_status=False)
+          s.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=8,pool_maxsize=8))
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36',
+                            'Accept-Language':'zh-CN,zh;q=0.9','Accept-Encoding':'identity',
+                            'Referer':'https://data.eastmoney.com/'})
+
+          params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':'2017-01-01','endTime':'2030-01-01','pageNo':'1','fields':'','qType':'0',
+                  'orgCode':'','code':STOCK,'rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
+          r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(30,180))
+          print('REPORT_API',r.status_code,len(r.content),r.url,flush=True); r.raise_for_status()
+          payload=r.json(); rows=payload.get('data') or payload.get('Data') or payload.get('list') or []
+          if isinstance(rows,dict): rows=rows.get('list') or rows.get('data') or []
+          if not rows: raise RuntimeError(f'No report rows; keys={list(payload)[:20]}')
+
+          def pick(rec,*keys):
+              for k in keys:
+                  if rec.get(k) not in (None,''): return rec.get(k)
+              return ''
+
+          reports=[]
+          for x in rows:
+              title=re.sub(r'\s+','',str(pick(x,'title','reportTitle','REPORT_TITLE')))
+              info=str(pick(x,'infoCode','info_code','reportId','report_id','INFO_CODE')).strip()
+              org=str(pick(x,'orgSName','orgName','org_name','ORG_SNAME','ORG_NAME')).strip()
+              date=str(pick(x,'publishDate','pubDate','pub_date','PUBLIC_DATE','PUBLISH_DATE')).strip()
+              researcher=str(pick(x,'researcher','researcherName','researcher_name','RESEARCHER')).strip()
+              pages=pick(x,'attachPages','attach_pages','ATTACH_PAGES')
+              try: pages=int(float(pages)) if pages not in ('',None) else None
+              except Exception: pages=None
+              if title and info: reports.append({'title':title,'info':info,'org':org,'date':date,'researcher':researcher,'api_pages':pages})
+          print('REPORTS',json.dumps(reports,ensure_ascii=False,indent=2),flush=True)
+
+          targets=[
+            {'frags':['全球轮胎骨架材料领军者','价值亟待重估'],'file':'01_中泰证券_全球轮胎骨架材料领军者_价值亟待重估_2023-06-30.pdf','min_pages':25,'org':'中泰'},
+            {'frags':['轮胎骨架材料龙头业绩反转','增收降本推动长期成长'],'file':'02_上海证券_首次覆盖_轮胎骨架材料龙头业绩反转_2024-03-07.pdf','min_pages':15,'org':'上海'},
+            {'frags':['骨架材料业务进入实质性优化成长新阶段','第二增长曲线有望推升业绩弹性'],'file':'03_东兴证券_骨架材料业务进入实质性优化成长新阶段_2024-04-29.pdf','min_pages':5,'org':'东兴'},
+          ]
+          selected=[]
+          for t in targets:
+              matches=[x for x in reports if all(f in x['title'] for f in t['frags'])]
+              if not matches: matches=[x for x in reports if sum(f in x['title'] for f in t['frags'])>=1 and t['org'] in x['org']]
+              if not matches: raise RuntimeError('Missing target: '+str(t['frags']))
+              matches.sort(key=lambda x:(t['org'] in x['org'],x['date']),reverse=True)
+              selected.append({**t,'rec':matches[0]})
+          print('SELECTED',json.dumps([{**x['rec'],'file':x['file']} for x in selected],ensure_ascii=False,indent=2),flush=True)
+
+          def download(doc,dest):
+              errors=[]
+              for prefix in ('H3','H2','H1'):
+                  url=f'https://pdf.dfcfw.com/pdf/{prefix}_{doc["rec"]["info"]}_1.pdf'
+                  for attempt in range(1,5):
+                      tmp=dest.with_suffix('.pdf.part')
+                      try:
+                          with s.get(url,headers={'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*;q=0.8','Accept-Encoding':'identity'},stream=True,timeout=(30,600)) as rr:
+                              print('DOWNLOAD',dest.name,prefix,attempt,rr.status_code,rr.headers.get('Content-Length'),flush=True)
+                              rr.raise_for_status()
+                              with tmp.open('wb') as fh:
+                                  for chunk in rr.iter_content(1048576):
+                                      if chunk: fh.write(chunk)
+                          data=tmp.read_bytes()
+                          if len(data)<100000 or not data.startswith(b'%PDF-'): raise RuntimeError(f'invalid {len(data)} {data[:12]!r}')
+                          tmp.replace(dest); return url
+                      except Exception as e:
+                          tmp.unlink(missing_ok=True); errors.append(repr(e)); time.sleep(attempt)
+              raise RuntimeError(f'{dest.name} download failed: {errors}')
+
+          manifest=[]; hashes=set()
+          for i,doc in enumerate(selected,1):
+              dest=OUT/doc['file']; source=download(doc,dest)
+              qc=subprocess.run(['qpdf','--check',str(dest)],capture_output=True,text=True)
+              if qc.returncode not in (0,3): raise RuntimeError(qc.stderr[-1500:])
+              pages=len(PdfReader(str(dest),strict=False).pages)
+              if pages<doc['min_pages']: raise RuntimeError(f'{dest.name}: {pages} pages < {doc["min_pages"]}')
+              txt=VERIFY/f'{i:02d}.txt'; subprocess.run(['pdftotext','-f','1','-l',str(min(20,pages)),str(dest),str(txt)],capture_output=True,text=True)
+              compact=re.sub(r'\s+','',txt.read_text(encoding='utf-8',errors='ignore') if txt.exists() else '')
+              if COMPANY not in compact: raise RuntimeError(f'{dest.name}: company identity missing')
+              pngp=VERIFY/f'{i:02d}_page1'; rr=subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','90',str(dest),str(pngp)],capture_output=True,text=True)
+              png=Path(str(pngp)+'.png')
+              if rr.returncode or not png.exists() or png.stat().st_size<10000: raise RuntimeError(f'{dest.name}: render failed')
+              data=dest.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+              if sha in hashes: raise RuntimeError('duplicate PDF')
+              hashes.add(sha)
+              rec=doc['rec']; item={'filename':dest.name,'title':rec['title'],'institution':rec['org'],'researcher':rec['researcher'],'publish_date':rec['date'],'infoCode':rec['info'],'pages':pages,'bytes':len(data),'pdf_url':source,'sha256':sha}
+              manifest.append(item); print('VALIDATED',json.dumps(item,ensure_ascii=False),flush=True)
+
+          readme=['大业股份（603278.SH）券商研究报告精选（3份）','整理日期：2026-09-29','','收录：公司深度报告、首次覆盖报告及较完整公司研究报告。','报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。','','文件清单：']
+          for n,x in enumerate(manifest,1):
+              readme += [f'{n}. {x["title"]}',f'   机构：{x["institution"]}；研究员：{x["researcher"]}；发布日期：{x["publish_date"]}',f'   文件：{x["filename"]}；页数：{x["pages"]}；大小：{x["bytes"]/1048576:.2f} MB',f'   PDF来源：{x["pdf_url"]}',f'   SHA-256：{x["sha256"]}','']
+          (OUT/'00_文件清单与来源说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest),encoding='utf-8')
+
+          z=Path('大业股份_603278_券商深度报告_3份.zip')
+          with zipfile.ZipFile(z,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as a:
+              for p in sorted(OUT.iterdir()): a.write(p,arcname=p.name)
+          with zipfile.ZipFile(z) as a:
+              bad=a.testzip(); pdfs=[n for n in a.namelist() if n.lower().endswith('.pdf')]
+              if bad: raise RuntimeError(f'ZIP CRC {bad}')
+              if len(pdfs)!=3: raise RuntimeError(f'ZIP PDF count {len(pdfs)}')
+          print('FINAL_ZIP',z.name,z.stat().st_size,hashlib.sha256(z.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: daye-603278-broker-research-3-reports-20260929
+          path: 大业股份_603278_券商深度报告_3份.zip
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
