@@ -1,0 +1,51 @@
+name: Discover Fujian Cement SGPJBG links 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-sgpjbg-link-discovery-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch pages and extract report links
+        run: |
+          python -m pip install --quiet beautifulsoup4
+          python - <<'PY'
+          from urllib.parse import urljoin
+          import requests
+          from bs4 import BeautifulSoup
+
+          pages=[
+            'https://www.sgpjbg.com/labels/shangfengshuinigongsi.html',
+            'https://www.sgpjbg.com/labels/fengbimuxiandefangchao.html',
+            'https://bg.sgpjbg.com/zhuanti/fujiangaosubaogao.html',
+          ]
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.sgpjbg.com/'})
+          keys=['福建水泥','封闭市场','高弹性低估值','石灰石资源优势突出','区域整合的领头羊','轻装上阵']
+          for idx,url in enumerate(pages,1):
+            try:
+              r=s.get(url,timeout=(30,120),allow_redirects=True)
+              print('PAGE',idx,r.status_code,len(r.content),r.url,r.headers.get('content-type'),flush=True)
+              text=r.text
+              soup=BeautifulSoup(text,'html.parser')
+              print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '',flush=True)
+              for a in soup.find_all('a',href=True):
+                label=' '.join(a.get_text(' ',strip=True).split())
+                href=urljoin(r.url,a['href'])
+                blob=(label+' '+href).lower()
+                if any(k.lower() in blob for k in keys) or ('福建水泥' in label):
+                  print('LINK',label[:500],href,flush=True)
+              for line in text.splitlines():
+                if any(k in line for k in keys):
+                  print('LINE',line[:4000],flush=True)
+            except Exception as e:
+              print('ERROR',idx,repr(e),flush=True)
+          PY
