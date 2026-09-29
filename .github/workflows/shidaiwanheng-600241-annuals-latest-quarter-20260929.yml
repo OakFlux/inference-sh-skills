@@ -1,0 +1,33 @@
+name: Build Times Wanheng 600241 annual reports package 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/shidaiwanheng-600241-annuals-latest-quarter-20260929.yml'
+      - 'scripts/build_shidaiwanheng_600241_annuals_latest_quarter_20260929.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        run: python scripts/build_shidaiwanheng_600241_annuals_latest_quarter_20260929.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: shidaiwanheng-600241-annuals-latest-quarter-20260929
+          path: 时代万恒_600241_2020-2025年报及2026年第一季度报告.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
