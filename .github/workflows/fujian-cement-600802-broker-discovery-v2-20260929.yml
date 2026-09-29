@@ -1,0 +1,52 @@
+name: Discover Fujian Cement broker research v2 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-600802-broker-discovery-v2-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query Eastmoney research report API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          code='600802'
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9',
+              'Referer':f'https://data.eastmoney.com/report/stock.jshtml?stockcode={code}',
+          })
+          params={
+              'industryCode':'*','pageSize':'5000','industry':'*','rating':'*','ratingChange':'*',
+              'beginTime':'2000-01-01','endTime':'2030-12-31','pageNo':'1','fields':'','qType':'0',
+              'orgCode':'','code':code,'rcode':'','p':'1','pageNum':'1','pageNumber':'1'
+          }
+          r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(30,180))
+          print('HTTP',r.status_code,len(r.content),r.url,flush=True)
+          r.raise_for_status()
+          payload=r.json(); rows=payload.get('data') or payload.get('Data') or payload.get('list') or []
+          if isinstance(rows,dict): rows=rows.get('list') or rows.get('data') or []
+          print('COUNT',len(rows),flush=True)
+          for x in rows:
+              rec={
+                  'title':x.get('title') or x.get('reportTitle') or x.get('REPORT_TITLE'),
+                  'infoCode':x.get('infoCode') or x.get('info_code') or x.get('reportId') or x.get('INFO_CODE'),
+                  'org':x.get('orgSName') or x.get('orgName') or x.get('ORG_SNAME') or x.get('ORG_NAME'),
+                  'date':x.get('publishDate') or x.get('pubDate') or x.get('PUBLIC_DATE') or x.get('PUBLISH_DATE'),
+                  'researcher':x.get('researcher') or x.get('researcherName') or x.get('RESEARCHER'),
+                  'pages':x.get('attachPages') or x.get('attach_pages') or x.get('ATTACH_PAGES'),
+                  'rating':x.get('emRatingName') or x.get('ratingName') or x.get('RATING_NAME'),
+              }
+              print('REPORT',json.dumps(rec,ensure_ascii=False),flush=True)
+          PY
