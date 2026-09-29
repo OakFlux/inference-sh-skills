@@ -1,0 +1,63 @@
+name: Discover Fujian Cement broker research 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-600802-broker-discovery-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query Eastmoney stock research metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import requests
+
+          code='600802'
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language':'zh-CN,zh;q=0.9',
+              'Referer':'https://data.eastmoney.com/report/stock.jshtml?stockcode=600802',
+          })
+          all_rows=[]
+          for page in range(1,6):
+              params={
+                  'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*',
+                  'beginTime':'2000-01-01','endTime':'2030-01-01','pageNo':str(page),'fields':'','qType':'0',
+                  'orgCode':'','code':code,'rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)
+              }
+              r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(30,120))
+              print('HTTP',page,r.status_code,len(r.content),r.url,flush=True)
+              r.raise_for_status()
+              d=r.json(); rows=d.get('data') or d.get('Data') or d.get('list') or []
+              if isinstance(rows,dict): rows=rows.get('list') or rows.get('data') or []
+              print('COUNT',page,len(rows),flush=True)
+              all_rows.extend(rows)
+              if len(rows)<100: break
+          print('TOTAL',len(all_rows),flush=True)
+          seen=set()
+          for x in all_rows:
+              info=x.get('infoCode') or x.get('info_code') or x.get('reportId') or x.get('INFO_CODE')
+              if not info or info in seen: continue
+              seen.add(info)
+              rec={
+                  'title':x.get('title') or x.get('reportTitle') or x.get('REPORT_TITLE'),
+                  'infoCode':info,
+                  'org':x.get('orgSName') or x.get('orgName') or x.get('ORG_SNAME') or x.get('ORG_NAME'),
+                  'date':x.get('publishDate') or x.get('pubDate') or x.get('PUBLIC_DATE') or x.get('PUBLISH_DATE'),
+                  'researcher':x.get('researcher') or x.get('researcherName') or x.get('RESEARCHER'),
+                  'pages':x.get('attachPages') or x.get('attach_pages') or x.get('ATTACH_PAGES'),
+                  'rating':x.get('emRatingName') or x.get('ratingName') or x.get('RATING_NAME'),
+              }
+              print('REPORT',json.dumps(rec,ensure_ascii=False),flush=True)
+          PY
