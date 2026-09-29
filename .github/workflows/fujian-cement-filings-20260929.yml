@@ -23,13 +23,13 @@ jobs:
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet requests pypdf
       - name: Build verified ZIP package
-        run: python scripts/run_fujian_cement_filings_20260929.py
+        run: python scripts/run_fujian_cement_filings_v2_20260929.py
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: fujian-cement-600802-filings-20260929
+          name: fujian-cement-600802-filings-v2-20260929
           path: 福建水泥_600802_2020-2025年报_2026最新季报.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
-# trigger: 2026-09-29T00:30:00+08:00
+# trigger: SSE annual-report fallback
