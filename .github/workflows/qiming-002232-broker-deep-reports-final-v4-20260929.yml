@@ -1,0 +1,61 @@
+name: Build Qiming Information broker reports final v4 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/qiming-002232-broker-deep-reports-final-v4-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Replace unavailable report source
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('scripts/build_qiming_002232_broker_deep_reports_final_20260929.py')
+          text = path.read_text(encoding='utf-8')
+          start_marker = '    {\n        "date": "2016-05-05"'
+          next_marker = '    {\n        "date": "2010-03-23"'
+          start = text.index(start_marker)
+          end = text.index(next_marker, start)
+          replacement = '\n'.join([
+              '    {',
+              '        "date": "2009-11-11",',
+              '        "broker": "江南证券",',
+              '        "broker_aliases": ["江南证券", "江南证券研究所"],',
+              '        "title": "从产业的角度全面认识——启明信息公司研究",',
+              '        "filename": "20091111_江南证券_从产业的角度全面认识.pdf",',
+              '        "url": "https://www.p5w.net/stock/lzft/gsyj/200911/P020091111538313890404.pdf",',
+              '        "page_url": "https://www.p5w.net/stock/lzft/gsyj/200911/t2666347.htm",',
+              '        "source": "全景网原始研报附件（江南证券研究所）",',
+              '        "authors": "未署名",',
+              '        "min_pages": 8,',
+              '    },',
+          ]) + '\n'
+          path.write_text(text[:start] + replacement + text[end:], encoding='utf-8')
+          PY
+          python -m py_compile scripts/build_qiming_002232_broker_deep_reports_final_20260929.py
+
+      - name: Download validate and package reports
+        run: python scripts/build_qiming_002232_broker_deep_reports_final_20260929.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: qiming-002232-broker-deep-reports-final-v4
+          path: 启明信息_002232_券商深度报告_3份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
