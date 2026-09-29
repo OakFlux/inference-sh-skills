@@ -1,0 +1,67 @@
+name: Inspect Fujian Cement Futu research pages 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-futu-page-inspect-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and inspect pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,re,html
+          from pathlib import Path
+          import requests
+
+          urls=[
+          'https://news.futunn.com/post/28984237/in-depth-study-of-fujian-cement-600802-company-outstanding-advantages',
+          'https://news.futunn.com/post/28980609/fujian-cement-600802-first-coverage-report-high-elasticity-and-low',
+          'https://news.futunn.com/post/28982593/fujian-cement-600802-the-small-and-beautiful-closed-market',
+          ]
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({
+            'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+            'Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          })
+          out=Path('pages'); out.mkdir(exist_ok=True)
+          for i,u in enumerate(urls,1):
+            try:
+              r=s.get(u,timeout=(30,120),allow_redirects=True)
+              print('PAGE',i,'STATUS',r.status_code,'BYTES',len(r.content),'FINAL',r.url,'TYPE',r.headers.get('content-type'),flush=True)
+              text=r.text
+              (out/f'{i}.html').write_text(text,encoding='utf-8',errors='ignore')
+              title=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              print('TITLE',html.unescape(re.sub(r'<[^>]+>','',title.group(1)).strip()) if title else '',flush=True)
+              urls_found=sorted(set(re.findall(r'https?://[^\"\'<>\\\s]+',text)))
+              for x in urls_found:
+                xl=x.lower()
+                if any(k in xl for k in ('.pdf','pdf/','attachment','download','research','report','file','oss','cdn')):
+                  print('URL',x[:1000],flush=True)
+              for key in ('pdf','download','attachment','source_url','sourceUrl','file_url','fileUrl','reportUrl','research','研报','福建水泥'):
+                pos=0; count=0
+                while True:
+                  pos=text.lower().find(key.lower(),pos)
+                  if pos<0 or count>=8: break
+                  snippet=text[max(0,pos-350):min(len(text),pos+850)].replace('\n',' ')
+                  print('SNIP',key,repr(snippet[:1200]),flush=True)
+                  pos+=len(key); count+=1
+            except Exception as e:
+              print('ERROR',i,repr(e),flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fujian-cement-futu-pages-20260929
+          path: pages
+          retention-days: 7
+          if-no-files-found: warn
