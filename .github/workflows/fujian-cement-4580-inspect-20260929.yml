@@ -1,0 +1,60 @@
+name: Inspect Fujian Cement 4580 archive 20260929
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-4580-inspect-20260929.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full unar file
+      - name: Download and extract
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python - <<'PY'
+          import time
+          from pathlib import Path
+          import requests
+          rid='4580'; page='https://www.sgpjbg.com/baogao/4580.html'
+          for generation in range(1,8):
+              s=requests.Session(); s.trust_env=False
+              s.headers.update({'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.sgpjbg.com/'})
+              r=s.get(page,timeout=(30,120)); print('PAGE',generation,r.status_code,len(r.content),flush=True)
+              if r.status_code != 200:
+                  time.sleep(3); continue
+              rr=s.post('https://www.sgpjbg.com/sgpjbg/View.aspx/DownLoad',json={'id':rid},headers={'Content-Type':'application/json; charset=utf-8','X-Requested-With':'XMLHttpRequest','Referer':page},timeout=(30,120))
+              print('POST',generation,rr.status_code,repr(rr.text[:300]),flush=True)
+              if rr.status_code != 200:
+                  time.sleep(3); continue
+              url=rr.json().get('d'); print('URL',generation,url,flush=True)
+              if not url:
+                  time.sleep(3); continue
+              for attempt in range(1,16):
+                  f=s.get(url,headers={'Referer':page},timeout=(30,300))
+                  print('GET',generation,attempt,f.status_code,len(f.content),f.headers.get('content-type'),flush=True)
+                  if f.status_code==200 and f.content.startswith(b'Rar!'):
+                      Path('out/4580.rar').write_bytes(f.content); raise SystemExit(0)
+                  time.sleep(2)
+              time.sleep(3)
+          raise RuntimeError('archive unavailable')
+          PY
+          file out/4580.rar
+          7z l -slt out/4580.rar || true
+          mkdir -p out/extracted
+          7z x -y -oout/extracted out/4580.rar || unar -f -o out/extracted out/4580.rar
+          find out/extracted -type f -printf '%p %s bytes\n' | sort
+          while IFS= read -r p; do file "$p"; done < <(find out/extracted -type f)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fujian-cement-4580-inspection-20260929
+          path: out
+          retention-days: 7
+          compression-level: 0
