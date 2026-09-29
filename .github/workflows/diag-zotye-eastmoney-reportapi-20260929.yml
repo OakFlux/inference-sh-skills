@@ -1,0 +1,95 @@
+name: Query Eastmoney Zotye report API and PDFs 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zotye-eastmoney-reportapi-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Query reportapi and probe PDFs
+        run: |
+          python - <<'PY'
+          import json
+          import re
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Accept': 'application/json,text/plain,*/*',
+          }
+          params = {
+              'industryCode': '*', 'pageSize': '100', 'industry': '*',
+              'rating': '*', 'ratingChange': '*',
+              'beginTime': '2017-01-01', 'endTime': '2019-12-31',
+              'pageNo': '1', 'fields': '', 'qType': '0',
+              'orgCode': '', 'code': '000980', 'rcode': '',
+              'p': '1', 'pageNum': '1', 'pageNumber': '1',
+          }
+
+          def decode_response(r):
+              text = r.text.strip()
+              try:
+                  return r.json()
+              except Exception:
+                  m = re.search(r'^[^(]*\((.*)\)\s*;?$', text, re.S)
+                  if m:
+                      return json.loads(m.group(1))
+                  raise RuntimeError('not JSON: ' + text[:500])
+
+          datasets = []
+          for endpoint in [
+              'https://reportapi.eastmoney.com/report/list',
+              'https://reportapi.eastmoney.com/report/list2',
+          ]:
+              for method in ['GET', 'POST']:
+                  try:
+                      if method == 'GET':
+                          r = s.get(endpoint, params=params, headers=headers, timeout=60)
+                      else:
+                          r = s.post(endpoint, params=params, data=params, headers=headers, timeout=60)
+                      print('\nENDPOINT', method, r.url, 'STATUS', r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+                      print('BODY_HEAD', r.text[:500].replace('\n',' '), flush=True)
+                      r.raise_for_status()
+                      data = decode_response(r)
+                      rows = data.get('data') or data.get('result', {}).get('data') or []
+                      print('TOP_KEYS', list(data.keys()), 'ROW_COUNT', len(rows), 'HITS', data.get('hits') or data.get('total') or data.get('TotalCount'), flush=True)
+                      for row in rows:
+                          title = str(row.get('title') or row.get('TITLE') or row.get('reportTitle') or '')
+                          if any(k in title for k in ['众泰', '金马', '从模仿到原创', '双轮驱动', '自主品牌后起之秀', 'OPPO']):
+                              print('MATCH_ROW', json.dumps(row, ensure_ascii=False, default=str), flush=True)
+                      datasets.extend(rows)
+                  except Exception as exc:
+                      print('ENDPOINT_ERROR', endpoint, method, repr(exc), flush=True)
+
+          unique = {}
+          for row in datasets:
+              info = row.get('infoCode') or row.get('INFO_CODE') or row.get('infocode') or row.get('reportId')
+              if info:
+                  unique[str(info)] = row
+          print('\nUNIQUE_INFO_CODES', len(unique), list(unique)[:100], flush=True)
+
+          for info, row in unique.items():
+              title = str(row.get('title') or row.get('TITLE') or row.get('reportTitle') or '')
+              if not any(k in title for k in ['众泰', '金马', '从模仿到原创', '双轮驱动', '自主品牌后起之秀', 'OPPO']):
+                  continue
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info}.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info}_1.pdf',
+              ]
+              for url in urls:
+                  try:
+                      p = s.get(url, headers={**headers, 'Accept': 'application/pdf,*/*'}, timeout=90, allow_redirects=True, stream=True)
+                      head = next(p.iter_content(64), b'')
+                      print('PDF_PROBE', info, title, p.status_code, p.headers.get('content-type'), p.headers.get('content-length'), p.url, repr(head[:20]), flush=True)
+                      p.close()
+                  except Exception as exc:
+                      print('PDF_PROBE_ERROR', info, url, repr(exc), flush=True)
+          PY
