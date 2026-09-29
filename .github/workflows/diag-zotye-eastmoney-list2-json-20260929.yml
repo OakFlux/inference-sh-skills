@@ -1,0 +1,71 @@
+name: Query Eastmoney Zotye stock reports list2 JSON 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zotye-eastmoney-list2-json-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Query list2 JSON and probe all PDFs
+        run: |
+          python - <<'PY'
+          import json
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/',
+              'Content-Type': 'application/json',
+              'Accept': 'application/json,text/plain,*/*',
+          }
+          all_rows = []
+          for begin, end in [
+              ('2017-01-01','2017-12-31'),
+              ('2018-01-01','2019-12-31'),
+              ('2000-01-01','2030-01-01'),
+          ]:
+              body = {
+                  'pageSize': 100,
+                  'pageNo': 1,
+                  'p': 1,
+                  'pageNum': 1,
+                  'pageNumber': 1,
+                  'beginTime': begin,
+                  'endTime': end,
+                  'code': '000980',
+                  'industryCode': '*',
+                  'rating': None,
+                  'ratingChange': None,
+                  'orgCode': None,
+                  'rcode': '',
+              }
+              r = s.post('https://reportapi.eastmoney.com/report/list2', json=body, headers=headers, timeout=60)
+              print('\nQUERY', begin, end, r.status_code, r.headers.get('content-type'), len(r.content), flush=True)
+              print('HEAD', r.text[:800].replace('\n',' '), flush=True)
+              r.raise_for_status()
+              data = r.json()
+              rows = data.get('data') or []
+              print('HITS', data.get('hits'), 'ROWS', len(rows), 'PAGES', data.get('TotalPage'), flush=True)
+              for row in rows:
+                  print('ROW', json.dumps(row, ensure_ascii=False, default=str), flush=True)
+              all_rows.extend(rows)
+
+          unique = {}
+          for row in all_rows:
+              info = str(row.get('infoCode') or '')
+              if info:
+                  unique[info] = row
+          print('\nUNIQUE', len(unique), flush=True)
+          for info, row in unique.items():
+              url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              p = s.get(url, headers={**headers, 'Content-Type':'', 'Accept':'application/pdf,*/*'}, timeout=120, stream=True, allow_redirects=True)
+              head = next(p.iter_content(64), b'')
+              print('PDF', info, row.get('publishDate'), row.get('orgSName'), row.get('title'), p.status_code, p.headers.get('content-type'), p.headers.get('content-length'), p.url, repr(head[:20]), flush=True)
+              p.close()
+          PY
