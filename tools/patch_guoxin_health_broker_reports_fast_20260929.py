@@ -7,6 +7,22 @@ text = text.replace('timeout=(45, 240)', 'timeout=(20, 60)')
 text = text.replace('timeout=120,\n                allow_redirects=True,', 'timeout=45,\n                allow_redirects=True,')
 text = text.replace('            quality=95,\n            optimize=True,', '            quality=90,\n            optimize=False,')
 
+old_image = '''                rgb = image.convert("RGB")
+                images.append(rgb)
+'''
+new_image = '''                if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                    rgba = image.convert("RGBA")
+                    rgb = Image.new("RGB", rgba.size, "white")
+                    rgb.paste(rgba, mask=rgba.getchannel("A"))
+                    rgba.close()
+                else:
+                    rgb = image.convert("RGB")
+                images.append(rgb)
+'''
+if old_image not in text:
+    raise SystemExit("image transparency patch anchor not found")
+text = text.replace(old_image, new_image, 1)
+
 old = '''    text_parts: list[str] = []
     for page in reader.pages[: min(pages, 12)]:
         try:
@@ -43,4 +59,4 @@ text = text.replace(old, new, 1)
 text = text.replace('timeout=240,\n    )', 'timeout=120,\n    )')
 text = text.replace('timeout=240,\n        capture_output=True,', 'timeout=120,\n        capture_output=True,')
 path.write_text(text, encoding="utf-8")
-print("Applied fast Guoxin Health packaging patch")
+print("Applied fast Guoxin Health packaging patch with white image backgrounds")
