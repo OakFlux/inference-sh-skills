@@ -1,0 +1,17 @@
+name: Discover Shidai Wanheng Hibor reports v2 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/discover-shidaiwanheng-hibor-v2-20260929.yml'
+      - 'scripts/discover_shidaiwanheng_hibor_v2_20260929.py'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/discover_shidaiwanheng_hibor_v2_20260929.py
