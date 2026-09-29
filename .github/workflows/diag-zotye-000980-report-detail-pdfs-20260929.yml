@@ -1,0 +1,122 @@
+name: Locate Zotye 000980 deep report PDFs 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zotye-000980-report-detail-pdfs-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  locate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Inspect detail pages and search exact titles
+        run: |
+          python - <<'PY'
+          import html
+          import json
+          import re
+          from urllib.parse import quote, unquote, urljoin, urlparse, parse_qs
+          import requests
+
+          reports = [
+              ('561650487353', '众泰汽车(000980)深度分析：从模仿到原创的自主车企黑马'),
+              ('544092112706', '金马股份(000980)深度研究：传统汽车和新能源汽车双轮驱动盈利快速增长'),
+              ('541841736457', '金马股份(000980)深度研究：众泰汽车-自主品牌后起之秀 持续享受中型SUV+A00级新能源高红利'),
+              ('616297399921', '金马股份(000980)“自主崛起”系列公司深度报告：二-收购剑走偏锋的众泰 打造汽车界的OPPO/VIVO'),
+              ('605961966126', '众泰汽车(000980)：网约车市场新军 纯电动更具竞争力'),
+          ]
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+
+          def clean_url(value, base):
+              value = html.unescape(value).replace('\\/', '/')
+              if value.startswith('//'):
+                  value = 'https:' + value
+              return urljoin(base, value)
+
+          def search_bing(query):
+              url = 'https://www.bing.com/search?q=' + quote(query)
+              r = s.get(url, headers=headers, timeout=60)
+              r.raise_for_status()
+              text = r.text
+              found = []
+              for m in re.finditer(r'<a[^>]+href=["\'](https?://[^"\']+)["\']', text, re.I):
+                  u = html.unescape(m.group(1))
+                  if 'bing.com/' in u or 'microsoft.com/' in u:
+                      continue
+                  parsed = urlparse(u)
+                  qs = parse_qs(parsed.query)
+                  if 'u' in qs and qs['u']:
+                      maybe = unquote(qs['u'][0])
+                      if maybe.startswith('http'):
+                          u = maybe
+                  if u not in found:
+                      found.append(u)
+              return found[:25]
+
+          for rid, expected_title in reports:
+              detail = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/index.phtml'
+              print('\n### REPORT', rid, expected_title, flush=True)
+              try:
+                  r = s.get(detail, headers=headers, timeout=60, allow_redirects=True)
+                  r.encoding = r.apparent_encoding or 'gbk'
+                  text = r.text
+                  print('DETAIL_STATUS', r.status_code, len(r.content), r.url, r.encoding, flush=True)
+                  title_match = re.search(r'<title[^>]*>(.*?)</title>', text, re.I | re.S)
+                  print('DETAIL_TITLE', re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else '', flush=True)
+                  candidates = []
+                  patterns = [
+                      r'''(?:href|src)\s*=\s*["']([^"']+)["']''',
+                      r'''https?://[^\s"'<>]+''',
+                      r'''(?:url|pdf|file|download|attachment)\s*[:=]\s*["']([^"']+)["']''',
+                  ]
+                  for pattern in patterns:
+                      for m in re.finditer(pattern, text, re.I):
+                          raw = m.group(1) if m.lastindex else m.group(0)
+                          u = clean_url(raw, r.url)
+                          low = u.lower()
+                          if any(key in low for key in ['.pdf', 'pdf.', 'download', 'attach', 'file.finance', 'report', 'research', 'rptid']):
+                              if u not in candidates:
+                                  candidates.append(u)
+                  print('DETAIL_CANDIDATES', json.dumps(candidates[:80], ensure_ascii=False), flush=True)
+                  for marker in ['下载', '报告页数', 'PDF', 'pdf', '附件', 'file.finance', 'url:', 'url=', '报告正文']:
+                      positions = [m.start() for m in re.finditer(re.escape(marker), text, re.I)]
+                      for pos in positions[:4]:
+                          snippet = re.sub(r'\s+', ' ', text[max(0,pos-350):pos+900])
+                          print('SNIPPET', marker, snippet, flush=True)
+              except Exception as exc:
+                  print('DETAIL_ERROR', repr(exc), flush=True)
+
+              for suffix in ['url', 'download', 'pdf']:
+                  probe = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/{suffix}'
+                  try:
+                      p = s.get(probe, headers={**headers, 'Referer': detail}, timeout=60, allow_redirects=True, stream=True)
+                      head = next(p.iter_content(64), b'')
+                      print('PROBE', suffix, p.status_code, p.headers.get('content-type'), p.headers.get('content-length'), p.url, repr(head[:20]), flush=True)
+                      p.close()
+                  except Exception as exc:
+                      print('PROBE_ERROR', suffix, repr(exc), flush=True)
+
+              queries = [
+                  f'"{expected_title}" pdf',
+                  f'"{expected_title}" filetype:pdf',
+                  f'"{expected_title}" site:pdf.dfcfw.com',
+                  f'"{expected_title}" site:p5w.net',
+              ]
+              all_hits = []
+              for query in queries:
+                  try:
+                      hits = search_bing(query)
+                      print('SEARCH', query, json.dumps(hits, ensure_ascii=False), flush=True)
+                      for hit in hits:
+                          if hit not in all_hits:
+                              all_hits.append(hit)
+                  except Exception as exc:
+                      print('SEARCH_ERROR', query, repr(exc), flush=True)
+              print('ALL_SEARCH_HITS', json.dumps(all_hits[:60], ensure_ascii=False), flush=True)
+          PY
