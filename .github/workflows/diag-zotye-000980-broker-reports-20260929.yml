@@ -1,0 +1,57 @@
+name: Inspect Zotye 000980 broker report sources 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zotye-000980-broker-reports-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Inspect report listings and candidate pages
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+          urls = [
+              'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=000980&t1=all',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=000980&t1=all',
+              'https://www.futunn.com/stock/000980-SZ/news/reports',
+              'https://webf10.gw.com.cn/SZ/B16/SZ000980_B16.html',
+              'https://www.p5w.net/search/?q=%E4%BC%97%E6%B3%B0%E6%B1%BD%E8%BD%A6',
+              'https://www.p5w.net/search/?q=%E9%87%91%E9%A9%AC%E8%82%A1%E4%BB%BD',
+          ]
+          for url in urls:
+              print('\n===URL===', url, flush=True)
+              try:
+                  r = s.get(url, headers=headers, timeout=60, allow_redirects=True)
+                  r.encoding = r.apparent_encoding or r.encoding or 'utf-8'
+                  text = r.text
+                  print('STATUS', r.status_code, r.headers.get('content-type'), len(r.content), r.url, r.encoding, flush=True)
+                  title_match = re.search(r'<title[^>]*>(.*?)</title>', text, re.I | re.S)
+                  title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else ''
+                  print('TITLE', title, flush=True)
+                  links = []
+                  for m in re.finditer(r'''(?:href|src)\s*=\s*["']([^"']+)["']''', text, re.I):
+                      raw = html.unescape(m.group(1))
+                      full = urljoin(r.url, raw)
+                      if any(k in full.lower() for k in ['vreport_show', 'report', '.pdf', '000980', 'zotye', 'attach', 'upload']):
+                          links.append(full)
+                  print('LINKS', json.dumps(list(dict.fromkeys(links))[:500], ensure_ascii=False, indent=2), flush=True)
+                  for pat in ['众泰汽车', '金马股份', '000980', '深度', '首次覆盖', '投资价值', '公司研究', '研报']:
+                      matches = list(re.finditer(pat, text, re.I))
+                      for m in matches[:10]:
+                          print('AROUND', pat, re.sub(r'\s+', ' ', text[max(0,m.start()-400):m.start()+1200]), flush=True)
+              except Exception as exc:
+                  print('ERROR', repr(exc), flush=True)
+          PY
