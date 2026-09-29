@@ -1,0 +1,37 @@
+name: Probe Fujian Cement PDF URLs 20260929
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-pdf-probe-20260929.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Probe candidate URLs
+        run: |
+          python - <<'PY'
+          import requests
+          reports = {
+            '4582': 'https://file.sgpjbg.com/fileroot1/2020-7/30/4f0ca4f1-e4a5-4924-89d8-3a793ae88646/4f0ca4f1-e4a5-4924-89d8-3a793ae88646',
+            '4580': 'https://file.sgpjbg.com/fileroot1/2020-7/30/e9fb8cb9-7cb4-4181-a151-54756c0513d3/e9fb8cb9-7cb4-4181-a151-54756c0513d3',
+          }
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Referer':'https://www.sgpjbg.com/','Accept':'*/*'})
+          for rid,base in reports.items():
+            candidates=[
+              base, base+'.pdf', base+'.PDF', base+'.doc', base+'.zip',
+              'https://www.sgpjbg.com/bgdown/'+rid+'.html',
+              'https://file.sgpjbg.com/fileroot1/2020-7/30/'+base.split('/')[-2]+'/'+rid+'.pdf',
+            ]
+            for url in candidates:
+              try:
+                with s.get(url,headers={'Range':'bytes=0-4095'},timeout=(20,90),allow_redirects=True,stream=True) as r:
+                  chunk=next(r.iter_content(4096),b'')
+                  print('PROBE',rid,r.status_code,r.url,r.headers.get('content-type'),r.headers.get('content-length'),r.headers.get('content-range'),repr(chunk[:40]),url,flush=True)
+              except Exception as e:
+                print('ERROR',rid,repr(e),url,flush=True)
+          PY
