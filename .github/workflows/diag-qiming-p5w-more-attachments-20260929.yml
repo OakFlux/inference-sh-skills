@@ -1,0 +1,52 @@
+name: Inspect more Qiming P5W report attachments 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-qiming-p5w-more-attachments-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect P5W PDF attachments
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+
+          pages = [
+              ('江南证券', 'https://www.p5w.net/stock/lzft/gsyj/200911/t2666347.htm'),
+              ('中金公司', 'https://www.p5w.net/stock/lzft/gsyj/200901/t2128440.htm'),
+              ('兴业证券', 'https://www.p5w.net/stock/lzft/gsyj/200903/t2230692.htm'),
+              ('中信建投', 'https://www.p5w.net/stock/lzft/gsyj/200903/t2213992.htm'),
+          ]
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9',
+          }
+          for broker, url in pages:
+              print('\n===', broker, url, '===', flush=True)
+              try:
+                  r = s.get(url, headers=headers, timeout=60, allow_redirects=True)
+                  r.encoding = r.apparent_encoding or r.encoding or 'utf-8'
+                  print('STATUS', r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+                  text = r.text
+                  title_match = re.search(r'<title[^>]*>(.*?)</title>', text, re.I | re.S)
+                  title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else ''
+                  print('TITLE', title, flush=True)
+                  links = []
+                  for match in re.finditer(r'''(?:href|src)\s*=\s*["']([^"']+)["']''', text, re.I):
+                      raw = html.unescape(match.group(1))
+                      full = urljoin(r.url, raw)
+                      if '.pdf' in full.lower():
+                          links.append(full)
+                  unique = list(dict.fromkeys(links))
+                  print('PDF_LINKS', json.dumps(unique, ensure_ascii=False, indent=2), flush=True)
+              except Exception as exc:
+                  print('ERROR', repr(exc), flush=True)
+          PY
