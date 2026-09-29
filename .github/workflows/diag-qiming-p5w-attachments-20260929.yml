@@ -1,0 +1,48 @@
+name: Inspect Qiming P5W report attachments 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-qiming-p5w-attachments-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect P5W attachment links
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'}
+          urls=[
+            'https://www.p5w.net/stock/lzft/gsyj/201003/t2882628.htm',
+            'https://www.p5w.net/stock/lzft/gsyj/201004/t2901168.htm',
+            'http://www.p5w.net/stock/lzft/gsyj/201003/t2882628.htm',
+            'http://www.p5w.net/stock/lzft/gsyj/201004/t2901168.htm',
+          ]
+          for url in urls:
+            print('\n===',url,'===',flush=True)
+            try:
+              r=s.get(url,headers=h,timeout=60,allow_redirects=True)
+              enc=r.apparent_encoding or r.encoding or 'utf-8'; r.encoding=enc
+              print('STATUS',r.status_code,r.headers.get('content-type'),len(r.content),r.url,'ENC',enc,flush=True)
+              text=r.text
+              title=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              print('TITLE',re.sub('<[^>]+>','',title.group(1)).strip() if title else '',flush=True)
+              links=[]
+              for m in re.finditer(r'''(?:href|src)\s*=\s*["']([^"']+)["']''',text,re.I):
+                raw=html.unescape(m.group(1)); full=urljoin(r.url,raw)
+                if any(k in full.lower() for k in ['pdf','attach','upload','2882628','2901168','download','002232']):
+                  links.append(full)
+              print('LINKS',json.dumps(list(dict.fromkeys(links)),ensure_ascii=False,indent=2),flush=True)
+              for pat in ['文档附件','附件','pdf','PDF','下载','启明信息']:
+                for m in list(re.finditer(pat,text,re.I))[-3:]:
+                  print('AROUND',pat,re.sub(r'\s+',' ',text[max(0,m.start()-700):m.start()+1800]),flush=True)
+            except Exception as e:
+              print('ERROR',repr(e),flush=True)
+          PY
