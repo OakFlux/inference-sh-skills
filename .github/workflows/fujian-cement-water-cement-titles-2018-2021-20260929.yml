@@ -1,0 +1,50 @@
+name: List cement research report metadata 2018-2021 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-water-cement-titles-2018-2021-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  list:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query cement report titles
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, requests
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Referer':'https://data.eastmoney.com/report/'})
+          seen=set(); results=[]
+          periods=[]
+          for year in range(2018,2022):
+              for q,(m1,m2) in enumerate(((1,3),(4,6),(7,9),(10,12)),1):
+                  periods.append((f'{year}-{m1:02d}-01',f'{year}-{m2:02d}-31'))
+          for start,end in periods:
+              for page in range(1,16):
+                  params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':start,'endTime':end,'pageNo':str(page),'fields':'','qType':'1','orgCode':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+                  r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(30,120)); r.raise_for_status()
+                  d=r.json(); rows=d.get('data') or d.get('Data') or d.get('list') or []
+                  if isinstance(rows,dict): rows=rows.get('list') or rows.get('data') or []
+                  print('PAGE',start,end,page,len(rows),flush=True)
+                  if not rows: break
+                  for x in rows:
+                      title=str(x.get('title') or x.get('reportTitle') or '')
+                      info=str(x.get('infoCode') or '')
+                      if info and info not in seen and ('水泥' in title or ('建材' in title and ('深度' in title or '策略' in title))):
+                          seen.add(info)
+                          rec={'title':title,'infoCode':info,'org':x.get('orgSName') or x.get('orgName'),'date':x.get('publishDate'),'researcher':x.get('researcher'),'pages':x.get('attachPages'),'industry':x.get('industryName') or x.get('industry')}
+                          results.append(rec)
+                  if len(rows)<100: break
+          results.sort(key=lambda x:str(x.get('date') or ''),reverse=True)
+          print('RESULTS',len(results),flush=True)
+          for rec in results:
+              print('REPORT',json.dumps(rec,ensure_ascii=False),flush=True)
+          PY
