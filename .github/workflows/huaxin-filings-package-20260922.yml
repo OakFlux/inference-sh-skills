@@ -23,7 +23,7 @@ jobs:
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet requests pypdf
       - name: Build verified ZIP package
-        run: python scripts/run_zhongxin_saike_filings_20260929.py
+        run: python scripts/run_zhongxin_saike_filings_v2_20260929.py
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
@@ -32,5 +32,3 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
-
-# Script syntax corrected; this commit starts the validated package build.
