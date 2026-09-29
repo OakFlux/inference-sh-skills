@@ -1,0 +1,78 @@
+name: Fast exact-date search for Zotye Eastmoney reports 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zotye-eastmoney-fast-exact-dates-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Search exact dates with broad report feeds
+        run: |
+          python - <<'PY'
+          import json
+          import requests
+
+          dates = ['2017-10-18', '2017-03-29', '2017-03-03', '2017-03-01']
+          needles = ['众泰', '金马', '模仿到原创', '双轮驱动', '后起之秀', 'OPPO', 'VIVO']
+          s = requests.Session(); s.trust_env = False
+          h = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/',
+              'Accept': 'application/json,text/plain,*/*',
+          }
+          found = {}
+          for date in dates:
+              print('\nDATE', date, flush=True)
+              bodies = [
+                  {'pageSize': 1000, 'pageNo': 1, 'beginTime': date, 'endTime': date},
+                  {'pageSize': 1000, 'pageNo': 1, 'beginTime': date, 'endTime': date, 'code': '*'},
+                  {'pageSize': 1000, 'pageNo': 1, 'beginTime': date, 'endTime': date, 'qType': 0},
+              ]
+              for idx, body in enumerate(bodies):
+                  body.update({'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''})
+                  try:
+                      r=s.post('https://reportapi.eastmoney.com/report/list2',json=body,headers={**h,'Content-Type':'application/json'},timeout=60)
+                      print('LIST2',idx,r.status_code,len(r.content),r.text[:120].replace('\n',' '),flush=True)
+                      if r.status_code!=200: continue
+                      data=r.json(); rows=data.get('data') or []
+                      print('META',data.get('hits'),data.get('TotalPage'),len(rows),flush=True)
+                      for row in rows:
+                          blob=' '.join(str(row.get(k) or '') for k in ('title','stockName','stockCode','orgSName','researcher'))
+                          if row.get('stockCode')=='000980' or any(n in blob for n in needles):
+                              info=str(row.get('infoCode') or '')
+                              found[info or blob]=row
+                              print('MATCH',json.dumps(row,ensure_ascii=False,default=str),flush=True)
+                  except Exception as e:
+                      print('ERR',idx,repr(e),flush=True)
+
+              params={'industryCode':'*','pageSize':'1000','industry':'*','rating':'*','ratingChange':'*','beginTime':date,'endTime':date,'pageNo':'1','fields':'','qType':'0','orgCode':'','rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
+              try:
+                  r=s.get('https://reportapi.eastmoney.com/report/list',params=params,headers=h,timeout=60)
+                  print('LISTGET',r.status_code,len(r.content),r.text[:120].replace('\n',' '),flush=True)
+                  if r.status_code==200:
+                      data=r.json(); rows=data.get('data') or []
+                      print('GETMETA',data.get('hits'),data.get('TotalPage'),len(rows),flush=True)
+                      for row in rows:
+                          blob=' '.join(str(row.get(k) or '') for k in ('title','stockName','stockCode','orgSName','researcher'))
+                          if row.get('stockCode')=='000980' or any(n in blob for n in needles):
+                              info=str(row.get('infoCode') or '')
+                              found[info or blob]=row
+                              print('MATCHGET',json.dumps(row,ensure_ascii=False,default=str),flush=True)
+              except Exception as e:
+                  print('GETERR',repr(e),flush=True)
+
+          print('\nFOUND',len(found),flush=True)
+          for info,row in found.items():
+              print('RESULT',info,json.dumps(row,ensure_ascii=False,default=str),flush=True)
+              if info.startswith('AP'):
+                  url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+                  p=s.get(url,headers={**h,'Accept':'application/pdf,*/*'},timeout=120,stream=True)
+                  head=next(p.iter_content(32),b'')
+                  print('PDF',info,p.status_code,p.headers.get('content-type'),p.headers.get('content-length'),repr(head[:16]),flush=True)
+                  p.close()
+          PY
