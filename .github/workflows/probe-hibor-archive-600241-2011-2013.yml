@@ -1,0 +1,17 @@
+name: Probe Hibor archive 600241 reports 2011 2013
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-hibor-archive-600241-2011-2013.yml'
+      - 'scripts/probe_hibor_archive_600241_2011_2013.py'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/probe_hibor_archive_600241_2011_2013.py
