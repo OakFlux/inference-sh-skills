@@ -1,0 +1,37 @@
+name: Probe Fujian Cement download API 20260929
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-download-api-probe-20260929.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Probe download API
+        run: |
+          python - <<'PY'
+          import json
+          import requests
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.sgpjbg.com/'})
+          for rid in ('4582','4580'):
+              page='https://www.sgpjbg.com/baogao/'+rid+'.html'
+              r=s.get(page,timeout=(30,120))
+              print('PAGE',rid,r.status_code,len(r.content),s.cookies.get_dict(),flush=True)
+              for body in ({'id':rid},{'id':int(rid)}):
+                  try:
+                      rr=s.post('https://www.sgpjbg.com/sgpjbg/View.aspx/DownLoad',json=body,headers={'Content-Type':'application/json; charset=utf-8','X-Requested-With':'XMLHttpRequest','Referer':page},timeout=(30,120),allow_redirects=True)
+                      print('POST_JSON',rid,body,rr.status_code,rr.url,rr.headers.get('content-type'),len(rr.content),repr(rr.text[:1000]),flush=True)
+                  except Exception as e:
+                      print('POST_JSON_ERROR',rid,repr(e),flush=True)
+              raw="{id:'"+rid+"'}"
+              try:
+                  rr=s.post('https://www.sgpjbg.com/sgpjbg/View.aspx/DownLoad',data=raw.encode(),headers={'Content-Type':'application/json; charset=utf-8','X-Requested-With':'XMLHttpRequest','Referer':page},timeout=(30,120),allow_redirects=True)
+                  print('POST_RAW',rid,rr.status_code,rr.url,rr.headers.get('content-type'),len(rr.content),repr(rr.text[:1000]),flush=True)
+              except Exception as e:
+                  print('POST_RAW_ERROR',rid,repr(e),flush=True)
+          PY
