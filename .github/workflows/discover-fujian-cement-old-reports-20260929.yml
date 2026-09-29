@@ -13,3 +13,4 @@ jobs:
       - uses: actions/checkout@v4
       - run: python -m pip install --quiet requests
       - run: python scripts/discover_fujian_cement_old_reports_20260929.py
+# rerun: extract embedded INFO_CODE metadata
