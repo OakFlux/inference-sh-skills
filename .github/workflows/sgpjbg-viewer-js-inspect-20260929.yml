@@ -1,0 +1,39 @@
+name: Inspect SGPJBG viewer JavaScript 20260929
+on:
+  push:
+    paths:
+      - '.github/workflows/sgpjbg-viewer-js-inspect-20260929.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and inspect viewer scripts
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import requests
+          urls=[
+            'https://cache.sgpjbg.com/master/view/view2.js',
+            'https://cache.sgpjbg.com/Master/view/view-mini-fz.js',
+            'https://cache.sgpjbg.com/css/view/encoder.js',
+          ]
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Referer':'https://www.sgpjbg.com/'})
+          Path('js').mkdir(exist_ok=True)
+          for i,u in enumerate(urls,1):
+            r=s.get(u,timeout=(30,120)); print('JS',i,r.status_code,len(r.content),r.url,flush=True); r.raise_for_status()
+            text=r.text; Path(f'js/{i}.js').write_text(text,encoding='utf-8')
+            for n,line in enumerate(text.splitlines(),1):
+              p=line.lower()
+              if any(k in p for k in ['#dp','getelementbyid("dp")','getelementbyid(\'dp\')','fileroot','_addpage','pageurl','imgurl','data-original','.svg','.jpg','.png','.webp']):
+                print('MATCH',i,n,line[:5000],flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sgpjbg-viewer-js-20260929
+          path: js
+          retention-days: 7
