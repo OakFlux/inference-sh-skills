@@ -1,0 +1,17 @@
+name: Probe fxbaogao search and view 600241 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-fxbaogao-search-view-600241-20260929.yml'
+      - 'scripts/probe_fxbaogao_search_view_600241_20260929.py'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/probe_fxbaogao_search_view_600241_20260929.py
