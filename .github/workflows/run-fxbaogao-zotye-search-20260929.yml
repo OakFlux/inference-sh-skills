@@ -1,0 +1,28 @@
+name: Run public Fxbaogao Zotye search 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/run-fxbaogao-zotye-search-20260929.yml'
+  workflow_dispatch:
+
+jobs:
+  search:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run archive search
+        run: |
+          cp scripts/probe_fxbaogao_search_view_600241_20260929.py /tmp/search.py
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/search.py')
+          s=p.read_text(encoding='utf-8')
+          s=s.replace('%E6%97%B6%E4%BB%A3%E4%B8%87%E6%81%92','%E4%BC%97%E6%B3%B0%E6%B1%BD%E8%BD%A6')
+          s=s.replace('时代万恒','众泰汽车').replace('600241','000980')
+          # Stop after search parsing; detail IDs are printed for follow-up verification.
+          s=s.split('# Detail/view page and image sequence probe')[0]
+          p.write_text(s,encoding='utf-8')
+          PY
+          python /tmp/search.py
