@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import html
-import json
 import re
 from urllib.parse import urljoin
 import requests
@@ -21,22 +20,19 @@ for pat in patterns:
         snippet=text[max(0,pos-3500):pos+3500]
         print('\n=== TITLE_SNIPPET',pat,'===\n',snippet,'\n=== END_SNIPPET ===',flush=True)
         for rx in [
-            r'INFO_CODE[\\\"\':= ]+([A-Za-z0-9_\-]+)',
-            r'infoCode[\\\"\':= ]+([A-Za-z0-9_\-]+)',
-            r'AP\d{15,}',
-            r'INFOCODE[^A-Za-z0-9]+([A-Za-z0-9_\-]+)',
+            r"INFO_CODE[\\\"':= ]+([A-Za-z0-9_\-]+)",
+            r"infoCode[\\\"':= ]+([A-Za-z0-9_\-]+)",
+            r"AP\d{15,}",
+            r"INFOCODE[^A-Za-z0-9]+([A-Za-z0-9_\-]+)",
         ]:
             print('REGEX',rx,re.findall(rx,snippet,re.I)[:20],flush=True)
 
-# Locate and decode the embedded page-data object if possible.
 for marker in ['var pagedata =', 'pagedata =', 'window.pagedata']:
     pos=text.find(marker)
     print('PAGEDATA_MARKER',marker,pos,flush=True)
     if pos >= 0:
         print(text[pos:pos+2500],flush=True)
 
-# Generic extraction of all research-report event objects near the embedded data.
-# The page contains JSON-like data; scan bounded objects that include EVENT_TYPE_CODE 020.
 objects=[]
 for match in re.finditer(r'\{[^{}]{0,6000}?EVENT_TYPE_CODE[^{}]{0,6000}?\}', text, re.S):
     block=html.unescape(match.group(0))
