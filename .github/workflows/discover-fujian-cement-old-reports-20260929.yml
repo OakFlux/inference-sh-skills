@@ -1,0 +1,15 @@
+name: Discover Fujian Cement legacy reports 20260929
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/discover-fujian-cement-old-reports-20260929.yml'
+  workflow_dispatch:
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/discover_fujian_cement_old_reports_20260929.py
