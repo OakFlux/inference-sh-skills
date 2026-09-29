@@ -1,0 +1,36 @@
+name: Package Taier filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_taier_filings_20260929.yml'
+      - 'tools/package_taier_filings_20260929.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Download validate and package filings
+        run: python tools/package_taier_filings_20260929.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: taier-002347-2020-2025-annual-latest-quarter
+          path: |
+            泰尔股份_002347_2020-2025年报及最新季报.zip
+            taier_filings_result.json
+            _previews_taier_filings/*.png
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
