@@ -1,0 +1,173 @@
+name: Build Daye 603278 reports ZIP v2 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/daye-603278-reports-v2-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Build verified package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          STOCK='603278'; COMPANY='大业股份'; FULL='山东大业股份有限公司'; ASOF='2026-09-29'
+          PACKAGE='大业股份_603278.SH_2020-2025年报及最新季报'
+          OUT=Path(PACKAGE); OUT.mkdir(exist_ok=True)
+          VERIFY=Path('_verify'); VERIFY.mkdir(exist_ok=True)
+
+          s=requests.Session(); s.trust_env=False
+          retry=Retry(total=5,connect=5,read=5,status=5,backoff_factor=1,status_forcelist=[429,500,502,503,504],allowed_methods=['GET'],raise_on_status=False)
+          s.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=8,pool_maxsize=8))
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Accept-Encoding':'identity','Referer':f'https://data.eastmoney.com/notices/stock/{STOCK}.html'})
+
+          def clean(x):
+              x=re.sub(r'<[^>]+>','',str(x or '')); return re.sub(r'\s+','',x.replace('&nbsp;','').replace('&#32;',''))
+
+          def get_page(page):
+              params={'page_size':100,'page_index':page,'ann_type':'A','client_source':'web','stock_list':STOCK}
+              errors=[]
+              for n in range(1,7):
+                  try:
+                      with s.get('https://np-anotice-stock.eastmoney.com/api/security/ann',params=params,timeout=(30,150),stream=True) as r:
+                          print('API',page,n,r.status_code,flush=True); r.raise_for_status()
+                          raw=b''.join(c for c in r.iter_content(65536) if c)
+                      return json.loads(raw.decode('utf-8'))
+                  except Exception as e:
+                      errors.append(repr(e)); time.sleep(n)
+              raise RuntimeError(errors)
+
+          rows=[]
+          for page in range(1,10):
+              payload=get_page(page); data=payload.get('data') or {}; batch=data.get('list') or data.get('data') or []
+              print('BATCH',page,len(batch),flush=True); rows.extend(batch)
+              if len(batch)<100: break
+
+          normalized=[]; seen=set()
+          for row in rows:
+              title=clean(row.get('title') or row.get('notice_title') or row.get('announcement_title'))
+              code=str(row.get('art_code') or row.get('info_code') or row.get('infoCode') or '')
+              date=str(row.get('notice_date') or row.get('display_time') or row.get('date') or '')
+              if title and code and code not in seen:
+                  seen.add(code); normalized.append({'title':title,'code':code,'date':date})
+
+          excluded=('摘要','英文版','英文','审计报告','鉴证报告','内部控制','社会责任','ESG','董事会工作','监事会工作','监管工作函','问询函','回复','核查意见','提示性公告','取消','业绩快报','业绩预告','财务报表','专项说明','募集资金','更正公告','补充公告','说明公告')
+          def dkey(x):
+              digits=re.sub(r'\D','',x['date']); return int(digits[:14] or 0)
+          def exact_annual(title,year):
+              return bool(re.fullmatch(rf'(?:\d{{6}}[:：])?(?:{COMPANY}|{FULL})?[:：]?(?:{year}年年度报告|{year}年度报告)(?:\(更正后\)|（更正后）|更正后|修订版|修订)?',title))
+
+          docs=[]
+          for year in range(2020,2026):
+              cand=[]
+              for x in normalized:
+                  t=x['title']
+                  if f'{year}年年度报告' not in t and f'{year}年度报告' not in t: continue
+                  if any(k in t for k in excluded): continue
+                  score=(500 if any(k in t for k in ('更正后','修订版','修订','更新后','更新')) else 0)+(200 if exact_annual(t,year) else 0)
+                  cand.append({**x,'score':score})
+              cand.sort(key=lambda x:(x['score'],dkey(x)),reverse=True)
+              print('ANNUAL_CANDIDATES',year,json.dumps(cand[:10],ensure_ascii=False),flush=True)
+              if not cand: raise RuntimeError(f'未找到{year}年完整年度报告')
+              docs.append({'filename':f'{year-2019:02d}_{COMPANY}_{STOCK}_{year}年年度报告.pdf','title':f'{COMPANY}{year}年年度报告','period':f'{year}年度','terms':[COMPANY,str(year),'年度报告'],'min_pages':70,'ann':cand[0]})
+
+          q=[]
+          for x in normalized:
+              m=re.search(r'2026年(第一|第三|一|三)季度报告',x['title'])
+              if not m or any(k in x['title'] for k in excluded+('半年度报告','中期报告')): continue
+              qnum=3 if m.group(1) in ('第三','三') else 1
+              exact=bool(re.fullmatch(rf'(?:\d{{6}}[:：])?(?:{COMPANY}|{FULL})?[:：]?2026年(?:第一|第三|一|三)季度报告',x['title']))
+              q.append({**x,'qnum':qnum,'score':200 if exact else 0})
+          q.sort(key=lambda x:(x['qnum'],x['score'],dkey(x)),reverse=True)
+          print('QUARTER_CANDIDATES',json.dumps(q[:10],ensure_ascii=False),flush=True)
+          if not q: raise RuntimeError('未找到2026年正式季报')
+          qword='第三' if q[0]['qnum']==3 else '第一'
+          docs.append({'filename':f'07_{COMPANY}_{STOCK}_2026年{qword}季度报告.pdf','title':f'{COMPANY}2026年{qword}季度报告','period':f'2026年{qword}季度','terms':[COMPANY,'2026','季度报告'],'min_pages':6,'ann':q[0]})
+
+          print('SELECTED',json.dumps([{'filename':d['filename'],**d['ann']} for d in docs],ensure_ascii=False,indent=2),flush=True)
+
+          def download(doc,dest):
+              errors=[]
+              for prefix in ('H2','H3','H1'):
+                  url=f'https://pdf.dfcfw.com/pdf/{prefix}_{doc["ann"]["code"]}_1.pdf'
+                  for attempt in range(1,5):
+                      tmp=dest.with_suffix('.pdf.part')
+                      try:
+                          with s.get(url,headers={'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*;q=0.8','Accept-Encoding':'identity'},stream=True,timeout=(30,600)) as r:
+                              print('DOWNLOAD',dest.name,prefix,attempt,r.status_code,flush=True); r.raise_for_status()
+                              with tmp.open('wb') as f:
+                                  for chunk in r.iter_content(1048576):
+                                      if chunk: f.write(chunk)
+                          data=tmp.read_bytes()
+                          if len(data)<70000 or not data.startswith(b'%PDF-'): raise RuntimeError(f'invalid {len(data)} {data[:8]!r}')
+                          tmp.replace(dest); return url
+                      except Exception as e:
+                          tmp.unlink(missing_ok=True); errors.append(repr(e)); time.sleep(attempt)
+              raise RuntimeError(f'{dest.name}: {errors}')
+
+          records=[]; hashes=set()
+          for i,doc in enumerate(docs,1):
+              dest=OUT/doc['filename']; source=download(doc,dest)
+              qc=subprocess.run(['qpdf','--check',str(dest)],capture_output=True,text=True)
+              if qc.returncode not in (0,3): raise RuntimeError(qc.stderr[-1500:])
+              pages=len(PdfReader(str(dest),strict=False).pages)
+              if pages<doc['min_pages']: raise RuntimeError(f'{dest.name}页数异常：{pages}')
+              txt=VERIFY/f'{i:02d}.txt'; subprocess.run(['pdftotext','-f','1','-l',str(min(30,pages)),str(dest),str(txt)],capture_output=True,text=True)
+              compact=re.sub(r'\s+','',txt.read_text(encoding='utf-8',errors='ignore') if txt.exists() else '')
+              missing=[t for t in doc['terms'] if t not in compact]
+              if missing: raise RuntimeError(f'{dest.name}身份检查缺少{missing}')
+              prefix=VERIFY/f'{i:02d}_page1'; rr=subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','90',str(dest),str(prefix)],capture_output=True,text=True)
+              png=Path(str(prefix)+'.png')
+              if rr.returncode or not png.exists() or png.stat().st_size<10000: raise RuntimeError(f'{dest.name}首页渲染失败')
+              data=dest.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+              if sha in hashes: raise RuntimeError(f'重复PDF {dest.name}')
+              hashes.add(sha)
+              r={'filename':dest.name,'title':doc['title'],'period':doc['period'],'announcement_title':doc['ann']['title'],'announcement_date':doc['ann']['date'],'art_code':doc['ann']['code'],'announcement_page':f'https://data.eastmoney.com/notices/detail/{STOCK}/{doc["ann"]["code"]}.html','pdf_mirror_url':source,'pages':pages,'bytes':len(data),'sha256':sha}
+              records.append(r); print('VALIDATED',json.dumps(r,ensure_ascii=False),flush=True)
+
+          readme=[f'{FULL}（{STOCK}.SH）2020-2025年年度报告及最新季报',f'整理与核验日期：{ASOF}','','收录2020—2025年度完整年度报告6份，以及截至整理日最新正式季报1份。','如同一年度存在更正后或修订版完整年报，优先采用最新版本。','已排除年报摘要、补充公告、更正公告、审计附件、问询回复、内部控制报告及半年报。','已执行PDF结构、页数、文本身份、首页渲染、SHA-256及ZIP CRC检查。','','文件清单：']
+          for n,r in enumerate(records,1):
+              readme += [f'{n}. {r["title"]}',f'   文件：{r["filename"]}',f'   公告标题：{r["announcement_title"]}',f'   公告日期：{r["announcement_date"]}',f'   页数：{r["pages"]}；大小：{r["bytes"]/1048576:.2f} MB',f'   公告页面：{r["announcement_page"]}',f'   PDF镜像：{r["pdf_mirror_url"]}',f'   SHA-256：{r["sha256"]}','']
+          (OUT/'00_文件清单与来源说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f'{r["sha256"]}  {r["filename"]}\n' for r in records),encoding='utf-8')
+
+          z=Path(PACKAGE+'.zip')
+          with zipfile.ZipFile(z,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as a:
+              for p in sorted(OUT.iterdir()): a.write(p,arcname=p.name)
+          with zipfile.ZipFile(z) as a:
+              bad=a.testzip(); pdfs=[n for n in a.namelist() if n.lower().endswith('.pdf')]
+              if bad: raise RuntimeError(f'ZIP CRC {bad}')
+              if len(pdfs)!=7: raise RuntimeError(f'ZIP PDF count {len(pdfs)}')
+          print('FINAL_ZIP',z.name,z.stat().st_size,hashlib.sha256(z.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: daye-603278-reports-v2-20260929
+          path: 大业股份_603278.SH_2020-2025年报及最新季报.zip
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
