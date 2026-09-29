@@ -1,0 +1,35 @@
+name: Find Dongwu optical report metadata 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/wufang-dongwu-optical-report-discovery-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query industry reports around 2020-07-20
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json,requests
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Referer':'https://data.eastmoney.com/report/'})
+          for page in range(1,6):
+              params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':'2020-07-19','endTime':'2020-07-22','pageNo':str(page),'fields':'','qType':'1','orgCode':'','rcode':'','p':str(page),'pageNum':str(page),'pageNumber':str(page)}
+              r=s.get('https://reportapi.eastmoney.com/report/list',params=params,timeout=(30,120)); print('HTTP',page,r.status_code,len(r.content),flush=True); r.raise_for_status()
+              d=r.json(); rows=d.get('data') or d.get('Data') or d.get('list') or []
+              if isinstance(rows,dict): rows=rows.get('list') or rows.get('data') or []
+              print('COUNT',page,len(rows),flush=True)
+              for x in rows:
+                  rec={'title':x.get('title') or x.get('reportTitle'),'infoCode':x.get('infoCode'),'org':x.get('orgSName') or x.get('orgName'),'date':x.get('publishDate'),'researcher':x.get('researcher'),'pages':x.get('attachPages'),'industry':x.get('industryName') or x.get('industry')}
+                  print('REPORT',json.dumps(rec,ensure_ascii=False),flush=True)
+              if len(rows)<100: break
+          PY
