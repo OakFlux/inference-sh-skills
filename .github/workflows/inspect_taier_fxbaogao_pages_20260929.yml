@@ -1,0 +1,26 @@
+name: Inspect Taier FxBaogao pages
+
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect_taier_fxbaogao_pages_20260929.yml'
+      - 'tools/inspect_taier_fxbaogao_pages_20260929.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests pillow
+      - run: python tools/inspect_taier_fxbaogao_pages_20260929.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: taier-fxbaogao-page-inventory
+          path: taier_fxbaogao_page_inventory.json
+          if-no-files-found: error
+          retention-days: 3
