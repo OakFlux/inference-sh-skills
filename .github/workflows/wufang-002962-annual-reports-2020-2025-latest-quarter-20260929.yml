@@ -1,0 +1,416 @@
+name: Package Wufang 002962 annual reports and latest quarter 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/wufang-002962-annual-reports-2020-2025-latest-quarter-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          STOCK = '002962'
+          COMPANY = '五方光电'
+          FULL_COMPANY = '湖北五方光电股份有限公司'
+          AS_OF = '2026-09-29'
+          PACKAGE = '五方光电_002962.SZ_2020-2025年报及最新季报'
+          OUT = Path(PACKAGE)
+          OUT.mkdir(parents=True, exist_ok=True)
+          VERIFY = Path('_verify')
+          VERIFY.mkdir(exist_ok=True)
+
+          session = requests.Session()
+          session.trust_env = False
+          retry = Retry(
+              total=6, connect=6, read=6, status=6,
+              backoff_factor=1.2,
+              status_forcelist=[429, 500, 502, 503, 504],
+              allowed_methods=['GET'],
+              raise_on_status=False,
+          )
+          session.mount('https://', HTTPAdapter(max_retries=retry, pool_connections=8, pool_maxsize=8))
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept-Encoding': 'identity',
+              'Referer': f'https://data.eastmoney.com/notices/stock/{STOCK}.html',
+          })
+
+          def clean_title(value: object) -> str:
+              text = re.sub(r'<[^>]+>', '', str(value or ''))
+              text = text.replace('&nbsp;', '').replace('&#32;', '')
+              return re.sub(r'\s+', '', text)
+
+          def fetch_json(page: int) -> dict:
+              params = {
+                  'page_size': 100,
+                  'page_index': page,
+                  'ann_type': 'A',
+                  'client_source': 'web',
+                  'stock_list': STOCK,
+              }
+              errors: list[str] = []
+              for attempt in range(1, 7):
+                  try:
+                      with session.get(
+                          'https://np-anotice-stock.eastmoney.com/api/security/ann',
+                          params=params,
+                          stream=True,
+                          timeout=(30, 180),
+                      ) as response:
+                          print('ANNOUNCEMENT_API', page, attempt, response.status_code, response.url, flush=True)
+                          response.raise_for_status()
+                          raw = b''.join(chunk for chunk in response.iter_content(64 * 1024) if chunk)
+                      return json.loads(raw.decode('utf-8'))
+                  except Exception as exc:
+                      errors.append(repr(exc))
+                      time.sleep(attempt * 1.2)
+              raise RuntimeError(f'公告接口第{page}页读取失败：{errors}')
+
+          rows: list[dict] = []
+          found_years: set[int] = set()
+          found_quarter = False
+          for page in range(1, 21):
+              payload = fetch_json(page)
+              data = payload.get('data') or {}
+              batch = data.get('list') or data.get('data') or payload.get('list') or []
+              print('BATCH', page, len(batch), flush=True)
+              if not batch:
+                  break
+              rows.extend(batch)
+              for row in batch:
+                  title = clean_title(row.get('title') or row.get('notice_title') or row.get('announcement_title'))
+                  for year in range(2020, 2026):
+                      if f'{year}年年度报告' in title or f'{year}年度报告' in title:
+                          found_years.add(year)
+                  if re.search(r'2026年(?:第一|第三|一|三)季度报告', title):
+                      found_quarter = True
+              print('FOUND', sorted(found_years), 'QUARTER', found_quarter, flush=True)
+              if found_years == set(range(2020, 2026)) and found_quarter:
+                  break
+              if len(batch) < 100:
+                  break
+              time.sleep(0.25)
+
+          if not rows:
+              raise RuntimeError('公告接口未返回数据')
+
+          normalized: list[dict] = []
+          seen_codes: set[str] = set()
+          for row in rows:
+              title = clean_title(row.get('title') or row.get('notice_title') or row.get('announcement_title'))
+              code = str(row.get('art_code') or row.get('info_code') or row.get('infoCode') or row.get('announcement_id') or '').strip()
+              date = str(row.get('notice_date') or row.get('display_time') or row.get('date') or '').strip()
+              if title and code and code not in seen_codes:
+                  seen_codes.add(code)
+                  normalized.append({'title': title, 'code': code, 'date': date})
+
+          excluded = (
+              '摘要', '英文版', '英文', '审计报告', '鉴证报告', '内部控制', '社会责任',
+              'ESG', '董事会工作', '监事会工作', '监管工作函', '问询函', '回复',
+              '核查意见', '提示性公告', '取消', '业绩快报', '业绩预告', '财务报表',
+              '专项说明', '募集资金', '更正公告', '补充公告', '说明公告',
+          )
+
+          def date_key(item: dict) -> int:
+              digits = re.sub(r'\D', '', item.get('date', ''))
+              return int(digits[:14] or 0)
+
+          def annual_exact(title: str, year: int) -> bool:
+              pattern = (
+                  rf'^(?:(?:\d{{6}}|{COMPANY}|{FULL_COMPANY})[:：])*'
+                  rf'(?:{COMPANY}|{FULL_COMPANY})?'
+                  rf'(?:{year}年年度报告|{year}年度报告)'
+                  rf'(?:\(更正后\)|（更正后）|更正后|修订版|修订|更新后|更新)?$'
+              )
+              return bool(re.fullmatch(pattern, title))
+
+          annual_candidates: dict[int, list[dict]] = {}
+          for year in range(2020, 2026):
+              candidates: list[dict] = []
+              for item in normalized:
+                  title = item['title']
+                  if f'{year}年年度报告' not in title and f'{year}年度报告' not in title:
+                      continue
+                  if any(term in title for term in excluded):
+                      continue
+                  score = 0
+                  if annual_exact(title, year):
+                      score += 300
+                  if any(term in title for term in ('更正后', '修订版', '修订', '更新后', '更新')):
+                      score += 500
+                  candidates.append({**item, 'score': score})
+              candidates.sort(key=lambda x: (x['score'], date_key(x)), reverse=True)
+              print('ANNUAL_CANDIDATES', year, json.dumps(candidates[:15], ensure_ascii=False), flush=True)
+              if not candidates:
+                  related = [x['title'] for x in normalized if str(year) in x['title'] and '年度报告' in x['title']]
+                  raise RuntimeError(f'未找到{year}年度完整报告；相关标题：{related[:40]}')
+              annual_candidates[year] = candidates
+
+          quarter_candidates: list[dict] = []
+          quarter_re = re.compile(r'2026年(第一|第三|一|三)季度报告')
+          for item in normalized:
+              title = item['title']
+              match = quarter_re.search(title)
+              if not match:
+                  continue
+              if any(term in title for term in excluded + ('半年度报告', '中期报告')):
+                  continue
+              qnum = 3 if match.group(1) in ('第三', '三') else 1
+              exact = bool(re.fullmatch(
+                  rf'^(?:(?:\d{{6}}|{COMPANY}|{FULL_COMPANY})[:：])*(?:{COMPANY}|{FULL_COMPANY})?2026年(?:第一|第三|一|三)季度报告$',
+                  title,
+              ))
+              quarter_candidates.append({**item, 'qnum': qnum, 'score': 300 if exact else 0})
+          quarter_candidates.sort(key=lambda x: (x['qnum'], x['score'], date_key(x)), reverse=True)
+          print('QUARTER_CANDIDATES', json.dumps(quarter_candidates[:20], ensure_ascii=False), flush=True)
+          if not quarter_candidates:
+              related = [x['title'] for x in normalized if '2026' in x['title'] and '季度报告' in x['title']]
+              raise RuntimeError(f'未找到2026年正式季度报告；相关标题：{related[:40]}')
+
+          def download_raw(code: str, dest: Path) -> str:
+              errors: list[str] = []
+              for prefix in ('H2', 'H3', 'H1'):
+                  url = f'https://pdf.dfcfw.com/pdf/{prefix}_{code}_1.pdf'
+                  for attempt in range(1, 5):
+                      tmp = dest.with_suffix(dest.suffix + '.part')
+                      try:
+                          with session.get(
+                              url,
+                              headers={
+                                  'Referer': 'https://data.eastmoney.com/',
+                                  'Accept': 'application/pdf,application/octet-stream;q=0.9,*/*;q=0.8',
+                                  'Accept-Encoding': 'identity',
+                              },
+                              stream=True,
+                              allow_redirects=True,
+                              timeout=(30, 600),
+                          ) as response:
+                              print('DOWNLOAD', dest.name, prefix, attempt, response.status_code, response.headers.get('Content-Length'), flush=True)
+                              response.raise_for_status()
+                              with tmp.open('wb') as handle:
+                                  for chunk in response.iter_content(1024 * 1024):
+                                      if chunk:
+                                          handle.write(chunk)
+                          data = tmp.read_bytes()
+                          if len(data) < 70_000 or not data.startswith(b'%PDF-'):
+                              raise RuntimeError(f'invalid PDF bytes={len(data)}, header={data[:12]!r}')
+                          tmp.replace(dest)
+                          return url
+                      except Exception as exc:
+                          tmp.unlink(missing_ok=True)
+                          errors.append(f'{url} attempt {attempt}: {exc!r}')
+                          time.sleep(attempt)
+              raise RuntimeError(f'{dest.name}下载失败：{errors}')
+
+          def validate_pdf(dest: Path, *, min_pages: int, terms: list[str], index: int) -> tuple[int, int, str]:
+              structure = subprocess.run(['qpdf', '--check', str(dest)], capture_output=True, text=True)
+              if structure.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf结构检查失败：{dest.name}\n{structure.stderr[-1800:]}')
+              pages = len(PdfReader(str(dest), strict=False).pages)
+              if pages < min_pages:
+                  raise RuntimeError(f'{dest.name}页数异常：{pages} < {min_pages}')
+              text_path = VERIFY / f'{index:02d}.txt'
+              extraction = subprocess.run(
+                  ['pdftotext', '-f', '1', '-l', str(min(35, pages)), str(dest), str(text_path)],
+                  capture_output=True,
+                  text=True,
+              )
+              text = text_path.read_text(encoding='utf-8', errors='ignore') if text_path.exists() else ''
+              compact = re.sub(r'\s+', '', text)
+              missing = [term for term in terms if term not in compact]
+              if missing:
+                  raise RuntimeError(f'{dest.name}身份检查缺少{missing}；pdftotext={extraction.returncode}')
+              render_prefix = VERIFY / f'{index:02d}_page1'
+              render = subprocess.run(
+                  ['pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '90', str(dest), str(render_prefix)],
+                  capture_output=True,
+                  text=True,
+              )
+              png = Path(str(render_prefix) + '.png')
+              if render.returncode != 0 or not png.exists() or png.stat().st_size < 10_000:
+                  raise RuntimeError(f'{dest.name}首页渲染失败：{render.stderr[-1000:]}')
+              data = dest.read_bytes()
+              return pages, len(data), hashlib.sha256(data).hexdigest()
+
+          records: list[dict] = []
+          seen_hashes: set[str] = set()
+          index = 0
+
+          for year in range(2020, 2026):
+              index += 1
+              filename = f'{index:02d}_{COMPANY}_{STOCK}_{year}年年度报告.pdf'
+              dest = OUT / filename
+              errors: list[str] = []
+              selected = None
+              selected_url = None
+              selected_stats = None
+              for candidate in annual_candidates[year]:
+                  try:
+                      source_url = download_raw(candidate['code'], dest)
+                      stats = validate_pdf(dest, min_pages=70, terms=[COMPANY, str(year), '年度报告'], index=index)
+                      selected = candidate
+                      selected_url = source_url
+                      selected_stats = stats
+                      break
+                  except Exception as exc:
+                      errors.append(f'{candidate["title"]} ({candidate["code"]}): {exc!r}')
+                      dest.unlink(missing_ok=True)
+              if selected is None or selected_stats is None or selected_url is None:
+                  raise RuntimeError(f'{year}年报候选均验证失败：{errors}')
+              pages, size, sha256 = selected_stats
+              if sha256 in seen_hashes:
+                  raise RuntimeError(f'检测到重复PDF：{filename}')
+              seen_hashes.add(sha256)
+              record = {
+                  'filename': filename,
+                  'title': f'{COMPANY}{year}年年度报告',
+                  'period': f'{year}年度',
+                  'announcement_title': selected['title'],
+                  'announcement_date': selected['date'],
+                  'art_code': selected['code'],
+                  'announcement_page': f'https://data.eastmoney.com/notices/detail/{STOCK}/{selected["code"]}.html',
+                  'pdf_mirror_url': selected_url,
+                  'pages': pages,
+                  'bytes': size,
+                  'sha256': sha256,
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          index += 1
+          quarter_errors: list[str] = []
+          qselected = None
+          qsource = None
+          qstats = None
+          qword = None
+          qdest = None
+          for candidate in quarter_candidates:
+              current_word = '第三' if candidate['qnum'] == 3 else '第一'
+              current_dest = OUT / f'{index:02d}_{COMPANY}_{STOCK}_2026年{current_word}季度报告.pdf'
+              try:
+                  source_url = download_raw(candidate['code'], current_dest)
+                  stats = validate_pdf(current_dest, min_pages=5, terms=[COMPANY, '2026', '季度报告'], index=index)
+                  qselected = candidate
+                  qsource = source_url
+                  qstats = stats
+                  qword = current_word
+                  qdest = current_dest
+                  break
+              except Exception as exc:
+                  quarter_errors.append(f'{candidate["title"]} ({candidate["code"]}): {exc!r}')
+                  current_dest.unlink(missing_ok=True)
+          if qselected is None or qstats is None or qsource is None or qword is None or qdest is None:
+              raise RuntimeError(f'季报候选均验证失败：{quarter_errors}')
+          pages, size, sha256 = qstats
+          if sha256 in seen_hashes:
+              raise RuntimeError(f'检测到重复PDF：{qdest.name}')
+          seen_hashes.add(sha256)
+          record = {
+              'filename': qdest.name,
+              'title': f'{COMPANY}2026年{qword}季度报告',
+              'period': f'2026年{qword}季度',
+              'announcement_title': qselected['title'],
+              'announcement_date': qselected['date'],
+              'art_code': qselected['code'],
+              'announcement_page': f'https://data.eastmoney.com/notices/detail/{STOCK}/{qselected["code"]}.html',
+              'pdf_mirror_url': qsource,
+              'pages': pages,
+              'bytes': size,
+              'sha256': sha256,
+          }
+          records.append(record)
+          print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          if len(records) != 7:
+              raise RuntimeError(f'应有7份PDF，实际为{len(records)}份')
+
+          readme = [
+              f'{FULL_COMPANY}（{STOCK}.SZ）2020—2025年年度报告及最新季报',
+              f'整理与核验日期：{AS_OF}',
+              '',
+              '收录内容：',
+              '1. 2020、2021、2022、2023、2024和2025年度完整年度报告，共6份。',
+              f'2. 截至{AS_OF}已披露的最新正式季度报告：{records[-1]["title"]}。',
+              '',
+              '口径说明：',
+              '1. 如同一年度存在更正后或修订版完整年报，优先采用最新完整版本。',
+              '2. 已排除年度报告摘要、英文版、补充公告、更正公告、单独审计附件、业绩快报、问询回复、内部控制报告和半年度报告。',
+              '3. 公告标题和日期通过公开公告接口检索；PDF为公告文件镜像。',
+              '4. 已执行PDF文件头、大小、页数、公司与报告期文本、qpdf结构、首页渲染、SHA-256和ZIP CRC检查。',
+              '',
+              '文件清单：',
+          ]
+          for number, item in enumerate(records, start=1):
+              readme.extend([
+                  f'{number}. {item["title"]}',
+                  f'   文件：{item["filename"]}',
+                  f'   公告标题：{item["announcement_title"]}',
+                  f'   公告日期：{item["announcement_date"]}',
+                  f'   页数：{item["pages"]}；大小：{item["bytes"] / 1048576:.2f} MB',
+                  f'   公告页面：{item["announcement_page"]}',
+                  f'   PDF镜像：{item["pdf_mirror_url"]}',
+                  f'   SHA-256：{item["sha256"]}',
+                  '',
+              ])
+
+          (OUT / '00_文件清单与来源说明.txt').write_text('\n'.join(readme), encoding='utf-8')
+          (OUT / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding='utf-8')
+          (OUT / 'SHA256SUMS.txt').write_text(
+              ''.join(f'{item["sha256"]}  {item["filename"]}\n' for item in records),
+              encoding='utf-8',
+          )
+
+          zip_path = Path(PACKAGE + '.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+              for path in sorted(OUT.iterdir()):
+                  archive.write(path, arcname=path.name)
+          with zipfile.ZipFile(zip_path, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC检查失败：{bad}')
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise RuntimeError(f'ZIP内PDF数量异常：{len(pdfs)}')
+          print('FINAL_ZIP', zip_path.name, zip_path.stat().st_size, hashlib.sha256(zip_path.read_bytes()).hexdigest(), flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: wufang-002962-annual-reports-latest-quarter-20260929
+          path: 五方光电_002962.SZ_2020-2025年报及最新季报.zip
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
