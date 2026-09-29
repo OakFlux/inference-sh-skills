@@ -1,0 +1,111 @@
+name: Build Daye 603278 full broker research ZIP v2 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/daye-603278-broker-research-v2-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Install PDF tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download, validate and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, re, subprocess, time, zipfile
+          from pathlib import Path
+          import requests
+          from pypdf import PdfReader
+          from requests.adapters import HTTPAdapter
+          from urllib3.util.retry import Retry
+
+          OUT=Path('大业股份_603278_券商深度报告_3份'); OUT.mkdir(exist_ok=True)
+          VERIFY=Path('_verify'); VERIFY.mkdir(exist_ok=True)
+          docs=[
+            {'filename':'01_上海证券_首次覆盖_轮胎骨架材料龙头业绩反转_2024-03-08.pdf','title':'大业股份首次覆盖：轮胎骨架材料龙头业绩反转，增收降本推动长期成长','institution':'上海证券','researcher':'仇百良、刘昊楠','date':'2024-03-08','info':'AP202403081626022330','min_pages':20},
+            {'filename':'02_东兴证券_金属骨架材料龙头或迈入第二成长极_2024-02-02.pdf','title':'金属骨架材料龙头或迈入第二成长极','institution':'东兴证券','researcher':'张天丰','date':'2024-02-02','info':'AP202402021620073839','min_pages':20},
+            {'filename':'03_华安证券_骨架材料需求回暖_产能释放大业将成_2023-09-27.pdf','title':'骨架材料需求回暖，产能释放大业将成','institution':'华安证券','researcher':'许勇其、黄玺、汪浚哲','date':'2023-09-27','info':'AP202309271600009092','min_pages':20},
+          ]
+
+          s=requests.Session(); s.trust_env=False
+          retry=Retry(total=6,connect=6,read=6,status=6,backoff_factor=1.2,status_forcelist=[429,500,502,503,504],allowed_methods=['GET'],raise_on_status=False)
+          s.mount('https://',HTTPAdapter(max_retries=retry,pool_connections=8,pool_maxsize=8))
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Accept-Encoding':'identity','Referer':'https://data.eastmoney.com/'})
+
+          def download(doc,dest):
+              errors=[]
+              for prefix in ('H3','H2','H1'):
+                  url=f'https://pdf.dfcfw.com/pdf/{prefix}_{doc["info"]}_1.pdf'
+                  for attempt in range(1,5):
+                      tmp=dest.with_suffix('.pdf.part')
+                      try:
+                          with s.get(url,headers={'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*;q=0.8','Accept-Encoding':'identity'},stream=True,timeout=(30,600)) as r:
+                              print('DOWNLOAD',dest.name,prefix,attempt,r.status_code,r.headers.get('Content-Length'),flush=True)
+                              r.raise_for_status()
+                              with tmp.open('wb') as f:
+                                  for chunk in r.iter_content(1048576):
+                                      if chunk: f.write(chunk)
+                          data=tmp.read_bytes()
+                          if len(data)<200000 or not data.startswith(b'%PDF-'): raise RuntimeError(f'invalid PDF {len(data)} {data[:12]!r}')
+                          tmp.replace(dest); return url
+                      except Exception as e:
+                          tmp.unlink(missing_ok=True); errors.append(repr(e)); time.sleep(attempt)
+              raise RuntimeError(f'{dest.name} download failed: {errors}')
+
+          manifest=[]; hashes=set()
+          for i,doc in enumerate(docs,1):
+              dest=OUT/doc['filename']; source=download(doc,dest)
+              qc=subprocess.run(['qpdf','--check',str(dest)],capture_output=True,text=True)
+              if qc.returncode not in (0,3): raise RuntimeError(qc.stderr[-1500:])
+              pages=len(PdfReader(str(dest),strict=False).pages)
+              if pages<doc['min_pages']: raise RuntimeError(f'{dest.name}: only {pages} pages')
+              txt=VERIFY/f'{i:02d}.txt'; subprocess.run(['pdftotext','-f','1','-l',str(min(20,pages)),str(dest),str(txt)],capture_output=True,text=True)
+              compact=re.sub(r'\s+','',txt.read_text(encoding='utf-8',errors='ignore') if txt.exists() else '')
+              if '大业股份' not in compact: raise RuntimeError(f'{dest.name}: company identity missing')
+              pngp=VERIFY/f'{i:02d}_page1'; rr=subprocess.run(['pdftoppm','-f','1','-l','1','-singlefile','-png','-r','90',str(dest),str(pngp)],capture_output=True,text=True)
+              png=Path(str(pngp)+'.png')
+              if rr.returncode or not png.exists() or png.stat().st_size<10000: raise RuntimeError(f'{dest.name}: render failed')
+              data=dest.read_bytes(); sha=hashlib.sha256(data).hexdigest()
+              if sha in hashes: raise RuntimeError('duplicate PDF')
+              hashes.add(sha)
+              item={**doc,'pages':pages,'bytes':len(data),'pdf_url':source,'sha256':sha}
+              manifest.append(item); print('VALIDATED',json.dumps(item,ensure_ascii=False),flush=True)
+
+          readme=['大业股份（603278.SH）券商深度报告精选（3份）','整理日期：2026-09-29','','本包收录三份25页以上的完整公司研究报告，未混入短篇业绩点评。','报告版权归原券商及作者所有，仅供研究参考，不构成投资建议。','','文件清单：']
+          for n,x in enumerate(manifest,1):
+              readme += [f'{n}. {x["title"]}',f'   机构：{x["institution"]}；研究员：{x["researcher"]}；发布日期：{x["date"]}',f'   文件：{x["filename"]}；页数：{x["pages"]}；大小：{x["bytes"]/1048576:.2f} MB',f'   PDF来源：{x["pdf_url"]}',f'   SHA-256：{x["sha256"]}','']
+          (OUT/'00_文件清单与来源说明.txt').write_text('\n'.join(readme),encoding='utf-8')
+          (OUT/'manifest.json').write_text(json.dumps(manifest,ensure_ascii=False,indent=2),encoding='utf-8')
+          (OUT/'SHA256SUMS.txt').write_text(''.join(f'{x["sha256"]}  {x["filename"]}\n' for x in manifest),encoding='utf-8')
+
+          z=Path('大业股份_603278_券商深度报告_3份.zip')
+          with zipfile.ZipFile(z,'w',compression=zipfile.ZIP_STORED,allowZip64=True) as a:
+              for p in sorted(OUT.iterdir()): a.write(p,arcname=p.name)
+          with zipfile.ZipFile(z) as a:
+              bad=a.testzip(); pdfs=[n for n in a.namelist() if n.lower().endswith('.pdf')]
+              if bad: raise RuntimeError(f'ZIP CRC {bad}')
+              if len(pdfs)!=3: raise RuntimeError(f'ZIP PDF count {len(pdfs)}')
+          print('FINAL_ZIP',z.name,z.stat().st_size,hashlib.sha256(z.read_bytes()).hexdigest(),flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: daye-603278-full-broker-research-v2-20260929
+          path: 大业股份_603278_券商深度报告_3份.zip
+          retention-days: 7
+          if-no-files-found: error
+          compression-level: 0
