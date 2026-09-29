@@ -1,0 +1,33 @@
+name: Build Zotye 000980 broker report package 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zotye-000980-broker-reports-package-20260929.yml'
+      - 'scripts/build_zotye_000980_broker_reports_package_20260929.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF tools and Python packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf reportlab
+
+      - name: Build validate and package reports
+        run: python scripts/build_zotye_000980_broker_reports_package_20260929.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zotye-000980-broker-reports-package
+          path: 众泰汽车_000980_券商深度报告资料包_3份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
