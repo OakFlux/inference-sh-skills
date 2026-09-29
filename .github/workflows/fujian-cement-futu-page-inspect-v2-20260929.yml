@@ -1,0 +1,50 @@
+name: Inspect Fujian Cement Futu pages v2 20260929
+
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-futu-page-inspect-v2-20260929.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch pages
+        run: |
+          mkdir -p pages
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          import requests
+          urls = [
+              'https://news.futunn.com/post/28984237/in-depth-study-of-fujian-cement-600802-company-outstanding-advantages',
+              'https://news.futunn.com/post/28980609/fujian-cement-600802-first-coverage-report-high-elasticity-and-low',
+              'https://news.futunn.com/post/28982593/fujian-cement-600802-the-small-and-beautiful-closed-market',
+          ]
+          s = requests.Session()
+          s.trust_env = False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'})
+          for i, url in enumerate(urls, 1):
+              try:
+                  r = s.get(url, timeout=(30, 120), allow_redirects=True)
+                  text = r.text
+                  Path(f'pages/{i}.html').write_text(text, encoding='utf-8')
+                  print('PAGE', i, r.status_code, len(r.content), r.url, r.headers.get('content-type'), flush=True)
+                  for line in text.splitlines():
+                      low = line.lower()
+                      if '.pdf' in low or 'download' in low or 'attachment' in low or 'fileurl' in low or 'sourceurl' in low:
+                          print('MATCH', i, line[:3000], flush=True)
+              except Exception as exc:
+                  print('ERROR', i, repr(exc), flush=True)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fujian-cement-futu-pages-v2-20260929
+          path: pages
+          retention-days: 7
+          if-no-files-found: warn
