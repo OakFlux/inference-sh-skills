@@ -1,0 +1,54 @@
+name: Inspect Fujian Cement report archives 20260929
+on:
+  push:
+    paths:
+      - '.github/workflows/fujian-cement-rar-inspect-20260929.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install archive tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq p7zip-full unar file
+      - name: Download and inspect archives
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import requests
+          Path('archives').mkdir(exist_ok=True)
+          s=requests.Session(); s.trust_env=False
+          s.headers.update({'User-Agent':'Mozilla/5.0 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.sgpjbg.com/'})
+          for rid in ('4582','4580'):
+              page='https://www.sgpjbg.com/baogao/'+rid+'.html'
+              r=s.get(page,timeout=(30,120)); r.raise_for_status()
+              rr=s.post('https://www.sgpjbg.com/sgpjbg/View.aspx/DownLoad',json={'id':rid},headers={'Content-Type':'application/json; charset=utf-8','X-Requested-With':'XMLHttpRequest','Referer':page},timeout=(30,120)); rr.raise_for_status()
+              url=rr.json()['d']; print('ARCHIVE_URL',rid,url,flush=True)
+              with s.get(url,headers={'Referer':page},stream=True,timeout=(30,300)) as f:
+                  print('ARCHIVE_GET',rid,f.status_code,f.url,f.headers.get('content-type'),f.headers.get('content-length'),flush=True); f.raise_for_status()
+                  dest=Path('archives')/(rid+'.rar')
+                  with dest.open('wb') as out:
+                      for chunk in f.iter_content(1024*1024):
+                          if chunk: out.write(chunk)
+              print('ARCHIVE_SAVED',rid,dest.stat().st_size,repr(dest.read_bytes()[:16]),flush=True)
+          PY
+          for f in archives/*.rar; do
+            echo "==== $f ===="
+            file "$f" || true
+            7z l -slt "$f" || true
+            mkdir -p "${f%.rar}_out"
+            7z x -y -o"${f%.rar}_out" "$f" || unar -f -o "${f%.rar}_out" "$f" || true
+            find "${f%.rar}_out" -type f -printf '%p %s bytes\n' | sort
+            while IFS= read -r p; do file "$p"; done < <(find "${f%.rar}_out" -type f)
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fujian-cement-rar-inspection-20260929
+          path: archives
+          retention-days: 7
+          if-no-files-found: error
