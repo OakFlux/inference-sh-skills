@@ -1,0 +1,23 @@
+name: Fetch Hibor 1818027 dynamic content
+on:
+  push:
+    paths:
+      - '.github/workflows/fetch_hibor_1818027_newcontent.yml'
+      - 'tools/fetch_hibor_1818027_newcontent.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python tools/fetch_hibor_1818027_newcontent.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hibor-1818027-newcontent
+          path: hibor_1818027_newcontent.html
+          if-no-files-found: error
+          retention-days: 3
