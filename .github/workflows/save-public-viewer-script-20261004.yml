@@ -4,19 +4,16 @@ on:
   push:
     paths:
       - '.github/workflows/save-public-viewer-script-20261004.yml'
+      - 'scripts/query_public_report_catalog_20261004.py'
+  workflow_dispatch:
 
 jobs:
   save:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - name: Save script
-        run: |
-          curl -L --fail --retry 3 -A 'Mozilla/5.0' 'https://www.fxbaogao.com/_fxbg/2609291744/js/app-pages-fxbg-main-js.4e85af91191f3f7c70f1.chunk.js' -o viewer.js
-          wc -c viewer.js
-      - name: Upload script
-        uses: actions/upload-artifact@v4
-        with:
-          name: public-report-viewer-script
-          path: viewer.js
-          compression-level: 0
-          retention-days: 1
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests
+      - name: Query public catalog
+        run: python scripts/query_public_report_catalog_20261004.py
