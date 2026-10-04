@@ -1,10 +1,10 @@
-name: Build Hotgen Biotech 688068 filings package 20261005
+name: Build Hotgen Biotech 688068 filings package 20261005 v2
 
 on:
   push:
     paths:
       - '.github/workflows/build-hotgen-688068-filings-20261005.yml'
-      - 'scripts/build_hotgen_688068_filings_20261005.py'
+      - 'scripts/build_hotgen_688068_filings_20261005_v2.py'
   workflow_dispatch:
 
 jobs:
@@ -21,12 +21,12 @@ jobs:
           python -m pip install --quiet requests pypdf
 
       - name: Discover download validate and package reports
-        run: python scripts/build_hotgen_688068_filings_20261005.py
+        run: python scripts/build_hotgen_688068_filings_20261005_v2.py
 
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: hotgen-688068-filings-20261005
+          name: hotgen-688068-filings-20261005-v2
           path: 热景生物_688068_2020-2025年报及最新季报_截至2026-10-05.zip
           if-no-files-found: error
           compression-level: 0
