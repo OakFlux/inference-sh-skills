@@ -1,0 +1,129 @@
+name: Inspect Tianpu 605255 broker reports 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-tianpu-605255-broker-reports-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Query report databases and search pages
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import quote, urljoin
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+
+          print('=== EASTMONEY API ===', flush=True)
+          for code in ['605255', 'sh605255']:
+              for qtype in ['0', '1']:
+                  params = {
+                      'industryCode': '*', 'pageSize': '100', 'industry': '*',
+                      'rating': '*', 'ratingChange': '*',
+                      'beginTime': '2015-01-01', 'endTime': '2030-01-01',
+                      'pageNo': '1', 'fields': '', 'qType': qtype,
+                      'orgCode': '', 'code': code, 'rcode': '',
+                      'p': '1', 'pageNum': '1', 'pageNumber': '1',
+                  }
+                  try:
+                      r = s.get('https://reportapi.eastmoney.com/report/list', params=params,
+                                headers={**headers, 'Referer':'https://data.eastmoney.com/report/605255.html'}, timeout=90)
+                      print('EASTMONEY', code, qtype, r.status_code, r.url, r.text[:15000], flush=True)
+                  except Exception as exc:
+                      print('EASTMONEY_ERROR', code, qtype, repr(exc), flush=True)
+
+          print('\n=== SINA LISTINGS ===', flush=True)
+          sina_urls = [
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=605255&t1=all',
+              'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=sh605255&t1=all',
+              'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=605255&t1=all',
+              'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=sh605255&t1=all',
+          ]
+          for url in sina_urls:
+              try:
+                  r = s.get(url, headers=headers, timeout=90, allow_redirects=True)
+                  r.encoding = r.apparent_encoding or r.encoding or 'gbk'
+                  text = r.text
+                  clean = re.sub(r'<script.*?</script>|<style.*?</style>', ' ', text, flags=re.I|re.S)
+                  clean = html.unescape(re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', clean)))
+                  links=[]
+                  for m in re.finditer(r'''(?:href|src)\s*=\s*["']([^"']+)["']''', text, re.I):
+                      full=urljoin(r.url, html.unescape(m.group(1)))
+                      if any(k in full.lower() for k in ['vreport_show','rptid','report','pdf']): links.append(full)
+                  print('\nSINA', url, r.status_code, r.url, flush=True)
+                  print('TEXT', clean[:20000], flush=True)
+                  print('LINKS', json.dumps(list(dict.fromkeys(links))[:300], ensure_ascii=False, indent=2), flush=True)
+              except Exception as exc:
+                  print('SINA_ERROR', url, repr(exc), flush=True)
+
+          print('\n=== SEARCH ENGINES ===', flush=True)
+          queries = [
+              '"天普股份" 券商 深度 报告 PDF',
+              '"天普股份" 605255 公司研究 PDF',
+              '"天普股份" 新股研究 报告',
+              '"宁波市天普橡胶科技股份有限公司" 研报',
+              'site:pdf.dfcfw.com "天普股份"',
+              'site:fxbaogao.com "天普股份"',
+              'site:sdyanbao.com "天普股份"',
+              'site:hangyan.co "天普股份"',
+          ]
+          for q in queries:
+              for engine, base in [
+                  ('bing', 'https://www.bing.com/search?q='),
+                  ('baidu', 'https://www.baidu.com/s?wd='),
+              ]:
+                  url = base + quote(q)
+                  try:
+                      r=s.get(url,headers=headers,timeout=90,allow_redirects=True)
+                      r.encoding=r.apparent_encoding or r.encoding or 'utf-8'
+                      text=r.text
+                      links=[]
+                      for m in re.finditer(r'''href\s*=\s*["']([^"']+)["']''',text,re.I):
+                          full=html.unescape(m.group(1))
+                          if full.startswith('http') and any(k in full.lower() for k in ['report','pdf','yanbao','hibor','fxbaogao','eastmoney','sina','hangyan','sdyanbao','stockstar','p5w']):
+                              links.append(full)
+                      clean=re.sub(r'<script.*?</script>|<style.*?</style>',' ',text,flags=re.I|re.S)
+                      clean=html.unescape(re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',clean)))
+                      print('\nSEARCH',engine,q,'STATUS',r.status_code,'FINAL',r.url,'LEN',len(r.content),flush=True)
+                      print('LINKS',json.dumps(list(dict.fromkeys(links))[:100],ensure_ascii=False,indent=2),flush=True)
+                      pos=clean.find('天普股份')
+                      print('TEXT',clean[max(0,pos-1000):pos+10000] if pos>=0 else clean[:5000],flush=True)
+                  except Exception as exc:
+                      print('SEARCH_ERROR',engine,q,repr(exc),flush=True)
+
+          print('\n=== DIRECT SITE SEARCHES ===', flush=True)
+          direct_urls = [
+              'https://www.fxbaogao.com/search?keyword=' + quote('天普股份'),
+              'https://www.fxbaogao.com/search?keywords=' + quote('天普股份'),
+              'https://www.sdyanbao.com/search?keyword=' + quote('天普股份'),
+              'https://www.hangyan.co/search?q=' + quote('天普股份'),
+              'https://data.eastmoney.com/report/605255.html',
+          ]
+          for url in direct_urls:
+              try:
+                  r=s.get(url,headers=headers,timeout=90,allow_redirects=True)
+                  r.encoding=r.apparent_encoding or r.encoding or 'utf-8'
+                  text=r.text
+                  clean=re.sub(r'<script.*?</script>|<style.*?</style>',' ',text,flags=re.I|re.S)
+                  clean=html.unescape(re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',clean)))
+                  links=[]
+                  for m in re.finditer(r'''href\s*=\s*["']([^"']+)["']''',text,re.I):
+                      full=urljoin(r.url,html.unescape(m.group(1)))
+                      if any(k in full.lower() for k in ['detail','report','pdf','605255']): links.append(full)
+                  print('\nDIRECT',url,'STATUS',r.status_code,'FINAL',r.url,'LEN',len(r.content),flush=True)
+                  print('LINKS',json.dumps(list(dict.fromkeys(links))[:200],ensure_ascii=False,indent=2),flush=True)
+                  pos=clean.find('天普股份')
+                  print('TEXT',clean[max(0,pos-1000):pos+12000] if pos>=0 else clean[:6000],flush=True)
+              except Exception as exc:
+                  print('DIRECT_ERROR',url,repr(exc),flush=True)
+          PY
