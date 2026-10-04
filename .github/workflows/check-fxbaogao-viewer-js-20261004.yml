@@ -1,0 +1,41 @@
+name: Check public report viewer JavaScript 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/check-fxbaogao-viewer-js-20261004.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Search viewer JavaScript
+        run: |
+          python - <<'PY'
+          import re
+          from urllib.parse import urljoin
+          import requests
+          s=requests.Session()
+          h={'User-Agent':'Mozilla/5.0'}
+          base='https://www.fxbaogao.com/view?id=1408531'
+          page=s.get(base,headers=h,timeout=60).text
+          scripts=re.findall(r'<script[^>]+src=["\']([^"\']+)',page,re.I)
+          for src in scripts:
+              url=urljoin(base,src)
+              try:
+                  r=s.get(url,headers=h,timeout=60)
+                  text=r.text
+                  print('\nSCRIPT',url,'STATUS',r.status_code,'LEN',len(r.content))
+                  found=False
+                  for pat in ['report-image','reportImage','pageCount','page_count','totalPage','viewReport','reportDetail','downloadReport','fileUrl','pdfUrl','oss','/api/']:
+                      positions=[m.start() for m in re.finditer(re.escape(pat),text,re.I)]
+                      if positions:
+                          found=True
+                          print('PAT',pat,'COUNT',len(positions))
+                          for pos in positions[:8]:
+                              print(text[max(0,pos-500):pos+1200])
+                  if not found:
+                      print('NO_RELEVANT_PATTERNS')
+              except Exception as exc:
+                  print('ERROR',url,repr(exc))
+          PY
