@@ -1,0 +1,17 @@
+name: Discover Hangzhou Thermal broker due diligence 20261004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/discover-hangzhou-thermal-broker-due-diligence-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/discover_hangzhou_thermal_broker_due_diligence_20261004.py
