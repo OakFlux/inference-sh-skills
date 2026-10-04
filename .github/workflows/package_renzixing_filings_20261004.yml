@@ -1,0 +1,36 @@
+name: Package Ren Zixing filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_renzixing_filings_20261004.yml'
+      - 'tools/package_renzixing_filings_20261004.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Download validate and package filings
+        run: python tools/package_renzixing_filings_20261004.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: renzixing-300311-2020-2025-annual-latest-quarter
+          path: |
+            任子行_300311_2020-2025年报及最新季报.zip
+            renzixing_filings_result.json
+            _previews_renzixing_filings/*.png
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
