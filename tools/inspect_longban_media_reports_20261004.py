@@ -5,6 +5,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 import requests
 
@@ -27,73 +28,138 @@ def parse_json_or_jsonp(text: str) -> Any:
         return json.loads(match.group(1))
 
 
+def data_from_payload(parsed: Any) -> list[dict[str, Any]]:
+    if not isinstance(parsed, dict):
+        return []
+    for key in ("data", "result", "list", "rows"):
+        value = parsed.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for nested in ("data", "list", "rows"):
+                nested_value = value.get(nested)
+                if isinstance(nested_value, list):
+                    return nested_value
+    return []
+
+
+def inspect_page_scripts(session: requests.Session) -> dict[str, Any]:
+    page_url = "https://data.eastmoney.com/report/605577.html"
+    result: dict[str, Any] = {"page_url": page_url, "scripts": [], "matches": []}
+    try:
+        response = session.get(page_url, timeout=120)
+        result.update({
+            "status": response.status_code,
+            "bytes": len(response.content),
+            "content_type": response.headers.get("content-type"),
+        })
+        html = response.text
+        script_urls = [urljoin(response.url, src) for src in re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', html, re.I)]
+        result["scripts"] = script_urls
+        for script_url in script_urls:
+            try:
+                script = session.get(script_url, timeout=120)
+                text = script.text
+                if any(token.lower() in text.lower() for token in ("reportapi", "/report/list", "qType", "report/list")):
+                    excerpts = []
+                    for token in ("reportapi", "/report/list", "qType"):
+                        for match in re.finditer(re.escape(token), text, re.I):
+                            excerpts.append(text[max(0, match.start() - 500): match.start() + 1200])
+                            if len(excerpts) >= 8:
+                                break
+                        if len(excerpts) >= 8:
+                            break
+                    item = {
+                        "url": script_url,
+                        "status": script.status_code,
+                        "bytes": len(script.content),
+                        "excerpts": excerpts,
+                    }
+                    result["matches"].append(item)
+                    print("SCRIPT_MATCH", json.dumps(item, ensure_ascii=False)[:8000], flush=True)
+            except Exception as exc:
+                result.setdefault("script_errors", []).append({"url": script_url, "error": repr(exc)})
+    except Exception as exc:
+        result["error"] = repr(exc)
+    return result
+
+
 def request_inventory(session: requests.Session) -> dict[str, Any]:
-    url = "https://reportapi.eastmoney.com/report/list"
-    parameter_sets = [
-        {
-            "industryCode": "*",
-            "pageSize": "100",
-            "industry": "*",
-            "rating": "*",
-            "ratingChange": "*",
-            "beginTime": "2020-01-01",
-            "endTime": "2026-10-04",
-            "fields": "",
-            "qType": "0",
-            "orgCode": "",
-            "code": "605577",
-            "pageNo": "1",
-        },
-        {
-            "cb": "datatable123456",
-            "industryCode": "*",
-            "pageSize": "100",
-            "industry": "*",
-            "rating": "*",
-            "ratingChange": "*",
-            "beginTime": "2020-01-01",
-            "endTime": "2026-10-04",
-            "fields": "",
-            "qType": "0",
-            "orgCode": "",
-            "code": "605577",
-            "pageNo": "1",
-        },
+    endpoints = [
+        "https://reportapi.eastmoney.com/report/list",
+        "http://reportapi.eastmoney.com/report/list",
+        "https://reportapi.eastmoney.com/report/list2",
+    ]
+    codes = ["605577", "SH605577", "sh605577", "605577.SH"]
+    qtypes = ["0", "1"]
+    date_ranges = [
+        ("2023-01-01", "2023-12-31"),
+        ("2022-01-01", "2024-12-31"),
+        ("2023-01-01", "2024-12-31"),
+        ("2020-01-01", "2024-12-31"),
+        ("2020-01-01", "2026-10-04"),
     ]
     attempts: list[dict[str, Any]] = []
-    payload: dict[str, Any] | None = None
-    for params in parameter_sets:
-        try:
-            response = session.get(url, params=params, timeout=120)
-            record: dict[str, Any] = {
-                "url": response.url,
-                "status": response.status_code,
-                "bytes": len(response.content),
-                "content_type": response.headers.get("content-type"),
-                "prefix": response.text[:1000],
-            }
-            try:
-                parsed = parse_json_or_jsonp(response.text)
-                record["parsed_type"] = type(parsed).__name__
-                if isinstance(parsed, dict):
-                    record["keys"] = list(parsed.keys())
-                    data = parsed.get("data") or parsed.get("result") or []
-                    record["data_count"] = len(data) if isinstance(data, list) else None
-                    if data:
-                        payload = parsed
-            except Exception as exc:
-                record["parse_error"] = repr(exc)
-            attempts.append(record)
-            print("REPORT_API", json.dumps(record, ensure_ascii=False), flush=True)
-            if payload:
-                break
-        except Exception as exc:
-            attempts.append({"params": params, "error": repr(exc)})
-            print("REPORT_API_ERROR", repr(exc), flush=True)
-    if payload is None:
-        return {"attempts": attempts, "records": []}
-    data = payload.get("data") or payload.get("result") or []
-    return {"attempts": attempts, "raw_payload": payload, "records": data}
+    deduped: dict[str, dict[str, Any]] = {}
+    for endpoint in endpoints:
+        for code in codes:
+            for qtype in qtypes:
+                for begin, end in date_ranges:
+                    params = {
+                        "industryCode": "*",
+                        "pageSize": "100",
+                        "industry": "*",
+                        "rating": "*",
+                        "ratingChange": "*",
+                        "beginTime": begin,
+                        "endTime": end,
+                        "fields": "",
+                        "qType": qtype,
+                        "orgCode": "",
+                        "code": code,
+                        "pageNo": "1",
+                    }
+                    try:
+                        response = session.get(endpoint, params=params, timeout=90)
+                        parsed: Any = None
+                        parse_error = None
+                        try:
+                            parsed = parse_json_or_jsonp(response.text)
+                        except Exception as exc:
+                            parse_error = repr(exc)
+                        rows = data_from_payload(parsed)
+                        record: dict[str, Any] = {
+                            "endpoint": endpoint,
+                            "code": code,
+                            "qType": qtype,
+                            "begin": begin,
+                            "end": end,
+                            "status": response.status_code,
+                            "bytes": len(response.content),
+                            "content_type": response.headers.get("content-type"),
+                            "row_count": len(rows),
+                            "prefix": response.text[:400],
+                        }
+                        if parse_error:
+                            record["parse_error"] = parse_error
+                        attempts.append(record)
+                        if rows:
+                            print("REPORT_API_HIT", json.dumps(record, ensure_ascii=False), flush=True)
+                            for row in rows:
+                                key = str(row.get("infoCode") or row.get("reportId") or row.get("id") or row)
+                                deduped[key] = dict(row)
+                        elif len(attempts) <= 20:
+                            print("REPORT_API_MISS", json.dumps(record, ensure_ascii=False), flush=True)
+                    except Exception as exc:
+                        attempts.append({
+                            "endpoint": endpoint,
+                            "code": code,
+                            "qType": qtype,
+                            "begin": begin,
+                            "end": end,
+                            "error": repr(exc),
+                        })
+    return {"attempts": attempts, "records": list(deduped.values())}
 
 
 def test_pdf_candidates(session: requests.Session, record: dict[str, Any]) -> list[dict[str, Any]]:
@@ -125,7 +191,6 @@ def test_pdf_candidates(session: requests.Session, record: dict[str, Any]) -> li
                 "bytes": len(response.content),
                 "content_type": response.headers.get("content-type"),
                 "content_length": response.headers.get("content-length"),
-                "accept_ranges": response.headers.get("accept-ranges"),
                 "prefix_hex": response.content[:16].hex(),
             }
             results.append(item)
@@ -143,6 +208,7 @@ def main() -> None:
     session = requests.Session()
     session.headers.update(HEADERS)
     inventory = request_inventory(session)
+    inventory["page_script_inspection"] = inspect_page_scripts(session)
     records = inventory.get("records") or []
     enriched: list[dict[str, Any]] = []
     for index, row in enumerate(records, start=1):
