@@ -1,0 +1,75 @@
+name: Build Zhongchuan 600072 reports package v2 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhongchuan-600072-reports-package-v2-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+
+      - name: Prepare Zhongchuan report packager
+        run: |
+          cp scripts/build_denghai_002041_reports_package_20261004.py scripts/build_zhongchuan_600072_reports_package_20261004.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/build_zhongchuan_600072_reports_package_20261004.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = [
+              ('COMPANY = "登海种业"', 'COMPANY = "中船科技"'),
+              ('FULL_COMPANY = "山东登海种业股份有限公司"', 'FULL_COMPANY = "中船科技股份有限公司"'),
+              ('STOCK_CODE = "002041"', 'STOCK_CODE = "600072"'),
+              ('PACKAGE = "登海种业_002041_2020-2025年报_2026最新季报及半年报"', 'PACKAGE = "中船科技_600072_2020-2025年报_2026最新季报及半年报"'),
+              ('_denghai_002041_filings_work', '_zhongchuan_600072_filings_work'),
+              ('"column": "szse"', '"column": "sse"'),
+              ('"plate": "sz"', '"plate": "sh"'),
+              ('巨潮资讯网（深交所法定信息披露平台）', '巨潮资讯网信息披露文件'),
+              ('登海种业', '中船科技'),
+              ('002041', '600072'),
+          ]
+          for old, new in replacements:
+              text = text.replace(old, new)
+
+          old = '''    key = f"{year}年年度报告"
+              rows = query_announcements(key, f"{year + 1}-01-01", f"{year + 2}-12-31")'''
+          new = '''    keys = [f"{year}年年度报告", f"{year}年度报告"]
+              rows = []
+              seen_query_rows = set()
+              for key in keys:
+                  for row in query_announcements(key, f"{year + 1}-01-01", f"{year + 2}-12-31"):
+                      rid = str(row.get("announcementId") or row.get("adjunctUrl") or "")
+                      if rid and rid not in seen_query_rows:
+                          seen_query_rows.add(rid)
+                          rows.append(row)'''
+          if old not in text:
+              raise RuntimeError('annual query block not found')
+          text = text.replace(old, new, 1)
+          text = text.replace('        if key not in title:\n', '        if not any(key in title for key in keys):\n', 1)
+          text = text.replace('        if title == key:\n', '        if title in keys:\n', 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+          python -m py_compile scripts/build_zhongchuan_600072_reports_package_20261004.py
+
+      - name: Download validate and package reports
+        run: python scripts/build_zhongchuan_600072_reports_package_20261004.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhongchuan-600072-2020-2025-annual-and-2026-latest-reports-v2
+          path: 中船科技_600072_2020-2025年报_2026最新季报及半年报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
