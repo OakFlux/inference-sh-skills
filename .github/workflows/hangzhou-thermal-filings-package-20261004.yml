@@ -1,0 +1,34 @@
+name: Build Hangzhou Thermal Power official filings package 20261004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/hangzhou-thermal-filings-package-20261004.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Build and validate package
+        run: python scripts/build_hangzhou_thermal_filings_20261004.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: hangzhou-thermal-605011-filings-20261004
+          path: 杭州热电_605011_全部年报_招股说明书_2026最新季报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
