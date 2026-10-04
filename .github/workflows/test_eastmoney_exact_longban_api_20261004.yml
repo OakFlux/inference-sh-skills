@@ -1,0 +1,26 @@
+name: Test exact Eastmoney Longban report API
+
+on:
+  push:
+    paths:
+      - '.github/workflows/test_eastmoney_exact_longban_api_20261004.yml'
+      - 'tools/test_eastmoney_exact_longban_api_20261004.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python tools/test_eastmoney_exact_longban_api_20261004.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: eastmoney-exact-longban-api
+          path: eastmoney_exact_longban_api.json
+          if-no-files-found: error
+          retention-days: 3
