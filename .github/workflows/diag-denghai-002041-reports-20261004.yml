@@ -1,0 +1,57 @@
+name: Diagnose Denghai Seed 002041 broker reports 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-denghai-002041-reports-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query Eastmoney report API
+        run: |
+          python - <<'PY'
+          import json, requests
+          s=requests.Session(); s.trust_env=False
+          h={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Referer':'https://data.eastmoney.com/report/',
+            'Accept':'application/json,text/plain,*/*',
+            'Content-Type':'application/json',
+          }
+          all_rows=[]
+          for page in range(1,10):
+            body={
+              'pageSize':100,'pageNo':page,'p':page,'pageNum':page,'pageNumber':page,
+              'beginTime':'2010-01-01','endTime':'2026-10-04','code':'002041',
+              'industryCode':'*','rating':None,'ratingChange':None,'orgCode':None,'rcode':''
+            }
+            r=s.post('https://reportapi.eastmoney.com/report/list2',json=body,headers=h,timeout=90)
+            print('PAGE',page,'STATUS',r.status_code,'LEN',len(r.content),flush=True)
+            r.raise_for_status(); obj=r.json(); rows=obj.get('data') or []
+            print('META',obj.get('hits'),obj.get('TotalPage'),len(rows),flush=True)
+            for row in rows:
+              slim={k:row.get(k) for k in ['title','orgSName','publishDate','stockName','stockCode','infoCode','researcher','ratingName','ratingChange','encodeUrl','reportType','column']}
+              print('REPORT',json.dumps(slim,ensure_ascii=False,default=str),flush=True)
+              all_rows.append(slim)
+            total=int(obj.get('TotalPage') or 1)
+            if not rows or page>=total: break
+          print('COUNT',len(all_rows),flush=True)
+          for row in all_rows:
+            info=str(row.get('infoCode') or '')
+            title=str(row.get('title') or '')
+            if not info: continue
+            if not any(k in title for k in ['深度','首次覆盖','龙头','良机','再起航','发展','价值','研究']):
+              continue
+            url=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+            try:
+              p=s.get(url,headers={'User-Agent':h['User-Agent'],'Referer':'https://data.eastmoney.com/','Accept':'application/pdf,*/*'},timeout=90,stream=True,allow_redirects=True)
+              head=next(p.iter_content(32),b'')
+              print('PDF_PROBE',info,p.status_code,p.headers.get('content-type'),p.headers.get('content-length'),p.url,repr(head[:16]),flush=True)
+              p.close()
+            except Exception as e:
+              print('PDF_ERROR',info,repr(e),flush=True)
+          PY
