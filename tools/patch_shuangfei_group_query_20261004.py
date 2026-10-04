@@ -79,7 +79,9 @@ new_query_company = r'''def query_company(session: requests.Session, category: s
                     combined[key] = row
 
     collect(category)
-    if allow_all_category and not combined:
+    # The historical CNINFO prospectus category can return unrelated or incomplete rows.
+    # For prospectuses, always supplement it with a full-text company search.
+    if allow_all_category:
         collect("")
     print("QUERY_COMPANY_RESULT", category or "ALL", len(combined), flush=True)
     return list(combined.values())
@@ -96,4 +98,4 @@ if count_company != 1:
     raise SystemExit(f"query_company patch count={count_company}")
 
 path.write_text(text, encoding="utf-8")
-print("Patched Shuangfei historical-name queries and repeated-page detection")
+print("Patched Shuangfei historical-name queries, repeated-page detection, and full-text prospectus search")
