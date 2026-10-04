@@ -63,6 +63,7 @@ new_query_company = r'''def query_company(session: requests.Session, category: s
         "双飞股份",
         "浙江双飞",
         "双飞无油轴承",
+        "浙江双飞无油轴承股份有限公司",
         "300817",
     ]
     combined: dict[str, dict[str, Any]] = {}
@@ -72,11 +73,19 @@ new_query_company = r'''def query_company(session: requests.Session, category: s
             rows = query_once(session, category=cat, searchkey=term)
             for row in rows:
                 sec_code = str(row.get("secCode") or "")
-                if sec_code != STOCK_CODE:
+                title = clean_title(str(row.get("announcementTitle") or row.get("shortTitle") or ""))
+                is_prelisting_prospectus = (
+                    allow_all_category
+                    and "招股说明书" in title
+                    and ("浙江双飞无油轴承" in title or "双飞无油轴承" in title)
+                )
+                if sec_code != STOCK_CODE and not is_prelisting_prospectus:
                     continue
                 key = str(row.get("announcementId") or row.get("adjunctUrl") or "")
                 if key:
                     combined[key] = row
+                    if is_prelisting_prospectus:
+                        print("PROSPECTUS_ROW_WITHOUT_CODE", title, sec_code, key, flush=True)
 
     collect(category)
     # The historical CNINFO prospectus category can return unrelated or incomplete rows.
@@ -98,4 +107,4 @@ if count_company != 1:
     raise SystemExit(f"query_company patch count={count_company}")
 
 path.write_text(text, encoding="utf-8")
-print("Patched Shuangfei historical-name queries, repeated-page detection, and full-text prospectus search")
+print("Patched Shuangfei queries, including prelisting prospectuses without a stock code")
