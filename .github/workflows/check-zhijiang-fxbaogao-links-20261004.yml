@@ -1,0 +1,28 @@
+name: Check public links for Zhijiang report 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/check-zhijiang-fxbaogao-links-20261004.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check public page links
+        run: |
+          python - <<'PY'
+          import re
+          import requests
+          url = 'https://www.fxbaogao.com/detail/1408531'
+          r = requests.get(url, headers={'User-Agent':'Mozilla/5.0'}, timeout=60)
+          print('STATUS', r.status_code, len(r.content), r.url)
+          text = r.text
+          for line in text.splitlines():
+              lower = line.lower()
+              if 'pdf' in lower or 'download' in lower or '1408531' in lower:
+                  print(line[:5000])
+          print('SCRIPTS')
+          for src in re.findall(r'<script[^>]+src=["\']([^"\']+)', text, re.I):
+              print(src)
+          PY
