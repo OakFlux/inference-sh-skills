@@ -1,0 +1,40 @@
+name: Resolve Zhongchuan Keji Sina PDF redirects 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zhongchuan-keji-sina-pdf-redirects-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Resolve historical report PDF links
+        run: |
+          python - <<'PY'
+          import re, requests
+          from urllib.parse import urljoin
+
+          s=requests.Session(); s.trust_env=False
+          headers={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'text/html,application/pdf,application/octet-stream;q=0.9,*/*;q=0.8','Referer':'https://stock.finance.sina.com.cn/'}
+          ids=['554379045165','521018899233','734684444314']
+          for rid in ids:
+            print('\n=== RID',rid,'===',flush=True)
+            for suffix in ['url','index.phtml']:
+              url=f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/{suffix}'
+              try:
+                r=s.get(url,headers=headers,timeout=90,allow_redirects=True)
+                print('GET',url,'STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'FINAL',r.url,flush=True)
+                print('HISTORY',[(x.status_code,x.url,x.headers.get('location')) for x in r.history],flush=True)
+                print('HEAD',repr(r.content[:32]),flush=True)
+                if not r.content.startswith(b'%PDF'):
+                  text=r.text
+                  print('TITLE',re.search(r'<title>(.*?)</title>',text,re.I|re.S).group(1) if re.search(r'<title>(.*?)</title>',text,re.I|re.S) else '',flush=True)
+                  for pat in [r'location\.href\s*=\s*["\']([^"\']+)',r'url=([^"\'> ]+)',r'href=["\']([^"\']+\.pdf[^"\']*)',r'href=["\']([^"\']+/url[^"\']*)']:
+                    for m in re.finditer(pat,text,re.I):
+                      print('PARSED',urljoin(r.url,m.group(1)),flush=True)
+              except Exception as e:
+                print('ERROR',url,repr(e),flush=True)
+          PY
