@@ -1,0 +1,17 @@
+name: Query Tianpu Eastmoney date window 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/query-tianpu-eastmoney-window-20261004.yml'
+      - 'scripts/query_tianpu_eastmoney_window_20261004.py'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/query_tianpu_eastmoney_window_20261004.py
