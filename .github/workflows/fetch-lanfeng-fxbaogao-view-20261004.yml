@@ -1,0 +1,20 @@
+name: Fetch Lanfeng Fxbaogao view 20261004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/fetch_lanfeng_fxbaogao_view_20261004.py'
+      - '.github/workflows/fetch-lanfeng-fxbaogao-view-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Fetch public report views
+        run: python scripts/fetch_lanfeng_fxbaogao_view_20261004.py
