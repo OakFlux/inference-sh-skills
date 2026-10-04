@@ -1,0 +1,35 @@
+name: Diagnose Chuanyi Sina reports 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-chuanyi-sina-reports-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Parse Sina report archive
+        run: |
+          python - <<'PY'
+          import re, requests
+          from html import unescape
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'}
+          for page in range(1,10):
+            url=f'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=002866&t1=all&p={page}'
+            r=s.get(url,headers=h,timeout=60); r.encoding=r.apparent_encoding or 'gbk'; text=r.text
+            print('\nPAGE',page,r.status_code,len(r.content),flush=True)
+            rows=re.findall(r'<tr[^>]*>(.*?)</tr>',text,re.I|re.S)
+            count=0
+            for row in rows:
+              m=re.search(r'vReport_Show/kind/search/rptid/(\d+)/index\.phtml[^>]*>(.*?)</a>',row,re.I|re.S)
+              if not m: continue
+              rid=m.group(1); title=re.sub(r'<[^>]+>','',unescape(m.group(2))); title=re.sub(r'\s+',' ',title).strip()
+              cells=[re.sub(r'\s+',' ',re.sub(r'<[^>]+>','',unescape(c))).strip() for c in re.findall(r'<td[^>]*>(.*?)</td>',row,re.I|re.S)]
+              print('REPORT',rid,'|',title,'|',' | '.join(cells),flush=True); count+=1
+            print('COUNT',count,flush=True)
+            if count==0: break
+          PY
