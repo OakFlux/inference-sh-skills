@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/package_shuangfei_group_filings_20261004.yml'
       - 'tools/package_shuangfei_group_filings_20261004.py'
+      - 'tools/patch_shuangfei_group_query_20261004.py'
   workflow_dispatch:
 
 permissions:
@@ -21,6 +22,8 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet requests pypdf
+      - name: Patch historical-name and pagination queries
+        run: python tools/patch_shuangfei_group_query_20261004.py
       - name: Download validate and package filings
         run: python tools/package_shuangfei_group_filings_20261004.py
       - name: Upload final package
