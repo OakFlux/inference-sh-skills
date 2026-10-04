@@ -1,0 +1,31 @@
+name: Locate exact Xiaoxiong target filings 20261004
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-xiaoxiong-targets-20261004.yml'
+  workflow_dispatch:
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query target disclosure windows
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'application/json, text/javascript, */*; q=0.01','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.cninfo.com.cn/new/disclosure/stock?stockCode=002959&orgId=9900037093','Origin':'https://www.cninfo.com.cn','X-Requested-With':'XMLHttpRequest'}
+          for label,start,end in [
+            ('2020_ANNUAL','2021-04-20','2021-05-05'),
+            ('2026_Q1','2026-04-20','2026-05-05'),
+            ('2026_H1','2026-08-10','2026-08-20'),
+          ]:
+            form={'pageNum':'1','pageSize':'30','column':'szse','tabName':'fulltext','plate':'sz','stock':'002959,9900037093','searchkey':'','secid':'','category':'','trade':'','seDate':start+'~'+end,'sortName':'','sortType':'','isHLtitle':'true'}
+            r=s.post('https://www.cninfo.com.cn/new/hisAnnouncement/query',headers=h,data=form,timeout=60)
+            print('\nWINDOW',label,start,end,r.status_code,len(r.content),flush=True)
+            r.raise_for_status(); data=r.json(); rows=data.get('announcements') or []
+            print('META',data.get('totalAnnouncement'),data.get('totalpages'),len(rows),flush=True)
+            for x in rows:
+              print('ROW',json.dumps({k:x.get(k) for k in ['announcementTitle','announcementTime','adjunctUrl','announcementId','secCode','secName','orgId']},ensure_ascii=False,default=str),flush=True)
+          PY
