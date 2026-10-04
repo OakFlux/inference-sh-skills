@@ -1,0 +1,27 @@
+name: Probe Lanfeng Fxbaogao image sequences 20261004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/probe_lanfeng_fxbaogao_image_sequences_20261004.py'
+      - '.github/workflows/probe-lanfeng-fxbaogao-image-sequences-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pillow
+      - name: Probe image sequences
+        run: python scripts/probe_lanfeng_fxbaogao_image_sequences_20261004.py
+      - name: Upload probe results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lanfeng-fxbaogao-image-probe-20261004
+          path: out/lanfeng_image_probe
+          if-no-files-found: error
+          retention-days: 7
