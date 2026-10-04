@@ -1,0 +1,33 @@
+name: Build Denghai Seed 002041 reports package 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/denghai-002041-reports-package-20261004.yml'
+      - 'scripts/build_denghai_002041_reports_package_20261004.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package reports
+        run: python scripts/build_denghai_002041_reports_package_20261004.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: denghai-002041-2020-2025-annual-and-2026-latest-reports
+          path: 登海种业_002041_2020-2025年报_2026最新季报及半年报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
