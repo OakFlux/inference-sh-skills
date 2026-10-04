@@ -20,13 +20,33 @@ jobs:
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet requests pypdf
 
+      - name: Select three publicly available deep reports
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/build_hotgen_688068_broker_deep_reports_20261004.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = {
+              '全球首创心梗单抗，FIC潜力催化价值重估': '创新布局心脑血管领域，看好SGC001的FIC及BIC潜力',
+              '"institution_key": "银河"': '"institution_key": "东吴"',
+              '"expected_date_prefix": "2026-08"': '"expected_date_prefix": "2025-10"',
+              '01_中国银河证券_公司深度_全球首创心梗单抗_FIC潜力催化价值重估.pdf': '01_东吴证券_公司深度_创新布局心脑血管领域_看好SGC001的FIC及BIC潜力.pdf',
+              '"kind": "公司深度/首次覆盖"': '"kind": "公司深度"',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise SystemExit(f'missing expected text: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+
       - name: Download validate and package reports
         run: python scripts/build_hotgen_688068_broker_deep_reports_20261004.py
 
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: hotgen-688068-broker-deep-reports-20261004
+          name: hotgen-688068-broker-deep-reports-20261004-v2
           path: 热景生物_688068_券商深度报告_3份_截至2026-10-04.zip
           if-no-files-found: error
           compression-level: 0
