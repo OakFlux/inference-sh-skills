@@ -1,0 +1,19 @@
+name: Discover ST Gudi historical broker reports 20261004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/discover-st-gudi-global-history-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests pypdf
+      - name: Scan historical report archive
+        run: python scripts/discover_st_gudi_global_history_20261004.py
