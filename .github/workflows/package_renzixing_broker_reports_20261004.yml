@@ -7,6 +7,7 @@ on:
       - 'tools/package_renzixing_broker_reports_20261004.py'
       - 'tools/patch_renzixing_broker_packaging_20261004.py'
       - 'tools/patch_renzixing_all_sina_20261004.py'
+      - 'tools/patch_renzixing_cjk_font_20261004.py'
   workflow_dispatch:
 
 permissions:
@@ -18,15 +19,17 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Install PDF validation tools
+      - name: Install PDF validation tools and Chinese font
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qpdf poppler-utils
+          sudo apt-get install -y -qq qpdf poppler-utils fonts-arphic-gbsn00lp
           python -m pip install --quiet requests beautifulsoup4 pillow pypdf reportlab
       - name: Patch generated text archive validation
         run: python tools/patch_renzixing_broker_packaging_20261004.py
       - name: Use three Sina report archives
         run: python tools/patch_renzixing_all_sina_20261004.py
+      - name: Embed readable Chinese font
+        run: python tools/patch_renzixing_cjk_font_20261004.py
       - name: Build and validate package
         run: python tools/package_renzixing_broker_reports_20261004.py
       - name: Upload final package
