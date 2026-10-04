@@ -1,19 +1,19 @@
-name: Probe Longban Media reports quick
+name: Discover Longban Media broker reports
 
 on:
   push:
     paths:
       - '.github/workflows/build-mengguli-broker-public-archive-20261004-v2.yml'
-      - 'scripts/probe_longban_605577_quick_20261004.py'
+      - 'scripts/discover_longban_reports_20261004.py'
   workflow_dispatch:
 
 jobs:
-  probe-longban-quick:
+  discover-longban:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Install requests
         run: python -m pip install --quiet requests
-      - name: Probe report sources
-        run: python scripts/probe_longban_605577_quick_20261004.py
+      - name: Discover reports and public page sources
+        run: python scripts/discover_longban_reports_20261004.py
