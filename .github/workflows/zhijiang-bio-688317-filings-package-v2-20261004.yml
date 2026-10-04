@@ -1,0 +1,91 @@
+name: Build Zhijiang Bio 688317 filings package v2 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zhijiang-bio-688317-filings-package-v2-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+
+      - name: Add formal prospectus fallback
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('scripts/build_zhijiang_bio_688317_filings_20261004.py')
+          text = path.read_text(encoding='utf-8')
+
+          old_fallback = '''    if not candidates:
+              raise RuntimeError("formal IPO prospectus not found")'''
+          new_fallback = '''    if not candidates:
+              return {
+                  "announcementTitle": "之江生物：之江生物首次公开发行股票并在科创板上市招股说明书",
+                  "announcementTime": 1610380800000,
+                  "announcementId": "6842954",
+                  "direct_urls": [
+                      "https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_STOCK/2021/2021-1/2021-01-12/6842954.PDF",
+                      "https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESH_KCB/2021/2021-1/2021-01-12/6842954.PDF",
+                  ],
+                  "source_label": "新浪财经上市公司发行资料镜像（正式发行版）",
+              }'''
+          if old_fallback not in text:
+              raise RuntimeError('prospectus fallback block not found')
+          text = text.replace(old_fallback, new_fallback, 1)
+
+          old_download = '''    source_url = static_url(row)
+              final_url = download_pdf(source_url, destination)'''
+          new_download = '''    direct_urls = row.get("direct_urls") or []
+              if direct_urls:
+                  download_errors = []
+                  source_url = ""
+                  final_url = ""
+                  for candidate_url in direct_urls:
+                      try:
+                          final_url = download_pdf(str(candidate_url), destination)
+                          source_url = str(candidate_url)
+                          break
+                      except Exception as exc:
+                          download_errors.append(f"{candidate_url}: {exc!r}")
+                          print("DIRECT_DOWNLOAD_FAILED", candidate_url, repr(exc), flush=True)
+                  if not final_url:
+                      raise RuntimeError(f"all direct prospectus downloads failed: {download_errors}")
+              else:
+                  source_url = static_url(row)
+                  final_url = download_pdf(source_url, destination)'''
+          if old_download not in text:
+              raise RuntimeError('add_record download block not found')
+          text = text.replace(old_download, new_download, 1)
+
+          old_source = '''            "source": "巨潮资讯网信息披露文件",'''
+          new_source = '''            "source": str(row.get("source_label") or "巨潮资讯网信息披露文件"),'''
+          if old_source not in text:
+              raise RuntimeError('record source block not found')
+          text = text.replace(old_source, new_source, 1)
+
+          path.write_text(text, encoding='utf-8')
+          PY
+          python -m py_compile scripts/build_zhijiang_bio_688317_filings_20261004.py
+
+      - name: Download validate and package reports
+        run: python scripts/build_zhijiang_bio_688317_filings_20261004.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhijiang-bio-688317-all-filings-v2
+          path: 之江生物_688317_全部年报_招股说明书_2026最新季报及半年报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
