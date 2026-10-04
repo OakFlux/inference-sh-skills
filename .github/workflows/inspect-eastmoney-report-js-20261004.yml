@@ -1,0 +1,19 @@
+name: Inspect Eastmoney report JS 20261004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/inspect-eastmoney-report-js-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependency
+        run: python -m pip install --quiet requests
+      - name: Inspect report page scripts
+        run: python scripts/inspect_eastmoney_report_js_20261004.py
