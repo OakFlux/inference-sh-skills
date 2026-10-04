@@ -1,0 +1,51 @@
+name: Inspect Zhongchuan Keji report pages 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zhongchuan-keji-report-pages-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Inspect report page links and scripts
+        run: |
+          python - <<'PY'
+          import html, json, re, requests
+          from urllib.parse import urljoin
+
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'}
+          urls=[
+            'https://fxbaogao.com/detail/3652397',
+            'https://www.sgpjbg.com/baogao/108674.html',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/554379045165/index.phtml',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/521018899233/index.phtml',
+          ]
+          for url in urls:
+            print('\n===',url,'===',flush=True)
+            try:
+              r=s.get(url,headers=h,timeout=90,allow_redirects=True)
+              r.encoding=r.apparent_encoding or r.encoding or 'utf-8'
+              print('STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'FINAL',r.url,'ENC',r.encoding,flush=True)
+              text=r.text
+              title=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              print('TITLE',re.sub(r'<[^>]+>','',title.group(1)).strip() if title else '',flush=True)
+              links=[]
+              for m in re.finditer(r'''(?:href|src|data-url|data-href|file|url)\s*=\s*["']([^"']+)["']''',text,re.I):
+                raw=html.unescape(m.group(1)); full=urljoin(r.url,raw)
+                if any(k in full.lower() for k in ['pdf','download','attach','file','report','baogao','api']): links.append(full)
+              for m in re.finditer(r'https?://[^"\'<> ]+',text,re.I):
+                full=html.unescape(m.group(0))
+                if any(k in full.lower() for k in ['pdf','download','attach','file','report','api']): links.append(full)
+              print('LINKS',json.dumps(list(dict.fromkeys(links))[:500],ensure_ascii=False,indent=2),flush=True)
+              for pat in ['完整报告','免费下载','download','pdf','PDF','附件','api','3652397','108674','554379045165','521018899233']:
+                pos=text.lower().find(pat.lower())
+                if pos>=0:
+                  print('AROUND',pat,re.sub(r'\s+',' ',text[max(0,pos-800):pos+2500]),flush=True)
+            except Exception as e:
+              print('ERROR',repr(e),flush=True)
+          PY
