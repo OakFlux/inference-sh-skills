@@ -1,0 +1,33 @@
+name: Build Mengguli 301487 filings package 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/mengguli-301487-filings-package-20261004.yml'
+      - 'scripts/build_mengguli_301487_filings_20261004.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package filings
+        run: python scripts/build_mengguli_301487_filings_20261004.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: mengguli-301487-filings-20261004
+          path: 盟固利_301487_全部年报_招股说明书_最新季报_截至2026-10-04.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
