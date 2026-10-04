@@ -1,10 +1,10 @@
-name: Build Longban Media broker report package
+name: Build targeted Longban Media research archive
 
 on:
   push:
     paths:
       - '.github/workflows/build-mengguli-broker-public-archive-20261004-v2.yml'
-      - 'scripts/build_longban_605577_broker_reports_20261004.py'
+      - 'scripts/build_longban_broker_archive_targeted_20261004.py'
   workflow_dispatch:
 
 jobs:
@@ -17,14 +17,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils
-          python -m pip install --quiet requests pypdf
-      - name: Download validate and package reports
-        run: python scripts/build_longban_605577_broker_reports_20261004.py
+          python -m pip install --quiet requests pillow pypdf img2pdf reportlab
+      - name: Download archive validate and package reports
+        run: python scripts/build_longban_broker_archive_targeted_20261004.py
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: longban-605577-broker-reports-20261004
-          path: 龙版传媒_605577_券商深度报告_公开原始PDF_截至2026-10-04.zip
+          name: longban-605577-research-archive-20261004
+          path: 龙版传媒_605577_券商研究报告_3份_公开资料存档版_2026-10-04.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
