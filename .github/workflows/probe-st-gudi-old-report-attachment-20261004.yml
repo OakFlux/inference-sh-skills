@@ -1,0 +1,19 @@
+name: Probe ST Gudi old report attachment 20261004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/probe-st-gudi-old-report-attachment-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependency
+        run: python -m pip install --quiet requests
+      - name: Probe archived report attachment
+        run: python scripts/probe_st_gudi_old_report_attachment_20261004.py
