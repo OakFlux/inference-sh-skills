@@ -1,0 +1,31 @@
+name: Build Zhijiang 688317 broker research package 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-zhijiang-688317-broker-research-package-20261004.yml'
+      - 'scripts/build_zhijiang_688317_broker_research_package_20261004.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools and Python libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils fonts-noto-cjk
+          python -m pip install --quiet requests pillow pypdf
+          command -v google-chrome || command -v chromium || command -v chromium-browser
+      - name: Build and validate package
+        run: python scripts/build_zhijiang_688317_broker_research_package_20261004.py
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: zhijiang-688317-broker-research-package
+          path: 之江生物_688317_券商深度研究资料包_2份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
