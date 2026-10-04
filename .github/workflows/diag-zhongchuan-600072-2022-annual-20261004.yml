@@ -1,0 +1,30 @@
+name: Diagnose Zhongchuan 2022 annual report 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zhongchuan-600072-2022-annual-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Query 2022 annual announcements
+        run: |
+          python - <<'PY'
+          import json, requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Content-Type':'application/x-www-form-urlencoded; charset=UTF-8','Origin':'https://www.cninfo.com.cn','X-Requested-With':'XMLHttpRequest','Referer':'https://www.cninfo.com.cn/'}
+          for key in ['','2022','2022年度报告','2022年报','年度报告']:
+            form={'pageNum':'1','pageSize':'100','column':'sse','tabName':'fulltext','plate':'sh','stock':'600072,gssh0600072','searchkey':key,'secid':'','category':'','trade':'','seDate':'2023-01-01~2024-12-31','sortName':'time','sortType':'desc','isHLtitle':'false'}
+            r=s.post('https://www.cninfo.com.cn/new/hisAnnouncement/query',data=form,headers=h,timeout=90)
+            print('\nKEY',repr(key),'STATUS',r.status_code,'LEN',len(r.content),flush=True)
+            obj=r.json(); rows=obj.get('announcements') or []
+            print('TOTAL',obj.get('totalAnnouncement'),'ROWS',len(rows),flush=True)
+            for row in rows:
+              title=str(row.get('announcementTitle') or '')
+              if '2022' in title or '年度报告' in title or not key:
+                print(json.dumps({k:row.get(k) for k in ['announcementTitle','announcementTime','adjunctUrl','announcementId']},ensure_ascii=False),flush=True)
+          PY
