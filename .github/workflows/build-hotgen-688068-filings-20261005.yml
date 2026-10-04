@@ -1,0 +1,33 @@
+name: Build Hotgen Biotech 688068 filings package 20261005
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-hotgen-688068-filings-20261005.yml'
+      - 'scripts/build_hotgen_688068_filings_20261005.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+
+      - name: Discover download validate and package reports
+        run: python scripts/build_hotgen_688068_filings_20261005.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: hotgen-688068-filings-20261005
+          path: 热景生物_688068_2020-2025年报及最新季报_截至2026-10-05.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
