@@ -1,0 +1,15 @@
+name: Print Eastmoney report JS range 20261004
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/print-eastmoney-report-js-range-20261004.yml'
+  workflow_dispatch:
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/print_eastmoney_report_js_range_20261004.py
