@@ -1,0 +1,67 @@
+name: Diagnose Zhongchuan 600072 CNInfo 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zhongchuan-600072-cninfo-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Probe stock lists and announcements
+        run: |
+          python - <<'PY'
+          import json, requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'}
+          endpoints=[
+            'https://www.cninfo.com.cn/new/data/sse_stock.json',
+            'https://www.cninfo.com.cn/new/data/shse_stock.json',
+            'https://www.cninfo.com.cn/new/data/szse_stock.json',
+            'https://www.cninfo.com.cn/new/data/stockList.json',
+          ]
+          for url in endpoints:
+            print('\nENDPOINT',url,flush=True)
+            try:
+              r=s.get(url,headers=h,timeout=60)
+              print('STATUS',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+              if r.ok:
+                try:
+                  obj=r.json(); print('TOPKEYS',list(obj)[:20],flush=True)
+                  rows=[]
+                  if isinstance(obj,dict):
+                    for k,v in obj.items():
+                      if isinstance(v,list): rows.extend(v)
+                  elif isinstance(obj,list): rows=obj
+                  for row in rows:
+                    if str(row.get('code') or row.get('SECURITY_CODE_A') or '')=='600072':
+                      print('MATCH',json.dumps(row,ensure_ascii=False),flush=True)
+                except Exception as e:
+                  print('JSON_ERROR',repr(e),r.text[:500],flush=True)
+            except Exception as e:
+              print('ERROR',repr(e),flush=True)
+
+          query='https://www.cninfo.com.cn/new/hisAnnouncement/query'
+          guesses=['gssh0600072','gssh0000072','gssz0000072','sh600072','600072']
+          for org in guesses:
+            for column,plate in [('sse','sh'),('szse','sh'),('sse',''),('szse','')]:
+              form={
+                'pageNum':'1','pageSize':'30','column':column,'tabName':'fulltext','plate':plate,
+                'stock':f'600072,{org}','searchkey':'2025年年度报告','secid':'','category':'',
+                'trade':'','seDate':'2026-01-01~2026-10-04','sortName':'time','sortType':'desc','isHLtitle':'false'
+              }
+              try:
+                hh=dict(h); hh.update({'Content-Type':'application/x-www-form-urlencoded; charset=UTF-8','Origin':'https://www.cninfo.com.cn','X-Requested-With':'XMLHttpRequest','Referer':'https://www.cninfo.com.cn/'})
+                r=s.post(query,data=form,headers=hh,timeout=60)
+                print('QUERY',org,column,plate,'STATUS',r.status_code,'LEN',len(r.content),flush=True)
+                obj=r.json(); rows=obj.get('announcements') or []
+                if rows:
+                  print('QUERY_MATCH',org,column,plate,'TOTAL',obj.get('totalAnnouncement'),'ROWS',len(rows),flush=True)
+                  for row in rows[:10]:
+                    print(json.dumps({k:row.get(k) for k in ['secCode','secName','orgId','announcementTitle','announcementTime','adjunctUrl','announcementId']},ensure_ascii=False),flush=True)
+              except Exception as e:
+                print('QUERY_ERROR',org,column,plate,repr(e),flush=True)
+          PY
