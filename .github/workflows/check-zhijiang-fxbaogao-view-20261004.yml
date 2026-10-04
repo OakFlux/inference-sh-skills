@@ -1,0 +1,28 @@
+name: Check public Zhijiang report viewer 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/check-zhijiang-fxbaogao-view-20261004.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check public report viewer
+        run: |
+          python - <<'PY'
+          import re
+          import requests
+          url = 'https://www.fxbaogao.com/view?id=1408531'
+          r = requests.get(url, headers={'User-Agent':'Mozilla/5.0'}, timeout=60)
+          print('STATUS', r.status_code, len(r.content), r.url)
+          text = r.text
+          for pat in ['report-image', '1408531-', 'pageCount', 'page_count', 'totalPage', 'pages', 'download', '.pdf']:
+              print('\nPATTERN', pat)
+              for m in list(re.finditer(re.escape(pat), text, re.I))[:30]:
+                  print(re.sub(r'\s+', ' ', text[max(0,m.start()-500):m.start()+1500])[:2500])
+          print('SCRIPTS')
+          for src in re.findall(r'<script[^>]+src=["\']([^"\']+)', text, re.I):
+              print(src)
+          PY
