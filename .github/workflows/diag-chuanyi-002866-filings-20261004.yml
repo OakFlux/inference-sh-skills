@@ -1,0 +1,72 @@
+name: Diagnose Chuanyi Technology 002866 filings 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-chuanyi-002866-filings-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query official CNInfo archive
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re, requests
+          from datetime import datetime, timezone, timedelta
+
+          CODE='002866'
+          s=requests.Session(); s.trust_env=False
+          h={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept':'application/json, text/javascript, */*; q=0.01',
+            'Accept-Language':'zh-CN,zh;q=0.9',
+            'Referer':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={CODE}',
+            'Origin':'https://www.cninfo.com.cn',
+            'X-Requested-With':'XMLHttpRequest',
+          }
+          r=s.get('https://www.cninfo.com.cn/new/data/szse_stock.json',headers=h,timeout=60)
+          r.raise_for_status(); data=r.json(); org=''
+          for x in data.get('stockList',[]):
+            if str(x.get('code'))==CODE:
+              print('STOCK_ROW',json.dumps(x,ensure_ascii=False),flush=True)
+              org=str(x.get('orgId') or '')
+              break
+          if not org: raise RuntimeError('org id not found')
+
+          windows=[
+            ('2020_ANNUAL','2021-03-01','2021-06-30'),
+            ('2021_ANNUAL','2022-03-01','2022-06-30'),
+            ('2022_ANNUAL','2023-03-01','2023-06-30'),
+            ('2023_ANNUAL','2024-03-01','2024-06-30'),
+            ('2024_ANNUAL','2025-03-01','2025-06-30'),
+            ('2025_ANNUAL','2026-03-01','2026-06-30'),
+            ('2026_Q1','2026-04-01','2026-05-31'),
+            ('2026_H1','2026-07-01','2026-09-30'),
+            ('2026_Q3_CHECK','2026-10-01','2026-10-04'),
+          ]
+          for label,start,end in windows:
+            form={
+              'pageNum':'1','pageSize':'100','column':'szse','tabName':'fulltext','plate':'sz',
+              'stock':f'{CODE},{org}','searchkey':'','secid':'','category':'','trade':'',
+              'seDate':start+'~'+end,'sortName':'','sortType':'','isHLtitle':'true'
+            }
+            q=s.post('https://www.cninfo.com.cn/new/hisAnnouncement/query',headers=h,data=form,timeout=90)
+            q.raise_for_status(); obj=q.json(); rows=obj.get('announcements') or []
+            print('\nWINDOW',label,start,end,'META',obj.get('totalAnnouncement'),obj.get('totalpages'),len(rows),flush=True)
+            for x in rows:
+              title=re.sub(r'<[^>]+>','',str(x.get('announcementTitle') or ''))
+              if any(k in title for k in ['年度报告','第一季度报告','一季度报告','第三季度报告','三季度报告','半年度报告']):
+                ts=x.get('announcementTime')
+                dt=''
+                if ts:
+                  dt=datetime.fromtimestamp(ts/1000,timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M')
+                print('MATCH',json.dumps({
+                  'title':title,'time':dt,'adjunctUrl':x.get('adjunctUrl'),
+                  'announcementId':x.get('announcementId'),'secCode':x.get('secCode'),
+                  'secName':x.get('secName'),'orgId':x.get('orgId')
+                },ensure_ascii=False),flush=True)
+          PY
