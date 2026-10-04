@@ -1,0 +1,35 @@
+name: Build Mengguli broker public archive 20261004 v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-mengguli-broker-public-archive-20261004-v2.yml'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pillow pypdf img2pdf
+
+      - name: Adjust public-page dimension threshold
+        run: sed -i 's/width < 900 or height < 900/width < 700 or height < 900/' scripts/build_mengguli_broker_public_archive_20261004.py
+
+      - name: Download page images, rebuild PDFs, validate and package
+        run: python scripts/build_mengguli_broker_public_archive_20261004.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: mengguli-broker-public-archive-20261004-v2
+          path: 盟固利_301487_券商研究报告_2份_公开页面存档版_2026-10-04.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
