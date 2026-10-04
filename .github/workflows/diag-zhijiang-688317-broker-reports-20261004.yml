@@ -1,0 +1,75 @@
+name: Inspect Zhijiang Bio 688317 broker reports 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zhijiang-688317-broker-reports-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Query Eastmoney and inspect PDFs
+        run: |
+          python - <<'PY'
+          import json, os, re, subprocess, tempfile
+          from pathlib import Path
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          s.headers.update({
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/688317.html',
+              'Accept-Language': 'zh-CN,zh;q=0.9',
+          })
+          params = {
+              'industryCode': '*', 'pageSize': '100', 'industry': '*',
+              'rating': '*', 'ratingChange': '*',
+              'beginTime': '2017-01-01', 'endTime': '2030-01-01',
+              'pageNo': '1', 'fields': '', 'qType': '0',
+              'orgCode': '', 'code': '688317', 'rcode': '',
+              'p': '1', 'pageNum': '1', 'pageNumber': '1',
+          }
+          r = s.get('https://reportapi.eastmoney.com/report/list', params=params, timeout=90)
+          print('API_STATUS', r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+          print('HEAD', repr(r.content[:300]), flush=True)
+          r.raise_for_status()
+          obj = r.json()
+          print('TOP_KEYS', list(obj) if isinstance(obj, dict) else type(obj), flush=True)
+          records = obj.get('data') or obj.get('result') or obj.get('reports') or []
+          if isinstance(records, dict):
+              records = records.get('data') or records.get('list') or []
+          print('COUNT', len(records), 'HITS', obj.get('hits'), 'TOTALPAGE', obj.get('TotalPage') or obj.get('totalPage'), flush=True)
+          simplified=[]
+          for rec in records:
+              simplified.append({k: rec.get(k) for k in [
+                  'title','publishDate','orgSName','orgName','researcher','infoCode','attachPages','attachSize',
+                  'emRatingName','ratingChange','reportType','indvInduName','stockCode','stockName'
+              ]})
+          print('RECORDS_JSON', json.dumps(simplified, ensure_ascii=False, indent=2), flush=True)
+
+          for rec in records:
+              info = rec.get('infoCode')
+              if not info:
+                  continue
+              url = f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+              try:
+                  rr = s.get(url, timeout=120)
+                  print('\nPDF', info, 'STATUS', rr.status_code, rr.headers.get('content-type'), len(rr.content), url, flush=True)
+                  if rr.status_code != 200 or not rr.content.startswith(b'%PDF'):
+                      continue
+                  with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as fh:
+                      fh.write(rr.content); p=fh.name
+                  proc = subprocess.run(['pdfinfo', p], capture_output=True, text=True, timeout=60)
+                  pages=''
+                  for line in proc.stdout.splitlines():
+                      if line.startswith('Pages:'):
+                          pages=line.split(':',1)[1].strip()
+                  txt = subprocess.run(['pdftotext','-f','1','-l','3',p,'-'], capture_output=True, text=True, timeout=60).stdout
+                  print('PDFINFO_PAGES', pages, 'TEXT_HEAD', re.sub(r'\s+',' ',txt)[:1500], flush=True)
+                  os.unlink(p)
+              except Exception as exc:
+                  print('PDF_ERROR', info, repr(exc), flush=True)
+          PY
