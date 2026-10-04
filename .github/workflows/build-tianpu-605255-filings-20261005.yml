@@ -1,0 +1,38 @@
+name: Build Tianpu 605255 filings 20261005
+
+on:
+  push:
+    paths:
+      - 'scripts/build_tianpu_605255_filings_20261005.py'
+      - '.github/workflows/build-tianpu-605255-filings-20261005.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package filings
+        run: python scripts/build_tianpu_605255_filings_20261005.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: tianpu-605255-filings-20261005
+          path: 天普股份_605255_全部年报_招股说明书_最新季报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
