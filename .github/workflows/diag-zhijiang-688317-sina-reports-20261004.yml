@@ -1,0 +1,50 @@
+name: Inspect Zhijiang Bio 688317 Sina reports 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-zhijiang-688317-sina-reports-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Inspect Sina report listings
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'}
+          urls=[
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=sh688317&t1=all',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=688317&t1=all',
+            'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=sh688317&t1=all',
+            'https://vip.stock.finance.sina.com.cn/q/go.php/vReport_List/kind/search/index.phtml?symbol=688317&t1=all',
+          ]
+          for url in urls:
+            print('\n===URL===',url,flush=True)
+            try:
+              r=s.get(url,headers=h,timeout=90,allow_redirects=True)
+              r.encoding=r.apparent_encoding or r.encoding or 'gbk'
+              text=r.text
+              print('STATUS',r.status_code,r.headers.get('content-type'),len(r.content),r.url,r.encoding,flush=True)
+              title=re.search(r'<title[^>]*>(.*?)</title>',text,re.I|re.S)
+              print('TITLE',re.sub('<[^>]+>','',title.group(1)).strip() if title else '',flush=True)
+              links=[]
+              for m in re.finditer(r'''(?:href|src)\s*=\s*["']([^"']+)["']''',text,re.I):
+                raw=html.unescape(m.group(1)); full=urljoin(r.url,raw)
+                if any(k in full.lower() for k in ['vreport_show','rptid','report','pdf']): links.append(full)
+              print('LINKS',json.dumps(list(dict.fromkeys(links)),ensure_ascii=False,indent=2),flush=True)
+              clean=re.sub(r'<script.*?</script>|<style.*?</style>',' ',text,flags=re.I|re.S)
+              clean=re.sub(r'<[^>]+>',' ',clean)
+              clean=html.unescape(re.sub(r'\s+',' ',clean))
+              pos=clean.find('之江生物')
+              print('TEXT_AROUND',clean[max(0,pos-1000):pos+8000] if pos>=0 else clean[:8000],flush=True)
+            except Exception as e:
+              print('ERROR',repr(e),flush=True)
+          PY
