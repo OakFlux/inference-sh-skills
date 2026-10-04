@@ -1,0 +1,26 @@
+name: Inspect Ren Zixing broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/inspect_renzixing_reports_20261004.yml'
+      - 'tools/inspect_renzixing_reports_20261004.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python tools/inspect_renzixing_reports_20261004.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: renzixing-report-inventory
+          path: renzixing_report_inventory.json
+          if-no-files-found: error
+          retention-days: 3
