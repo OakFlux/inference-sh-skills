@@ -1,0 +1,36 @@
+name: Package Longban Media filings
+
+on:
+  push:
+    paths:
+      - '.github/workflows/package_longban_media_filings_20261004.yml'
+      - 'tools/package_longban_media_filings_20261004.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Download validate and package filings
+        run: python tools/package_longban_media_filings_20261004.py
+      - name: Upload final package
+        uses: actions/upload-artifact@v4
+        with:
+          name: longban-media-605577-all-annual-prospectus-latest-quarter
+          path: |
+            龙版传媒_605577_所有年报_招股说明书及最新季报.zip
+            longban_media_filings_result.json
+            _previews_longban_media_filings/*.png
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
