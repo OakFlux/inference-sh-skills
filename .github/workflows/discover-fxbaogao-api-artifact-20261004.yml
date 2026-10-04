@@ -1,0 +1,27 @@
+name: Discover Fxbaogao API artifact 20261004
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/discover_fxbaogao_api_artifact_20261004.py'
+      - '.github/workflows/discover-fxbaogao-api-artifact-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4
+      - name: Discover endpoint references
+        run: python scripts/discover_fxbaogao_api_artifact_20261004.py
+      - name: Upload discovery bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: fxbaogao-api-discovery-20261004
+          path: out/fxbaogao_api_discovery
+          if-no-files-found: error
+          retention-days: 7
