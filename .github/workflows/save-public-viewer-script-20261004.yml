@@ -1,0 +1,22 @@
+name: Save public report viewer script 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/save-public-viewer-script-20261004.yml'
+
+jobs:
+  save:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Save script
+        run: |
+          curl -L --fail --retry 3 -A 'Mozilla/5.0' 'https://www.fxbaogao.com/_fxbg/2609291744/js/app-pages-fxbg-main-js.4e85af91191f3f7c70f1.chunk.js' -o viewer.js
+          wc -c viewer.js
+      - name: Upload script
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-report-viewer-script
+          path: viewer.js
+          compression-level: 0
+          retention-days: 1
