@@ -1,0 +1,31 @@
+name: Locate exact Chuanyi annual reports 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-chuanyi-002866-exact-annuals-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query exact annual titles
+        run: |
+          python - <<'PY'
+          import json, re, requests
+          CODE='002866'; ORG='9900031481'
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'application/json, text/javascript, */*; q=0.01','Accept-Language':'zh-CN,zh;q=0.9','Referer':f'https://www.cninfo.com.cn/new/disclosure/stock?stockCode={CODE}&orgId={ORG}','Origin':'https://www.cninfo.com.cn','X-Requested-With':'XMLHttpRequest'}
+          for year in range(2020,2026):
+            start=f'{year+1}-01-01'; end=f'{year+1}-12-31'; key=f'{year}年年度报告'
+            form={'pageNum':'1','pageSize':'100','column':'szse','tabName':'fulltext','plate':'sz','stock':f'{CODE},{ORG}','searchkey':key,'secid':'','category':'','trade':'','seDate':start+'~'+end,'sortName':'','sortType':'','isHLtitle':'false'}
+            r=s.post('https://www.cninfo.com.cn/new/hisAnnouncement/query',headers=h,data=form,timeout=90)
+            print('\nYEAR',year,r.status_code,len(r.content),flush=True)
+            r.raise_for_status(); obj=r.json(); rows=obj.get('announcements') or []
+            print('META',obj.get('totalAnnouncement'),obj.get('totalpages'),len(rows),flush=True)
+            for x in rows:
+              title=re.sub(r'<[^>]+>','',str(x.get('announcementTitle') or ''))
+              print('ROW',json.dumps({'title':title,'announcementTime':x.get('announcementTime'),'adjunctUrl':x.get('adjunctUrl'),'announcementId':x.get('announcementId')},ensure_ascii=False),flush=True)
+          PY
