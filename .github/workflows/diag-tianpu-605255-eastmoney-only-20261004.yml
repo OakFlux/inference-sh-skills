@@ -1,0 +1,34 @@
+name: Query Tianpu Eastmoney and Sina reports 20261004
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-tianpu-605255-eastmoney-only-20261004.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Query report indexes
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'}
+          params={'industryCode':'*','pageSize':'100','industry':'*','rating':'*','ratingChange':'*','beginTime':'2015-01-01','endTime':'2030-01-01','pageNo':'1','fields':'','qType':'0','orgCode':'','code':'605255','rcode':'','p':'1','pageNum':'1','pageNumber':'1'}
+          r=s.get('https://reportapi.eastmoney.com/report/list',params=params,headers={**h,'Referer':'https://data.eastmoney.com/report/605255.html'},timeout=60)
+          print('EASTMONEY',r.status_code,r.url,r.text,flush=True)
+          for sym in ['605255','sh605255']:
+            url=f'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol={sym}&t1=all'
+            rr=s.get(url,headers=h,timeout=60,allow_redirects=True); rr.encoding=rr.apparent_encoding or 'gbk'; text=rr.text
+            clean=html.unescape(re.sub(r'\s+',' ',re.sub(r'<[^>]+>',' ',re.sub(r'<script.*?</script>|<style.*?</style>',' ',text,flags=re.I|re.S))))
+            links=[]
+            for m in re.finditer(r'''href\s*=\s*["']([^"']+)["']''',text,re.I):
+              full=urljoin(rr.url,html.unescape(m.group(1)))
+              if 'vReport_Show' in full or 'rptid' in full: links.append(full)
+            print('SINA',sym,rr.status_code,rr.url,clean[:12000],json.dumps(list(dict.fromkeys(links)),ensure_ascii=False),flush=True)
+          PY
