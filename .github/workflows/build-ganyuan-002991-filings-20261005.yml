@@ -1,36 +1,20 @@
-name: Build Ganyuan Foods 002991 filings 20261005
+name: Inspect Ganyuan Foods prospectus sources 20261005
 
 on:
   push:
     paths:
       - '.github/workflows/build-ganyuan-002991-filings-20261005.yml'
-      - 'scripts/build_ganyuan_002991_filings_20261005.py'
+      - 'scripts/inspect_ganyuan_prospectus_sources_20261005.py'
   workflow_dispatch:
 
 jobs:
-  package:
+  inspect:
     runs-on: ubuntu-24.04
-    timeout-minutes: 75
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install PDF validation tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
-          python -m pip install --quiet requests pypdf
-
-      - name: Download validate and package filings
-        run: python scripts/build_ganyuan_002991_filings_20261005.py
-
-      - name: Upload final ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: ganyuan-002991-filings-20261005
-          path: 甘源食品_002991_全部年报_招股说明书_最新季报.zip
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 30
-
-# Triggered after workflow registration.
+      - name: Install requests
+        run: python -m pip install --quiet requests
+      - name: Inspect prospectus sources
+        run: python scripts/inspect_ganyuan_prospectus_sources_20261005.py
