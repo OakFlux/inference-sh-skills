@@ -1,0 +1,37 @@
+name: Build Meinuohua 603538 filings 20261005
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-meinuohua-603538-filings-20261005.yml'
+      - 'scripts/build_minuohua_603538_filings_20261005.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
+          python -m pip install --quiet requests pypdf
+
+      - name: Download validate and package filings
+        run: python scripts/build_minuohua_603538_filings_20261005.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: meinuohua-603538-filings-20261005
+          path: 美诺华_603538_2020-2025年报_最新季报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
