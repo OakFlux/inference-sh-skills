@@ -1,0 +1,17 @@
+name: Probe Berry Genomics SGPJBG targeted reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-berrygenomics-sgpjbg-targeted-20261005.yml'
+      - 'scripts/probe_berrygenomics_sgpjbg_targeted_20261005.py'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/probe_berrygenomics_sgpjbg_targeted_20261005.py
