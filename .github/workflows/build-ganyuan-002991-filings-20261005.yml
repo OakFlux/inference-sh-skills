@@ -1,9 +1,10 @@
-name: Build Ganyuan Foods 002991 filings v2 20261005
+name: Build Ganyuan Foods 002991 filings v3 20261005
 
 on:
   push:
     paths:
       - '.github/workflows/build-ganyuan-002991-filings-20261005.yml'
+      - 'scripts/build_ganyuan_002991_filings_v3_20261005.py'
       - 'scripts/build_ganyuan_002991_filings_v2_20261005.py'
   workflow_dispatch:
 
@@ -20,11 +21,11 @@ jobs:
           sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
           python -m pip install --quiet requests pypdf
       - name: Download validate and package filings
-        run: python scripts/build_ganyuan_002991_filings_v2_20261005.py
+        run: python scripts/build_ganyuan_002991_filings_v3_20261005.py
       - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: ganyuan-002991-filings-v2-20261005
+          name: ganyuan-002991-filings-v3-20261005
           path: 甘源食品_002991_全部年报_招股说明书_最新季报.zip
           if-no-files-found: error
           compression-level: 0
