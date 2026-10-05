@@ -1,0 +1,17 @@
+name: Query Meinuohua broker reports 20261005
+
+on:
+  push:
+    paths:
+      - '.github/workflows/query-meinuohua-reports-20261005.yml'
+      - 'scripts/query_meinuohua_reports_20261005.py'
+  workflow_dispatch:
+
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/query_meinuohua_reports_20261005.py
