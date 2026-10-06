@@ -1,0 +1,67 @@
+name: Inspect Ganyuan Foods broker reports 20261006
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-ganyuan-002991-broker-reports-20261006.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Query Eastmoney report metadata
+        run: |
+          python - <<'PY'
+          import json
+          import requests
+
+          s = requests.Session()
+          s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Referer': 'https://data.eastmoney.com/report/002991.html',
+              'Accept-Language': 'zh-CN,zh;q=0.9',
+          }
+          params = {
+              'industryCode': '*',
+              'pageSize': '100',
+              'industry': '*',
+              'rating': '*',
+              'ratingChange': '*',
+              'beginTime': '2020-01-01',
+              'endTime': '2026-10-06',
+              'pageNo': '1',
+              'fields': '',
+              'qType': '0',
+              'orgCode': '',
+              'code': '002991',
+              'rcode': '',
+              'p': '1',
+              'pageNum': '1',
+              'pageNumber': '1',
+          }
+          r = s.get('https://reportapi.eastmoney.com/report/list', params=params, headers=headers, timeout=90)
+          print('STATUS', r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+          r.raise_for_status()
+          obj = r.json()
+          rows = obj.get('data') or []
+          print('TOTAL', obj.get('TotalCount'), obj.get('hits'), 'ROWS', len(rows), flush=True)
+          out = []
+          for x in rows:
+              out.append({
+                  'infoCode': x.get('infoCode'),
+                  'publishDate': x.get('publishDate'),
+                  'title': x.get('title'),
+                  'orgSName': x.get('orgSName'),
+                  'researcher': x.get('researcher'),
+                  'attachPages': x.get('attachPages'),
+                  'attachSize': x.get('attachSize'),
+                  'rating': x.get('emRatingName'),
+                  'stockName': x.get('stockName'),
+                  'stockCode': x.get('stockCode'),
+              })
+          out.sort(key=lambda z: (int(z.get('attachPages') or 0), str(z.get('publishDate') or '')), reverse=True)
+          print(json.dumps(out, ensure_ascii=False, indent=2), flush=True)
+          PY
