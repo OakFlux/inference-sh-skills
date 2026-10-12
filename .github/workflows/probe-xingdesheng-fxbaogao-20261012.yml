@@ -1,0 +1,23 @@
+name: Probe Xingdesheng FXBaogao 20261012
+
+on:
+  push:
+    branches:
+      - xingdesheng-broker-reports-20261012
+    paths:
+      - '.github/workflows/probe-xingdesheng-fxbaogao-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install requests
+        run: python -m pip install --quiet requests
+      - name: Probe FXBaogao
+        run: python scripts/probe_xingdesheng_fxbaogao_20261012.py
