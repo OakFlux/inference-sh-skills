@@ -1,0 +1,28 @@
+name: Ciwen Media broker reports v2 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/build-ciwen-002343-broker-reports-v2-20261012.yml'
+  workflow_dispatch: {}
+permissions:
+  contents: read
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
+          python -m pip install --quiet requests pypdf
+      - name: Build archive
+        run: python scripts/build_ciwen_002343_broker_reports_20261012.py
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ciwen-002343-broker-reports-20261012
+          path: 慈文传媒_002343_券商深度报告_3份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
