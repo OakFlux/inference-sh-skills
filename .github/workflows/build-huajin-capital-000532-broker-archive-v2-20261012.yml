@@ -1,10 +1,9 @@
 name: Build Huajin Capital broker archive v2 20261012
-# Trigger revision 3: use ReportLab CID font
+# Trigger revision 4 with simple patch command
 on:
   push:
     paths:
       - '.github/workflows/build-huajin-capital-000532-broker-archive-v2-20261012.yml'
-      - 'scripts/build_huajin_capital_000532_broker_archive_20261012.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -15,32 +14,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
-        shell: bash
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
           python -m pip install --quiet requests beautifulsoup4 pillow reportlab pypdf
-      - name: Patch Chinese font registration
-        shell: bash
+      - name: Patch and build archive
         run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('scripts/build_huajin_capital_000532_broker_archive_20261012.py')
-          text = path.read_text(encoding='utf-8')
-          text = text.replace(
-              'from reportlab.pdfbase.ttfonts import TTFont',
-              'from reportlab.pdfbase.cidfonts import UnicodeCIDFont',
-          )
-          start = text.index('FONT_PATH_CANDIDATES = [')
-          end = text.index('\n\n\ndef get(', start)
-          replacement = 'pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))'
-          text = text[:start] + replacement + text[end:]
-          text = text.replace('fontName="CJK"', 'fontName="STSong-Light"')
-          path.write_text(text, encoding='utf-8')
-          PY
-      - name: Build archive
-        shell: bash
-        run: |
+          sed -i 's/from reportlab.pdfbase.ttfonts import TTFont/from reportlab.pdfbase.cidfonts import UnicodeCIDFont/' scripts/build_huajin_capital_000532_broker_archive_20261012.py
+          python -c "from pathlib import Path; p=Path('scripts/build_huajin_capital_000532_broker_archive_20261012.py'); s=p.read_text(encoding='utf-8'); a=s.index('FONT_PATH_CANDIDATES = ['); b=s.index('\\n\\n\\ndef get(',a); s=s[:a]+'pdfmetrics.registerFont(UnicodeCIDFont(\"STSong-Light\"))'+s[b:]; s=s.replace('fontName=\"CJK\"','fontName=\"STSong-Light\"'); p.write_text(s,encoding='utf-8')"
           python scripts/build_huajin_capital_000532_broker_archive_20261012.py
       - name: Upload archive
         uses: actions/upload-artifact@v4
