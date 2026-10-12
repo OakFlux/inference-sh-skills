@@ -1,0 +1,19 @@
+name: Probe Baida report pages
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-baida-report-pages-20261012.yml'
+      - 'scripts/probe_baida_report_pages_20261012.py'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install requests
+        run: python -m pip install --quiet requests
+      - name: Probe report pages
+        run: python scripts/probe_baida_report_pages_20261012.py
