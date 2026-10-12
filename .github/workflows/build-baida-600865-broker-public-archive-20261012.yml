@@ -1,0 +1,33 @@
+name: Build Baida Group 600865 broker public archive
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-baida-600865-broker-public-archive-20261012.yml'
+      - 'scripts/build_baida_600865_broker_public_archive_20261012.py'
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PDF and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf reportlab
+
+      - name: Build validate and package archive
+        run: python scripts/build_baida_600865_broker_public_archive_20261012.py
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: baida-600865-broker-public-archive-20261012
+          path: 百大集团_600865_券商深度报告_3份_公开索引存档版_2026-10-12.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
