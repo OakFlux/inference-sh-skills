@@ -1,0 +1,96 @@
+name: Inspect legacy Xiangrikui broker report sources 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/diag-xiangrikui-legacy-report-sources-20261012.yml'
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Inspect legacy report pages and search results
+        run: |
+          python - <<'PY'
+          import html
+          import json
+          import re
+          from urllib.parse import urljoin, quote
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          h = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+
+          urls = []
+          for host in ['https://stock.finance.sina.com.cn', 'https://vip.stock.finance.sina.com.cn']:
+              for p in range(1, 6):
+                  urls.append(f'{host}/stock/go.php/vReport_List/kind/search/index.phtml?symbol=300111&t1=all&p={p}')
+                  urls.append(f'{host}/q/go.php/vReport_List/kind/search/index.phtml?symbol=300111&t1=all&p={p}')
+          urls += [
+              'https://www.futunn.com/stock/300111-SZ/news/reports',
+              'https://www.futunn.com/stock/300111-SZ/institutional-ratings',
+              'https://basic.10jqka.com.cn/300111/worth.html',
+              'https://f10.eastmoney.com/f10_v2/InvestmentRating.aspx?code=sz300111',
+              'https://data.eastmoney.com/report/300111.html',
+          ]
+
+          for url in urls:
+              print('\n===URL===', url, flush=True)
+              try:
+                  r = s.get(url, headers=h, timeout=60, allow_redirects=True)
+                  enc = r.apparent_encoding or r.encoding or 'utf-8'
+                  r.encoding = enc
+                  text = r.text
+                  print('STATUS', r.status_code, r.headers.get('content-type'), len(r.content), r.url, 'ENC', enc, flush=True)
+                  m = re.search(r'<title[^>]*>(.*?)</title>', text, re.I | re.S)
+                  if m:
+                      print('TITLE', re.sub(r'<[^>]+>', '', m.group(1)).strip(), flush=True)
+                  hits = []
+                  for pattern in [
+                      r'vReport_Show[^"\'<> ]+',
+                      r'href\s*=\s*["\']([^"\']+)["\']',
+                  ]:
+                      for match in re.finditer(pattern, text, re.I):
+                          raw = match.group(1) if match.lastindex else match.group(0)
+                          raw = html.unescape(raw)
+                          full = urljoin(r.url, raw)
+                          if any(k in full.lower() for k in ['report', 'pdf', '300111', 'xiangri', '向日葵']):
+                              hits.append(full)
+                  unique = list(dict.fromkeys(hits))
+                  print('LINKS', json.dumps(unique[:300], ensure_ascii=False, indent=2), flush=True)
+                  for pat in ['向日葵', '浙江向日葵', '300111', '研报', '研究报告', '公司研究']:
+                      positions = [m.start() for m in re.finditer(pat, text, re.I)]
+                      for pos in positions[:5]:
+                          snippet = re.sub(r'\s+', ' ', text[max(0, pos-600):pos+1800])
+                          print('AROUND', pat, snippet, flush=True)
+              except Exception as exc:
+                  print('ERROR', repr(exc), flush=True)
+
+          queries = [
+              '"300111" "研究报告"',
+              '"向日葵" "300111" "公司研究"',
+              '"浙江向日葵光能" "研报"',
+              '"向日葵光能" "券商" "PDF"',
+              '"300111" "新股询价"',
+              '"300111" "新股研究"',
+          ]
+          for q in queries:
+              url = 'https://www.baidu.com/s?wd=' + quote(q)
+              print('\n===BAIDU===', q, flush=True)
+              try:
+                  r = s.get(url, headers=h, timeout=60)
+                  r.encoding = r.apparent_encoding or 'utf-8'
+                  print('STATUS', r.status_code, len(r.content), r.url, flush=True)
+                  text = re.sub(r'\s+', ' ', r.text)
+                  for m in re.finditer(r'<h3[^>]*>.*?</h3>', text, re.I | re.S):
+                      chunk = re.sub(r'<[^>]+>', ' ', m.group(0))
+                      chunk = html.unescape(re.sub(r'\s+', ' ', chunk)).strip()
+                      print('RESULT', chunk, flush=True)
+              except Exception as exc:
+                  print('ERROR', repr(exc), flush=True)
+          PY
