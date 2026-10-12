@@ -19,7 +19,7 @@ for old, new in replacements.items():
 
 resolver_start = wrapper.index("resolver = r'''def find_org_id() -> str:")
 resolver_end = wrapper.index("\n'''\nsource = source[:resolver_start]", resolver_start) + len("\n'''")
-resolver_literal = r'''resolver = r'''def find_org_id() -> str:
+resolver_body = r"""def find_org_id() -> str:
     for warm_url in ("https://www.cninfo.com.cn/new/disclosure", "https://www.cninfo.com.cn/"):
         try:
             response = SESSION.get(warm_url, timeout=(20, 60))
@@ -118,8 +118,8 @@ resolver_literal = r'''resolver = r'''def find_org_id() -> str:
             print("ORG_RESOLVER_FAILED", url, repr(exc), flush=True)
 
     raise RuntimeError(f"Unable to resolve CNINFO orgId for {CODE}")
-'''
-'''
+"""
+resolver_literal = "resolver = r'''" + resolver_body + "'''"
 wrapper = wrapper[:resolver_start] + resolver_literal + wrapper[resolver_end:]
 
 pagination_hook = 'source = source.replace("if page > 20:", "if page > 60:")'
