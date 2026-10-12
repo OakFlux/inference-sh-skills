@@ -1,0 +1,33 @@
+name: Find Xiangrikui research memo IDs 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/find-xiangrikui-research-memos-20261012.yml'
+  workflow_dispatch:
+
+jobs:
+  find:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Parse candidate titles
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9'}
+          rows=[]
+          for p in range(1,4):
+            u=f'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=300111&t1=all&p={p}'
+            r=s.get(u,headers=h,timeout=60); r.encoding=r.apparent_encoding or 'gbk'
+            for m in re.finditer(r'<a[^>]+href=["\']([^"\']*vReport_Show[^"\']+)["\'][^>]*>(.*?)</a>',r.text,re.I|re.S):
+              href=html.unescape(m.group(1)); title=html.unescape(re.sub(r'<[^>]+>','',m.group(2)))
+              title=re.sub(r'\s+',' ',title).strip(); full=urljoin(r.url,href)
+              rid=re.search(r'/rptid/(\d+)/',full)
+              if rid and any(k in title for k in ['调研简报','调研纪要','深度研究','公司研究','新股','首次覆盖']):
+                rows.append({'rid':rid.group(1),'title':title,'url':full})
+          print(json.dumps(rows,ensure_ascii=False,indent=2),flush=True)
+          PY
