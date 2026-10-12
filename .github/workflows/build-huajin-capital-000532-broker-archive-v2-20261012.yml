@@ -1,0 +1,33 @@
+name: Build Huajin Capital broker archive v2 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/build-huajin-capital-000532-broker-archive-v2-20261012.yml'
+      - 'scripts/build_huajin_capital_000532_broker_archive_20261012.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
+          python -m pip install --quiet requests beautifulsoup4 pillow reportlab pypdf
+      - name: Build archive
+        shell: bash
+        run: |
+          python scripts/build_huajin_capital_000532_broker_archive_20261012.py
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: huajin-capital-000532-broker-archive-20261012
+          path: 华金资本_000532_券商深度研究资料_3份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
