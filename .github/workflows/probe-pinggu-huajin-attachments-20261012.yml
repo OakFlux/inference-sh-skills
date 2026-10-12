@@ -36,7 +36,7 @@ jobs:
                 full=urljoin(r.url,html.unescape(m.group(1)))
                 if any(k in full.lower() for k in ['attach','4219548','.pdf','download','aid=']): links.append(full)
               print('LINKS',json.dumps(list(dict.fromkeys(links))[:200],ensure_ascii=False),flush=True)
-              for pat in ['4219548','attachment','attach','aid=','.pdf','download','file']: 
+              for pat in ['4219548','attachment','attach','aid=','.pdf','download','file']:
                 for m in list(re.finditer(re.escape(pat),t,re.I))[:20]:
                   snip=re.sub(r'\s+',' ',t[max(0,m.start()-400):m.start()+1200])
                   print('SNIP',pat,snip[:1600],flush=True)
