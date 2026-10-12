@@ -1,0 +1,132 @@
+name: Discover Ciwen Media broker reports 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/discover-ciwen-002343-reports-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Discover report metadata and assets
+        shell: bash
+        run: |
+          python - <<'PY'
+          import html, json, re, time
+          from urllib.parse import urljoin
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://data.eastmoney.com/report/stock.jshtml',
+          }
+
+          print('=== SINA REPORT LIST ===', flush=True)
+          seen = set()
+          rows = []
+          for p in range(1, 8):
+              url = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=002343&t1=all&p={p}'
+              r = s.get(url, headers=headers, timeout=60)
+              r.encoding = r.apparent_encoding or 'gb18030'
+              print('SINA_LIST', p, r.status_code, len(r.content), r.url, flush=True)
+              for m in re.finditer(r'<a[^>]+href=["\']([^"\']*vReport_Show[^"\']+)["\'][^>]*>(.*?)</a>', r.text, re.I|re.S):
+                  href = html.unescape(m.group(1))
+                  title = html.unescape(re.sub(r'<[^>]+>', '', m.group(2)))
+                  title = re.sub(r'\s+', ' ', title).strip()
+                  full = urljoin(r.url, href)
+                  ridm = re.search(r'/rptid/(\d+)/', full)
+                  if not ridm or ridm.group(1) in seen:
+                      continue
+                  seen.add(ridm.group(1))
+                  row = {'rid': ridm.group(1), 'title': title, 'url': full}
+                  rows.append(row)
+                  print('SINA_ROW', json.dumps(row, ensure_ascii=False), flush=True)
+          print('SINA_COUNT', len(rows), flush=True)
+
+          print('\n=== SINA SELECTED DETAILS ===', flush=True)
+          kws = ['首次覆盖','深度','精品剧','国有影视龙头','战略纲要','先锋转型','内容制作','IP','泛娱乐','网生内容']
+          selected = [x for x in rows if any(k in x['title'] for k in kws)]
+          for row in selected:
+              r = s.get(row['url'], headers=headers, timeout=60)
+              r.encoding = r.apparent_encoding or 'gb18030'
+              text = r.text
+              broker = re.search(r'机构：.*?>([^<>]+)</a>', text, re.S)
+              analysts = re.search(r'研究员：.*?>([^<>]+)</a>', text, re.S)
+              date = re.search(r'日期：\s*([0-9-]+)', text)
+              bodym = re.search(r'<div class="blk_container">\s*<p>(.*?)</p>', text, re.I|re.S)
+              body = html.unescape(re.sub(r'<br\s*/?>', '\n', bodym.group(1), flags=re.I)) if bodym else ''
+              body = re.sub(r'<[^>]+>', '', body)
+              body = re.sub(r'\s+', ' ', body).strip()
+              meta = {
+                  **row,
+                  'broker': broker.group(1).strip() if broker else None,
+                  'analysts': analysts.group(1).strip() if analysts else None,
+                  'date': date.group(1) if date else None,
+                  'body_chars': len(body),
+                  'body_head': body[:400],
+              }
+              print('SINA_DETAIL', json.dumps(meta, ensure_ascii=False), flush=True)
+
+          print('\n=== EASTMONEY API TRIALS ===', flush=True)
+          base = 'https://reportapi.eastmoney.com/report/list'
+          trials = [
+              {'pageSize':'100','pageNo':'1','code':'002343','qType':'0','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':'2010-01-01','endTime':'2026-10-12','orgCode':'','rcode':'','fields':''},
+              {'pageSize':'100','pageNo':'1','stockCode':'002343','qType':'0'},
+              {'pageSize':'100','pageNo':'1','code':'002343','qType':'1'},
+          ]
+          for i, params in enumerate(trials, 1):
+              r = s.get(base, params=params, headers=headers, timeout=60)
+              print('EM_TRIAL', i, r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+              print('EM_HEAD', i, r.text[:1200].replace('\n',' '), flush=True)
+              try:
+                  j = r.json()
+                  print('EM_JSON_KEYS', i, list(j) if isinstance(j, dict) else type(j).__name__, flush=True)
+                  print('EM_JSON', i, json.dumps(j, ensure_ascii=False)[:12000], flush=True)
+              except Exception as e:
+                  print('EM_JSON_ERROR', i, repr(e), flush=True)
+
+          print('\n=== FXBAOGAO DETAIL ===', flush=True)
+          for u in ['https://fxbaogao.com/detail/4422231','https://www.fxbaogao.com/detail/4422231']:
+              try:
+                  r = s.get(u, headers=headers, timeout=60)
+                  print('FX', r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+                  r.encoding = r.apparent_encoding or 'utf-8'
+                  txt = r.text
+                  title = re.search(r'<title>(.*?)</title>', txt, re.I|re.S)
+                  print('FX_TITLE', re.sub(r'<[^>]+>','',title.group(1)).strip() if title else '', flush=True)
+                  links=[]
+                  for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+)["\']', txt, re.I):
+                      full=urljoin(r.url, html.unescape(m.group(1)))
+                      if any(k in full.lower() for k in ['pdf','download','attachment','report','file','oss','cos']):
+                          links.append(full)
+                  print('FX_LINKS', json.dumps(list(dict.fromkeys(links))[:100], ensure_ascii=False), flush=True)
+                  for pat in ['pdf','download','4422231','首次覆盖报告','先锋转型']:
+                      pos=txt.lower().find(pat.lower())
+                      if pos>=0: print('FX_SNIP',pat,re.sub(r'\s+',' ',txt[max(0,pos-400):pos+1000])[:1400],flush=True)
+              except Exception as e:
+                  print('FX_ERROR', u, repr(e), flush=True)
+
+          print('\n=== EXACT TITLE SEARCH VIA BAIDU-LIKE PUBLIC SEARCH PAGES ===', flush=True)
+          urls = [
+              'https://www.ifxh.com/2563.html',
+              'https://news.futunn.com/post/42491197/ciwen-media-002343-first-coverage-leading-high-quality-state-owned',
+              'https://www.10100.com/article/2836196',
+          ]
+          for u in urls:
+              try:
+                  r=s.get(u,headers=headers,timeout=60)
+                  print('PAGE',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+                  r.encoding=r.apparent_encoding or 'utf-8'
+                  txt=r.text
+                  links=[]
+                  for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+)["\']',txt,re.I):
+                      full=urljoin(r.url,html.unescape(m.group(1)))
+                      if '.pdf' in full.lower() or 'download' in full.lower(): links.append(full)
+                  print('PAGE_LINKS',u,json.dumps(list(dict.fromkeys(links))[:80],ensure_ascii=False),flush=True)
+              except Exception as e:
+                  print('PAGE_ERROR',u,repr(e),flush=True)
+          PY
