@@ -1,3 +1,4 @@
+# Triggered after workflow registration.
 name: Build Baida Group 600865 filings package 20261012
 
 on:
