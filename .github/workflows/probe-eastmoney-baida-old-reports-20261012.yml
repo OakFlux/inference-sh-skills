@@ -1,0 +1,17 @@
+name: Probe Eastmoney Baida old reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-eastmoney-baida-old-reports-20261012.yml'
+      - 'scripts/probe_eastmoney_baida_old_reports_20261012.py'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/probe_eastmoney_baida_old_reports_20261012.py
