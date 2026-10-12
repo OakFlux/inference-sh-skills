@@ -1,4 +1,4 @@
-name: Huajin Capital filings archive v2 20261012
+name: Huajin Capital broker archive runner 20261012
 on:
   push:
     paths:
@@ -17,15 +17,18 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
-          python -m pip install --quiet requests beautifulsoup4 pypdf
-      - name: Build archive
+          python -m pip install --quiet requests beautifulsoup4 pillow reportlab pypdf
+      - name: Patch and build broker archive
         shell: bash
-        run: python scripts/build_huajin_capital_000532_filings_20261012.py
-      - name: Upload archive
+        run: |
+          sed -i 's/from reportlab.pdfbase.ttfonts import TTFont/from reportlab.pdfbase.cidfonts import UnicodeCIDFont/' scripts/build_huajin_capital_000532_broker_archive_20261012.py
+          python -c "from pathlib import Path; p=Path('scripts/build_huajin_capital_000532_broker_archive_20261012.py'); s=p.read_text(encoding='utf-8'); a=s.index('FONT_PATH_CANDIDATES = ['); b=s.index('\\n\\n\\ndef get(',a); s=s[:a]+'pdfmetrics.registerFont(UnicodeCIDFont(\"STSong-Light\"))'+s[b:]; s=s.replace('fontName=\"CJK\"','fontName=\"STSong-Light\"'); p.write_text(s,encoding='utf-8')"
+          python scripts/build_huajin_capital_000532_broker_archive_20261012.py
+      - name: Upload broker archive
         uses: actions/upload-artifact@v4
         with:
-          name: huajin-capital-000532-filings-20261012
-          path: 华金资本_000532_2020-2025年报及最新季报.zip
+          name: huajin-capital-000532-broker-archive-20261012
+          path: 华金资本_000532_券商深度研究资料_3份.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
