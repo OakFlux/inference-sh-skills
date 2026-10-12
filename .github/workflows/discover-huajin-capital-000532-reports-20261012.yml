@@ -1,0 +1,70 @@
+name: Discover Huajin Capital broker reports 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/discover-huajin-capital-000532-reports-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Discover report metadata
+        shell: bash
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+
+          s = requests.Session(); s.trust_env = False
+          h = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Referer': 'https://data.eastmoney.com/report/stock.jshtml',
+          }
+
+          print('=== EASTMONEY ===', flush=True)
+          params = {
+              'pageSize':'100','pageNo':'1','code':'000532','qType':'0',
+              'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+              'beginTime':'2008-01-01','endTime':'2026-10-12','orgCode':'','rcode':'','fields':''
+          }
+          r = s.get('https://reportapi.eastmoney.com/report/list', params=params, headers=h, timeout=90)
+          print('EM_HTTP', r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+          try:
+              j = r.json()
+              data = j.get('data') or []
+              print('EM_COUNT', len(data), flush=True)
+              for x in data:
+                  out = {k:x.get(k) for k in ['title','stockName','stockCode','orgName','orgSName','publishDate','infoCode','attachPages','attachSize','researcher','emRatingName','sRatingName']}
+                  print('EM_ROW', json.dumps(out, ensure_ascii=False), flush=True)
+          except Exception as e:
+              print('EM_ERROR', repr(e), r.text[:1000], flush=True)
+
+          print('\n=== SINA ===', flush=True)
+          seen=set(); rows=[]
+          for p in range(1,9):
+              u=f'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=000532&t1=all&p={p}'
+              rr=s.get(u,headers=h,timeout=60); rr.encoding=rr.apparent_encoding or 'gb18030'
+              print('SINA_LIST',p,rr.status_code,len(rr.content),rr.url,flush=True)
+              for m in re.finditer(r'<a[^>]+href=["\']([^"\']*vReport_Show[^"\']+)["\'][^>]*>(.*?)</a>',rr.text,re.I|re.S):
+                  href=html.unescape(m.group(1)); title=html.unescape(re.sub(r'<[^>]+>','',m.group(2)))
+                  title=re.sub(r'\s+',' ',title).strip(); full=urljoin(rr.url,href)
+                  ridm=re.search(r'/rptid/(\d+)/',full)
+                  if ridm and ridm.group(1) not in seen:
+                      seen.add(ridm.group(1)); rows.append({'rid':ridm.group(1),'title':title,'url':full})
+          print('SINA_COUNT',len(rows),flush=True)
+          for row in rows:
+              if any(k in row['title'] for k in ['深度','首次覆盖','首次报告','调研','公司研究','力合股份','华金资本']):
+                  rr=s.get(row['url'],headers=h,timeout=60); rr.encoding=rr.apparent_encoding or 'gb18030'; t=rr.text
+                  broker=re.search(r'机构：.*?>([^<>]+)</a>',t,re.S)
+                  analysts=re.search(r'研究员：.*?>([^<>]+)</a>',t,re.S)
+                  date=re.search(r'日期：\s*([0-9-]+)',t)
+                  bodym=re.search(r'<div class="blk_container">\s*<p>(.*?)</p>',t,re.I|re.S)
+                  body=html.unescape(re.sub(r'<br\s*/?>','\n',bodym.group(1),flags=re.I)) if bodym else ''
+                  body=re.sub(r'<[^>]+>','',body); body=re.sub(r'\s+',' ',body).strip()
+                  out={**row,'broker':broker.group(1).strip() if broker else None,'analysts':analysts.group(1).strip() if analysts else None,'date':date.group(1) if date else None,'body_chars':len(body),'body_head':body[:300]}
+                  print('SINA_ROW',json.dumps(out,ensure_ascii=False),flush=True)
+          PY
