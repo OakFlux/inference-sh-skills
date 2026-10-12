@@ -1,5 +1,5 @@
 name: Build Huajin Capital broker archive v2 20261012
-# Trigger revision 2
+# Trigger revision 3: use ReportLab CID font
 on:
   push:
     paths:
@@ -20,6 +20,24 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
           python -m pip install --quiet requests beautifulsoup4 pillow reportlab pypdf
+      - name: Patch Chinese font registration
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/build_huajin_capital_000532_broker_archive_20261012.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              'from reportlab.pdfbase.ttfonts import TTFont',
+              'from reportlab.pdfbase.cidfonts import UnicodeCIDFont',
+          )
+          start = text.index('FONT_PATH_CANDIDATES = [')
+          end = text.index('\n\n\ndef get(', start)
+          replacement = 'pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))'
+          text = text[:start] + replacement + text[end:]
+          text = text.replace('fontName="CJK"', 'fontName="STSong-Light"')
+          path.write_text(text, encoding='utf-8')
+          PY
       - name: Build archive
         shell: bash
         run: |
