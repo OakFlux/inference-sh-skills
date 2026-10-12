@@ -1,0 +1,43 @@
+name: Extract Sdyanbao API concise 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/extract-sdyanbao-api-concise-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Print concise API findings
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re, requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0'}
+          urls=[
+            'https://www.sdyanbao.com/_nuxt/0bec462.js',
+            'https://www.sdyanbao.com/_nuxt/7ff3a18.js',
+            'https://www.sdyanbao.com/_nuxt/359ac1f.js',
+            'https://www.sdyanbao.com/_nuxt/a94fdf1.js',
+          ]
+          for u in urls:
+            r=s.get(u,headers=h,timeout=90); t=r.text
+            print('FILE',u,'STATUS',r.status_code,'LEN',len(t),flush=True)
+            findings=[]
+            # quoted HTTP(S) URLs and protocol-relative domains
+            for m in re.finditer(r'["\']((?:https?:)?//[^"\']+)["\']',t):
+              val=m.group(1)
+              if any(k in val.lower() for k in ['api','sdyanbao','yanbao','samorun']): findings.append(val)
+            # snippets around baseURL and exact API paths
+            for pat in ['baseURL','/api/file/search','/api/file/detail','/api/file/download','file/search','file/detail','file/download','axios.create']:
+              for m in list(re.finditer(re.escape(pat),t,re.I))[:10]:
+                snip=re.sub(r'\s+',' ',t[max(0,m.start()-250):m.start()+500])
+                findings.append(pat+' :: '+snip)
+            seen=[]
+            for x in findings:
+              if x not in seen: seen.append(x)
+            for x in seen[:80]: print('FINDING',x[:1000],flush=True)
+          PY
