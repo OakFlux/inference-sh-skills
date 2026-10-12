@@ -1,0 +1,101 @@
+name: Resolve Xiangrikui Sina report PDFs 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/resolve-xiangrikui-sina-reports-20261012.yml'
+  workflow_dispatch:
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Parse list and resolve candidate downloads
+        run: |
+          python - <<'PY'
+          import html
+          import json
+          import re
+          from pathlib import Path
+          from urllib.parse import urljoin
+          import requests
+
+          outdir = Path('xiangrikui_candidates')
+          outdir.mkdir(exist_ok=True)
+          s = requests.Session(); s.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9',
+          }
+          candidates = []
+          for p in range(1, 4):
+              url = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_List/kind/search/index.phtml?symbol=300111&t1=all&p={p}'
+              r = s.get(url, headers=headers, timeout=60)
+              r.encoding = r.apparent_encoding or 'gbk'
+              print('LIST', p, r.status_code, len(r.content), r.url, flush=True)
+              text = r.text
+              for m in re.finditer(r'<a[^>]+href=["\']([^"\']*vReport_Show[^"\']+)["\'][^>]*>(.*?)</a>', text, re.I|re.S):
+                  href = html.unescape(m.group(1))
+                  title = html.unescape(re.sub(r'<[^>]+>', '', m.group(2)))
+                  title = re.sub(r'\s+', ' ', title).strip()
+                  full = urljoin(r.url, href)
+                  ridm = re.search(r'/rptid/(\d+)/', full)
+                  if ridm:
+                      candidates.append({'rid': ridm.group(1), 'title': title, 'detail_url': full})
+
+          uniq = []
+          seen = set()
+          for row in candidates:
+              if row['rid'] not in seen:
+                  seen.add(row['rid']); uniq.append(row)
+          selected = [r for r in uniq if any(k in r['title'] for k in ['深度研究','专注分布式光伏发电','调研纪要'])]
+          print('ALL_COUNT', len(uniq), flush=True)
+          print('SELECTED_META', json.dumps(selected, ensure_ascii=False, indent=2), flush=True)
+
+          results = []
+          for row in selected:
+              rid = row['rid']
+              detail = row['detail_url']
+              dr = s.get(detail, headers=headers, timeout=60)
+              dr.encoding = dr.apparent_encoding or 'gbk'
+              dtext = dr.text
+              title_match = re.search(r'<title>(.*?)</title>', dtext, re.I|re.S)
+              page_title = re.sub(r'<[^>]+>', '', title_match.group(1)).strip() if title_match else ''
+              print('\nDETAIL', rid, dr.status_code, len(dr.content), detail, page_title, flush=True)
+              for pat in ['类别：','机构：','研究员：','日期：','报告摘要','报告正文','下载']:
+                  pos = dtext.find(pat)
+                  if pos >= 0:
+                      print('SNIP', pat, re.sub(r'\s+', ' ', dtext[max(0,pos-200):pos+800]), flush=True)
+
+              dl = f'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/{rid}/url'
+              rr = s.get(dl, headers={**headers, 'Referer': detail}, timeout=90, allow_redirects=True)
+              print('DOWNLOAD', rid, rr.status_code, rr.headers.get('content-type'), len(rr.content), rr.url, flush=True)
+              print('HISTORY', [(h.status_code, h.url, h.headers.get('location')) for h in rr.history], flush=True)
+              pdf_path = None
+              if rr.content.startswith(b'%PDF'):
+                  pdf_path = outdir / f'{rid}.pdf'
+                  pdf_path.write_bytes(rr.content)
+                  print('SAVED_PDF', pdf_path, pdf_path.stat().st_size, flush=True)
+              else:
+                  body = rr.text[:5000]
+                  print('BODY_HEAD', re.sub(r'\s+', ' ', body)[:1500], flush=True)
+                  links = []
+                  for m in re.finditer(r'''(?:href|src)\s*=\s*["']([^"']+)["']''', body, re.I):
+                      full = urljoin(rr.url, html.unescape(m.group(1)))
+                      if any(k in full.lower() for k in ['pdf','download','attach','report']):
+                          links.append(full)
+                  print('BODY_LINKS', json.dumps(list(dict.fromkeys(links)), ensure_ascii=False), flush=True)
+              results.append({**row, 'page_title': page_title, 'download_final_url': rr.url, 'content_type': rr.headers.get('content-type'), 'bytes': len(rr.content), 'saved_pdf': str(pdf_path) if pdf_path else None})
+
+          (outdir/'results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+          PY
+
+      - name: Upload candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: xiangrikui-sina-candidates
+          path: xiangrikui_candidates
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
