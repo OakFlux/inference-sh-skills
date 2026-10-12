@@ -1,0 +1,37 @@
+name: Find Sdyanbao API base 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/find-sdyanbao-api-base-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Inspect JS for API base
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re, requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0'}
+          urls=[
+            'https://www.sdyanbao.com/_nuxt/0bec462.js',
+            'https://www.sdyanbao.com/_nuxt/7ff3a18.js',
+            'https://www.sdyanbao.com/_nuxt/359ac1f.js',
+            'https://www.sdyanbao.com/_nuxt/a94fdf1.js',
+          ]
+          for u in urls:
+            r=s.get(u,headers=h,timeout=90); t=r.text
+            print('\nFILE',u,len(t),flush=True)
+            for pat in ['baseURL','api.sdyanbao','sdyanbao.com/api','http://','https://','request=function','axios.create','withCredentials','sid','Authorization','token']:
+              positions=[m.start() for m in re.finditer(re.escape(pat),t,re.I)]
+              print('PAT',pat,'COUNT',len(positions),flush=True)
+              for p in positions[:50]:
+                print('SNIP',pat,re.sub(r'\s+',' ',t[max(0,p-800):p+1800])[:2600],flush=True)
+            # all domain strings
+            domains=sorted(set(re.findall(r'https?:\\?/\\?/[A-Za-z0-9._:-]+',t)))
+            print('DOMAINS',domains,flush=True)
+          PY
