@@ -27,11 +27,9 @@ jobs:
             r=s.get(u,headers=h,timeout=90); t=r.text
             print('FILE',u,'STATUS',r.status_code,'LEN',len(t),flush=True)
             findings=[]
-            # quoted HTTP(S) URLs and protocol-relative domains
             for m in re.finditer(r'["\']((?:https?:)?//[^"\']+)["\']',t):
               val=m.group(1)
               if any(k in val.lower() for k in ['api','sdyanbao','yanbao','samorun']): findings.append(val)
-            # snippets around baseURL and exact API paths
             for pat in ['baseURL','/api/file/search','/api/file/detail','/api/file/download','file/search','file/detail','file/download','axios.create']:
               for m in list(re.finditer(re.escape(pat),t,re.I))[:10]:
                 snip=re.sub(r'\s+',' ',t[max(0,m.start()-250):m.start()+500])
