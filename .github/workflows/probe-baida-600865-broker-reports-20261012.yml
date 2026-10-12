@@ -1,0 +1,19 @@
+name: Probe Baida Group 600865 broker reports
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-baida-600865-broker-reports-20261012.yml'
+      - 'scripts/probe_baida_600865_broker_reports_20261012.py'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install requests
+        run: python -m pip install --quiet requests
+      - name: Query public broker report index
+        run: python scripts/probe_baida_600865_broker_reports_20261012.py
