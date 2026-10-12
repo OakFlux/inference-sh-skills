@@ -1,5 +1,5 @@
 name: Build Huajin Capital broker archive v3 20261012
-# Trigger revision 1
+# Trigger revision 2 after workflow registration
 on:
   push:
     paths:
