@@ -1,0 +1,34 @@
+name: Build Anheng Information broker deep reports 20261012
+
+on:
+  push:
+    branches: [anheng-broker-reports-20261012]
+    paths:
+      - '.github/workflows/anheng-broker-deep-reports-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Build verified package
+        run: python scripts/build_anheng_broker_deep_reports_20261012.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: anheng-688023-broker-deep-reports-20261012
+          path: 安恒信息_688023_券商深度报告_*份_20261012.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
