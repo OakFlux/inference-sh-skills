@@ -1,0 +1,35 @@
+name: Build Anheng Information official filings package 20261012
+
+on:
+  push:
+    branches:
+      - anheng-filings-20261012
+    paths:
+      - '.github/workflows/anheng-filings-package-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools and Python dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Build verified ZIP package
+        run: python scripts/build_anheng_filings_20261012.py
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: anheng-688023-filings-package-20261012
+          path: 安恒信息_688023_2020-2025年报_最新季报_截至20261012.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
