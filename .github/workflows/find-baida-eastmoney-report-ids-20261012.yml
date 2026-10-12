@@ -1,0 +1,17 @@
+name: Find Baida Eastmoney report IDs
+
+on:
+  push:
+    paths:
+      - '.github/workflows/find-baida-eastmoney-report-ids-20261012.yml'
+      - 'scripts/find_baida_eastmoney_report_ids_20261012.py'
+  workflow_dispatch:
+
+jobs:
+  find:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - run: python -m pip install --quiet requests
+      - run: python scripts/find_baida_eastmoney_report_ids_20261012.py
