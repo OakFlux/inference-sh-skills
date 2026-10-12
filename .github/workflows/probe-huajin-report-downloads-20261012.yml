@@ -1,0 +1,85 @@
+name: Probe Huajin report downloads 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-huajin-report-downloads-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Probe download endpoints
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re
+          from urllib.parse import quote
+          import requests
+
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+
+          urls=[
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/523277190294/url',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/778514540284/url',
+            'https://oss.sdyanbao.com/pdf/2024/9/10/1081871.pdf',
+            'https://oss.sdyanbao.com/file/2024/9/10/1081871.pdf',
+            'https://oss.sdyanbao.com/report/2024/9/10/1081871.pdf',
+            'https://oss.sdyanbao.com/source/2024/9/10/1081871.pdf',
+            'https://oss.sdyanbao.com/2024/9/10/1081871.pdf',
+            'https://oss.sdyanbao.com/pdf/1081871.pdf',
+            'https://public.fxbaogao.com/report-image/2024/09/01/4478831-1.png',
+            'https://www.fxbaogao.com/view?id=4478831',
+          ]
+          for u in urls:
+            try:
+              r=s.get(u,headers=h,timeout=90,allow_redirects=True)
+              print('PROBE',r.status_code,r.headers.get('content-type'),len(r.content),r.url,r.content[:20],flush=True)
+            except Exception as e:
+              print('PROBE_ERROR',u,repr(e),flush=True)
+
+          print('\nSDYANBAO_IMAGES',flush=True)
+          for i in range(0,23):
+            u=f'https://oss.sdyanbao.com/page/2024/9/10/1081871/{i}.png'
+            try:
+              r=s.get(u,headers=h,timeout=60)
+              print('IMG',i,r.status_code,r.headers.get('content-type'),len(r.content),r.content[:8],flush=True)
+            except Exception as e: print('IMGERR',i,repr(e),flush=True)
+
+          print('\nFXBAOGAO_IMAGES',flush=True)
+          for i in range(1,24):
+            u=f'https://public.fxbaogao.com/report-image/2024/09/01/4478831-{i}.png'
+            try:
+              r=s.get(u,headers=h,timeout=60)
+              print('FXIMG',i,r.status_code,r.headers.get('content-type'),len(r.content),r.content[:8],flush=True)
+            except Exception as e: print('FXIMGERR',i,repr(e),flush=True)
+
+          bundles=['https://www.sdyanbao.com/_nuxt/0bec462.js','https://www.sdyanbao.com/_nuxt/7ff3a18.js','https://www.sdyanbao.com/_nuxt/359ac1f.js','https://www.sdyanbao.com/_nuxt/a94fdf1.js']
+          for u in bundles:
+            try:
+              r=s.get(u,headers=h,timeout=90); t=r.text
+              print('\nBUNDLE',r.status_code,len(r.content),u,flush=True)
+              for pat in ['download','original_id','page_url','online_url','/api/','axios','search','report/detail','detail/']:
+                pos=[m.start() for m in re.finditer(re.escape(pat),t,re.I)]
+                for p in pos[:10]: print('BSNIP',pat,re.sub(r'\s+',' ',t[max(0,p-500):p+1200])[:1700],flush=True)
+            except Exception as e: print('BUNDLEERR',u,repr(e),flush=True)
+
+          # Try likely internal search pages and APIs.
+          probes=[
+            'https://www.sdyanbao.com/report?keyword='+quote('借国企改革之力 转创投发展之路'),
+            'https://www.sdyanbao.com/search?keyword='+quote('借国企改革之力'),
+            'https://www.sdyanbao.com/report?name='+quote('力合股份'),
+            'https://www.fxbaogao.com/search?keyword='+quote('借国企改革之力 转创投发展之路'),
+            'https://www.fxbaogao.com/search?q='+quote('力合股份'),
+          ]
+          for u in probes:
+            try:
+              r=s.get(u,headers=h,timeout=90); r.encoding=r.apparent_encoding or 'utf-8'; t=r.text
+              print('\nSEARCHPAGE',r.status_code,len(r.content),r.url,flush=True)
+              for term in ['借国企改革','力合股份','523277190294','detail/','original_id','page_url']:
+                if term in t:
+                  p=t.find(term); print('SEARCHSNIP',term,re.sub(r'\s+',' ',t[max(0,p-400):p+1800])[:2200],flush=True)
+            except Exception as e: print('SEARCHERR',u,repr(e),flush=True)
+          PY
