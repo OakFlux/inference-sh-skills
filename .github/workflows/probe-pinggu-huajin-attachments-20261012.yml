@@ -1,0 +1,44 @@
+name: Probe Pinggu Huajin attachments 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-pinggu-huajin-attachments-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Probe attachment sources
+        shell: bash
+        run: |
+          python - <<'PY'
+          import html, json, re
+          from urllib.parse import urljoin
+          import requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept-Language':'zh-CN,zh;q=0.9'}
+          urls=[
+            'https://bbs.pinggu.org/thread-11872238-1-1.html',
+            'https://bbs.pinggu.org/a-4219548.html',
+            'https://bbs.pinggu.org/forum.php?mod=attachment&aid=4219548',
+            'https://bbs.pinggu.org/attachment.php?aid=4219548',
+          ]
+          for u in urls:
+            try:
+              r=s.get(u,headers=h,timeout=90,allow_redirects=True); r.encoding=r.apparent_encoding or 'utf-8'; t=r.text
+              print('\nPAGE',r.status_code,r.headers.get('content-type'),len(r.content),r.url,'SIG',r.content[:20],flush=True)
+              tm=re.search(r'<title[^>]*>(.*?)</title>',t,re.I|re.S)
+              print('TITLE',re.sub(r'<[^>]+>','',html.unescape(tm.group(1))).strip() if tm else '',flush=True)
+              links=[]
+              for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+)["\']',t,re.I):
+                full=urljoin(r.url,html.unescape(m.group(1)))
+                if any(k in full.lower() for k in ['attach','4219548','.pdf','download','aid=']): links.append(full)
+              print('LINKS',json.dumps(list(dict.fromkeys(links))[:200],ensure_ascii=False),flush=True)
+              for pat in ['4219548','attachment','attach','aid=','.pdf','download','file']: 
+                for m in list(re.finditer(re.escape(pat),t,re.I))[:20]:
+                  snip=re.sub(r'\s+',' ',t[max(0,m.start()-400):m.start()+1200])
+                  print('SNIP',pat,snip[:1600],flush=True)
+            except Exception as e: print('ERR',u,repr(e),flush=True)
+          PY
