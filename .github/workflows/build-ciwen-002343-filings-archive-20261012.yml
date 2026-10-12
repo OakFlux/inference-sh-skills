@@ -1,0 +1,300 @@
+name: Build Ciwen Media filings archive 20261012
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-ciwen-002343-filings-archive-20261012.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests beautifulsoup4 pypdf
+
+      - name: Download validate and package filings
+        shell: bash
+        run: |
+          python - <<'PY'
+          import csv
+          import hashlib
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import time
+          import zipfile
+          from pathlib import Path
+          from urllib.parse import urljoin
+
+          import requests
+          from bs4 import BeautifulSoup
+          from pypdf import PdfReader
+
+          PACKAGE_DIR = Path('慈文传媒_002343_2020-2025年报及最新季报')
+          PDF_DIR = PACKAGE_DIR / '报告文件'
+          VERIFY_DIR = Path('_verification_renders')
+          PACKAGE_DIR.mkdir(exist_ok=True)
+          PDF_DIR.mkdir(exist_ok=True)
+          VERIFY_DIR.mkdir(exist_ok=True)
+
+          records = [
+              {
+                  'period': '2020年度',
+                  'type': '年度报告',
+                  'announcement_date': '2021-04-29',
+                  'detail_id': '7180965',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=7180965&stockid=002343',
+                  'fallback_url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2021/2021-4/2021-04-29/7180965.PDF',
+                  'filename': '慈文传媒_2020年年度报告.pdf',
+                  'expected': ['慈文传媒', '2020年年度报告'],
+              },
+              {
+                  'period': '2021年度',
+                  'type': '年度报告',
+                  'announcement_date': '2022-04-27',
+                  'detail_id': '8087197',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=8087197&stockid=002343',
+                  'fallback_url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2022/2022-4/2022-04-27/8087197.PDF',
+                  'filename': '慈文传媒_2021年年度报告.pdf',
+                  'expected': ['慈文传媒', '2021年年度报告'],
+              },
+              {
+                  'period': '2022年度',
+                  'type': '年度报告',
+                  'announcement_date': '2023-04-25',
+                  'detail_id': '9057484',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=9057484&stockid=002343',
+                  'fallback_url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2023/2023-4/2023-04-25/9057484.PDF',
+                  'filename': '慈文传媒_2022年年度报告.pdf',
+                  'expected': ['慈文传媒', '2022年年度报告'],
+              },
+              {
+                  'period': '2023年度',
+                  'type': '年度报告',
+                  'announcement_date': '2024-04-19',
+                  'detail_id': '9999215',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=9999215&stockid=002343',
+                  'fallback_url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2024/2024-4/2024-04-19/9999215.PDF',
+                  'filename': '慈文传媒_2023年年度报告.pdf',
+                  'expected': ['慈文传媒', '2023年年度报告'],
+              },
+              {
+                  'period': '2024年度',
+                  'type': '年度报告',
+                  'announcement_date': '2025-04-10',
+                  'detail_id': '10856119',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=10856119&stockid=002343',
+                  'fallback_url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2025/2025-4/2025-04-10/10856119.PDF',
+                  'filename': '慈文传媒_2024年年度报告.pdf',
+                  'expected': ['慈文传媒', '2024年年度报告'],
+              },
+              {
+                  'period': '2025年度',
+                  'type': '年度报告',
+                  'announcement_date': '2026-04-17',
+                  'detail_id': '12103100',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=12103100&stockid=002343',
+                  'fallback_url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2026/2026-4/2026-04-17/12103100.PDF',
+                  'filename': '慈文传媒_2025年年度报告.pdf',
+                  'expected': ['慈文传媒', '2025年年度报告'],
+              },
+              {
+                  'period': '2026年第一季度',
+                  'type': '季度报告（截至2026-10-12最新已披露季报）',
+                  'announcement_date': '2026-04-30',
+                  'detail_id': '12281868',
+                  'detail_url': 'https://money.finance.sina.com.cn/corp/view/vCB_AllBulletinDetail.php?id=12281868&stockid=002343',
+                  'fallback_url': 'https://file.finance.sina.com.cn/211.154.219.97%3A9494/MRGG/CNSESZ_STOCK/2026/2026-4/2026-04-30/12281868.PDF',
+                  'filename': '慈文传媒_2026年第一季度报告.pdf',
+                  'expected': ['慈文传媒', '2026年第一季度报告'],
+              },
+          ]
+
+          session = requests.Session()
+          session.trust_env = False
+          headers = {
+              'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,*/*;q=0.7',
+          }
+
+          def get_with_retries(url, referer=None, binary=False):
+              last = None
+              for attempt in range(1, 5):
+                  h = dict(headers)
+                  if referer:
+                      h['Referer'] = referer
+                  try:
+                      r = session.get(url, headers=h, timeout=180, allow_redirects=True)
+                      print('HTTP', attempt, r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+                      last = r
+                      if r.status_code == 200 and (not binary or r.content.startswith(b'%PDF')):
+                          return r
+                  except Exception as exc:
+                      print('REQUEST_ERROR', attempt, url, repr(exc), flush=True)
+                      last = exc
+                  time.sleep(attempt * 2)
+              if isinstance(last, Exception):
+                  raise last
+              return last
+
+          def resolve_pdf_url(record):
+              r = get_with_retries(record['detail_url'])
+              if r.status_code == 200:
+                  enc = r.apparent_encoding or 'gb18030'
+                  r.encoding = enc
+                  soup = BeautifulSoup(r.text, 'html.parser')
+                  for a in soup.find_all('a', href=True):
+                      text = a.get_text(' ', strip=True)
+                      href = a['href'].strip()
+                      full = urljoin(r.url, href)
+                      if ('下载公告' in text or full.lower().endswith('.pdf')) and 'file.finance.sina.com.cn' in full:
+                          return full
+                  # Regex fallback for malformed legacy markup.
+                  m = re.search(r'https?://file\.finance\.sina\.com\.cn/[^\"\'<>\s]+?\.PDF', r.text, re.I)
+                  if m:
+                      return m.group(0)
+              return record['fallback_url']
+
+          def candidate_urls(url):
+              out = [url]
+              if '%3A9494' in url:
+                  out.append(url.replace('%3A9494', ':9494'))
+              if '/211.154.219.97%3A9494/' in url:
+                  out.append(url.replace('/211.154.219.97%3A9494/', '/'))
+              # De-duplicate while keeping order.
+              seen = set(); result = []
+              for item in out:
+                  if item not in seen:
+                      seen.add(item); result.append(item)
+              return result
+
+          def download_pdf(record, destination):
+              resolved = resolve_pdf_url(record)
+              errors = []
+              for url in candidate_urls(resolved) + candidate_urls(record['fallback_url']):
+                  try:
+                      r = get_with_retries(url, referer=record['detail_url'], binary=True)
+                      if r.status_code == 200 and r.content.startswith(b'%PDF') and len(r.content) > 20_000:
+                          destination.write_bytes(r.content)
+                          return url, r.url, r.headers.get('content-type')
+                      errors.append(f'{url}: status={getattr(r, "status_code", None)}, bytes={len(getattr(r, "content", b""))}')
+                  except Exception as exc:
+                      errors.append(f'{url}: {exc!r}')
+              raise RuntimeError('PDF download failed: ' + ' | '.join(errors))
+
+          output_rows = []
+          for idx, record in enumerate(records, 1):
+              path = PDF_DIR / record['filename']
+              source_url, final_url, content_type = download_pdf(record, path)
+
+              raw = path.read_bytes()
+              sha = hashlib.sha256(raw).hexdigest()
+              if not raw.startswith(b'%PDF'):
+                  raise RuntimeError(f'Not a PDF: {path}')
+
+              qpdf = subprocess.run(['qpdf', '--check', str(path)], text=True, capture_output=True)
+              if qpdf.returncode not in (0, 3):
+                  raise RuntimeError(f'qpdf check failed for {path}: {qpdf.stdout}\n{qpdf.stderr}')
+
+              reader = PdfReader(str(path))
+              pages = len(reader.pages)
+              if pages < 2:
+                  raise RuntimeError(f'Unexpectedly short PDF: {path}, pages={pages}')
+
+              txt_path = Path('_text_check.txt')
+              subprocess.run(['pdftotext', '-f', '1', '-l', str(min(pages, 8)), str(path), str(txt_path)], check=True)
+              text = txt_path.read_text(encoding='utf-8', errors='ignore')
+              if '慈文传媒' not in text:
+                  raise RuntimeError(f'Company identity check failed for {path}')
+              expected_ok = any(term in text for term in record['expected'][1:])
+              if not expected_ok:
+                  # Layout/extraction can separate title tokens; require the period year at minimum.
+                  year = re.search(r'20\d{2}', record['period']).group(0)
+                  if year not in text:
+                      raise RuntimeError(f'Report period check failed for {path}')
+
+              render_base = VERIFY_DIR / f'{idx:02d}_{path.stem}'
+              subprocess.run([
+                  'pdftoppm', '-f', '1', '-l', '1', '-singlefile', '-png', '-r', '110',
+                  str(path), str(render_base)
+              ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+              render_path = Path(str(render_base) + '.png')
+              if not render_path.exists() or render_path.stat().st_size < 10_000:
+                  raise RuntimeError(f'Render verification failed for {path}')
+
+              row = {
+                  **record,
+                  'source_url': source_url,
+                  'download_final_url': final_url,
+                  'content_type': content_type,
+                  'file_path': str(path.relative_to(PACKAGE_DIR)),
+                  'bytes': path.stat().st_size,
+                  'pages': pages,
+                  'sha256': sha,
+                  'qpdf_return_code': qpdf.returncode,
+                  'render_verified': True,
+              }
+              output_rows.append(row)
+              print('VALIDATED', json.dumps(row, ensure_ascii=False), flush=True)
+
+          readme = f'''慈文传媒（002343）2020-2025年年度报告及最新季报\n\n文件范围\n- 年度报告：2020、2021、2022、2023、2024、2025年度，共6份。\n- 最新季报：2026年第一季度报告，公告日期为2026-04-30。\n- 核对截止日：2026-10-12。截止该日，公司公告列表尚未披露2026年第三季度报告，因此本包将2026年第一季度报告作为最新已披露“季度报告”。2026年半年度报告属于中期报告，不按“季报”口径收录。\n\n来源与校验\n- 文件来自新浪财经公司公告下载镜像，内容为上市公司原始披露PDF。\n- 每份PDF均进行了文件头、文件大小、qpdf结构、页数、公司名称、报告期间及首页渲染检查。\n- SHA-256校验值见 SHA256SUMS.txt；来源、页数和下载地址见 文件清单.csv 与 manifest.json。\n\n共收录 {len(output_rows)} 份PDF。\n'''
+          (PACKAGE_DIR / 'README.txt').write_text(readme, encoding='utf-8')
+
+          csv_fields = [
+              'period', 'type', 'announcement_date', 'filename', 'pages', 'bytes', 'sha256',
+              'source_url', 'download_final_url', 'detail_url', 'detail_id', 'qpdf_return_code', 'render_verified'
+          ]
+          with (PACKAGE_DIR / '文件清单.csv').open('w', encoding='utf-8-sig', newline='') as f:
+              writer = csv.DictWriter(f, fieldnames=csv_fields)
+              writer.writeheader()
+              for row in output_rows:
+                  writer.writerow({k: row.get(k, '') for k in csv_fields})
+
+          with (PACKAGE_DIR / 'SHA256SUMS.txt').open('w', encoding='utf-8') as f:
+              for row in output_rows:
+                  f.write(f"{row['sha256']}  {row['file_path']}\n")
+
+          manifest = {
+              'company': '慈文传媒股份有限公司',
+              'stock_code': '002343',
+              'checked_as_of': '2026-10-12',
+              'annual_report_years': [2020, 2021, 2022, 2023, 2024, 2025],
+              'latest_quarterly_report': '2026年第一季度报告',
+              'document_count': len(output_rows),
+              'records': output_rows,
+          }
+          (PACKAGE_DIR / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+
+          zip_path = Path('慈文传媒_002343_2020-2025年报及最新季报.zip')
+          with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for item in sorted(PACKAGE_DIR.rglob('*')):
+                  if item.is_file():
+                      zf.write(item, arcname=str(item))
+
+          final_sha = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+          print('FINAL_ZIP', zip_path, 'bytes', zip_path.stat().st_size, 'sha256', final_sha, flush=True)
+          PY
+
+      - name: Upload final ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ciwen-002343-filings-20261012
+          path: 慈文传媒_002343_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
