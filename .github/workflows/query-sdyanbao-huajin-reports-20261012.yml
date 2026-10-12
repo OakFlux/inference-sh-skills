@@ -1,0 +1,81 @@
+name: Query Sdyanbao Huajin reports 20261012
+on:
+  push:
+    paths:
+      - '.github/workflows/query-sdyanbao-huajin-reports-20261012.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  query:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Query report API and probe images
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, requests
+          s=requests.Session(); s.trust_env=False
+          h={
+            'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+            'Accept':'application/json, text/plain, */*',
+            'Content-Type':'application/json;charset=UTF-8',
+            'Origin':'https://www.sdyanbao.com',
+            'Referer':'https://www.sdyanbao.com/report',
+          }
+          keywords=[
+            '借国企改革之力 转创投发展之路',
+            '力合股份',
+            '实业和投资双轮驱动 锂电设备有望爆发',
+            '新创投项目尚待时日',
+            '华金资本 自动驾驶风头正盛 耐心资本伏线千里',
+            '华金资本',
+          ]
+          all_items={}
+          for kw in keywords:
+            payload={
+              'device':1,'hideTrader':0,'onlyTitle':0,'order':0,'page':1,'pageSize':50,
+              'keyword':kw,'pageCount':0,'dateRange':0,'startTime':'','endTime':'',
+              'typeIds':'','industryIds':''
+            }
+            r=s.post('https://www.sdyanbao.com/api/file/search',headers=h,json=payload,timeout=90)
+            print('\nSEARCH',kw,r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+            print('BODY',r.text[:30000],flush=True)
+            try:
+              j=r.json()
+            except Exception as e:
+              print('JSONERR',repr(e),flush=True); continue
+            data=j.get('data') or {}
+            items=data.get('files') or data.get('items') or data.get('data') or []
+            print('ITEMCOUNT',len(items),flush=True)
+            for item in items:
+              fid=item.get('id')
+              if fid is None: continue
+              all_items[str(fid)]=item
+          print('\nUNIQUE_ITEMS',json.dumps(all_items,ensure_ascii=False,indent=2)[:100000],flush=True)
+
+          for fid,item in all_items.items():
+            r=s.post('https://www.sdyanbao.com/api/file/detail',headers=h,json={'id':int(fid)},timeout=90)
+            print('\nDETAIL',fid,r.status_code,r.headers.get('content-type'),len(r.content),flush=True)
+            print('DETAIL_BODY',r.text[:30000],flush=True)
+            try:
+              j=r.json(); d=j.get('data')
+            except Exception as e:
+              print('DETAIL_JSONERR',repr(e),flush=True); continue
+            if not isinstance(d,dict): continue
+            page_url=d.get('page_url') or ''
+            page_count=int(d.get('page_count') or 0)
+            print('DETAIL_META',json.dumps({'id':fid,'name':d.get('name'),'page_url':page_url,'page_count':page_count,'online_url':d.get('online_url'),'share_url':d.get('share_url'),'time_text':d.get('time_text'),'organization':d.get('organization'),'researcher':d.get('researcher')},ensure_ascii=False),flush=True)
+            if page_url and page_count:
+              statuses=[]
+              for i in range(page_count):
+                u=f'{page_url}/{i}.png'
+                try:
+                  rr=s.get(u,headers={'User-Agent':h['User-Agent'],'Referer':f'https://www.sdyanbao.com/detail/{fid}'},timeout=45)
+                  statuses.append({'i':i,'status':rr.status_code,'ct':rr.headers.get('content-type'),'bytes':len(rr.content),'sig':rr.content[:8].hex()})
+                except Exception as e:
+                  statuses.append({'i':i,'error':repr(e)})
+              print('IMAGE_STATUSES',fid,json.dumps(statuses,ensure_ascii=False),flush=True)
+            rd=s.post('https://www.sdyanbao.com/api/file/download',headers=h,json={'id':int(fid)},timeout=90)
+            print('DOWNLOAD_API',fid,rd.status_code,rd.headers.get('content-type'),len(rd.content),rd.text[:5000],flush=True)
+          PY
