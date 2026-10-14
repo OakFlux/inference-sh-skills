@@ -1,0 +1,28 @@
+name: Probe Yanbaoke Solex 20261014
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-yanbaoke-solex-20261014.yml'
+      - 'scripts/probe_yanbaoke_solex_20261014.py'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Probe Yanbaoke pages
+        run: python scripts/probe_yanbaoke_solex_20261014.py | tee yanbaoke_solex_probe.log
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: yanbaoke-solex-probe-20261014
+          path: |
+            yanbaoke_solex_probe/
+            yanbaoke_solex_probe.log
+          if-no-files-found: error
+          retention-days: 30
