@@ -1,0 +1,33 @@
+name: Build Yaxiang 301220 reports archive 20261014
+on:
+  push:
+    paths:
+      - '.github/workflows/build-yaxiang-301220-reports-20261014.yml'
+      - 'scripts/build_yaxiang_301220_reports_20261014.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+          python -m pip install --quiet requests pypdf
+      - name: Build archive
+        shell: bash
+        run: |
+          python scripts/build_yaxiang_301220_reports_20261014.py
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: yaxiang-301220-reports-20261014
+          path: 亚香股份_301220_所有年报_招股说明书及最新季报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
