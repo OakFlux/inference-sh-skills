@@ -1,0 +1,36 @@
+name: Package Meon broker research 20261014
+
+on:
+  push:
+    branches:
+      - meinong-broker-reports-20261014
+    paths:
+      - scripts/package_meinong_broker_research_20261014.py
+      - .github/workflows/package-meinong-broker-research-20261014.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+      - name: Download, validate, and package materials
+        run: python scripts/package_meinong_broker_research_20261014.py
+      - name: Show package summary
+        run: cat dist_meinong_broker/package_summary.json
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: meinong-301156-broker-research-20261014
+          path: |
+            dist_meinong_broker/*.zip
+            dist_meinong_broker/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
