@@ -1,0 +1,36 @@
+name: Probe Kaichuang 600097 broker reports 20261014
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-kaichuang-600097-broker-reports-20261014.yml'
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Query Eastmoney report metadata and PDF endpoints
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, requests
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36','Accept':'application/json,text/plain,*/*','Referer':'https://data.eastmoney.com/report/stock.jshtml','Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8'}
+          params={'pageSize':'200','pageNo':'1','code':'600097','qType':'0','industryCode':'*','industry':'*','rating':'*','ratingChange':'*','beginTime':'2000-01-01','endTime':'2026-10-14','orgCode':'','rcode':'','fields':''}
+          r=s.get('https://reportapi.eastmoney.com/report/list',params=params,headers=h,timeout=120)
+          print('LIST',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+          r.raise_for_status(); rows=r.json().get('data') or []
+          print('COUNT',len(rows),flush=True)
+          for x in rows:
+              out={k:x.get(k) for k in ['title','stockName','stockCode','orgName','orgSName','publishDate','infoCode','attachPages','attachSize','researcher','emRatingName','sRatingName']}
+              print('ROW',json.dumps(out,ensure_ascii=False),flush=True)
+              pages=int(x.get('attachPages') or 0)
+              title=str(x.get('title') or '')
+              if pages>=12 or any(k in title for k in ['深度','首次覆盖','公司研究','调研']):
+                  info=str(x.get('infoCode') or '')
+                  u=f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf'
+                  try:
+                      rr=s.get(u,headers={**h,'Accept':'application/pdf,*/*;q=0.8','Referer':f'https://data.eastmoney.com/report/info/{info}.html'},timeout=120,allow_redirects=True)
+                      print('PDF',info,rr.status_code,rr.headers.get('content-type'),len(rr.content),rr.url,rr.content[:8],flush=True)
+                  except Exception as e:
+                      print('PDF_ERR',info,repr(e),flush=True)
+          PY
