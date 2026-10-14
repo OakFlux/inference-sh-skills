@@ -1,0 +1,43 @@
+name: Download Kaichuang Hibor pages 20261014
+on:
+  push:
+    paths:
+      - '.github/workflows/download-kaichuang-hibor-pages-20261014.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download page sources
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests
+          from pathlib import Path
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9'}
+          for name,url in [
+            ('hibor_178938.html','https://www.hibor.com.cn/docdetail_178938.html'),
+            ('hibor_182952.html','https://www.hibor.com.cn/docdetail_182952.html'),
+          ]:
+            r=s.get(url,headers=h,timeout=90,allow_redirects=True)
+            r.raise_for_status()
+            Path(name).write_bytes(r.content)
+            Path(name+'.url.txt').write_text(r.url,encoding='utf-8')
+            print(name,len(r.content),r.url,flush=True)
+          PY
+      - name: Upload page sources
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaichuang-hibor-pages-20261014
+          path: |
+            hibor_178938.html
+            hibor_178938.html.url.txt
+            hibor_182952.html
+            hibor_182952.html.url.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
