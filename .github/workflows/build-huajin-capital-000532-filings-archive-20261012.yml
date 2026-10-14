@@ -1,5 +1,5 @@
 name: Build ST Lianguang 600363 filings via registered workflow
-# Revision 2: accept 2020年度报告全文 title
+# Revision 3: accept annual-report titles with or without 年
 on:
   push:
     paths:
@@ -26,13 +26,14 @@ jobs:
           from pathlib import Path
           path = Path('scripts/build_st_lianguang_600363_filings_20261014.py')
           text = path.read_text(encoding='utf-8')
-          old = 're.search(r"(20\\d{2})年年度报告", title)'
-          new = 're.search(r"(20\\d{2})年?年度报告", title)'
+          old = r'(20\d{2})年年度报告'
+          new = r'(20\d{2})年?年度报告'
           count = text.count(old)
-          if count < 2:
-              raise RuntimeError(f'Expected at least 2 annual-title patterns, found {count}')
+          if count < 1:
+              raise RuntimeError(f'Annual-title regex not found: {old}')
           text = text.replace(old, new)
           path.write_text(text, encoding='utf-8')
+          print('PATCHED_ANNUAL_PATTERNS', count, flush=True)
           PY
       - name: Build ST Lianguang archive
         shell: bash
