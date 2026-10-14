@@ -1,0 +1,31 @@
+name: Capture FX Solex network 20261014
+
+on:
+  push:
+    paths:
+      - '.github/workflows/capture-fx-solex-network-20261014.yml'
+      - 'scripts/capture_fx_solex_network_20261014.py'
+  workflow_dispatch:
+
+jobs:
+  capture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Playwright
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+      - name: Capture public viewer network
+        run: python scripts/capture_fx_solex_network_20261014.py | tee fx_solex_network_capture.log
+      - name: Upload capture
+        uses: actions/upload-artifact@v4
+        with:
+          name: fx-solex-network-capture-20261014
+          path: |
+            fx_solex_network_capture/
+            fx_solex_network_capture.log
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
