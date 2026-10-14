@@ -1,48 +1,39 @@
-name: Build ST Lianguang 600363 filings via registered workflow
-# Revision 2: accept 2020年度报告全文 title
+name: Build Solex 603992 filings via registered workflow
+
 on:
   push:
     paths:
       - '.github/workflows/build-huajin-capital-000532-filings-archive-20261012.yml'
+      - 'scripts/build_solex_603992_filings_20261014.py'
+      - 'scripts/build_solex_603992_filings_20261014_v2.py'
   workflow_dispatch:
+
 permissions:
   contents: read
   actions: write
+
 jobs:
   package:
     runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
-        shell: bash
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install PDF validation tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data fonts-noto-cjk
           python -m pip install --quiet requests pypdf
-      - name: Patch historical annual-report title format
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('scripts/build_st_lianguang_600363_filings_20261014.py')
-          text = path.read_text(encoding='utf-8')
-          old = 're.search(r"(20\\d{2})年年度报告", title)'
-          new = 're.search(r"(20\\d{2})年?年度报告", title)'
-          count = text.count(old)
-          if count < 2:
-              raise RuntimeError(f'Expected at least 2 annual-title patterns, found {count}')
-          text = text.replace(old, new)
-          path.write_text(text, encoding='utf-8')
-          PY
-      - name: Build ST Lianguang archive
-        shell: bash
-        run: |
-          python scripts/build_st_lianguang_600363_filings_20261014.py
-      - name: Upload ST Lianguang archive
+
+      - name: Download validate and package filings
+        run: python scripts/build_solex_603992_filings_20261014.py
+
+      - name: Upload final ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: st-lianguang-600363-filings-20261014
-          path: ST联光_600363_2020-2025年报及最新季报.zip
+          name: solex-603992-filings-20261014
+          path: 松霖科技_603992_2020-2025年报_2026最新季报及半年报.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
