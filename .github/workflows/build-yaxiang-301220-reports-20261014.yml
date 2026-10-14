@@ -19,6 +19,27 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet requests pypdf
+      - name: Patch abbreviated quarterly titles
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/build_yaxiang_301220_reports_20261014.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              'q1 = re.search(r"(20\\d{2})年第一季度报告", title)',
+              'q1 = re.search(r"(20\\d{2})年(?:第一|一)季度报告", title)',
+          )
+          text = text.replace(
+              'q3 = re.search(r"(20\\d{2})年第三季度报告", title)',
+              'q3 = re.search(r"(20\\d{2})年(?:第三|三)季度报告", title)',
+          )
+          text = text.replace(
+              'if "第一季度" in title:',
+              'if "第一季度" in title or "一季度" in title:',
+          )
+          path.write_text(text, encoding='utf-8')
+          PY
       - name: Build archive
         shell: bash
         run: |
