@@ -5,6 +5,7 @@ import time
 import requests
 
 CODE = "301156"
+ORG_ID = "gfbj0873489"
 H = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -18,7 +19,6 @@ S = requests.Session(); S.headers.update(H)
 for url in [
     "https://www.cninfo.com.cn/new/data/szse_stock.json",
     "https://www.cninfo.com.cn/new/data/szse_stock.json?_=" + str(int(time.time()*1000)),
-    "https://www.cninfo.com.cn/data20/dataapi/stock/p_stock0000",
 ]:
     try:
         r = S.get(url, timeout=45)
@@ -40,13 +40,13 @@ for url in [
         print("GET_ERROR", url, repr(e))
 
 query_url = "https://www.cninfo.com.cn/new/hisAnnouncement/query"
-stock_values = [CODE]
-# Add likely values discovered manually if any can be extracted from the stock list in a later run.
+stock_values = [CODE, f"{CODE},{ORG_ID}"]
 for stock in stock_values:
     for category, searchkey in [
         ("category_ndbg_szsh", ""),
         ("", "年度报告"),
-        ("", "美农生物"),
+        ("", "招股说明书"),
+        ("", "季度报告"),
         ("", ""),
     ]:
         payload = {
@@ -62,7 +62,7 @@ for stock in stock_values:
                 d = r.json()
                 anns = d.get("announcements") or []
                 print("COUNT", len(anns), "TOTAL", d.get("totalAnnouncement"), d.get("totalpages"))
-                for a in anns[:10]:
-                    print("ANN", a.get("secCode"), a.get("secName"), a.get("orgId"), a.get("announcementTitle"), a.get("adjunctUrl"))
+                for a in anns[:30]:
+                    print("ANN", a.get("secCode"), a.get("secName"), a.get("orgId"), a.get("announcementTitle"), a.get("adjunctUrl"), a.get("announcementId"), a.get("announcementTime"))
         except Exception as e:
             print("POST_ERROR", stock, category, searchkey, repr(e))
