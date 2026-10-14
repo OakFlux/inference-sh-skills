@@ -5,8 +5,6 @@ import time
 from datetime import date, timedelta
 from typing import Any
 
-import requests
-
 import build_solex_603992_broker_deep_reports_20261014 as base
 
 
@@ -31,7 +29,8 @@ def _query_window(start: str, end: str, code: str, tag: str) -> list[dict[str, A
             "p": str(page),
             "pageNum": str(page),
             "pageNumber": str(page),
-            "cb": f"datatableSolex{tag}{page}",
+            # Eastmoney validates callback names; keep the known-working value fixed.
+            "cb": "datatableSolex",
             "_": str(int(time.time() * 1000)),
         }
         response = base.SESSION.get(
@@ -69,7 +68,7 @@ def fetch_report_rows_v2() -> list[dict[str, Any]]:
     collected: list[dict[str, Any]] = []
     errors: list[str] = []
 
-    # First try the normal stock-specific query over a very broad range.
+    # First try the normal stock-specific query over a broad range.
     try:
         collected.extend(_query_window("2000-01-01", "2030-01-01", base.CODE, "stock_all"))
     except Exception as exc:  # noqa: BLE001
