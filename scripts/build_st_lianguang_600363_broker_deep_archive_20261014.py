@@ -23,7 +23,7 @@ AS_OF_DATE = "2026-10-14"
 BJ = timezone(timedelta(hours=8))
 
 WORK_ROOT = Path("_build_st_lianguang_600363_broker")
-PACKAGE_NAME = f"{CURRENT_NAME}_{CODE}_券商深度报告_2份"
+PACKAGE_NAME = f"{CURRENT_NAME}_{CODE}_券商深度报告_3份"
 PACKAGE_ROOT = WORK_ROOT / PACKAGE_NAME
 PDF_DIR = PACKAGE_ROOT / "01_完整原始PDF"
 VERIFY_DIR = WORK_ROOT / "_verify"
@@ -31,24 +31,28 @@ ZIP_PATH = Path(PACKAGE_NAME + ".zip")
 
 TARGETS = [
     {
-        "info_code": "AP202602121819892631",
-        "report_date": "2026-02-12",
-        "broker": "国信证券",
-        "broker_full": "国信证券股份有限公司",
-        "analyst_hint": "李聪",
-        "title_hint": "向新而行厚积薄发，激光+超导双翼齐飞",
-        "classification": "公司深度研究/首次覆盖",
-        "rating_hint": "优于大市",
-    },
-    {
         "info_code": "AP202303311584779306",
         "report_date": "2023-03-31",
         "broker": "信达证券",
         "broker_full": "信达证券股份有限公司",
-        "analyst_hint": "王舫朝",
         "title_hint": "公司首次覆盖报告：夯实智控主业，发力激光超导",
         "classification": "公司深度报告/首次覆盖",
-        "rating_hint": "买入",
+    },
+    {
+        "info_code": "AP202302141583131939",
+        "report_date": "2023-02-14",
+        "broker": "华鑫证券",
+        "broker_full": "华鑫证券有限责任公司",
+        "title_hint": "公司深度报告：高速光耦空间广阔，激光与超导两翼加速成长",
+        "classification": "公司深度报告",
+    },
+    {
+        "info_code": "AP202212131581051995",
+        "report_date": "2022-12-13",
+        "broker": "东吴证券",
+        "broker_full": "东吴证券股份有限公司",
+        "title_hint": "传统光电龙头转型蓄力，激光+超导开启成长第二曲线",
+        "classification": "公司深度研究",
     },
 ]
 
@@ -76,22 +80,26 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def get_with_retry(
-    session: requests.Session,
-    url: str,
-    *,
-    headers: dict[str, str],
-    timeout: int = 120,
-    require_pdf: bool = False,
-) -> requests.Response:
+def get_with_retry(session: requests.Session, url: str, *, referer: str) -> requests.Response:
     last_error: Exception | None = None
     for attempt in range(1, 6):
         try:
-            response = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+            response = session.get(
+                url,
+                headers={
+                    **HEADERS,
+                    "Accept": "application/pdf,*/*;q=0.8",
+                    "Referer": referer,
+                },
+                timeout=120,
+                allow_redirects=True,
+            )
             log("HTTP", attempt, response.status_code, response.headers.get("content-type"), len(response.content), response.url)
             response.raise_for_status()
-            if require_pdf and (not response.content.startswith(b"%PDF-") or len(response.content) < 50_000):
-                raise RuntimeError(f"Invalid PDF response: {len(response.content)} bytes, {response.headers.get('content-type')}")
+            if not response.content.startswith(b"%PDF-") or len(response.content) < 50_000:
+                raise RuntimeError(
+                    f"Invalid PDF response: {len(response.content)} bytes, {response.headers.get('content-type')}"
+                )
             return response
         except Exception as exc:  # noqa: BLE001
             last_error = exc
@@ -128,18 +136,6 @@ def load_metadata(session: requests.Session) -> dict[str, dict[str, Any]]:
     response.raise_for_status()
     rows = response.json().get("data") or []
     log("METADATA_COUNT", len(rows))
-    for row in rows:
-        log(
-            "METADATA_ROW",
-            json.dumps(
-                {key: row.get(key) for key in [
-                    "title", "stockName", "stockCode", "orgName", "orgSName",
-                    "publishDate", "infoCode", "attachPages", "attachSize",
-                    "researcher", "emRatingName", "sRatingName"
-                ]},
-                ensure_ascii=False,
-            ),
-        )
     return {str(row.get("infoCode") or ""): row for row in rows}
 
 
@@ -202,7 +198,7 @@ def validate_pdf(path: Path, target: dict[str, Any], metadata: dict[str, Any]) -
     expected_pages = int(metadata.get("attachPages") or 0)
     if expected_pages and page_count != expected_pages:
         raise RuntimeError(f"Page count mismatch for {path}: expected {expected_pages}, got {page_count}")
-    if page_count < 15:
+    if page_count < 20:
         raise RuntimeError(f"Report too short for deep-report package: {path}, pages={page_count}")
 
     qpdf = subprocess.run(["qpdf", "--check", str(path)], capture_output=True, text=True, check=False)
@@ -211,7 +207,7 @@ def validate_pdf(path: Path, target: dict[str, Any], metadata: dict[str, Any]) -
 
     text = extract_opening_text(path, page_count)
     compact = re.sub(r"\s+", "", text)
-    identity_verified = any(token in compact for token in (CURRENT_NAME, HISTORICAL_NAME, FULL_COMPANY, CODE))
+    identity_verified = any(token in compact for token in (HISTORICAL_NAME, FULL_COMPANY, CODE))
     broker_verified = any(token in compact for token in (target["broker"], target["broker_full"]))
     title_keywords = [
         item for item in re.split(r"[，：,+/（）()\s]+", target["title_hint"])
@@ -246,7 +242,7 @@ def write_metadata(records: list[dict[str, Any]]) -> None:
         f"检索与核验截止日期：{AS_OF_DATE}",
         "",
         "说明：",
-        f"1. 公司于2026年9月30日起由“{HISTORICAL_NAME}”变更为“{CURRENT_NAME}”，两份研报发布时均使用原证券简称。",
+        f"1. 公司于2026年9月30日起由“{HISTORICAL_NAME}”变更为“{CURRENT_NAME}”，三份研报发布时均使用原证券简称。",
         "2. 本资料包只收录可直接取得并核验为完整原始排版PDF的公司深度/首次覆盖报告。",
         "3. 未使用短篇财报点评、事件点评、网页摘要或残缺预览版凑数。",
         "4. 每份PDF均检查文件头、qpdf结构、实际页数、公司与券商身份，并渲染首页、中间页和末页。",
@@ -331,7 +327,7 @@ def main() -> None:
             raise RuntimeError(f"Missing Eastmoney metadata for {target['info_code']}")
         if str(metadata.get("stockCode") or "") != CODE:
             raise RuntimeError(f"Stock-code mismatch: {metadata}")
-        if HISTORICAL_NAME not in str(metadata.get("stockName") or "") and CURRENT_NAME not in str(metadata.get("stockName") or ""):
+        if HISTORICAL_NAME not in str(metadata.get("stockName") or ""):
             raise RuntimeError(f"Stock-name mismatch: {metadata}")
         broker_text = str(metadata.get("orgSName") or metadata.get("orgName") or "")
         if target["broker"] not in broker_text:
@@ -341,23 +337,15 @@ def main() -> None:
             raise RuntimeError(f"Missing title in metadata: {metadata}")
 
         source_url = f"https://pdf.dfcfw.com/pdf/H3_{target['info_code']}_1.pdf"
-        response = get_with_retry(
-            session,
-            source_url,
-            headers={
-                **HEADERS,
-                "Accept": "application/pdf,*/*;q=0.8",
-                "Referer": f"https://data.eastmoney.com/report/info/{target['info_code']}.html",
-            },
-            require_pdf=True,
-        )
+        metadata_page = f"https://data.eastmoney.com/report/info/{target['info_code']}.html"
+        response = get_with_retry(session, source_url, referer=metadata_page)
         filename = f"{target['report_date'].replace('-', '')}_{target['broker']}_{safe_name(title)}.pdf"
         path = PDF_DIR / filename
         path.write_bytes(response.content)
         validation = validate_pdf(path, target, metadata)
 
-        analysts = str(metadata.get("researcher") or target.get("analyst_hint") or "").replace(",", "、")
-        rating = str(metadata.get("emRatingName") or metadata.get("sRatingName") or target.get("rating_hint") or "")
+        analysts = str(metadata.get("researcher") or "").replace(",", "、")
+        rating = str(metadata.get("emRatingName") or metadata.get("sRatingName") or "")
         record = {
             **target,
             **validation,
@@ -367,7 +355,7 @@ def main() -> None:
             "rating": rating,
             "source_url": source_url,
             "download_final_url": response.url,
-            "metadata_page": f"https://data.eastmoney.com/report/info/{target['info_code']}.html",
+            "metadata_page": metadata_page,
             "relative_path": str(path.relative_to(PACKAGE_ROOT)),
             "eastmoney_attach_pages": metadata.get("attachPages"),
             "eastmoney_attach_size_kb": metadata.get("attachSize"),
@@ -376,8 +364,8 @@ def main() -> None:
         records.append(record)
         time.sleep(0.5)
 
-    if len(records) != 2:
-        raise RuntimeError(f"Expected 2 reports, got {len(records)}")
+    if len(records) != 3:
+        raise RuntimeError(f"Expected 3 reports, got {len(records)}")
     if len({record["sha256"] for record in records}) != len(records):
         raise RuntimeError("Duplicate report PDF detected")
 
