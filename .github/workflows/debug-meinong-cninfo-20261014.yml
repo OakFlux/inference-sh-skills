@@ -1,0 +1,25 @@
+name: Debug Meon Biological CNINFO 20261014
+
+on:
+  push:
+    branches:
+      - meinong-filings-20261014
+    paths:
+      - scripts/debug_meinong_cninfo_20261014.py
+      - .github/workflows/debug-meinong-cninfo-20261014.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check --quiet requests
+      - run: python scripts/debug_meinong_cninfo_20261014.py
