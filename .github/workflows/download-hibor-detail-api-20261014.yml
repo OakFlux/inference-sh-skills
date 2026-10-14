@@ -1,0 +1,45 @@
+name: Download Hibor detail API resources 20261014
+on:
+  push:
+    paths:
+      - '.github/workflows/download-hibor-detail-api-20261014.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  download:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download JS and detail responses
+        shell: bash
+        run: |
+          python - <<'PY'
+          import requests
+          from pathlib import Path
+          s=requests.Session(); s.trust_env=False
+          h={'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9','Referer':'https://www.hibor.com.cn/data/c579f2b23849ad8c2e3f0e2ebe4a6f7f.html'}
+          js='https://www.hibor.com.cn/hiborweb/DocDetailNew/js?v=JhJG5MdT9wDoAQX8-xy-bc9qho_6DU5Ailv07PYCEEg1'
+          r=s.get(js,headers=h,timeout=90); r.raise_for_status(); Path('docdetail.js').write_bytes(r.content)
+          for label,ncid in [('178938','066cd115-245c-4102-828c-c37119ac3647'),('182952','f6df98cf-f5dc-46db-892a-a3fcaa7468bb')]:
+              base='https://www.hibor.com.cn/hiborweb/DocDetail/NewContent'
+              for method in ['get','post']:
+                  if method=='get':
+                      rr=s.get(base,params={'ncid':ncid},headers=h,timeout=90)
+                  else:
+                      rr=s.post(base,data={'ncid':ncid},headers=h,timeout=90)
+                  Path(f'{label}_{method}.bin').write_bytes(rr.content)
+                  Path(f'{label}_{method}.meta.txt').write_text(f'{rr.status_code}\n{rr.headers.get("content-type")}\n{rr.url}\n',encoding='utf-8')
+                  print(label,method,rr.status_code,rr.headers.get('content-type'),len(rr.content),rr.url,flush=True)
+          PY
+      - name: Upload resources
+        uses: actions/upload-artifact@v4
+        with:
+          name: hibor-detail-api-resources-20261014
+          path: |
+            docdetail.js
+            178938_*
+            182952_*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
