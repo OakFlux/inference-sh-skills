@@ -1,9 +1,8 @@
-name: Build Yaxiang 301220 reports archive 20261014
+name: Build ST Lianguang 600363 filings archive via registered runner
 on:
   push:
     paths:
       - '.github/workflows/build-yaxiang-301220-reports-20261014.yml'
-      - 'scripts/build_yaxiang_301220_reports_20261014.py'
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,38 +16,17 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qpdf poppler-utils
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
           python -m pip install --quiet requests pypdf
-      - name: Patch abbreviated quarterly titles
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-          path = Path('scripts/build_yaxiang_301220_reports_20261014.py')
-          text = path.read_text(encoding='utf-8')
-          text = text.replace(
-              'q1 = re.search(r"(20\\d{2})年第一季度报告", title)',
-              'q1 = re.search(r"(20\\d{2})年(?:第一|一)季度报告", title)',
-          )
-          text = text.replace(
-              'q3 = re.search(r"(20\\d{2})年第三季度报告", title)',
-              'q3 = re.search(r"(20\\d{2})年(?:第三|三)季度报告", title)',
-          )
-          text = text.replace(
-              'if "第一季度" in title:',
-              'if "第一季度" in title or "一季度" in title:',
-          )
-          path.write_text(text, encoding='utf-8')
-          PY
       - name: Build archive
         shell: bash
         run: |
-          python scripts/build_yaxiang_301220_reports_20261014.py
+          python scripts/build_st_lianguang_600363_filings_20261014.py
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: yaxiang-301220-reports-20261014
-          path: 亚香股份_301220_所有年报_招股说明书及最新季报.zip
+          name: st-lianguang-600363-filings-20261014
+          path: ST联光_600363_2020-2025年报及最新季报.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
