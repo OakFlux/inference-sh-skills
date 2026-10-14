@@ -5,6 +5,7 @@ on:
     paths:
       - '.github/workflows/build-solex-603992-broker-deep-reports-20261014.yml'
       - 'scripts/build_solex_603992_broker_deep_reports_20261014.py'
+      - 'scripts/build_solex_603992_broker_deep_reports_20261014_v2.py'
   workflow_dispatch:
 
 jobs:
@@ -25,7 +26,7 @@ jobs:
         id: build
         continue-on-error: true
         run: |
-          python scripts/build_solex_603992_broker_deep_reports_20261014.py > solex_broker_build.log 2>&1
+          python scripts/build_solex_603992_broker_deep_reports_20261014_v2.py > solex_broker_build.log 2>&1
           status=$?
           cat solex_broker_build.log
           exit $status
