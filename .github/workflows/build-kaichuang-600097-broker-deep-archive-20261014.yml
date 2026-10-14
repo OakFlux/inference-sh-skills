@@ -19,6 +19,30 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils poppler-data
           python -m pip install --quiet requests beautifulsoup4 pypdf
+      - name: Correct metadata from original PDF covers
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/build_kaichuang_600097_broker_deep_archive_20261014.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = [
+              ('"analysts": "朱卫华",', '"analysts": "朱卫华、黄珺、董广阳",'),
+              ('"report_date": "2009-08-13",', '"report_date": "2009-08-11",'),
+              ('"analysts": "朱卫华、黄珺、董广",', '"analysts": "朱卫华、黄珺、董广阳",'),
+              ('"title": "中报业绩符合预期",', '"title": "中报业绩符合预期，维持强烈推荐",'),
+              ('"report_date": "2009-07-08",', '"report_date": "2009-07-06",'),
+              ('"broker": "国联证券",', '"broker": "国金证券",'),
+              ('"broker_full": "国联证券股份有限公司",', '"broker_full": "国金证券股份有限公司",'),
+              ('"analysts": "谢刚",', '"analysts": "谢刚、朱莉",'),
+              ('broker_found = report["broker"] in page_text', 'broker_found = report["broker"] in page_text or any(report["broker"] in label for label in attachment_labels)'),
+          ]
+          for old, new in replacements:
+              if old not in text:
+                  raise RuntimeError(f'Expected metadata text not found: {old}')
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
       - name: Build archive
         shell: bash
         run: |
@@ -26,7 +50,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: kaichuang-600097-broker-deep-20261014
+          name: kaichuang-600097-broker-deep-20261014-corrected
           path: 开创国际_600097_券商深度报告_3份.zip
           if-no-files-found: error
           compression-level: 0
