@@ -19,6 +19,42 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils poppler-data
           python -m pip install --quiet requests pypdf
+      - name: Patch 2026 metadata fallback
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/build_st_lianguang_600363_broker_deep_archive_20261014.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''        metadata = metadata_by_code.get(target["info_code"])
+          if not metadata:
+              raise RuntimeError(f"Missing Eastmoney metadata for {target['info_code']}")
+          if str(metadata.get("stockCode") or "") != CODE:
+          '''
+          new = '''        metadata = metadata_by_code.get(target["info_code"])
+          if not metadata:
+              metadata = {
+                  "stockCode": CODE,
+                  "stockName": HISTORICAL_NAME,
+                  "orgName": target["broker_full"],
+                  "orgSName": target["broker"],
+                  "publishDate": target["report_date"],
+                  "infoCode": target["info_code"],
+                  "attachPages": 0,
+                  "attachSize": 0,
+                  "researcher": target.get("analyst_hint") or "",
+                  "emRatingName": target.get("rating_hint") or "",
+                  "sRatingName": target.get("rating_hint") or "",
+                  "title": target["title_hint"],
+                  "metadata_fallback": True,
+              }
+              log("METADATA_FALLBACK", json.dumps(metadata, ensure_ascii=False))
+          if str(metadata.get("stockCode") or "") != CODE:
+          '''
+          if old not in text:
+              raise RuntimeError('Expected metadata block not found')
+          path.write_text(text.replace(old, new), encoding='utf-8')
+          PY
       - name: Build archive
         shell: bash
         run: |
