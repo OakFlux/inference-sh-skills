@@ -1,0 +1,33 @@
+name: Build ST Lianguang 600363 broker deep archive 20261014
+on:
+  push:
+    paths:
+      - '.github/workflows/build-st-lianguang-600363-broker-deep-20261014.yml'
+      - 'scripts/build_st_lianguang_600363_broker_deep_archive_20261014.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+      - name: Build archive
+        shell: bash
+        run: |
+          python scripts/build_st_lianguang_600363_broker_deep_archive_20261014.py
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: st-lianguang-600363-broker-deep-20261014
+          path: ST联光_600363_券商深度报告_2份.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
