@@ -8,18 +8,21 @@ jobs:
   probe:
     runs-on: ubuntu-24.04
     steps:
-      - name: Inspect historical report pages
+      - name: Inspect public report pages
         shell: bash
         run: |
           python -m pip install --quiet requests beautifulsoup4
           python - <<'PY'
-          import requests
+          import json, requests
           from bs4 import BeautifulSoup
           from urllib.parse import urljoin
           s=requests.Session(); s.trust_env=False
           h={'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9'}
-          for url in ['https://www.hibor.com.cn/docdetail_178938.html','https://www.hibor.com.cn/docdetail_182952.html','https://finance.sina.com.cn/stock/e/20090813/15536613276.shtml']:
-              r=s.get(url,headers=h,timeout=90,allow_redirects=True)
+          for url in [
+              'https://www.p5w.net/stock/lzft/gsyj/200907/t2461725.htm',
+              'https://www.p5w.net/stock/lzft/gsyj/200908/t2507867.htm',
+          ]:
+              r=s.get(url,headers=h,timeout=120,allow_redirects=True)
               print('PAGE',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
               r.encoding=r.apparent_encoding or 'utf-8'
               soup=BeautifulSoup(r.text,'html.parser')
@@ -27,6 +30,6 @@ jobs:
               for a in soup.find_all('a',href=True):
                   text=' '.join(a.get_text(' ',strip=True).split())
                   href=urljoin(r.url,a['href'])
-                  if '.pdf' in href.lower() or '下载' in text or '原文' in text:
-                      print('LINK',text,href,flush=True)
+                  if '.pdf' in href.lower() or '附件' in text or '下载' in text or '开创国际' in text or '招商证券' in text:
+                      print('LINK',json.dumps({'text':text,'href':href},ensure_ascii=False),flush=True)
           PY
