@@ -20,6 +20,25 @@ jobs:
           sudo apt-get install -y -qq qpdf poppler-utils
           python -m pip install --quiet requests pypdf
 
+      - name: Patch ChiNext market category candidates
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/build_haixin_300072_filings_20261014.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'for ann_type in ("SZA", "SZSA", "SZ"):'
+          new = 'for ann_type in ("CYB", "SZCY", "SZCYB", "", "SZA", "SZSA", "SZ"):'
+          if old not in text:
+              raise SystemExit('market category loop not found')
+          text = text.replace(old, new, 1)
+          marker = '            response = request("GET", API, params=params)'
+          replacement = '            if not ann_type:\n                params.pop("ann_type", None)\n            response = request("GET", API, params=params)'
+          if marker not in text:
+              raise SystemExit('request marker not found')
+          text = text.replace(marker, replacement, 1)
+          path.write_text(text, encoding='utf-8')
+          PY
+
       - name: Discover download validate and package reports
         run: python scripts/build_haixin_300072_filings_20261014.py
 
