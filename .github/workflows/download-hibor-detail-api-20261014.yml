@@ -18,15 +18,18 @@ jobs:
           import requests
           from pathlib import Path
           s=requests.Session(); s.trust_env=False
-          h={'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9'}
-          for label,ncid,referer in [
-            ('178938','066cd115-245c-4102-828c-c37119ac3647','https://www.hibor.com.cn/data/c579f2b23849ad8c2e3f0e2ebe4a6f7f.html'),
-            ('182952','197faef3-b9ec-476b-988a-59a013b5a219','https://www.hibor.com.cn/data/3461a4dd219fa77381b748e3df7b8697.html'),
+          h={'User-Agent':'Mozilla/5.0','Accept-Language':'zh-CN,zh;q=0.9','X-Requested-With':'XMLHttpRequest'}
+          js='https://www.hibor.com.cn/hiborweb/DocDetailNew/js?v=JhJG5MdT9wDoAQX8-xy-bc9qho_6DU5Ailv07PYCEEg1'
+          s.get(js,headers=h,timeout=90).raise_for_status()
+          for label,ncid,page in [
+            ('178938','066cd115-245c-4102-828c-c37119ac3647','https://www.hibor.com.cn/docdetail_178938.html'),
+            ('182952','197faef3-b9ec-476b-988a-59a013b5a219','https://www.hibor.com.cn/docdetail_182952.html'),
           ]:
-              rr=s.post('https://www.hibor.com.cn/hiborweb/DocDetail/NewContent',data={'ncid':ncid},headers={**h,'Referer':referer},timeout=90)
+              pg=s.get(page,headers=h,timeout=90,allow_redirects=True); pg.raise_for_status()
+              rr=s.post('https://www.hibor.com.cn/hiborweb/DocDetail/NewContent',data={'ncid':ncid},headers={**h,'Referer':pg.url},timeout=90)
               rr.raise_for_status()
               Path(f'{label}_post.html').write_bytes(rr.content)
-              print(label,rr.status_code,rr.headers.get('content-type'),len(rr.content),flush=True)
+              print(label,rr.status_code,rr.headers.get('content-type'),len(rr.content),pg.url,flush=True)
           PY
       - name: Upload resources
         uses: actions/upload-artifact@v4
