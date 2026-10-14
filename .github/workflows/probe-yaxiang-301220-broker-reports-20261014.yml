@@ -1,0 +1,57 @@
+name: Probe Yaxiang 301220 broker report PDFs 20261014
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-yaxiang-301220-broker-reports-20261014.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Probe Eastmoney reports and PDFs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, re, requests
+          from urllib.parse import quote
+
+          s=requests.Session(); s.trust_env=False
+          h={
+              'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+              'Accept':'application/json,text/plain,*/*',
+              'Referer':'https://data.eastmoney.com/report/stock.jshtml',
+              'Accept-Language':'zh-CN,zh;q=0.9,en;q=0.8',
+          }
+          params={
+              'pageSize':'200','pageNo':'1','code':'301220','qType':'0',
+              'industryCode':'*','industry':'*','rating':'*','ratingChange':'*',
+              'beginTime':'2022-01-01','endTime':'2026-10-14','orgCode':'','rcode':'','fields':''
+          }
+          r=s.get('https://reportapi.eastmoney.com/report/list',params=params,headers=h,timeout=90)
+          print('LIST',r.status_code,r.headers.get('content-type'),len(r.content),r.url,flush=True)
+          j=r.json(); rows=j.get('data') or []
+          print('COUNT',len(rows),flush=True)
+          targets=['天然香料龙头蓄势待发','全球香精香料细分龙头','立足香料中高端市场','专注细分领域的优质香料供应商']
+          for x in rows:
+              title=str(x.get('title') or '')
+              if any(t in title for t in targets):
+                  out={k:x.get(k) for k in ['title','stockName','stockCode','orgName','orgSName','publishDate','infoCode','attachPages','attachSize','researcher','emRatingName','sRatingName']}
+                  print('ROW',json.dumps(out,ensure_ascii=False),flush=True)
+                  info=str(x.get('infoCode') or '')
+                  candidates=[
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf',
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?{x.get("publishDate") or ""}',
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?download=1',
+                      f'https://pdf.dfcfw.com/pdf/H3_{info}_1.pdf?source=choice',
+                  ]
+                  for u in candidates:
+                      try:
+                          rr=s.get(u,headers={**h,'Accept':'application/pdf,*/*;q=0.8','Referer':f'https://data.eastmoney.com/report/info/{info}.html'},timeout=90,allow_redirects=True)
+                          print('PDF',rr.status_code,rr.headers.get('content-type'),len(rr.content),rr.url,rr.content[:12],flush=True)
+                          if rr.content.startswith(b'%PDF-') and len(rr.content)>10000:
+                              break
+                      except Exception as e:
+                          print('PDF_ERR',u,repr(e),flush=True)
+          PY
