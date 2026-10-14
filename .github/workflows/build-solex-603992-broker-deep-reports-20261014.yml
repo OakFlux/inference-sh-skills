@@ -22,9 +22,28 @@ jobs:
           python -m pip install --quiet requests pypdf
 
       - name: Download validate and package broker reports
-        run: python scripts/build_solex_603992_broker_deep_reports_20261014.py
+        id: build
+        continue-on-error: true
+        run: |
+          python scripts/build_solex_603992_broker_deep_reports_20261014.py > solex_broker_build.log 2>&1
+          status=$?
+          cat solex_broker_build.log
+          exit $status
+
+      - name: Upload diagnostic files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: solex-603992-broker-report-diagnostics-20261014
+          path: |
+            solex_broker_build.log
+            _solex_broker_report_debug/
+          if-no-files-found: warn
+          compression-level: 6
+          retention-days: 30
 
       - name: Upload final ZIP
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: solex-603992-broker-deep-reports-20261014
@@ -32,3 +51,7 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+
+      - name: Fail when build failed
+        if: steps.build.outcome == 'failure'
+        run: exit 1
