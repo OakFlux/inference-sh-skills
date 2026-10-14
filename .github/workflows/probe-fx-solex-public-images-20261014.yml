@@ -1,0 +1,29 @@
+name: Probe FX Solex public images 20261014
+
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-fx-solex-public-images-20261014.yml'
+      - 'scripts/probe_fx_solex_public_images_20261014.py'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: python -m pip install --quiet requests beautifulsoup4 lxml
+      - name: Probe public report pages
+        run: python scripts/probe_fx_solex_public_images_20261014.py | tee fx_solex_public_probe.log
+      - name: Upload probe results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fx-solex-public-probe-20261014
+          path: |
+            fx_solex_public_probe/
+            fx_solex_public_probe.log
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
