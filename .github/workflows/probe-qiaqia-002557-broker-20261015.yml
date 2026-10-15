@@ -1,0 +1,16 @@
+name: Probe Qiaqia 002557 broker reports 20261015
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-qiaqia-002557-broker-20261015.yml'
+      - 'scripts/probe_qiaqia_002557_broker_20261015.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe report metadata
+        run: python scripts/probe_qiaqia_002557_broker_20261015.py
