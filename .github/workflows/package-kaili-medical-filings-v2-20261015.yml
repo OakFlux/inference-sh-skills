@@ -1,0 +1,64 @@
+name: Package Kaili Medical filings v2 20261015
+
+on:
+  push:
+    branches:
+      - kaili-medical-filings-20261015
+    paths:
+      - .github/workflows/package-kaili-medical-filings-v2-20261015.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+      - name: Correct package target path
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/package_kaili_medical_filings_20261015.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'target = ROOT / filing.relative_path'
+          new = 'target = PACKAGE_ROOT / filing.relative_path'
+          if old not in text:
+              raise SystemExit('Target line not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+      - name: Download, validate, and package filings
+        run: python scripts/package_kaili_medical_filings_20261015.py
+      - name: Show package summary
+        run: cat dist_kaili_medical_filings/package_summary.json
+      - name: Verify packaged PDF count
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          archives = list(Path('dist_kaili_medical_filings').glob('*.zip'))
+          if len(archives) != 1:
+              raise SystemExit(f'Expected one ZIP, found {archives}')
+          with zipfile.ZipFile(archives[0]) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise SystemExit(f'ZIP CRC failure: {bad}')
+              pdfs = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              if len(pdfs) != 7:
+                  raise SystemExit(f'Expected 7 PDFs, found {len(pdfs)}: {pdfs}')
+              print({'zip': str(archives[0]), 'pdf_count': len(pdfs)})
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaili-medical-300633-filings-v2-20261015
+          path: |
+            dist_kaili_medical_filings/*.zip
+            dist_kaili_medical_filings/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
