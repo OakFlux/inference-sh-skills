@@ -1,0 +1,34 @@
+name: Build Ruochen 003010 filings archive 20261015
+on:
+  push:
+    paths:
+      - '.github/workflows/build-ruochen-003010-filings-20261015.yml'
+      - 'scripts/build_ruochen_003010_filings_20261015.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PDF tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+      - name: Build archive
+        shell: bash
+        run: |
+          python scripts/build_ruochen_003010_filings_20261015.py
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruochen-003010-filings-20261015
+          path: 若羽臣_003010_所有年报_招股说明书及最新季报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
