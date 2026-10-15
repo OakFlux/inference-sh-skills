@@ -1,0 +1,17 @@
+name: Probe Joincare 600380 broker reports 20261016
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-joincare-600380-broker-20261016.yml'
+      - 'scripts/probe_joincare_600380_broker_20261016.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe report metadata
+        shell: bash
+        run: python scripts/probe_joincare_600380_broker_20261016.py
