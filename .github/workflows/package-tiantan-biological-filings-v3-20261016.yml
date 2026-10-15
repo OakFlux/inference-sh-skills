@@ -1,0 +1,75 @@
+name: Package Tiantan Biological filings v3 20261016
+
+on:
+  push:
+    branches:
+      - tiantan-biological-filings-20261016
+    paths:
+      - .github/workflows/package-tiantan-biological-filings-v3-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+      - name: Patch CNINFO query strategy
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/package_tiantan_biological_filings_20261016.py')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace(
+              '"sortName": "",\n            "sortType": "",',
+              '"sortName": "time",\n            "sortType": "desc",'
+          )
+          text = text.replace(
+              'if added == 0 or len(announcements) < 30 or not data.get("hasMore"):\n            break',
+              'total = int(data.get("totalAnnouncement") or 0)\n        if added == 0 or len(announcements) < 30 or page_num * 30 >= total:\n            break'
+          )
+          text = text.replace('searchkey=f"{year}年年度报告",', 'searchkey="",')
+          text = text.replace('searchkey="季度报告",', 'searchkey="",')
+          text = text.replace(
+              'start=f"{year}-01-01",\n            end=f"{year + 2}-12-31" if year < 2025 else AS_OF,',
+              'start=f"{year + 1}-01-01",\n            end=f"{year + 1}-12-31" if year < 2025 else AS_OF,'
+          )
+          text = text.replace(
+              'start=f"{year}-01-01",\n                end=f"{year + 2}-12-31" if year < 2025 else AS_OF,',
+              'start=f"{year + 1}-01-01",\n                end=f"{year + 1}-12-31" if year < 2025 else AS_OF,'
+          )
+          text = text.replace('start="2024-01-01",', 'start="2026-01-01",')
+          path.write_text(text, encoding='utf-8')
+          PY
+      - name: Download, validate, and package filings
+        run: python scripts/package_tiantan_biological_filings_20261016.py
+      - name: Show package summary
+        run: cat dist_tiantan/package_summary.json
+      - name: Verify packaged PDF count
+        run: |
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+          zips = list(Path('dist_tiantan').glob('*.zip'))
+          assert len(zips) == 1, zips
+          with zipfile.ZipFile(zips[0]) as zf:
+              assert zf.testzip() is None
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              assert len(pdfs) == 7, pdfs
+          print(zips[0], len(pdfs))
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiantan-biological-600161-filings-v3-20261016
+          path: |
+            dist_tiantan/*.zip
+            dist_tiantan/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
