@@ -1,0 +1,33 @@
+name: Build Ruida 002961 filings archive 20261015
+on:
+  push:
+    paths:
+      - '.github/workflows/build-ruida-002961-filings-20261015.yml'
+      - 'scripts/build_ruida_002961_filings_20261015.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+      - name: Build archive
+        shell: bash
+        run: |
+          python scripts/build_ruida_002961_filings_20261015.py
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ruida-002961-filings-20261015
+          path: 瑞达期货_002961_2020-2025年报及最新季报.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
