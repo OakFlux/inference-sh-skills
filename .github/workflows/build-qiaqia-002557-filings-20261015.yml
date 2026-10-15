@@ -35,26 +35,13 @@ jobs:
               'FULL_COMPANY = "马应龙药业集团股份有限公司"': 'FULL_COMPANY = "洽洽食品股份有限公司"',
               'WORK_ROOT = ROOT / "_build_mayinglong_600993"': 'WORK_ROOT = ROOT / "_build_qiaqia_002557"',
               'ZIP_PATH = ROOT / "mayinglong_600993_2020_2025_annual_reports_latest_quarter.zip"': 'ZIP_PATH = ROOT / "qiaqia_food_002557_2020_2025_annual_reports_latest_quarter.zip"',
+              '"sse", "shmb"': '"szse", "szmb"',
+              '"sse", ""': '"szse", ""',
           }
           for old, new in replacements.items():
               if old not in t:
                   raise RuntimeError(f'Missing expected text: {old}')
-              t = t.replace(old, new, 1)
-          old_block = '''    candidates = [
-        (f"{CODE},{org_id}", "sse", "shmb"),
-        (f"{CODE},{org_id}", "sse", ""),
-        (CODE, "sse", "shmb"),
-        (CODE, "sse", ""),
-    ]'''
-          new_block = '''    candidates = [
-        (f"{CODE},{org_id}", "szse", "szmb"),
-        (f"{CODE},{org_id}", "szse", ""),
-        (CODE, "szse", "szmb"),
-        (CODE, "szse", ""),
-    ]'''
-          if old_block not in t:
-              raise RuntimeError('Expected SSE candidate block not found')
-          t = t.replace(old_block, new_block, 1)
+              t = t.replace(old, new)
           p.write_text(t, encoding='utf-8')
           PY
       - name: Build archive
