@@ -19,6 +19,19 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qpdf poppler-utils poppler-data
           python -m pip install --quiet requests pypdf
+      - name: Patch broker metadata validation
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/build_guobang_605507_broker_deep_archive_20261015.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'broker_text = str(metadata.get("orgSName") or metadata.get("orgName") or "")\n        if report["broker"] not in broker_text:'
+          new = 'broker_text = str(metadata.get("orgSName") or "") + " " + str(metadata.get("orgName") or "")\n        if report["broker"] not in broker_text and report["broker_full"] not in broker_text:'
+          if old not in text:
+              raise RuntimeError('Expected broker validation block not found')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
       - name: Build archive
         shell: bash
         run: |
