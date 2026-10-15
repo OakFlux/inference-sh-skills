@@ -36,6 +36,7 @@ jobs:
               'AS_OF_DATE = "2026-10-15"': 'AS_OF_DATE = "2026-10-16"',
               'WORK_ROOT = ROOT / "_build_mayinglong_600993"': 'WORK_ROOT = ROOT / "_build_joincare_600380"',
               'ZIP_PATH = ROOT / "mayinglong_600993_2020_2025_annual_reports_latest_quarter.zip"': 'ZIP_PATH = ROOT / "joincare_600380_2020_2025_annual_reports_latest_quarter.zip"',
+              '("摘要", "英文版", "关于", "审计报告", "内部控制", "取消", "说明", "问询")': '("摘要", "英文版", "英文", "关于", "审计报告", "内部控制", "取消", "说明", "问询")',
           }
           for old, new in replacements.items():
               if old not in t:
