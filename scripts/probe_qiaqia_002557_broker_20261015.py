@@ -10,15 +10,15 @@ headers = {
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
 }
 params = {
-    "pageSize": "200",
-    "pageNo": "1",
+    "pageSize": "100",
+    "pageNo": "2",
     "code": "002557",
     "qType": "0",
     "industryCode": "*",
     "industry": "*",
     "rating": "*",
     "ratingChange": "*",
-    "beginTime": "2015-01-01",
+    "beginTime": "2010-01-01",
     "endTime": "2026-10-15",
     "orgCode": "",
     "rcode": "",
