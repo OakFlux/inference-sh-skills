@@ -1,0 +1,49 @@
+name: Package Tiantan Biological filings v4 20261016
+
+on:
+  push:
+    branches:
+      - tiantan-biological-filings-20261016
+    paths:
+      - scripts/package_tiantan_biological_filings_eastmoney_20261016.py
+      - .github/workflows/package-tiantan-biological-filings-v4-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+      - name: Download, validate, and package filings
+        run: python scripts/package_tiantan_biological_filings_eastmoney_20261016.py
+      - name: Show package summary
+        run: cat dist_tiantan_em/package_summary.json
+      - name: Verify packaged PDF count
+        run: |
+          python - <<'PY'
+          import zipfile
+          from pathlib import Path
+          zips = list(Path('dist_tiantan_em').glob('*.zip'))
+          assert len(zips) == 1, zips
+          with zipfile.ZipFile(zips[0]) as zf:
+              assert zf.testzip() is None
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              assert len(pdfs) == 7, pdfs
+          print(zips[0], len(pdfs))
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiantan-biological-600161-filings-v4-20261016
+          path: |
+            dist_tiantan_em/*.zip
+            dist_tiantan_em/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
