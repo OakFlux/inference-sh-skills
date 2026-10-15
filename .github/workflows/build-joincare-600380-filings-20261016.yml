@@ -1,0 +1,57 @@
+name: Build Joincare 600380 filings archive 20261016
+on:
+  push:
+    paths:
+      - '.github/workflows/build-joincare-600380-filings-20261016.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install PDF tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+      - name: Prepare Joincare builder
+        shell: bash
+        run: |
+          git fetch --depth=1 origin task-mayinglong-600993-filings-20261015:refs/remotes/origin/task-mayinglong-600993-filings-20261015
+          git show origin/task-mayinglong-600993-filings-20261015:scripts/build_mayinglong_600993_filings_20261015.py > scripts/build_joincare_600380_filings_20261016.py
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/build_joincare_600380_filings_20261016.py')
+          t = p.read_text(encoding='utf-8')
+          replacements = {
+              'CODE = "600993"': 'CODE = "600380"',
+              'COMPANY = "马应龙"': 'COMPANY = "健康元"',
+              'FULL_COMPANY = "马应龙药业集团股份有限公司"': 'FULL_COMPANY = "健康元药业集团股份有限公司"',
+              'AS_OF_DATE = "2026-10-15"': 'AS_OF_DATE = "2026-10-16"',
+              'WORK_ROOT = ROOT / "_build_mayinglong_600993"': 'WORK_ROOT = ROOT / "_build_joincare_600380"',
+              'ZIP_PATH = ROOT / "mayinglong_600993_2020_2025_annual_reports_latest_quarter.zip"': 'ZIP_PATH = ROOT / "joincare_600380_2020_2025_annual_reports_latest_quarter.zip"',
+          }
+          for old, new in replacements.items():
+              if old not in t:
+                  raise RuntimeError(f'Missing expected text: {old}')
+              t = t.replace(old, new, 1)
+          p.write_text(t, encoding='utf-8')
+          PY
+      - name: Build archive
+        shell: bash
+        run: |
+          python scripts/build_joincare_600380_filings_20261016.py
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: joincare-600380-filings-20261016
+          path: joincare_600380_2020_2025_annual_reports_latest_quarter.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
