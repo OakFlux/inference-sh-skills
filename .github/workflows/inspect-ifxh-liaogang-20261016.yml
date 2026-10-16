@@ -1,0 +1,49 @@
+name: Inspect IFXH Liaogang 20261016
+
+on:
+  push:
+    branches:
+      - liaogang-broker-reports-20261016
+    paths:
+      - .github/workflows/inspect-ifxh-liaogang-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tools
+        run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4
+      - name: Inspect page links and scripts
+        run: |
+          python - <<'PY'
+          import re, json, requests
+          from bs4 import BeautifulSoup
+          url='https://www.ifxh.com/2732.html'
+          h={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':'https://www.ifxh.com/'}
+          r=requests.get(url,headers=h,timeout=120)
+          print('STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'FINAL',r.url)
+          text=r.text
+          soup=BeautifulSoup(text,'html.parser')
+          print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+          print('TEXT_AROUND')
+          plain=soup.get_text('\n',strip=True)
+          idx=plain.find('辽港股份')
+          print(plain[max(0,idx-2000):idx+3000])
+          for tag in soup.find_all(['a','iframe','embed','object','source','script','form','input','button']):
+              attrs={k:v for k,v in tag.attrs.items() if k in ['href','src','data','action','value','name','id','class','onclick','type']}
+              label=tag.get_text(' ',strip=True)[:200]
+              blob=json.dumps(attrs,ensure_ascii=False)
+              if re.search(r'download|pan\.|baidu|aliyun|quark|123pan|lanzou|file|zip|pdf|2732|辽港|601880',blob+' '+label,re.I):
+                  print('TAG',tag.name,blob,'LABEL',label)
+          for m in sorted(set(re.findall(r'https?://[^\"\'<>\s]+',text))):
+              if re.search(r'pan\.|baidu|aliyun|quark|123pan|lanzou|download|\.zip|\.pdf',m,re.I): print('URL',m[:1000])
+          for key in ['下载','提取码','网盘','隐藏内容','reply','password','pan_url','download_url']:
+              if key in text:
+                  print('HAS_KEY',key)
+          print('END_HTML',text[-10000:])
+          PY
