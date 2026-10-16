@@ -1,0 +1,17 @@
+name: Probe fxbaogao PDF functions 20261016
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-fxbaogao-pdf-functions-20261016.yml'
+      - 'scripts/probe_fxbaogao_pdf_functions_20261016.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Inspect PDF functions
+        shell: bash
+        run: python scripts/probe_fxbaogao_pdf_functions_20261016.py
