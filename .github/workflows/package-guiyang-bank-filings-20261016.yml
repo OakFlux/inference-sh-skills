@@ -1,0 +1,80 @@
+name: Package Guiyang Bank filings 20261016
+
+on:
+  push:
+    branches:
+      - guiyang-bank-filings-20261016
+    paths:
+      - .github/workflows/package-guiyang-bank-filings-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+
+      - name: Prepare Guiyang Bank packager
+        run: |
+          mkdir -p scripts
+          curl -L --fail --retry 4 \
+            https://raw.githubusercontent.com/OakFlux/inference-sh-skills/erdos-filings-20261016/scripts/package_erdos_filings_20261016.py \
+            -o scripts/package_guiyang_bank_filings_20261016.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/package_guiyang_bank_filings_20261016.py')
+          text = path.read_text(encoding='utf-8')
+          replacements = [
+              ('内蒙古鄂尔多斯资源股份有限公司', '贵阳银行股份有限公司'),
+              ('鄂尔多斯', '贵阳银行'),
+              ('600295', '601997'),
+              ('_erdos_601997_work', '_guiyang_bank_601997_work'),
+              ('_erdos_600295_work', '_guiyang_bank_601997_work'),
+          ]
+          for old, new in replacements:
+              text = text.replace(old, new)
+          path.write_text(text, encoding='utf-8')
+          PY
+
+      - name: Download, validate, and package filings
+        run: python scripts/package_guiyang_bank_filings_20261016.py
+
+      - name: Show package summary
+        run: cat package_summary.json
+
+      - name: Verify packaged PDF count
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          paths = glob.glob('贵阳银行_601997_2020-2025年报_最新季报_截至20261016.zip')
+          assert len(paths) == 1, paths
+          with zipfile.ZipFile(paths[0]) as zf:
+              assert zf.testzip() is None
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              assert len(pdfs) == 7, pdfs
+          print(paths[0], len(pdfs))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guiyang-bank-601997-filings-20261016
+          path: |
+            贵阳银行_601997_2020-2025年报_最新季报_截至20261016.zip
+            package_summary.json
+          if-no-files-found: error
+          retention-days: 30
