@@ -1,0 +1,48 @@
+name: Package Erdos filings 20261016
+
+on:
+  push:
+    branches:
+      - erdos-filings-20261016
+    paths:
+      - scripts/package_erdos_filings_20261016.py
+      - .github/workflows/package-erdos-filings-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+      - name: Download, validate, and package filings
+        run: python scripts/package_erdos_filings_20261016.py
+      - name: Show package summary
+        run: cat package_summary.json
+      - name: Verify packaged PDF count
+        run: |
+          python - <<'PY'
+          import glob, zipfile
+          paths = glob.glob('鄂尔多斯_600295_2020-2025年报_最新季报_截至20261016.zip')
+          assert len(paths) == 1, paths
+          with zipfile.ZipFile(paths[0]) as zf:
+              assert zf.testzip() is None
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              assert len(pdfs) == 7, pdfs
+          print(paths[0], len(pdfs))
+          PY
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: erdos-600295-filings-20261016
+          path: |
+            鄂尔多斯_600295_2020-2025年报_最新季报_截至20261016.zip
+            package_summary.json
+          if-no-files-found: error
+          retention-days: 30
