@@ -1,0 +1,276 @@
+name: Package Liaogang public research fallback 20261016
+
+on:
+  push:
+    branches:
+      - liaogang-broker-reports-20261016
+    paths:
+      - .github/workflows/package-liaogang-public-research-fallback-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+
+      - name: Build transparent public research package
+        run: |
+          cat > /tmp/build_package.py <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          ROOT = Path('dist_liaogang_public_research')
+          PKG = ROOT / '辽港股份_601880_券商研究公开资料包'
+          FULL = PKG / '01_可直接取得的完整PDF'
+          INDEX = PKG / '02_券商研报索引与公开入口'
+          META = PKG / '03_说明与校验'
+          RENDER = ROOT / '_verify_renders'
+          ZIP = ROOT / '辽港股份_601880_券商研究公开资料包_20261016.zip'
+          SUMMARY = ROOT / 'package_summary.json'
+
+          if ROOT.exists():
+              shutil.rmtree(ROOT)
+          for d in (FULL, INDEX, META, RENDER):
+              d.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def download_pdf(info_code: str, dest: Path) -> str:
+              source_page = f'https://data.eastmoney.com/report/info/{info_code}.html'
+              urls = [
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf',
+                  f'https://pdf.dfcfw.com/pdf/H3_{info_code}_1.pdf?{int(time.time()*1000)}.pdf=',
+                  f'https://pdf.dfcfw.com/pdf/H2_{info_code}_1.pdf?{int(time.time()*1000)}.pdf=',
+              ]
+              errors = []
+              for url in urls:
+                  try:
+                      r = session.get(url, headers={'Referer': source_page}, timeout=180, allow_redirects=True)
+                      print('PDF_TRY', r.status_code, r.headers.get('content-type'), len(r.content), r.url, flush=True)
+                      r.raise_for_status()
+                      if not r.content.startswith(b'%PDF-') or len(r.content) < 40000:
+                          raise RuntimeError('invalid PDF payload')
+                      dest.write_bytes(r.content)
+                      return str(r.url)
+                  except Exception as e:
+                      errors.append(repr(e))
+                      dest.unlink(missing_ok=True)
+              raise RuntimeError('Unable to download institutional PDF: ' + ' | '.join(errors))
+
+          pdf_dest = FULL / '补充_20240930_亿渡数据_辽港股份机构研究报告_非券商.pdf'
+          pdf_url = download_pdf('AP202409301640100556', pdf_dest)
+          reader = PdfReader(str(pdf_dest), strict=False)
+          pages = len(reader.pages)
+          if pages != 8:
+              raise RuntimeError(f'Unexpected page count for 亿渡数据 PDF: {pages}')
+          sampled = []
+          for i in sorted({0, 1, min(3, pages-1), pages-1}):
+              try:
+                  sampled.append(reader.pages[i].extract_text() or '')
+              except Exception:
+                  pass
+          norm = re.sub(r'\s+', '', '\n'.join(sampled))
+          if not any(x in norm for x in ('辽港股份', '辽宁港口股份有限公司', '601880')):
+              raise RuntimeError('Company identity missing in institutional PDF')
+          with pymupdf.open(pdf_dest) as doc:
+              for idx, label in [(0, 'first'), (len(doc)-1, 'last')]:
+                  pix = doc[idx].get_pixmap(matrix=pymupdf.Matrix(1.4, 1.4), alpha=False)
+                  out = RENDER / f'yidu_{label}.png'
+                  pix.save(out)
+                  if out.stat().st_size < 5000:
+                      raise RuntimeError(f'Render too small: {out}')
+
+          records = [
+              {
+                  'sequence': 1,
+                  'institution': '招商证券',
+                  'date': '2025-08-05',
+                  'title': '东北地区最大码头运营商，业务综合性强',
+                  'type': '正式公司深度报告',
+                  'verified_pages': 22,
+                  'analysts': '王春环、孙修远、肖欣晨、刘若琮、张瑜玲',
+                  'status': '已核实题目、机构、日期与22页记录；原PDF公开附件需要登录或付费，本包未绕过访问限制，未收录全文',
+                  'primary_url': 'https://finance.sina.com.cn/roll/2025-08-06/doc-infiywak1190454.shtml',
+                  'archive_url': 'https://www.ifxh.com/2732.html',
+              },
+              {
+                  'sequence': 2,
+                  'institution': '招商证券',
+                  'date': '2026-03-30',
+                  'title': '25年业绩稳健增长，归母净利同比+14%',
+                  'type': '公司跟踪/年报点评',
+                  'verified_pages': '',
+                  'analysts': '',
+                  'status': '公开全文网页可阅读；未找到可直接下载且可验证的原始PDF附件',
+                  'primary_url': 'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/828179450864/index.phtml',
+                  'archive_url': '',
+              },
+              {
+                  'sequence': 3,
+                  'institution': '招商证券',
+                  'date': '2026-09-08',
+                  'title': '集装箱业务表现稳健，Q2业绩环比向好',
+                  'type': '公司跟踪/中报点评',
+                  'verified_pages': 4,
+                  'analysts': '',
+                  'status': '公开全文网页可阅读；历史附件记录为4页，但原PDF下载入口受限，本包未绕过访问限制',
+                  'primary_url': 'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/842168040243/index.phtml',
+                  'archive_url': '',
+              },
+          ]
+
+          for rec in records:
+              seq = rec['sequence']
+              date = rec['date'].replace('-', '')
+              safe_title = re.sub(r'[\\/:*?"<>|]', '_', rec['title'])
+              txt = INDEX / f'{seq:02d}_{date}_{rec["institution"]}_{safe_title}_索引记录_非全文.txt'
+              lines = [
+                  '辽港股份券商研报索引记录（非报告全文）',
+                  '',
+                  f'机构：{rec["institution"]}',
+                  f'日期：{rec["date"]}',
+                  f'题目：{rec["title"]}',
+                  f'类型：{rec["type"]}',
+                  f'已核实页数：{rec["verified_pages"] or "未确认"}',
+                  f'分析师：{rec["analysts"] or "公开页面未列明"}',
+                  f'文件状态：{rec["status"]}',
+                  f'公开入口：{rec["primary_url"]}',
+              ]
+              if rec['archive_url']:
+                  lines.append(f'附件索引页：{rec["archive_url"]}')
+              lines += ['', '本文件仅为来源与状态记录，不是券商报告全文。']
+              txt.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+              shortcut = INDEX / f'{seq:02d}_{date}_{rec["institution"]}_{safe_title}_公开入口.url'
+              shortcut.write_text('[InternetShortcut]\nURL=' + rec['primary_url'] + '\n', encoding='utf-8')
+
+          readme = '''辽港股份（601880）券商研究公开资料包
+整理日期：2026-10-16
+
+重要说明
+========
+1. 严格按“券商公司深度报告完整PDF”口径检索，已确认招商证券2025-08-05《东北地区最大码头运营商，业务综合性强》为22页正式深度报告。
+2. 该22页原始PDF目前可见的附件入口需要登录、积分或付费。本包没有绕过访问限制，也没有用预览页或网页摘要冒充报告全文。
+3. 另收录招商证券2026-03-30与2026-09-08两份公司跟踪报告的公开阅读快捷入口及索引记录；它们不是20页以上长篇深度报告。
+4. 包内唯一完整PDF为亿渡数据2024-09-30的8页机构研究报告。亿渡数据不是证券公司，该文件仅作补充材料，不能视为券商深度报告。
+
+目录
+====
+01_可直接取得的完整PDF
+- 补充_20240930_亿渡数据_辽港股份机构研究报告_非券商.pdf（8页，完整PDF）
+
+02_券商研报索引与公开入口
+- 招商证券2025年22页深度报告：索引记录与公开来源入口，非全文
+- 招商证券2026年年报点评：公开网页快捷入口，非原始PDF
+- 招商证券2026年中报点评：公开网页快捷入口，非原始PDF
+
+校验
+====
+- 亿渡数据PDF：文件头、实际页数、公司身份、首页与末页渲染、SHA-256
+- ZIP：CRC完整性测试
+- 券商索引：题目、机构、日期、公开页数记录与访问状态核对
+
+资料仅供个人研究参考，不构成投资建议。报告版权归相应机构与作者所有。
+'''
+          (PKG / '00_重要说明与文件清单.txt').write_text(readme, encoding='utf-8')
+
+          csv_path = META / '券商研报索引.csv'
+          with csv_path.open('w', encoding='utf-8-sig', newline='') as f:
+              fields = ['sequence','institution','date','title','type','verified_pages','analysts','status','primary_url','archive_url']
+              w = csv.DictWriter(f, fieldnames=fields)
+              w.writeheader(); w.writerows(records)
+
+          yidu_sha = sha256(pdf_dest)
+          manifest = {
+              'company': '辽港股份',
+              'company_full_name': '辽宁港口股份有限公司',
+              'stock_code': '601880',
+              'as_of': '2026-10-16',
+              'strict_complete_broker_pdf_count': 0,
+              'verified_broker_report_records': records,
+              'supplementary_complete_pdf': {
+                  'institution': '亿渡数据',
+                  'is_broker': False,
+                  'date': '2024-09-30',
+                  'title': '持续推进国企改革与资产优化，价值有望重估',
+                  'pages': pages,
+                  'source_page': 'https://data.eastmoney.com/report/info/AP202409301640100556.html',
+                  'pdf_url': pdf_url,
+                  'relative_path': str(pdf_dest.relative_to(PKG)),
+                  'bytes': pdf_dest.stat().st_size,
+                  'sha256': yidu_sha,
+              },
+              'scope_note': '未绕过任何登录、付费、积分或会员限制；索引记录明确标注非全文。',
+          }
+          (META / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (META / 'SHA256SUMS.txt').write_text(f'{yidu_sha}  {pdf_dest.relative_to(PKG)}\n', encoding='utf-8')
+
+          ZIP.parent.mkdir(parents=True, exist_ok=True)
+          with zipfile.ZipFile(ZIP, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+              for p in sorted(PKG.rglob('*')):
+                  if p.is_file():
+                      zf.write(p, p.relative_to(ROOT))
+          with zipfile.ZipFile(ZIP, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failed: {bad}')
+              pdfs = [n for n in zf.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 1:
+                  raise RuntimeError(f'Unexpected PDF count: {pdfs}')
+
+          summary = {
+              'zip': str(ZIP),
+              'zip_bytes': ZIP.stat().st_size,
+              'zip_sha256': sha256(ZIP),
+              'complete_pdf_count': 1,
+              'strict_broker_complete_pdf_count': 0,
+              'broker_index_record_count': 3,
+              'supplementary_pdf_pages': pages,
+              'records': records,
+          }
+          SUMMARY.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2))
+          PY
+          python /tmp/build_package.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: liaogang-601880-public-research-package-20261016
+          path: |
+            dist_liaogang_public_research/*.zip
+            dist_liaogang_public_research/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
