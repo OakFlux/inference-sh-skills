@@ -1,0 +1,20 @@
+name: Probe complete HBIS report sources 20261016
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-hbis-complete-sources-20261016.yml'
+      - 'scripts/probe_hbis_complete_sources_20261016.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install probe dependencies
+        shell: bash
+        run: python -m pip install --quiet requests pillow
+      - name: Probe complete report sources
+        shell: bash
+        run: python scripts/probe_hbis_complete_sources_20261016.py
