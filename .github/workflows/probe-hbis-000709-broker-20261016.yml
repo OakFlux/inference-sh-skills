@@ -1,0 +1,17 @@
+name: Probe HBIS 000709 broker reports 20261016
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-hbis-000709-broker-20261016.yml'
+      - 'scripts/probe_hbis_000709_broker_20261016.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe report metadata
+        shell: bash
+        run: python scripts/probe_hbis_000709_broker_20261016.py
