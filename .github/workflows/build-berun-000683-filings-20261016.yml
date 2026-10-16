@@ -39,28 +39,13 @@ jobs:
               'ZIP_PATH = ROOT / "mayinglong_600993_2020_2025_annual_reports_latest_quarter.zip"': 'ZIP_PATH = ROOT / "berun_chemical_000683_2020_2025_annual_reports_latest_quarter.zip"',
               '("摘要", "英文版", "关于", "审计报告", "内部控制", "取消", "说明", "问询")': '("摘要", "英文版", "英文", "关于", "审计报告", "内部控制", "取消", "说明", "问询")',
               'identity_verified = any(token in compact for token in (COMPANY, FULL_COMPANY, CODE))': 'identity_verified = any(token in compact for token in (COMPANY, FULL_COMPANY, "远兴能源", "内蒙古远兴能源股份有限公司", CODE))',
+              '"sse", "shmb"': '"szse", "szmb"',
+              '"sse", ""': '"szse", ""',
           }
           for old, new in replacements.items():
               if old not in t:
                   raise RuntimeError(f'Missing expected text: {old}')
-              t = t.replace(old, new, 1)
-
-          old_block = '''    candidates = [
-        (f"{CODE},{org_id}", "sse", "shmb"),
-        (f"{CODE},{org_id}", "sse", ""),
-        (CODE, "sse", "shmb"),
-        (CODE, "sse", ""),
-    ]'''
-          new_block = '''    candidates = [
-        (f"{CODE},{org_id}", "szse", "szmb"),
-        (f"{CODE},{org_id}", "szse", ""),
-        (CODE, "szse", "szmb"),
-        (CODE, "szse", ""),
-    ]'''
-          if old_block not in t:
-              raise RuntimeError('Expected SSE candidate block not found')
-          t = t.replace(old_block, new_block, 1)
-
+              t = t.replace(old, new)
           p.write_text(t, encoding='utf-8')
           PY
       - name: Build archive
