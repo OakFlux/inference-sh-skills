@@ -1,0 +1,47 @@
+name: Diagnose Liaogang report API 20261016
+
+on:
+  push:
+    branches:
+      - liaogang-broker-reports-20261016
+    paths:
+      - .github/workflows/diagnose-liaogang-report-api-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install requests
+        run: python -m pip install --disable-pip-version-check --quiet requests
+      - name: Probe report API variants
+        run: |
+          python - <<'PY'
+          import json, re, requests
+          url='https://reportapi.eastmoney.com/report/list'
+          variants=[]
+          for code in ['601880','02880','600317','SH601880','601880.SH']:
+              for qtype in ['0','1','2','3']:
+                  variants.append((code,'',qtype))
+          variants += [('', '601880', '0'), ('601880','601880','0'), ('','SH601880','0')]
+          headers={'User-Agent':'Mozilla/5.0','Referer':'https://data.eastmoney.com/report/'}
+          for code, rcode, qtype in variants:
+              params={'cb':'datatable','pageSize':'100','beginTime':'2000-01-01','endTime':'2026-10-16','pageNo':'1','fields':'','qType':qtype,'orgCode':'','author':'','code':code,'rcode':rcode,'p':'1','pageNum':'1','pageNumber':'1'}
+              try:
+                  r=requests.get(url,params=params,headers=headers,timeout=60)
+                  text=r.text.strip()
+                  m=re.match(r'^[^(]+\((.*)\)\s*;?$',text,re.S)
+                  if m: text=m.group(1)
+                  data=json.loads(text)
+                  rows=data.get('data') or []
+                  print('\nVARIANT',json.dumps({'code':code,'rcode':rcode,'qType':qtype},ensure_ascii=False),'STATUS',r.status_code,'ROWS',len(rows),'TOTALPAGE',data.get('TotalPage'),'TOTALCOUNT',data.get('TotalCount'))
+                  for row in rows[:20]:
+                      keep={k:row.get(k) for k in ['stockCode','stockName','title','orgSName','orgName','publishDate','attachPages','infoCode','researcher','emRatingName','sRatingName']}
+                      print(json.dumps(keep,ensure_ascii=False))
+              except Exception as e:
+                  print('ERROR',code,rcode,qtype,repr(e))
+          PY
