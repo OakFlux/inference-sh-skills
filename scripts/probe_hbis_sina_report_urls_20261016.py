@@ -40,8 +40,9 @@ for label, kind, rptid in rptids:
         except Exception as exc:
             print("ERROR", suffix, repr(exc), flush=True)
 
-    # inspect exact anchor markup around /url
     page = session.get(f"{base}/index.phtml", headers=headers, timeout=90)
     text = page.content.decode("gb18030", errors="replace")
     for m in re.finditer(r".{0,300}/url.{0,500}", text, re.I | re.S):
         print("URL_CONTEXT", re.sub(r"\s+", " ", m.group(0)), flush=True)
+
+print("PROBE_COMPLETE", flush=True)
