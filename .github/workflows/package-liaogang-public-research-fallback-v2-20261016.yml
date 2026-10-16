@@ -1,0 +1,41 @@
+name: Package Liaogang public research fallback v2 20261016
+
+on:
+  push:
+    branches:
+      - liaogang-broker-reports-20261016
+    paths:
+      - scripts/package_liaogang_public_research_fallback_20261016.py
+      - .github/workflows/package-liaogang-public-research-fallback-v2-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+
+      - name: Build package
+        run: python scripts/package_liaogang_public_research_fallback_20261016.py
+
+      - name: Show summary
+        run: cat dist_liaogang_public_research/package_summary.json
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: liaogang-601880-public-research-package-v2-20261016
+          path: |
+            dist_liaogang_public_research/*.zip
+            dist_liaogang_public_research/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
