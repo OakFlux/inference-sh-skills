@@ -1,0 +1,53 @@
+name: Inspect VZKOO Liaogang 20261016
+
+on:
+  push:
+    branches:
+      - liaogang-broker-reports-20261016
+    paths:
+      - .github/workflows/inspect-vzkoo-liaogang-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tools
+        run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4
+      - name: Inspect page
+        run: |
+          python - <<'PY'
+          import re, json, requests
+          from bs4 import BeautifulSoup
+          url='https://www.vzkoo.com/read/20250806bcd2156202f6d35698b9d9dd.html'
+          headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36','Referer':'https://www.vzkoo.com/'}
+          r=requests.get(url,headers=headers,timeout=120)
+          print('STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'FINAL',r.url)
+          print('HEADERS',dict(r.headers))
+          text=r.text
+          print('FIRST5000',text[:5000])
+          soup=BeautifulSoup(text,'html.parser')
+          print('TITLE',soup.title.get_text(' ',strip=True) if soup.title else '')
+          for tag in soup.find_all(['a','iframe','embed','object','source','img','script']):
+              attrs={k:v for k,v in tag.attrs.items() if k in ['href','src','data','value','type','id','class']}
+              blob=json.dumps(attrs,ensure_ascii=False)
+              label=tag.get_text(' ',strip=True)[:120]
+              if re.search(r'pdf|download|file|attach|document|report|20250806|bcd215',blob+' '+label,re.I):
+                  print('TAG',tag.name,blob,'LABEL',label)
+          patterns=[
+              r'https?://[^\"\'<>\s]+',
+              r'[^\"\'<>\s]{0,200}\.pdf[^\"\'<>\s]{0,200}',
+              r'[^\"\'<>\s]{0,200}(?:download|file|attach|report)[^\"\'<>\s]{0,300}',
+          ]
+          for pat in patterns:
+              print('PATTERN',pat)
+              vals=[]
+              for m in re.findall(pat,text,re.I):
+                  v=m if isinstance(m,str) else ''.join(m)
+                  if v not in vals: vals.append(v)
+              for v in vals[:300]: print('MATCH',v[:1000])
+          PY
