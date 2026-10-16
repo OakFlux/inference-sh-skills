@@ -1,0 +1,17 @@
+name: Extract fxbaogao URL PDF module 20261016
+on:
+  push:
+    paths:
+      - '.github/workflows/extract-fxbaogao-urlpdf-module-20261016.yml'
+      - 'scripts/extract_fxbaogao_urlpdf_module_20261016.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract module
+        shell: bash
+        run: python scripts/extract_fxbaogao_urlpdf_module_20261016.py
