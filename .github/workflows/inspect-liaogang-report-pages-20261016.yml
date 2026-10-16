@@ -1,0 +1,54 @@
+name: Inspect Liaogang report pages 20261016
+
+on:
+  push:
+    branches:
+      - liaogang-broker-reports-20261016
+    paths:
+      - .github/workflows/inspect-liaogang-report-pages-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tools
+        run: python -m pip install --disable-pip-version-check --quiet requests beautifulsoup4
+      - name: Inspect pages
+        run: |
+          python - <<'PY'
+          import re, json, requests
+          from bs4 import BeautifulSoup
+          urls = [
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/828179450864/index.phtml',
+            'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/842168040243/index.phtml',
+            'https://finance.sina.cn/sa/2010-11-18/detail-ikftpnnx9947807.d.html',
+            'https://finance.sina.com.cn/stock/companyresearch/20101118/15123524558.shtml',
+            'https://www.p5w.net/today/201001/t2763646.htm',
+          ]
+          headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/155 Safari/537.36'}
+          for url in urls:
+              print('\nURL', url)
+              r=requests.get(url,headers=headers,timeout=60)
+              print('STATUS',r.status_code,'TYPE',r.headers.get('content-type'),'LEN',len(r.content),'FINAL',r.url)
+              enc=r.apparent_encoding or r.encoding or 'utf-8'
+              try: text=r.content.decode(enc,errors='replace')
+              except: text=r.text
+              soup=BeautifulSoup(text,'html.parser')
+              title=soup.title.get_text(' ',strip=True) if soup.title else ''
+              print('TITLE',title)
+              links=[]
+              for a in soup.find_all('a',href=True):
+                  href=a.get('href','')
+                  label=a.get_text(' ',strip=True)
+                  if re.search(r'pdf|download|附件|报告|原文|研报',href+' '+label,re.I):
+                      links.append((label,href))
+              for item in links[:100]: print('LINK',json.dumps(item,ensure_ascii=False))
+              for m in sorted(set(re.findall(r'https?://[^\"\'<>\s]+',text))):
+                  if re.search(r'\.pdf(?:\?|$)|pdf\.',m,re.I): print('PDFURL',m[:500])
+              print('PDF_TOKENS',len(re.findall(r'pdf',text,re.I)))
+          PY
