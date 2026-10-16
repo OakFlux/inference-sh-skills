@@ -16,20 +16,26 @@ for begin, end in [
 ]:
     print('\nWINDOW', begin, end, flush=True)
     for qtype in ['0','1','2']:
-        params = {
-            'pageSize':'500', 'pageNo':'1', 'code':'', 'qType':qtype,
-            'industryCode':'*', 'industry':'*', 'rating':'*', 'ratingChange':'*',
-            'beginTime':begin, 'endTime':end, 'orgCode':'', 'rcode':'', 'fields':''
-        }
-        try:
-            r = s.get('https://reportapi.eastmoney.com/report/list', params=params, headers=headers, timeout=120)
-            print('STATUS', qtype, r.status_code, len(r.content), r.url, flush=True)
-            rows = r.json().get('data') or []
-            print('COUNT', qtype, len(rows), flush=True)
-            for row in rows:
-                text = ' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode'])
-                if '河钢股份' in text or '000709' in text or '穿越周期谷底' in text or '钢铁向材料' in text or '河北龙头钢企' in text:
-                    out={k:row.get(k) for k in ['title','stockName','stockCode','orgName','orgSName','publishDate','infoCode','attachPages','attachSize','researcher','emRatingName','sRatingName']}
-                    print('MATCH', json.dumps(out, ensure_ascii=False), flush=True)
-        except Exception as exc:
-            print('ERROR', qtype, repr(exc), flush=True)
+        total = 0
+        for page in range(1, 16):
+            params = {
+                'pageSize':'100', 'pageNo':str(page), 'code':'', 'qType':qtype,
+                'industryCode':'*', 'industry':'*', 'rating':'*', 'ratingChange':'*',
+                'beginTime':begin, 'endTime':end, 'orgCode':'', 'rcode':'', 'fields':''
+            }
+            try:
+                r = s.get('https://reportapi.eastmoney.com/report/list', params=params, headers=headers, timeout=120)
+                rows = r.json().get('data') or []
+                total += len(rows)
+                print('PAGE', qtype, page, r.status_code, len(rows), flush=True)
+                for row in rows:
+                    text = ' '.join(str(row.get(k) or '') for k in ['title','stockName','stockCode'])
+                    if '河钢股份' in text or '000709' in text or '穿越周期谷底' in text or '钢铁向材料' in text or '河北龙头钢企' in text:
+                        out={k:row.get(k) for k in ['title','stockName','stockCode','orgName','orgSName','publishDate','infoCode','attachPages','attachSize','researcher','emRatingName','sRatingName']}
+                        print('MATCH', json.dumps(out, ensure_ascii=False), flush=True)
+                if not rows:
+                    break
+            except Exception as exc:
+                print('ERROR', qtype, page, repr(exc), flush=True)
+                break
+        print('TOTAL', qtype, total, flush=True)
