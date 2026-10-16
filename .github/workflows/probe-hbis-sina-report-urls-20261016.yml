@@ -1,0 +1,17 @@
+name: Probe HBIS Sina report URLs 20261016
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-hbis-sina-report-urls-20261016.yml'
+      - 'scripts/probe_hbis_sina_report_urls_20261016.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe report URLs
+        shell: bash
+        run: python scripts/probe_hbis_sina_report_urls_20261016.py
