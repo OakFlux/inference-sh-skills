@@ -1,0 +1,17 @@
+name: Probe HBIS report viewer assets 20261016
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-hbis-fxbaogao-20261016.yml'
+      - 'scripts/probe_hbis_fxbaogao_20261016.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe viewer assets
+        shell: bash
+        run: python scripts/probe_hbis_fxbaogao_20261016.py
