@@ -1,0 +1,291 @@
+name: Package Guiyang Bank public broker reports v2 20261016
+
+on:
+  push:
+    branches:
+      - guiyang-bank-broker-reports-20261016
+    paths:
+      - .github/workflows/package-guiyang-bank-public-broker-reports-v2-20261016.yml
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+
+      - name: Build verified package
+        run: |
+          cat > /tmp/build_guiyang_bank_reports.py <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import re
+          import shutil
+          import time
+          import zipfile
+          from pathlib import Path
+
+          import pymupdf
+          import requests
+          from pypdf import PdfReader
+
+          AS_OF = '2026-10-16'
+          COMPANY = '贵阳银行'
+          COMPANY_FULL = '贵阳银行股份有限公司'
+          STOCK_CODE = '601997'
+          ROOT = Path('dist_guiyang_bank_public_reports')
+          PKG = ROOT / f'{COMPANY}_{STOCK_CODE}_券商研究报告_3份'
+          REPORT_DIR = PKG / '01_完整券商报告PDF'
+          META_DIR = PKG / '02_来源与校验'
+          RENDER_DIR = ROOT / '_renders'
+          ZIP_PATH = ROOT / f'{COMPANY}_{STOCK_CODE}_券商研究报告_3份_{AS_OF.replace("-", "")}.zip'
+          SUMMARY_PATH = ROOT / 'package_summary.json'
+
+          REPORTS = [
+              {
+                  'sequence': 1,
+                  'institution': '太平洋证券',
+                  'date': '2019-04-16',
+                  'title': '贵阳银行：信贷快速扩张，高ROE独领风骚',
+                  'analysts': '孙立金、支初蓉',
+                  'rating': '增持',
+                  'info_code': 'AP201904161319735941',
+                  'expected_pages': 10,
+              },
+              {
+                  'sequence': 2,
+                  'institution': '太平洋证券',
+                  'date': '2018-08-27',
+                  'title': '贵阳银行：业绩增速放缓，不良确认标准趋严',
+                  'analysts': '孙立金',
+                  'rating': '持有',
+                  'info_code': 'AP201808271183093386',
+                  'expected_pages': 9,
+              },
+              {
+                  'sequence': 3,
+                  'institution': '中银国际证券',
+                  'date': '2018-05-03',
+                  'title': '2017年年报暨2018年一季报点评：规模环比下降资产结构优化，资产质量有待进一步观察',
+                  'analysts': '励雅敏、袁喆奇',
+                  'rating': '增持',
+                  'info_code': 'AP201805031135820264',
+                  'expected_pages': 6,
+              },
+          ]
+
+          for directory in (REPORT_DIR, META_DIR, RENDER_DIR):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          session = requests.Session()
+          session.headers.update({
+              'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/155 Safari/537.36',
+              'Accept': 'application/pdf,*/*;q=0.8',
+              'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+          })
+
+          def sha256(path: Path) -> str:
+              h = hashlib.sha256()
+              with path.open('rb') as f:
+                  for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                      h.update(chunk)
+              return h.hexdigest()
+
+          def safe_name(value: str) -> str:
+              return re.sub(r'[\\/:*?"<>|]', '_', value)
+
+          def download_pdf(info_code: str, destination: Path) -> str:
+              source_page = f'https://data.eastmoney.com/report/info/{info_code}.html'
+              errors = []
+              for prefix in ('H3', 'H2'):
+                  for suffix in ('', f'?{int(time.time()*1000)}.pdf='):
+                      url = f'https://pdf.dfcfw.com/pdf/{prefix}_{info_code}_1.pdf{suffix}'
+                      try:
+                          response = session.get(url, headers={'Referer': source_page}, timeout=180, allow_redirects=True)
+                          payload = response.content
+                          print('PDF_TRY', info_code, prefix, response.status_code, response.headers.get('content-type'), len(payload), response.url, flush=True)
+                          response.raise_for_status()
+                          if not payload.startswith(b'%PDF-') or len(payload) < 100_000:
+                              raise RuntimeError('Invalid PDF payload')
+                          destination.write_bytes(payload)
+                          return str(response.url)
+                      except Exception as exc:
+                          errors.append(repr(exc))
+                          destination.unlink(missing_ok=True)
+              raise RuntimeError(f'Could not download {info_code}: {errors}')
+
+          def validate_report(report: dict, path: Path) -> dict:
+              reader = PdfReader(str(path), strict=False)
+              if reader.is_encrypted:
+                  reader.decrypt('')
+              pages = len(reader.pages)
+              if pages != int(report['expected_pages']):
+                  raise RuntimeError(f'Page mismatch for {path.name}: {pages} != {report["expected_pages"]}')
+
+              indices = sorted({0, 1, min(2, pages-1), pages-1})
+              parts = []
+              for idx in indices:
+                  try:
+                      parts.append(reader.pages[idx].extract_text() or '')
+                  except Exception as exc:
+                      print('TEXT_WARNING', path.name, idx, repr(exc), flush=True)
+              normalized = re.sub(r'\s+', '', '\n'.join(parts))
+              if not any(token in normalized for token in (COMPANY, COMPANY_FULL, STOCK_CODE)):
+                  raise RuntimeError(f'Company identity not found in {path.name}')
+              institution_core = report['institution'].replace('证券', '')
+              institution_ok = report['institution'] in normalized or institution_core in normalized
+
+              with pymupdf.open(path) as document:
+                  for idx, label in ((0, 'first'), (len(document)-1, 'last')):
+                      pix = document[idx].get_pixmap(matrix=pymupdf.Matrix(1.4, 1.4), alpha=False)
+                      out = RENDER_DIR / f'{report["sequence"]:02d}_{label}.png'
+                      pix.save(out)
+                      if out.stat().st_size < 5000:
+                          raise RuntimeError(f'Render validation failed: {out}')
+
+              return {
+                  'pages': pages,
+                  'bytes': path.stat().st_size,
+                  'sha256': sha256(path),
+                  'company_identity_verified': True,
+                  'institution_identity_verified_when_extractable': institution_ok,
+                  'first_and_last_page_rendered': True,
+              }
+
+          records = []
+          seen_hashes = set()
+          for report in REPORTS:
+              filename = safe_name(f'{report["sequence"]:02d}_{report["date"].replace("-", "")}_{report["institution"]}_{report["title"]}.pdf')
+              destination = REPORT_DIR / filename
+              pdf_url = download_pdf(report['info_code'], destination)
+              metadata = validate_report(report, destination)
+              if metadata['sha256'] in seen_hashes:
+                  raise RuntimeError(f'Duplicate report hash: {filename}')
+              seen_hashes.add(metadata['sha256'])
+              record = {
+                  **report,
+                  **metadata,
+                  'source_page': f'https://data.eastmoney.com/report/info/{report["info_code"]}.html',
+                  'pdf_url': pdf_url,
+                  'relative_path': str(destination.relative_to(PKG)),
+              }
+              records.append(record)
+              print('VALIDATED', json.dumps(record, ensure_ascii=False), flush=True)
+
+          note = [
+              f'{COMPANY}（{STOCK_CODE}）券商研究报告资料包',
+              f'整理日期：{AS_OF}',
+              '',
+              '收录说明：',
+              '1. 本包收录公开渠道可直接取得并完整验证的3份券商公司研究PDF。',
+              '2. 公开渠道另有国联民生证券2026-05-14《2025年年报及2026年一季报点评：息差反弹，营收高增》（25页，首次覆盖）记录；其原始PDF入口目前需要登录、积分或付费，因此本包未绕过访问限制，未将预览页冒充完整报告。',
+              '3. 由于贵阳银行公开可直接下载的20页以上长篇报告较少，本包3份完整PDF实际页数为10页、9页和6页，属于公司研究/财报点评资料，不全部等同于20页以上经典深度报告。',
+              '',
+              '文件清单：',
+          ]
+          for r in records:
+              note.append(f'{r["sequence"]}. {r["date"]}｜{r["institution"]}｜{r["title"]}｜{r["pages"]}页｜{r["rating"]}')
+          note += [
+              '',
+              '校验范围：PDF文件头、实际页数、贵阳银行/601997身份、首页与末页渲染、单文件SHA-256及ZIP CRC。',
+              '资料仅供个人研究参考，不构成投资建议。报告版权归相应证券研究机构及作者所有。',
+          ]
+          (PKG / '00_重要说明与文件清单.txt').write_text('\n'.join(note) + '\n', encoding='utf-8')
+
+          fields = ['sequence','institution','date','title','analysts','rating','info_code','pages','bytes','sha256','source_page','pdf_url','relative_path']
+          with (META_DIR / '文件清单.csv').open('w', encoding='utf-8-sig', newline='') as handle:
+              writer = csv.DictWriter(handle, fieldnames=fields, extrasaction='ignore')
+              writer.writeheader()
+              writer.writerows(records)
+
+          latest_index = {
+              'institution': '国联民生证券',
+              'date': '2026-05-14',
+              'title': '2025年年报及2026年一季报点评：息差反弹，营收高增',
+              'pages': 25,
+              'type': '首次覆盖/长篇公司研究',
+              'analysts': '王先爽、文雪阳、乔丹、马高平',
+              'rating': '推荐',
+              'status': '已核实公开记录；原始PDF下载入口需登录、积分或付费，未收录全文',
+              'public_reading_page': 'https://stock.finance.sina.com.cn/stock/go.php/vReport_Show/kind/search/rptid/832160896919/index.phtml',
+              'archive_record': 'https://www.sgpjbg.com.cn/baogao/1239000.html',
+          }
+          (META_DIR / '2026_国联民生证券_25页首次覆盖报告_索引记录_非全文.txt').write_text(
+              '\n'.join([
+                  '贵阳银行最新长篇券商报告索引记录（非报告全文）','',
+                  f'机构：{latest_index["institution"]}', f'日期：{latest_index["date"]}',
+                  f'题目：{latest_index["title"]}', f'页数：{latest_index["pages"]}页',
+                  f'类型：{latest_index["type"]}', f'分析师：{latest_index["analysts"]}',
+                  f'评级：{latest_index["rating"]}', f'状态：{latest_index["status"]}',
+                  f'公开阅读页：{latest_index["public_reading_page"]}',
+                  f'档案记录页：{latest_index["archive_record"]}', '',
+                  '本文件仅为来源与访问状态记录，不是券商报告全文。'
+              ]) + '\n', encoding='utf-8'
+          )
+
+          manifest = {
+              'company': COMPANY,
+              'company_full_name': COMPANY_FULL,
+              'stock_code': STOCK_CODE,
+              'as_of': AS_OF,
+              'package_scope': '3份公开可完整下载的券商公司研究PDF，并附最新25页长篇报告索引说明',
+              'complete_pdf_count': len(records),
+              'documents': records,
+              'latest_long_report_index': latest_index,
+          }
+          (META_DIR / 'manifest.json').write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+          (META_DIR / 'SHA256SUMS.txt').write_text(
+              '\n'.join(f'{r["sha256"]}  {r["relative_path"]}' for r in records) + '\n', encoding='utf-8'
+          )
+
+          ZIP_PATH.parent.mkdir(parents=True, exist_ok=True)
+          ZIP_PATH.unlink(missing_ok=True)
+          with zipfile.ZipFile(ZIP_PATH, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+              for path in sorted(PKG.rglob('*')):
+                  if path.is_file():
+                      archive.write(path, path.relative_to(ROOT))
+          with zipfile.ZipFile(ZIP_PATH, 'r') as archive:
+              bad = archive.testzip()
+              if bad:
+                  raise RuntimeError(f'ZIP CRC failure: {bad}')
+              pdfs = [n for n in archive.namelist() if n.lower().endswith('.pdf')]
+              if len(pdfs) != 3:
+                  raise RuntimeError(f'Unexpected PDF count: {pdfs}')
+
+          summary = {
+              'zip': str(ZIP_PATH),
+              'zip_bytes': ZIP_PATH.stat().st_size,
+              'zip_sha256': sha256(ZIP_PATH),
+              'pdf_count': len(records),
+              'documents': [
+                  {
+                      'institution': r['institution'], 'date': r['date'], 'title': r['title'],
+                      'pages': r['pages'], 'rating': r['rating'], 'analysts': r['analysts'],
+                  }
+                  for r in records
+              ],
+              'latest_long_report_index': latest_index,
+          }
+          SUMMARY_PATH.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
+          PY
+          python /tmp/build_guiyang_bank_reports.py
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: guiyang-bank-601997-public-broker-reports-v2-20261016
+          path: |
+            dist_guiyang_bank_public_reports/*.zip
+            dist_guiyang_bank_public_reports/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
