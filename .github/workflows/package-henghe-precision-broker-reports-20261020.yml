@@ -6,8 +6,7 @@ on:
       - henghe-precision-broker-reports-20261020
     paths:
       - .github/workflows/package-henghe-precision-broker-reports-20261020.yml
-      - scripts/build_henghe_precision_broker_reports_20261020.py
-      - scripts/run_henghe_precision_broker_reports_v2_20261020.py
+      - scripts/probe_henghe_broker_sources_20261020.py
   workflow_dispatch:
 
 jobs:
@@ -22,42 +21,19 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PDF validation tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qpdf poppler-utils
-
       - name: Install Python dependencies
-        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+        run: python -m pip install --disable-pip-version-check --quiet requests
 
-      - name: Download validate and package reports
-        id: build
-        shell: bash
-        run: |
-          set +e
-          python scripts/run_henghe_precision_broker_reports_v2_20261020.py > run.log 2>&1
-          status=$?
-          echo "$status" > exit_code.txt
-          cat run.log
-          exit 0
+      - name: Probe public report sources
+        run: python scripts/probe_henghe_broker_sources_20261020.py | tee probe.log
 
-      - name: Upload diagnostics and any package
+      - name: Upload source diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: henghe-precision-300539-broker-reports-diagnostic-20261020
+          name: henghe-precision-public-source-probe-20261020
           path: |
-            run.log
-            exit_code.txt
-            report_catalog.json
-            package_summary.json
-            横河精密_300539_券商研究报告_3份_截至20261020.zip
-            横河精密_300539_券商研究报告_3份_截至20261020/**
-            _verify_henghe_precision_broker_reports/**
-          if-no-files-found: warn
+            probe.log
+            source_probe/**
+          if-no-files-found: error
           retention-days: 30
-
-      - name: Mark failure after diagnostics
-        shell: bash
-        run: |
-          test "$(cat exit_code.txt)" = "0"
