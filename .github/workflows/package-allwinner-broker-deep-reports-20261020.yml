@@ -1,0 +1,72 @@
+name: Package Allwinner broker deep reports 20261020
+
+on:
+  push:
+    branches:
+      - allwinner-broker-reports-20261020
+    paths:
+      - scripts/build_allwinner_300458_broker_deep_reports_20261020.py
+      - .github/workflows/package-allwinner-broker-deep-reports-20261020.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+
+      - name: Download validate and package reports
+        run: python scripts/build_allwinner_300458_broker_deep_reports_20261020.py
+
+      - name: Show package summary
+        run: cat dist/package_summary.json
+
+      - name: Verify packaged PDF count
+        run: |
+          python - <<'PY'
+          import json
+          import zipfile
+          from pathlib import Path
+          summary = json.loads(Path('dist/package_summary.json').read_text(encoding='utf-8'))
+          zips = list(Path('dist').glob('*.zip'))
+          assert len(zips) == 1, zips
+          with zipfile.ZipFile(zips[0]) as zf:
+              bad = zf.testzip()
+              assert bad is None, bad
+              pdfs = [name for name in zf.namelist() if name.lower().endswith('.pdf')]
+              assert len(pdfs) == 3, pdfs
+          assert summary['pdf_count'] == 3, summary
+          print('FINAL_ZIP', zips[0], zips[0].stat().st_size)
+          print('PDF_COUNT', len(pdfs))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: allwinner-300458-broker-deep-reports-20261020
+          path: |
+            dist/*.zip
+            dist/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
