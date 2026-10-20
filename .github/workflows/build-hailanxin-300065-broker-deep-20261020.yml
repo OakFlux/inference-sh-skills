@@ -22,6 +22,15 @@ jobs:
       - name: Build archive
         shell: bash
         run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('scripts/build_hailanxin_300065_broker_deep_archive_20261020.py')
+          text = p.read_text(encoding='utf-8')
+          old = 'str(min(6, pages))'
+          if old not in text:
+              raise RuntimeError('Expected opening-page extraction expression not found')
+          p.write_text(text.replace(old, 'str(pages)', 1), encoding='utf-8')
+          PY
           python scripts/build_hailanxin_300065_broker_deep_archive_20261020.py
       - name: Upload archive
         uses: actions/upload-artifact@v4
