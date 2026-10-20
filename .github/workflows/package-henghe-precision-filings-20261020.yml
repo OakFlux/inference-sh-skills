@@ -47,7 +47,7 @@ jobs:
               ('_erdos_600295_work', '_henghe_precision_300539_work'),
               ('for ann_type in ("SHA", "SH"):', 'for ann_type in ("SZSA", "SZ", "A"):'),
               (
-                  'identity_ok = any(marker in normalized for marker in (COMPANY, FULL_COMPANY, STOCK_CODE))',
+                  'identity_ok = any(marker in normalized for marker in (COMPANY, FULL_COMPANY, STOCK_CODE, "900936"))',
                   'identity_ok = any(marker in normalized for marker in (COMPANY, FULL_COMPANY, STOCK_CODE, "横河模具", "宁波横河模具股份有限公司"))',
               ),
           ]
