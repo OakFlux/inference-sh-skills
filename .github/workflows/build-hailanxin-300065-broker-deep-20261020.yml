@@ -26,15 +26,21 @@ jobs:
           from pathlib import Path
           p = Path('scripts/build_hailanxin_300065_broker_deep_archive_20261020.py')
           text = p.read_text(encoding='utf-8')
-          old_extract = 'str(min(6, pages))'
-          if old_extract not in text:
-              raise RuntimeError('Expected opening-page extraction expression not found')
-          text = text.replace(old_extract, 'str(pages)', 1)
-          old_identity = '    if not identity_verified:\n        raise RuntimeError(f"Company identity not found in opening pages: {path}")'
-          new_identity = '    if not identity_verified:\n        log("IDENTITY_TEXT_NOT_EXTRACTABLE_USING_METADATA_FALLBACK", path.name)'
-          if old_identity not in text:
-              raise RuntimeError('Expected identity validation block not found')
-          text = text.replace(old_identity, new_identity, 1)
+          replacements = {
+              'str(min(6, pages))': 'str(pages)',
+              '"info_code": "AP202209071578123195"': '"info_code": "AP202111231530676079"',
+              '"report_date": "2022-09-07"': '"report_date": "2021-11-23"',
+              '"broker": "中航证券"': '"broker": "东吴证券"',
+              '"broker_full": "中航证券有限公司"': '"broker_full": "东吴证券股份有限公司"',
+              '"analysts": "张超"': '"analysts": "侯宾"',
+              '"title": "军品UDC齐发力，海中娇兰可期盛放"': '"title": "海兰信：海洋硬科技领军者，双向布局UDC及海洋娱乐，业绩加速拐点或将至"',
+              '"filename_title": "军品UDC齐发力，海中娇兰可期盛放"': '"filename_title": "海洋硬科技领军者，双向布局UDC及海洋娱乐"',
+              '"title_tokens": ["军品UDC齐发力", "海中娇兰可期盛放"]': '"title_tokens": ["海洋硬科技领军者", "双向布局UDC及海洋娱乐"]',
+          }
+          for old, new in replacements.items():
+              if old not in text:
+                  raise RuntimeError(f'Expected builder text not found: {old}')
+              text = text.replace(old, new, 1)
           p.write_text(text, encoding='utf-8')
           PY
           python scripts/build_hailanxin_300065_broker_deep_archive_20261020.py
