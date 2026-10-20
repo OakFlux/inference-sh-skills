@@ -1,0 +1,71 @@
+name: Package Allwinner Technology filings 20261020
+
+on:
+  push:
+    branches:
+      - allwinner-filings-20261020
+    paths:
+      - scripts/package_allwinner_filings_20261020.py
+      - .github/workflows/package-allwinner-filings-20261020.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PDF validation tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils
+
+      - name: Install Python dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf
+
+      - name: Download, validate, and package filings
+        run: python scripts/package_allwinner_filings_20261020.py
+
+      - name: Show package summary
+        run: cat package_summary.json
+
+      - name: Verify packaged PDF count
+        run: |
+          python - <<'PY'
+          import glob
+          import json
+          import zipfile
+
+          paths = glob.glob('全志科技_300458_全部年报_招股说明书_最新季报_截至20261020.zip')
+          assert len(paths) == 1, paths
+          with zipfile.ZipFile(paths[0]) as archive:
+              assert archive.testzip() is None
+              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
+              assert len(pdfs) == 13, pdfs
+          summary = json.load(open('package_summary.json', encoding='utf-8'))
+          assert summary['pdf_count'] == 13, summary
+          print(paths[0], len(pdfs))
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: allwinner-300458-filings-20261020
+          path: |
+            全志科技_300458_全部年报_招股说明书_最新季报_截至20261020.zip
+            package_summary.json
+          if-no-files-found: error
+          retention-days: 30
