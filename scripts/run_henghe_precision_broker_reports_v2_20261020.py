@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import importlib.util
 import json
 from pathlib import Path
@@ -26,89 +27,134 @@ def extract_rows(payload: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in rows if isinstance(item, dict)]
 
 
-def patched_list_reports() -> list[dict[str, Any]]:
-    variants = [
-        ("stockCodes", module.CODE, "2022-01-01"),
-        ("stockCodes", module.CODE, "2000-01-01"),
-        ("code", module.CODE, "2022-01-01"),
-        ("code", module.CODE, "2000-01-01"),
-    ]
-    all_records: list[dict[str, Any]] = []
-    selected_variant: tuple[str, str, str] | None = None
+def fetch_window(begin: str, end: str, *, code: str | None = None) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {
+        "industryCode": "*",
+        "pageSize": "5000",
+        "industry": "*",
+        "rating": "*",
+        "ratingChange": "*",
+        "beginTime": begin,
+        "endTime": end,
+        "pageNo": "1",
+        "fields": "",
+        "qType": "0",
+        "orgCode": "",
+        "rcode": "",
+        "p": "1",
+        "pageNum": "1",
+        "pageNumber": "1",
+    }
+    if code is not None:
+        params["code"] = code
 
-    for key, value, begin in variants:
-        first_params = {
-            "industryCode": "*",
-            "pageSize": "100",
-            "industry": "*",
-            "rating": "*",
-            "ratingChange": "*",
-            "beginTime": begin,
-            "endTime": module.AS_OF,
-            "pageNo": "1",
-            "fields": "",
-            "qType": "0",
-            "orgCode": "",
-            "rcode": "",
-            "p": "1",
-            "pageNum": "1",
-            "pageNumber": "1",
-            "author": "",
-            key: value,
-        }
-        response = module.request_with_retry(module.REPORT_API, params=first_params)
+    response = module.request_with_retry(module.REPORT_API, params=params)
+    try:
+        raw_text = response.text
+        payload = module.parse_json_or_jsonp(raw_text)
+    finally:
+        response.close()
+    rows = extract_rows(payload)
+    print(
+        "WINDOW",
+        begin,
+        end,
+        "CODE",
+        code,
+        "ROWS",
+        len(rows),
+        "TARGET_ROWS",
+        sum(str(item.get("stockCode") or "") == module.CODE for item in rows),
+        "RAW_PREFIX",
+        raw_text[:400],
+        flush=True,
+    )
+
+    total_page = 1
+    if isinstance(payload, dict):
+        total_page = int(payload.get("TotalPage") or payload.get("totalPage") or 1)
+    all_rows = list(rows)
+    for page in range(2, min(total_page, 50) + 1):
+        page_params = dict(params)
+        page_params.update(
+            {
+                "pageNo": str(page),
+                "p": str(page),
+                "pageNum": str(page),
+                "pageNumber": str(page),
+            }
+        )
+        page_response = module.request_with_retry(module.REPORT_API, params=page_params)
         try:
-            raw_text = response.text
-            payload = module.parse_json_or_jsonp(raw_text)
+            page_payload = module.parse_json_or_jsonp(page_response.text)
         finally:
-            response.close()
-        rows = extract_rows(payload)
-        print("API_VARIANT", key, begin, "ROWS", len(rows), "RAW", raw_text[:500], flush=True)
-        if not rows:
-            continue
+            page_response.close()
+        page_rows = extract_rows(page_payload)
+        print("WINDOW_PAGE", begin, end, page, len(page_rows), flush=True)
+        if not page_rows:
+            break
+        all_rows.extend(page_rows)
+    return all_rows
 
-        selected_variant = (key, value, begin)
-        all_records.extend(rows)
-        total_page = 1
-        if isinstance(payload, dict):
-            total_page = int(payload.get("TotalPage") or payload.get("totalPage") or 1)
-        for page in range(2, min(total_page, 20) + 1):
-            params = dict(first_params)
-            params.update(
+
+def patched_list_reports() -> list[dict[str, Any]]:
+    collected: list[dict[str, Any]] = []
+
+    # First reproduce the currently documented Eastmoney/AKShare query exactly.
+    filtered = fetch_window("2000-01-01", "2027-01-01", code=module.CODE)
+    filtered_target = [
+        item for item in filtered if str(item.get("stockCode") or "") == module.CODE
+    ]
+    if filtered_target:
+        collected.extend(filtered_target)
+        print("FILTERED_QUERY_ACCEPTED", len(filtered_target), flush=True)
+    else:
+        print("FILTERED_QUERY_IGNORED_OR_EMPTY; USING NARROW DATE WINDOWS", flush=True)
+
+    # The public endpoint has at times ignored the stock-code parameter. Query small
+    # date windows around the known publication dates, then apply the stock-code filter locally.
+    for target in module.TARGETS:
+        center = dt.date.fromisoformat(str(target["preferred_date"]))
+        begin = (center - dt.timedelta(days=3)).isoformat()
+        end = (center + dt.timedelta(days=3)).isoformat()
+        rows = fetch_window(begin, end)
+        window_target = [
+            item for item in rows if str(item.get("stockCode") or "") == module.CODE
+        ]
+        print(
+            "LOCAL_CODE_FILTER",
+            target["preferred_date"],
+            len(window_target),
+            [
                 {
-                    "pageNo": str(page),
-                    "p": str(page),
-                    "pageNum": str(page),
-                    "pageNumber": str(page),
+                    "date": str(item.get("publishDate") or "")[:10],
+                    "org": item.get("orgSName"),
+                    "pages": item.get("attachPages"),
+                    "infoCode": item.get("infoCode"),
+                    "title": item.get("title"),
                 }
-            )
-            page_response = module.request_with_retry(module.REPORT_API, params=params)
-            try:
-                page_payload = module.parse_json_or_jsonp(page_response.text)
-            finally:
-                page_response.close()
-            page_rows = extract_rows(page_payload)
-            print("REPORT_PAGE", page, len(page_rows), flush=True)
-            if not page_rows:
-                break
-            all_records.extend(page_rows)
-        break
-
-    if not all_records:
-        raise RuntimeError("Eastmoney report API returned no records for all code/stockCodes variants")
+                for item in window_target
+            ],
+            flush=True,
+        )
+        collected.extend(window_target)
 
     unique: dict[str, dict[str, Any]] = {}
-    for item in all_records:
+    for item in collected:
         info_code = str(item.get("infoCode") or "")
         if info_code:
             unique[info_code] = item
     records = list(unique.values())
-    print("SELECTED_API_VARIANT", selected_variant, flush=True)
+    if not records:
+        raise RuntimeError("No Henghe Precision reports found after local stock-code filtering")
+
     print("REPORT_COUNT", len(records), flush=True)
     for item in sorted(records, key=lambda row: str(row.get("publishDate") or ""), reverse=True):
         print(
             "REPORT",
             str(item.get("publishDate") or "")[:10],
+            item.get("stockCode"),
+            item.get("stockName"),
             item.get("orgSName"),
             item.get("attachPages"),
             item.get("infoCode"),
