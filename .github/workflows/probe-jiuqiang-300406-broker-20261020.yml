@@ -1,0 +1,17 @@
+name: Probe Jiuqiang 300406 broker reports 20261020
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-jiuqiang-300406-broker-20261020.yml'
+      - 'scripts/probe_jiuqiang_300406_broker_20261020.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe report metadata
+        shell: bash
+        run: python scripts/probe_jiuqiang_300406_broker_20261020.py
