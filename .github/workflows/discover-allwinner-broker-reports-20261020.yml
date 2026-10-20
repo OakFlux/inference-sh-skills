@@ -1,0 +1,46 @@
+name: Discover Allwinner broker reports 20261020
+
+on:
+  push:
+    branches:
+      - allwinner-broker-reports-20261020
+    paths:
+      - scripts/discover_allwinner_300458_broker_reports_20261020.py
+      - .github/workflows/discover-allwinner-broker-reports-20261020.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  discover:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests
+
+      - name: Discover reports
+        run: python scripts/discover_allwinner_300458_broker_reports_20261020.py
+
+      - name: Show catalog
+        run: cat dist_discovery/catalog.txt
+
+      - name: Upload discovery catalog
+        uses: actions/upload-artifact@v4
+        with:
+          name: allwinner-300458-broker-report-catalog-20261020
+          path: dist_discovery/*
+          if-no-files-found: error
+          retention-days: 30
