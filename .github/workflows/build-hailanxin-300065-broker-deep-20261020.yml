@@ -30,10 +30,8 @@ jobs:
           if old_extract not in text:
               raise RuntimeError('Expected opening-page extraction expression not found')
           text = text.replace(old_extract, 'str(pages)', 1)
-          old_identity = '''    if not identity_verified:
-        raise RuntimeError(f"Company identity not found in opening pages: {path}")'''
-          new_identity = '''    if not identity_verified:
-        log("IDENTITY_TEXT_NOT_EXTRACTABLE_USING_METADATA_FALLBACK", path.name)'''
+          old_identity = '    if not identity_verified:\n        raise RuntimeError(f"Company identity not found in opening pages: {path}")'
+          new_identity = '    if not identity_verified:\n        log("IDENTITY_TEXT_NOT_EXTRACTABLE_USING_METADATA_FALLBACK", path.name)'
           if old_identity not in text:
               raise RuntimeError('Expected identity validation block not found')
           text = text.replace(old_identity, new_identity, 1)
