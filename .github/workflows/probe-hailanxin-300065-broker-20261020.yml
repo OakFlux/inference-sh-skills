@@ -1,0 +1,19 @@
+name: Probe Hailanxin 300065 broker reports 20261020
+on:
+  push:
+    paths:
+      - '.github/workflows/probe-hailanxin-300065-broker-20261020.yml'
+      - 'scripts/probe_hailanxin_300065_broker_20261020.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe report metadata
+        shell: bash
+        run: |
+          python -m pip install --quiet requests
+          python scripts/probe_hailanxin_300065_broker_20261020.py
