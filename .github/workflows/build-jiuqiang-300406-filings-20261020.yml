@@ -1,0 +1,61 @@
+name: Build Jiuqiang 300406 filings archive 20261020
+on:
+  push:
+    paths:
+      - '.github/workflows/build-jiuqiang-300406-filings-20261020.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install PDF tools
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qpdf poppler-utils poppler-data
+          python -m pip install --quiet requests pypdf
+      - name: Prepare Jiuqiang builder
+        shell: bash
+        run: |
+          git fetch --depth=1 origin task-mayinglong-600993-filings-20261015:refs/remotes/origin/task-mayinglong-600993-filings-20261015
+          git show origin/task-mayinglong-600993-filings-20261015:scripts/build_mayinglong_600993_filings_20261015.py > scripts/build_jiuqiang_300406_filings_20261020.py
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('scripts/build_jiuqiang_300406_filings_20261020.py')
+          t = p.read_text(encoding='utf-8')
+          replacements = {
+              'CODE = "600993"': 'CODE = "300406"',
+              'COMPANY = "马应龙"': 'COMPANY = "九强生物"',
+              'FULL_COMPANY = "马应龙药业集团股份有限公司"': 'FULL_COMPANY = "北京九强生物技术股份有限公司"',
+              'AS_OF_DATE = "2026-10-15"': 'AS_OF_DATE = "2026-10-20"',
+              'WORK_ROOT = ROOT / "_build_mayinglong_600993"': 'WORK_ROOT = ROOT / "_build_jiuqiang_300406"',
+              'ZIP_PATH = ROOT / "mayinglong_600993_2020_2025_annual_reports_latest_quarter.zip"': 'ZIP_PATH = ROOT / "jiuqiang_biotech_300406_2020_2025_annual_reports_latest_quarter.zip"',
+              '("摘要", "英文版", "关于", "审计报告", "内部控制", "取消", "说明", "问询")': '("摘要", "英文版", "英文", "关于", "审计报告", "内部控制", "取消", "说明", "问询")',
+              '"sse", "shmb"': '"szse", ""',
+              '"sse", ""': '"szse", ""',
+          }
+          for old, new in replacements.items():
+              if old not in t:
+                  raise RuntimeError(f'Missing expected text: {old}')
+              t = t.replace(old, new)
+          p.write_text(t, encoding='utf-8')
+          PY
+      - name: Build archive
+        shell: bash
+        run: |
+          python scripts/build_jiuqiang_300406_filings_20261020.py
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiuqiang-300406-filings-20261020
+          path: jiuqiang_biotech_300406_2020_2025_annual_reports_latest_quarter.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
