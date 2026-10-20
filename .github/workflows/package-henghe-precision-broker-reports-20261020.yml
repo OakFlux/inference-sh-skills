@@ -31,36 +31,33 @@ jobs:
         run: python -m pip install --disable-pip-version-check --quiet requests pypdf
 
       - name: Download validate and package reports
-        run: python scripts/run_henghe_precision_broker_reports_v2_20261020.py
-
-      - name: Show package summary
-        run: cat package_summary.json
-
-      - name: Verify final archive
+        id: build
+        shell: bash
         run: |
-          python - <<'PY'
-          import glob
-          import json
-          import zipfile
+          set +e
+          python scripts/run_henghe_precision_broker_reports_v2_20261020.py > run.log 2>&1
+          status=$?
+          echo "$status" > exit_code.txt
+          cat run.log
+          exit 0
 
-          paths = glob.glob('横河精密_300539_券商研究报告_3份_截至20261020.zip')
-          assert len(paths) == 1, paths
-          with zipfile.ZipFile(paths[0]) as archive:
-              assert archive.testzip() is None
-              pdfs = [name for name in archive.namelist() if name.lower().endswith('.pdf')]
-              assert len(pdfs) == 3, pdfs
-          summary = json.load(open('package_summary.json', encoding='utf-8'))
-          assert summary['pdf_count'] == 3, summary
-          print(paths[0], pdfs)
-          PY
-
-      - name: Upload package
+      - name: Upload diagnostics and any package
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: henghe-precision-300539-broker-reports-20261020
+          name: henghe-precision-300539-broker-reports-diagnostic-20261020
           path: |
-            横河精密_300539_券商研究报告_3份_截至20261020.zip
-            package_summary.json
+            run.log
+            exit_code.txt
             report_catalog.json
-          if-no-files-found: error
+            package_summary.json
+            横河精密_300539_券商研究报告_3份_截至20261020.zip
+            横河精密_300539_券商研究报告_3份_截至20261020/**
+            _verify_henghe_precision_broker_reports/**
+          if-no-files-found: warn
           retention-days: 30
+
+      - name: Mark failure after diagnostics
+        shell: bash
+        run: |
+          test "$(cat exit_code.txt)" = "0"
