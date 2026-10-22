@@ -1,0 +1,31 @@
+name: Diagnose Wuhan Fingu Sina reports 20261022
+
+on:
+  push:
+    branches:
+      - wuhan-fingu-broker-reports-20261022
+    paths:
+      - scripts/diag_wuhan_fingu_sina_reports_20261022.py
+      - .github/workflows/diag-wuhan-fingu-sina-reports-20261022.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --disable-pip-version-check --quiet requests
+      - run: python scripts/diag_wuhan_fingu_sina_reports_20261022.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wuhan-fingu-sina-report-diagnostics
+          path: diag_wuhan_fingu_sina
+          if-no-files-found: error
+          retention-days: 7
