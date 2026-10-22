@@ -1,0 +1,68 @@
+{
+  "zip": "dist/卧龙电驱_600580_2020-2025年报_最新季报_截至20261022.zip",
+  "zip_bytes": 17700958,
+  "zip_sha256": "74dda1ee42b7fc7d8945ff4278927c99bc396b673cff9d27e718b2d4c2feeadb",
+  "pdf_count": 7,
+  "scope": "2020—2025年年度报告全文 + 最新严格季度报告",
+  "latest_quarterly_report": "卧龙电驱:卧龙电驱2026年第一季度报告",
+  "latest_quarterly_report_date": "2026-04-29",
+  "q3_2026_disclosed_in_checked_index": false,
+  "documents": [
+    {
+      "type": "年度报告",
+      "period": "2020",
+      "title": "600580:卧龙电驱2020年年度报告",
+      "publication_date": "2021-04-30",
+      "pages": 263,
+      "bytes": 4878665
+    },
+    {
+      "type": "年度报告",
+      "period": "2021",
+      "title": "卧龙电驱:卧龙电驱2021年年度报告(更正后)",
+      "publication_date": "2024-06-26",
+      "pages": 213,
+      "bytes": 4749388
+    },
+    {
+      "type": "年度报告",
+      "period": "2022",
+      "title": "卧龙电驱:卧龙电驱2022年年度报告(更正后)",
+      "publication_date": "2024-06-26",
+      "pages": 266,
+      "bytes": 4899922
+    },
+    {
+      "type": "年度报告",
+      "period": "2023",
+      "title": "卧龙电驱:卧龙电驱2023年年度报告(更正后)",
+      "publication_date": "2024-06-26",
+      "pages": 275,
+      "bytes": 4803550
+    },
+    {
+      "type": "年度报告",
+      "period": "2024",
+      "title": "卧龙电驱:卧龙电驱2024年年度报告",
+      "publication_date": "2025-04-26",
+      "pages": 262,
+      "bytes": 1655460
+    },
+    {
+      "type": "年度报告",
+      "period": "2025",
+      "title": "卧龙电驱:卧龙电驱2025年年度报告",
+      "publication_date": "2026-03-20",
+      "pages": 241,
+      "bytes": 1714342
+    },
+    {
+      "type": "季度报告",
+      "period": "2026_Q1",
+      "title": "卧龙电驱:卧龙电驱2026年第一季度报告",
+      "publication_date": "2026-04-29",
+      "pages": 12,
+      "bytes": 195891
+    }
+  ]
+}
