@@ -29,18 +29,36 @@ jobs:
         run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
 
       - name: Download validate and package reports
-        run: python scripts/build_wolong_electric_drive_broker_reports_20261022.py
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+          from pathlib import Path
+
+          script = Path('scripts/build_wolong_electric_drive_broker_reports_20261022.py')
+          spec = importlib.util.spec_from_file_location('wolong_broker_builder', script)
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          module.PREFERRED_PATTERNS = [
+              '全球电机行业老牌企业，前瞻布局航空电机领域',
+              '工业电机盈利修复',
+              '工业电机有望受益于节能设备改造',
+          ]
+          module.main()
+          PY
 
       - name: Show package summary
         run: cat dist/package_summary.json
 
-      - name: Verify packaged PDF count
+      - name: Verify packaged PDF count and total pages
         run: |
           python - <<'PY'
           import json
           from pathlib import Path
           summary = json.loads(Path('dist/package_summary.json').read_text(encoding='utf-8'))
-          assert 2 <= summary['pdf_count'] <= 3, summary
+          assert summary['pdf_count'] == 3, summary
+          assert summary['total_pages'] >= 90, summary
           print('Verified PDF count:', summary['pdf_count'])
           print('Verified total pages:', summary['total_pages'])
           PY
@@ -48,7 +66,7 @@ jobs:
       - name: Upload package
         uses: actions/upload-artifact@v4
         with:
-          name: wolong-electric-drive-600580-broker-reports-20261022
+          name: wolong-electric-drive-600580-broker-reports-20261022-v2
           path: |
             dist/*.zip
             dist/package_summary.json
