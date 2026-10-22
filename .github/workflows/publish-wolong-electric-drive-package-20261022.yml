@@ -1,0 +1,54 @@
+name: Publish Wolong Electric Drive package 20261022
+
+on:
+  push:
+    branches:
+      - wolong-electric-drive-filings-20261022
+    paths:
+      - .github/workflows/publish-wolong-electric-drive-package-20261022.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: wolong-electric-drive-filings-20261022
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+
+      - name: Build verified package
+        run: python scripts/build_wolong_electric_drive_600580_filings_20261022.py
+
+      - name: Prepare direct-download files
+        run: |
+          mkdir -p downloads
+          SOURCE="$(find dist -maxdepth 1 -type f -name '*.zip' -print -quit)"
+          test -n "$SOURCE"
+          cp "$SOURCE" downloads/Wolong_Electric_Drive_600580_2020-2025_Annual_Reports_Latest_Quarter.zip
+          cp "$SOURCE" downloads/卧龙电驱_2020-2025年报_最新季报.zip
+          cp dist/package_summary.json downloads/Wolong_Electric_Drive_600580_package_summary.json
+          sha256sum downloads/*.zip > downloads/Wolong_Electric_Drive_600580_SHA256SUMS.txt
+
+      - name: Commit package files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add downloads/
+          git commit -m "Publish verified Wolong Electric Drive filings package" || exit 0
+          git push origin HEAD:wolong-electric-drive-filings-20261022
