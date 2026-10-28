@@ -1,0 +1,58 @@
+name: Package Jiangshun Technology filings 20261028
+
+on:
+  push:
+    branches:
+      - jiangshun-technology-filings-20261028
+    paths:
+      - scripts/build_jiangshun_001400_filings_20261028.py
+      - .github/workflows/package-jiangshun-001400-filings-20261028.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --disable-pip-version-check --quiet requests pypdf pymupdf
+
+      - name: Download validate and package filings
+        run: python scripts/build_jiangshun_001400_filings_20261028.py
+
+      - name: Show package summary
+        run: cat dist/package_summary.json
+
+      - name: Verify packaged PDF count
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          summary = json.loads(Path('dist/package_summary.json').read_text(encoding='utf-8'))
+          assert summary['pdf_count'] >= 3, summary
+          assert summary['annual_report_years'] == [2025], summary
+          assert '第三季度' in summary['latest_quarterly_report'], summary
+          print('Verified PDF count:', summary['pdf_count'])
+          print('Verified annual years:', summary['annual_report_years'])
+          PY
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: jiangshun-001400-filings-20261028
+          path: |
+            dist/*.zip
+            dist/package_summary.json
+          if-no-files-found: error
+          retention-days: 30
