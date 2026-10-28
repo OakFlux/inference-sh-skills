@@ -40,11 +40,13 @@ jobs:
           import json
           from pathlib import Path
           summary = json.loads(Path('dist/package_summary.json').read_text(encoding='utf-8'))
-          assert summary['pdf_count'] >= 3, summary
+          assert summary['pdf_count'] == 3, summary
           assert summary['annual_report_years'] == [2025], summary
-          assert '第三季度' in summary['latest_quarterly_report'], summary
+          assert summary['documents'][-1]['period'] == '2026_Q3', summary
+          assert '三季度报告' in summary['latest_quarterly_report'] or '第三季度报告' in summary['latest_quarterly_report'], summary
           print('Verified PDF count:', summary['pdf_count'])
           print('Verified annual years:', summary['annual_report_years'])
+          print('Verified latest quarter:', summary['latest_quarterly_report'])
           PY
 
       - name: Upload package
